@@ -634,6 +634,80 @@ test("failed drain preserves state and remains retryable", async (t) => {
   assert.equal(calls, 2);
 });
 
+test("failed stop cleanup is terminal and repeats its canonical result without rerunning cleanup", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        start: async (context) => {
+          context.disposables.add(() => context.events.emit("dispose", null));
+        },
+        run: async () => "ran",
+        stop: async (context) => context.events.emit("stop", null)
+      });
+    `,
+  );
+  const calls = { dispose: 0, stop: 0 };
+  const host = new ComponentHost(
+    allowedOptions(fixture, {
+      events: {
+        emit: async (type) => {
+          if (type !== "dispose" && type !== "stop") return;
+          calls[type] += 1;
+          throw new Error(`${type} failed`);
+        },
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "import-terminal-stop", { artifactDigest: digest }));
+  await host.handle(command("start", "start-terminal-stop", { artifactDigest: digest }));
+  await host.handle(command("drain", "drain-terminal-stop", { artifactDigest: digest }));
+
+  const first = await host.handle(
+    command("stop", "stop-terminal-first", { artifactDigest: digest }),
+  );
+  const repeated = await host.handle(
+    command("stop", "stop-terminal-repeated", { artifactDigest: digest }),
+  );
+
+  assert.equal(first.ok, false);
+  assert.equal(first.state, "failed");
+  assert.equal(first.diagnostics.length, 2);
+  assert.equal(repeated.ok, false);
+  assert.equal(repeated.state, "failed");
+  assert.deepEqual(
+    { ...repeated, commandId: first.commandId },
+    first,
+  );
+  assert.deepEqual(calls, { dispose: 1, stop: 1 });
+
+  const start = await host.handle(
+    command("start", "start-after-terminal-stop", { artifactDigest: digest }),
+  );
+  assert.equal(start.ok, false);
+  assert.equal(start.state, "failed");
+  const run = await host.handle(
+    command("run", "run-after-terminal-stop", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("task-after-terminal-stop"),
+        attemptId: parseAttemptId("attempt-after-terminal-stop"),
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        input: null,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+  );
+  assert.equal(run.ok, false);
+  assert.equal(run.state, "failed");
+});
+
 test("transition hook reentrancy returns promptly without waiting on the active hook", async (t) => {
   const fixture = await artifactFixture(
     t,
