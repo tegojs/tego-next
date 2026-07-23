@@ -104,6 +104,7 @@ class TestHostedProcess implements HostedProcess {
 class TestProcessHost implements ProcessHost {
   readonly #processes = new Set<TestHostedProcess>();
   #open = false;
+  #peakActiveProcessCount = 0;
   #signalCount = 0;
 
   get activeProcessCount(): number {
@@ -112,6 +113,10 @@ class TestProcessHost implements ProcessHost {
 
   get signalCount(): number {
     return this.#signalCount;
+  }
+
+  get peakActiveProcessCount(): number {
+    return this.#peakActiveProcessCount;
   }
 
   async open(): Promise<void> {
@@ -140,6 +145,7 @@ class TestProcessHost implements ProcessHost {
       },
     );
     this.#processes.add(hosted);
+    this.#peakActiveProcessCount = Math.max(this.#peakActiveProcessCount, this.#processes.size);
     return hosted;
   }
 
@@ -772,6 +778,39 @@ test("late-spawn cancellation cannot be blocked by stalled stdin closure", async
       attempts: 100,
       advance: () => new Promise((resolve) => setImmediate(resolve)),
     });
+  } finally {
+    processHost.gate.resolve();
+    await processHost.close();
+  }
+});
+
+test("late-spawn cleanup retains its reservation before replacement and drain complete", async () => {
+  const processHost = new DelayedSpawnProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost, maxConcurrency: 1 }));
+  const first = request({ mode: "echo", value: "first" }, "cancel-reserved-spawn");
+  const firstHandle = await executor.submit(first);
+  await processHost.started.promise;
+  try {
+    await executor.cancel(first.taskId, first.attemptId);
+    clock.advanceBy(100);
+    const replacement = request({ mode: "echo", value: "replacement" }, "replacement-after-cancel");
+    const replacementHandle = await executor.submit(replacement);
+    let firstSettled = false;
+    void firstHandle.result.then(() => {
+      firstSettled = true;
+    });
+    const draining = executor.drain({});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(firstSettled, false);
+    assert.equal(processHost.spawnCount, 1);
+
+    processHost.gate.resolve();
+    assert.equal((await firstHandle.result).status, "cancelled");
+    assert.equal((await replacementHandle.result).status, "succeeded");
+    await draining;
+    assert.equal(processHost.spawnCount, 2);
+    assert.equal(processHost.peakActiveProcessCount, 1);
+    assert.equal(processHost.activeProcessCount, 0);
   } finally {
     processHost.gate.resolve();
     await processHost.close();
