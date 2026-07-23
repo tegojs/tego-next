@@ -380,6 +380,29 @@ test("duplicate deployments, providers, and requirements are rejected determinis
   }
 });
 
+test("duplicate deployment diagnostics are independent of duplicate input order", () => {
+  const valid = deployment("duplicate", {
+    provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+  });
+  const invalid = deployment("duplicate", {
+    provides: [{ name: auditName, protocolVersion: "not-a-version" }],
+    requires: [{ name: echoName, protocolRange: "not-a-range" }],
+  });
+  const first = resolveCapabilities({ deployments: [valid, invalid] });
+  const second = resolveCapabilities({ deployments: [invalid, valid] });
+
+  assert.equal(first.ok, false);
+  assert.deepEqual(first, second);
+  assert.deepEqual(
+    first.diagnostics.map((item) => item.code),
+    [
+      "CAPABILITY_DUPLICATE_DEPLOYMENT",
+      "CAPABILITY_PROTOCOL_RANGE_INVALID",
+      "CAPABILITY_PROTOCOL_VERSION_INVALID",
+    ],
+  );
+});
+
 test("one deployment may expose distinct protocol versions of the same capability", () => {
   const result = resolveCapabilities({
     deployments: [
@@ -435,6 +458,12 @@ test("supported version ranges have strict partial, wildcard, caret, and prerele
   for (const range of ["1.0.0 - 2.0.0", "latest", ">=1.0.0 ||", "|| >=1.0.0"]) {
     assert.equal(isValidVersionRange(range), false, range);
     assert.equal(satisfiesVersionRange("1.5.0", range), false, range);
+  }
+
+  for (const range of ["x.x", "x.x.x", "*.*", "X.*.x"]) {
+    assert.equal(isValidVersionRange(range), false, range);
+    assert.equal(satisfiesVersionRange("0.5.0", range), false, range);
+    assert.equal(satisfiesVersionRange("99.0.0", range), false, range);
   }
 });
 
@@ -548,4 +577,28 @@ test("initial unready providers do not look like provider loss and recovery clea
   });
   assert.equal(recovered.ok, true);
   assert.deepEqual(recovered.providerLossActions, []);
+});
+
+test("a consumer that was not ready does not receive provider loss actions", () => {
+  const result = resolveCapabilities({
+    deployments: [
+      deployment("consumer", {
+        ready: false,
+        requires: [{ name: echoName, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+      }),
+      deployment("provider", {
+        ready: false,
+        provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+      }),
+    ],
+    previousBindings: [
+      {
+        consumer: identity("consumer"),
+        capability: echoName,
+        provider: identity("provider"),
+      },
+    ],
+  });
+
+  assert.deepEqual(result.providerLossActions, []);
 });
