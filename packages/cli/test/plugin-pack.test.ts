@@ -7,6 +7,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -16,6 +17,7 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DiagnosticError } from "@tegojs/contracts";
+import { buildPlugin } from "../src/plugin/build-plugin.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { signArtifact } from "../src/plugin/sign-plugin.js";
 
@@ -182,6 +184,31 @@ test("build:false rejects a symlinked build root before reading external files",
   } finally {
     await rm(directory, { force: true, recursive: true });
     await rm(outside, { force: true, recursive: true });
+  }
+});
+
+test("build rejects a tsconfig reached through a symlinked internal ancestor", async () => {
+  const directory = await temporaryFixture();
+  try {
+    const pluginRoot = await realpath(directory);
+    const configurationDirectory = join(pluginRoot, "configuration");
+    await mkdir(configurationDirectory);
+    await copyFile(join(pluginRoot, "tsconfig.json"), join(configurationDirectory, "tsconfig.json"));
+    await symlink(configurationDirectory, join(pluginRoot, "configuration-link"), "dir");
+    await assert.rejects(
+      () =>
+        buildPlugin({
+          pluginDirectory: pluginRoot,
+          tsconfigPath: join(pluginRoot, "configuration-link/tsconfig.json"),
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_BUILD_PATH_UNSAFE");
+        return true;
+      },
+    );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
   }
 });
 
