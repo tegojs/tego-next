@@ -1,0 +1,871 @@
+import { isAbsolute } from "node:path";
+import {
+  DiagnosticError,
+  runtimeDiagnostic,
+  type ArtifactDigest,
+  type ComponentCapabilityBoundary,
+  type ComponentCapabilityDiagnostic,
+  type ComponentPermissionBoundary,
+  type ComponentPermissionDiagnostic,
+  type DiagnosticCode,
+  type JsonObject,
+  type JsonValue,
+  type RuntimeDiagnostic,
+  type SecretProvider,
+} from "@tegojs/contracts";
+import { loadPreparedComponent, type LoadedComponentDefinition } from "./component-loader.js";
+import {
+  cloneComponentHostValue,
+  COMPONENT_HOST_PROTOCOL,
+  parseComponentHostCommand,
+  parseComponentHostResult,
+  type ComponentHostCommand,
+  type ComponentHostResult,
+  type ComponentHostState,
+  type ArtifactComponentHostCommand,
+  type PrepareComponentHostPayload,
+  type RunComponentHostCommand,
+} from "./protocol.js";
+
+export type ComponentHostPermissionBoundary = ComponentPermissionBoundary;
+export type ComponentHostCapabilityBoundary = ComponentCapabilityBoundary;
+
+export interface ComponentHostLogger {
+  debug(...values: readonly unknown[]): void;
+  error(...values: readonly unknown[]): void;
+  info(...values: readonly unknown[]): void;
+  warn(...values: readonly unknown[]): void;
+}
+
+export interface ComponentHostEvents {
+  emit(type: string, payload: JsonValue): Promise<void>;
+}
+
+export interface ComponentHostOptions {
+  readonly logger: ComponentHostLogger;
+  readonly events: ComponentHostEvents;
+  readonly permissionBoundary: ComponentPermissionBoundary;
+  readonly capabilityBoundary: ComponentCapabilityBoundary;
+  readonly secretProvider?: SecretProvider;
+  readonly now?: () => Date;
+}
+
+interface PreparedComponent {
+  readonly payload: PrepareComponentHostPayload;
+  readonly entrypoint: string;
+  readonly kind: "service" | "task";
+}
+
+interface CachedCommand {
+  readonly fingerprint: string;
+  readonly result: Promise<ComponentHostResult>;
+}
+
+interface ActiveRun {
+  readonly controller: AbortController;
+  cancellation: "cancelled" | "timed-out" | undefined;
+  result: Promise<JsonValue>;
+}
+
+type HookName = "drain" | "health" | "run" | "start" | "stop";
+
+const SENSITIVE_KEY = /(?:credential|password|secret|token)/iu;
+const DIAGNOSTIC_CODE =
+  /^(?:BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_[A-Z0-9_]+$/u;
+const MAX_TIMER_DELAY = 2_147_483_647;
+
+function freezeJson<T extends JsonValue>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const item of Array.isArray(value) ? value : Object.values(value)) freezeJson(item);
+  return Object.freeze(value);
+}
+
+function taskKey(taskId: string, attemptId: string): string {
+  return `${taskId.length}:${taskId}${attemptId}`;
+}
+
+function armDeadline(deadline: string, onDeadline: () => void): () => void {
+  let timer: NodeJS.Timeout | undefined;
+  let cancelled = false;
+  const schedule = (): void => {
+    if (cancelled) return;
+    const remaining = Date.parse(deadline) - Date.now();
+    if (remaining <= 0) {
+      onDeadline();
+      return;
+    }
+    timer = setTimeout(
+      remaining > MAX_TIMER_DELAY ? schedule : onDeadline,
+      Math.min(remaining, MAX_TIMER_DELAY),
+    );
+    timer.unref();
+  };
+  schedule();
+  return () => {
+    cancelled = true;
+    if (timer !== undefined) clearTimeout(timer);
+  };
+}
+
+export class ComponentHost {
+  readonly #options: ComponentHostOptions;
+  readonly #commands = new Map<string, CachedCommand>();
+  readonly #runs = new Map<string, ActiveRun>();
+  readonly #secretValues = new Set<string>();
+  #state: ComponentHostState = "new";
+  #prepared: PreparedComponent | undefined;
+  #definition: LoadedComponentDefinition | undefined;
+  #disposables: ReturnType<ComponentHost["createDisposables"]> | undefined;
+
+  constructor(options: ComponentHostOptions) {
+    this.#options = options;
+  }
+
+  async handle(input: unknown): Promise<ComponentHostResult> {
+    let command: ComponentHostCommand;
+    try {
+      command = parseComponentHostCommand(input);
+    } catch (error) {
+      return this.#failure("invalid", "invalid", error);
+    }
+    const fingerprint = JSON.stringify(command);
+    const cached = this.#commands.get(command.commandId);
+    if (cached !== undefined) {
+      if (cached.fingerprint === fingerprint) return cached.result;
+      return this.#failure(
+        command.commandId,
+        command.type,
+        new DiagnosticError(
+          runtimeDiagnostic({
+            code: "PROTOCOL_IDEMPOTENCY_CONFLICT",
+            message: "Command identity was reused with different content",
+            source: { kind: "protocol", id: command.commandId },
+            observedAt: this.#now(),
+          }),
+        ),
+      );
+    }
+    const result = this.#dispatch(command).then((value) => this.#validateResult(value));
+    this.#commands.set(command.commandId, { fingerprint, result });
+    return result;
+  }
+
+  async #dispatch(command: ComponentHostCommand): Promise<ComponentHostResult> {
+    if (Date.parse(command.deadline) <= Date.parse(this.#now())) {
+      return this.#failure(
+        command.commandId,
+        command.type,
+        new DiagnosticError(
+          runtimeDiagnostic({
+            code: "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+            message: "Component host command deadline has elapsed",
+            source: { kind: "executor", id: command.commandId },
+            observedAt: this.#now(),
+          }),
+        ),
+      );
+    }
+    try {
+      switch (command.type) {
+        case "prepare":
+          return this.#prepare(command);
+        case "import":
+          return await this.#import(command);
+        case "start":
+          return await this.#start(command);
+        case "health":
+          return await this.#health(command);
+        case "run":
+          return await this.#run(command);
+        case "drain":
+          return await this.#drain(command);
+        case "stop":
+          return await this.#stop(command);
+        case "cancel":
+          return this.#cancel(command);
+      }
+    } catch (error) {
+      return this.#failure(command.commandId, command.type, error);
+    }
+  }
+
+  #prepare(
+    command: Extract<ComponentHostCommand, { readonly type: "prepare" }>,
+  ): ComponentHostResult {
+    const payload = command.payload;
+    if (this.#state !== "new") {
+      if (
+        this.#prepared?.payload.artifactDigest === payload.artifactDigest &&
+        this.#prepared.payload.componentId === payload.componentId
+      ) {
+        return this.#success(command, { status: "prepared" });
+      }
+      throw this.#lifecycleError("prepare", "new");
+    }
+    if (!isAbsolute(payload.artifactRoot)) {
+      throw this.#diagnosticError(
+        "ARTIFACT_ENTRY_OUTSIDE_ROOT",
+        "Prepared artifact root must be absolute",
+      );
+    }
+    if (
+      payload.identity.pluginId !== payload.manifest.pluginId ||
+      payload.identity.componentId !== payload.componentId
+    ) {
+      throw this.#diagnosticError(
+        "DEPLOYMENT_COMPONENT_IDENTITY_MISMATCH",
+        "Prepared component identity does not match the manifest request",
+      );
+    }
+    const component = payload.manifest.components.find(
+      (candidate) => candidate.componentId === payload.componentId,
+    );
+    if (component === undefined) {
+      throw this.#diagnosticError(
+        "ARTIFACT_ENTRY_UNDECLARED",
+        "Prepared component is not declared by the manifest",
+      );
+    }
+    const grant = this.#options.permissionBoundary.validateGrant(
+      payload.manifest.permissions,
+      payload.permissionGrants,
+    );
+    if (!grant.allowed) throw this.#boundaryError(grant.diagnostics, "permission");
+    const registration = this.#options.capabilityBoundary.register(payload.capabilityDefinitions);
+    if (!registration.ok) {
+      throw this.#boundaryError(registration.diagnostics, "capability");
+    }
+    this.#prepared = {
+      payload: freezeJson(payload),
+      entrypoint: component.entrypoint,
+      kind: component.kind,
+    };
+    this.#disposables = this.createDisposables();
+    this.#state = "prepared";
+    return this.#success(command, { status: "prepared" });
+  }
+
+  async #import(
+    command: Extract<ComponentHostCommand, { readonly type: "import" }>,
+  ): Promise<ComponentHostResult> {
+    if (this.#state === "imported" || this.#state === "started" || this.#state === "draining") {
+      this.#assertDigest(command.payload.artifactDigest);
+      if (command.payload.entrypoint !== this.#prepared?.entrypoint) {
+        throw this.#diagnosticError(
+          "ARTIFACT_ENTRY_UNDECLARED",
+          "Import entrypoint is not declared for the prepared component",
+        );
+      }
+      return this.#success(command, { status: "imported" });
+    }
+    if (this.#state !== "prepared" || this.#prepared === undefined) {
+      throw this.#lifecycleError("import", "prepared");
+    }
+    this.#assertDigest(command.payload.artifactDigest);
+    if (command.payload.entrypoint !== this.#prepared.entrypoint) {
+      throw this.#diagnosticError(
+        "ARTIFACT_ENTRY_UNDECLARED",
+        "Import entrypoint is not declared for the prepared component",
+      );
+    }
+    this.#definition = await loadPreparedComponent({
+      artifactDigest: command.payload.artifactDigest,
+      artifactRoot: this.#prepared.payload.artifactRoot,
+      entrypoint: command.payload.entrypoint,
+      expectedKind: this.#prepared.kind,
+    });
+    this.#state = "imported";
+    return this.#success(command, { status: "imported" });
+  }
+
+  async #start(command: ArtifactComponentHostCommand): Promise<ComponentHostResult> {
+    this.#assertDigest(command.payload.artifactDigest);
+    if (this.#state === "started" || this.#state === "draining") {
+      return this.#success(command, { status: "started" });
+    }
+    if (this.#state !== "imported") throw this.#lifecycleError("start", "imported");
+    await this.#invokeLifecycleHook("start", command.deadline);
+    this.#state = "started";
+    return this.#success(command, { status: "started" });
+  }
+
+  async #health(command: ArtifactComponentHostCommand): Promise<ComponentHostResult> {
+    this.#assertDigest(command.payload.artifactDigest);
+    if (!["imported", "started", "draining"].includes(this.#state)) {
+      throw this.#lifecycleError("health", "imported, started, or draining");
+    }
+    const value =
+      this.#definition?.health === undefined
+        ? { status: "healthy" }
+        : await this.#invokeHook("health", command.deadline);
+    return this.#success(command, this.#wireOutput(value));
+  }
+
+  async #run(command: RunComponentHostCommand): Promise<ComponentHostResult> {
+    this.#assertDigest(command.payload.artifactDigest);
+    if (this.#state !== "started") throw this.#lifecycleError("run", "started");
+    const execution = command.payload.execution;
+    if (
+      command.deadline !== execution.deadline ||
+      execution.applicationId !== this.#prepared?.payload.identity.applicationId ||
+      execution.pluginId !== this.#prepared.payload.identity.pluginId ||
+      execution.componentId !== this.#prepared.payload.identity.componentId
+    ) {
+      throw this.#diagnosticError(
+        "EXECUTOR_REQUEST_IDENTITY_MISMATCH",
+        "Execution request does not match the prepared component or command deadline",
+      );
+    }
+    const key = taskKey(execution.taskId, execution.attemptId);
+    const existing = this.#runs.get(key);
+    if (existing !== undefined) {
+      return this.#success(command, await existing.result);
+    }
+    if (this.#definition?.run === undefined) {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMPONENT_HOOK_MISSING",
+        "Task component does not define a run hook",
+      );
+    }
+    const controller = new AbortController();
+    const active: ActiveRun = {
+      controller,
+      cancellation: undefined,
+      result: Promise.resolve(null),
+    };
+    active.result = this.#executeRun(command, active);
+    this.#runs.set(key, active);
+    return this.#success(command, await active.result);
+  }
+
+  async #executeRun(command: RunComponentHostCommand, active: ActiveRun): Promise<JsonValue> {
+    const execution = command.payload.execution;
+    const clearDeadline = armDeadline(execution.deadline, () => {
+      active.cancellation = "timed-out";
+      active.controller.abort("deadline");
+    });
+    const context = this.#context(active.controller.signal, "started");
+    const hook = Promise.resolve()
+      .then(() => this.#definition?.run?.(context, execution.input))
+      .then(
+        (value) => ({ kind: "value" as const, value }),
+        (error: unknown) => ({ kind: "error" as const, error }),
+      );
+    const aborted = new Promise<{ readonly kind: "aborted" }>((resolve) => {
+      active.controller.signal.addEventListener("abort", () => resolve({ kind: "aborted" }), {
+        once: true,
+      });
+    });
+    const outcome = await Promise.race([hook, aborted]);
+    clearDeadline();
+    if (outcome.kind === "aborted") {
+      return {
+        taskId: execution.taskId,
+        attemptId: execution.attemptId,
+        status: active.cancellation ?? "cancelled",
+      };
+    }
+    if (outcome.kind === "error") throw outcome.error;
+    return {
+      taskId: execution.taskId,
+      attemptId: execution.attemptId,
+      status: "succeeded",
+      output: this.#wireOutput(outcome.value),
+    };
+  }
+
+  async #drain(command: ArtifactComponentHostCommand): Promise<ComponentHostResult> {
+    this.#assertDigest(command.payload.artifactDigest);
+    if (this.#state === "draining") return this.#success(command, { status: "draining" });
+    if (this.#state !== "started") throw this.#lifecycleError("drain", "started");
+    this.#state = "draining";
+    await this.#invokeLifecycleHook("drain", command.deadline);
+    return this.#success(command, { status: "draining" });
+  }
+
+  async #stop(command: ArtifactComponentHostCommand): Promise<ComponentHostResult> {
+    this.#assertDigest(command.payload.artifactDigest);
+    if (this.#state === "stopped") return this.#success(command, { status: "stopped" });
+    if (!["prepared", "imported", "draining"].includes(this.#state)) {
+      throw this.#lifecycleError("stop", "prepared, imported, or draining");
+    }
+    const diagnostics: RuntimeDiagnostic[] = [];
+    try {
+      if (this.#definition !== undefined) {
+        await this.#invokeLifecycleHook("stop", command.deadline);
+      }
+    } catch (error) {
+      diagnostics.push(this.#asDiagnostic(error));
+    }
+    diagnostics.push(...((await this.#disposables?.dispose()) ?? []));
+    this.#options.capabilityBoundary.clear();
+    this.#state = "stopped";
+    if (diagnostics.length > 0) {
+      return this.#result(command.commandId, command.type, false, undefined, diagnostics);
+    }
+    return this.#success(command, { status: "stopped" });
+  }
+
+  #cancel(
+    command: Extract<ComponentHostCommand, { readonly type: "cancel" }>,
+  ): ComponentHostResult {
+    const active = this.#runs.get(taskKey(command.payload.taskId, command.payload.attemptId));
+    if (active === undefined || active.controller.signal.aborted) {
+      return this.#success(command, {
+        taskId: command.payload.taskId,
+        attemptId: command.payload.attemptId,
+        cancelled: false,
+      });
+    }
+    active.cancellation = "cancelled";
+    active.controller.abort(command.payload.reason ?? "cancelled");
+    return this.#success(command, {
+      taskId: command.payload.taskId,
+      attemptId: command.payload.attemptId,
+      cancelled: true,
+    });
+  }
+
+  async #invokeLifecycleHook(name: Exclude<HookName, "health" | "run">, deadline: string) {
+    const hook = this.#definition?.[name];
+    if (hook === undefined) return;
+    await this.#invokeHook(name, deadline);
+  }
+
+  async #invokeHook(name: Exclude<HookName, "run">, deadline: string): Promise<unknown> {
+    const hook = this.#definition?.[name];
+    if (hook === undefined) return undefined;
+    const controller = new AbortController();
+    const clearDeadline = armDeadline(deadline, () => controller.abort("deadline"));
+    const outcome = await Promise.race([
+      Promise.resolve()
+        .then(() => hook(this.#context(controller.signal, this.#state)))
+        .then(
+          (value) => ({ kind: "value" as const, value }),
+          (error: unknown) => ({ kind: "error" as const, error }),
+        ),
+      new Promise<{ readonly kind: "deadline" }>((resolve) => {
+        controller.signal.addEventListener("abort", () => resolve({ kind: "deadline" }), {
+          once: true,
+        });
+      }),
+    ]);
+    clearDeadline();
+    if (outcome.kind === "deadline") {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+        `Component ${name} hook exceeded its deadline`,
+      );
+    }
+    if (outcome.kind === "error") throw outcome.error;
+    return outcome.value;
+  }
+
+  #context(signal: AbortSignal, lifecycle: ComponentHostState): object {
+    const prepared = this.#prepared;
+    const disposables = this.#disposables;
+    if (prepared === undefined || disposables === undefined) {
+      throw this.#lifecycleError("context", "prepared");
+    }
+    const configuration = prepared.payload.configuration;
+    const config = Object.freeze({
+      get(key?: string): JsonValue | undefined {
+        if (key === undefined) return configuration;
+        if (
+          typeof configuration !== "object" ||
+          configuration === null ||
+          Array.isArray(configuration)
+        ) {
+          return undefined;
+        }
+        const objectConfiguration = configuration as JsonObject;
+        return Object.hasOwn(objectConfiguration, key) ? objectConfiguration[key] : undefined;
+      },
+    });
+    return Object.freeze({
+      identity: prepared.payload.identity,
+      config,
+      logger: this.#logger(),
+      events: Object.freeze({
+        emit: async (type: string, payload: JsonValue) => {
+          if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(type)) {
+            throw this.#diagnosticError(
+              "PROTOCOL_COMPONENT_EVENT_INVALID",
+              "Component event type is invalid",
+            );
+          }
+          await this.#options.events.emit(type, this.#redactJson(cloneComponentHostValue(payload)));
+        },
+      }),
+      capabilities: Object.freeze({
+        call: (request: unknown) => this.#capabilityCall(request),
+      }),
+      lifecycle: Object.freeze({ state: lifecycle }),
+      runtime: Object.freeze({
+        runtimeId: prepared.payload.identity.runtimeId,
+        ...prepared.payload.runtime,
+      }),
+      cancellation: signal,
+      disposables,
+      secrets: Object.freeze({
+        get: (name: string) => this.#secret(name),
+      }),
+    });
+  }
+
+  async #capabilityCall(input: unknown): Promise<JsonValue> {
+    const requestValue = cloneComponentHostValue(input);
+    if (typeof requestValue !== "object" || requestValue === null || Array.isArray(requestValue)) {
+      throw this.#diagnosticError(
+        "CAPABILITY_REQUEST_INVALID",
+        "Capability call must be an object",
+      );
+    }
+    const request = requestValue as JsonObject;
+    const fields = Object.keys(request).sort();
+    if (
+      fields.join(",") !== "input,method,name,protocolVersion" ||
+      typeof request.name !== "string" ||
+      typeof request.protocolVersion !== "string" ||
+      typeof request.method !== "string" ||
+      request.input === undefined
+    ) {
+      throw this.#diagnosticError(
+        "CAPABILITY_REQUEST_INVALID",
+        "Capability call fields are invalid",
+      );
+    }
+    const requestInput = request.input;
+    if (this.#containsSecret(requestInput)) {
+      throw this.#diagnosticError(
+        "PERMISSION_SECRET_EXFILTRATION_BLOCKED",
+        "Secret values cannot be sent through capability calls",
+      );
+    }
+    const prepared = this.#prepared;
+    if (prepared === undefined) throw this.#lifecycleError("capability", "prepared");
+    const permission = this.#options.permissionBoundary.authorize(
+      prepared.payload.permissionGrants,
+      { kind: "capability", name: request.name, method: request.method },
+    );
+    if (!permission.allowed) throw this.#boundaryError(permission.diagnostics, "permission");
+    const identity = { name: request.name, protocolVersion: request.protocolVersion };
+    const requestDecision = this.#options.capabilityBoundary.request(identity, requestInput);
+    if (!requestDecision.allowed || requestDecision.value === undefined) {
+      throw this.#boundaryError(requestDecision.diagnostics, "capability");
+    }
+    const response = cloneComponentHostValue(
+      await this.#options.capabilityBoundary.invoke({
+        identity,
+        method: request.method,
+        input: requestDecision.value,
+      }),
+    );
+    const responseDecision = this.#options.capabilityBoundary.response(identity, response);
+    if (!responseDecision.allowed || responseDecision.value === undefined) {
+      throw this.#boundaryError(responseDecision.diagnostics, "capability");
+    }
+    return freezeJson(responseDecision.value);
+  }
+
+  async #secret(name: string): Promise<string | undefined> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(name)) {
+      throw this.#diagnosticError("PERMISSION_SECRET_NAME_INVALID", "Secret name is invalid");
+    }
+    const prepared = this.#prepared;
+    if (prepared === undefined) throw this.#lifecycleError("secret", "prepared");
+    const requested = prepared.payload.manifest.permissions.some(
+      (permission) => permission.kind === "secret" && permission.names.includes(name),
+    );
+    if (!requested) {
+      throw this.#diagnosticError(
+        "PERMISSION_SECRET_NOT_REQUESTED",
+        "Secret was not requested by the plugin manifest",
+      );
+    }
+    const permission = this.#options.permissionBoundary.authorize(
+      prepared.payload.permissionGrants,
+      { kind: "secret", name },
+    );
+    if (!permission.allowed) throw this.#boundaryError(permission.diagnostics, "permission");
+    if (this.#options.secretProvider === undefined) {
+      throw this.#diagnosticError(
+        "BOOTSTRAP_SECRET_PROVIDER_UNAVAILABLE",
+        "Secret provider is unavailable",
+      );
+    }
+    const value = await this.#options.secretProvider.get(name);
+    if (value !== undefined) {
+      if (typeof value !== "string") {
+        throw this.#diagnosticError(
+          "BOOTSTRAP_SECRET_PROVIDER_INVALID",
+          "Secret provider returned an invalid value",
+        );
+      }
+      if (value.length > 0) this.#secretValues.add(value);
+    }
+    return value;
+  }
+
+  createDisposables() {
+    const items: Array<() => Promise<void> | void> = [];
+    let result: Promise<readonly RuntimeDiagnostic[]> | undefined;
+    return Object.freeze({
+      add: (input: unknown): void => {
+        if (result !== undefined) throw new Error("Cannot add a disposable after disposal");
+        if (typeof input === "function") {
+          items.push(input as () => Promise<void> | void);
+          return;
+        }
+        if (typeof input !== "object" || input === null || Array.isArray(input)) {
+          throw new TypeError("Disposable must be a function or plain object");
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(input, "dispose");
+        if (
+          Object.getPrototypeOf(input) !== Object.prototype ||
+          descriptor === undefined ||
+          !descriptor.enumerable ||
+          !("value" in descriptor) ||
+          typeof descriptor.value !== "function"
+        ) {
+          throw new TypeError("Disposable object must expose a dispose data function");
+        }
+        items.push(descriptor.value as () => Promise<void> | void);
+      },
+      dispose: (): Promise<readonly RuntimeDiagnostic[]> => {
+        result ??= (async () => {
+          const diagnostics: RuntimeDiagnostic[] = [];
+          for (const dispose of items.splice(0).reverse()) {
+            try {
+              await dispose();
+            } catch (error) {
+              diagnostics.push(
+                this.#asDiagnostic(
+                  error,
+                  "LIFECYCLE_DISPOSAL_FAILED",
+                  "Component disposable failed",
+                ),
+              );
+            }
+          }
+          return Object.freeze(diagnostics);
+        })();
+        return result;
+      },
+      get disposed(): boolean {
+        return result !== undefined;
+      },
+    });
+  }
+
+  #logger(): ComponentHostLogger {
+    const send =
+      (level: keyof ComponentHostLogger) =>
+      (...values: readonly unknown[]): void => {
+        this.#options.logger[level](...values.map((value) => this.#safeLogValue(value)));
+      };
+    return Object.freeze({
+      debug: send("debug"),
+      error: send("error"),
+      info: send("info"),
+      warn: send("warn"),
+    });
+  }
+
+  #safeLogValue(value: unknown): unknown {
+    if (typeof value === "string") return this.#redactText(value);
+    if (value instanceof Error) {
+      return {
+        name: this.#redactText(value.name),
+        message: this.#redactText(value.message),
+      };
+    }
+    try {
+      return this.#redactJson(cloneComponentHostValue(value));
+    } catch {
+      return "[UNSERIALIZABLE]";
+    }
+  }
+
+  #redactText(value: string): string {
+    let result = value;
+    for (const secret of this.#secretValues) result = result.replaceAll(secret, "[REDACTED]");
+    return result;
+  }
+
+  #redactJson(value: JsonValue): JsonValue {
+    if (typeof value === "string") return this.#redactText(value);
+    if (typeof value !== "object" || value === null) return value;
+    if (Array.isArray(value)) return value.map((item) => this.#redactJson(item));
+    const result: Record<string, JsonValue> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : this.#redactJson(item);
+    }
+    return result;
+  }
+
+  #containsSecret(value: JsonValue): boolean {
+    if (typeof value === "string") {
+      return [...this.#secretValues].some((secret) => secret.length > 0 && value.includes(secret));
+    }
+    if (typeof value !== "object" || value === null) return false;
+    return (Array.isArray(value) ? value : Object.values(value)).some((item) =>
+      this.#containsSecret(item),
+    );
+  }
+
+  #wireOutput(value: unknown): JsonValue {
+    return freezeJson(this.#redactJson(cloneComponentHostValue(value)));
+  }
+
+  #assertDigest(actual: ArtifactDigest): void {
+    const expected = this.#prepared?.payload.artifactDigest;
+    if (expected === undefined) throw this.#lifecycleError("artifact", "prepared");
+    if (actual !== expected) {
+      throw this.#diagnosticError(
+        "ARTIFACT_DIGEST_MISMATCH",
+        "Command artifact digest does not match the prepared immutable artifact",
+      );
+    }
+  }
+
+  #success(command: ComponentHostCommand, value: JsonValue): ComponentHostResult {
+    return this.#result(command.commandId, command.type, true, value, []);
+  }
+
+  #failure(
+    commandId: string,
+    type: ComponentHostResult["type"],
+    error: unknown,
+  ): ComponentHostResult {
+    return this.#result(commandId, type, false, undefined, [this.#asDiagnostic(error)]);
+  }
+
+  #result(
+    commandId: string,
+    type: ComponentHostResult["type"],
+    ok: boolean,
+    value: JsonValue | undefined,
+    diagnostics: readonly RuntimeDiagnostic[],
+  ): ComponentHostResult {
+    return {
+      protocol: COMPONENT_HOST_PROTOCOL,
+      commandId,
+      type,
+      ok,
+      state: this.#state,
+      ...(value === undefined ? {} : { value }),
+      diagnostics: diagnostics.map((diagnostic) => this.#redactDiagnostic(diagnostic)),
+    };
+  }
+
+  #validateResult(result: ComponentHostResult): ComponentHostResult {
+    try {
+      return parseComponentHostResult(result);
+    } catch (error) {
+      return parseComponentHostResult(this.#failure("invalid", "invalid", error));
+    }
+  }
+
+  #boundaryError(
+    diagnostics: readonly (ComponentCapabilityDiagnostic | ComponentPermissionDiagnostic)[],
+    source: "capability" | "permission",
+  ): DiagnosticError {
+    const first = diagnostics[0];
+    const code =
+      first !== undefined && DIAGNOSTIC_CODE.test(first.code)
+        ? (first.code as DiagnosticCode)
+        : source === "capability"
+          ? "CAPABILITY_BOUNDARY_REJECTED"
+          : "PERMISSION_BOUNDARY_REJECTED";
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code,
+        message: first?.message ?? `${source} boundary rejected the operation`,
+        source: {
+          kind: source === "capability" ? "capability" : "deployment",
+          id: "component-host",
+        },
+        details: {
+          diagnostics: this.#redactJson(cloneComponentHostValue(diagnostics)),
+        },
+        observedAt: this.#now(),
+      }),
+    );
+  }
+
+  #diagnosticError(code: DiagnosticCode, message: string): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code,
+        message,
+        source: { kind: "executor", id: "component-host" },
+        observedAt: this.#now(),
+      }),
+    );
+  }
+
+  #lifecycleError(operation: string, expected: string): DiagnosticError {
+    return this.#diagnosticError(
+      "LIFECYCLE_TRANSITION_INVALID",
+      `Cannot ${operation} while component is ${this.#state}; expected ${expected}`,
+    );
+  }
+
+  #asDiagnostic(
+    error: unknown,
+    code: DiagnosticCode = "EXECUTOR_COMPONENT_HOOK_FAILED",
+    message = "Component hook failed",
+  ): RuntimeDiagnostic {
+    if (error instanceof DiagnosticError) return this.#redactDiagnostic(error.diagnostic);
+    if (error instanceof Error) {
+      return runtimeDiagnostic({
+        code,
+        message,
+        source: { kind: "executor", id: "component-host" },
+        cause: {
+          name: this.#redactText(error.name),
+          message: this.#redactText(error.message),
+          ...(error.stack === undefined ? {} : { stack: this.#redactText(error.stack) }),
+        },
+        observedAt: this.#now(),
+      });
+    }
+    return runtimeDiagnostic({
+      code,
+      message,
+      source: { kind: "executor", id: "component-host" },
+      cause: {
+        name: "UnknownCause",
+        message: "Non-Error value thrown by component hook",
+      },
+      observedAt: this.#now(),
+    });
+  }
+
+  #redactDiagnostic(diagnostic: RuntimeDiagnostic): RuntimeDiagnostic {
+    return {
+      ...diagnostic,
+      message: this.#redactText(diagnostic.message),
+      ...(diagnostic.details === undefined
+        ? {}
+        : { details: this.#redactJson(diagnostic.details) }),
+      ...(diagnostic.cause === undefined
+        ? {}
+        : {
+            cause: {
+              ...diagnostic.cause,
+              name: this.#redactText(diagnostic.cause.name),
+              message: this.#redactText(diagnostic.cause.message),
+              ...(diagnostic.cause.stack === undefined
+                ? {}
+                : { stack: this.#redactText(diagnostic.cause.stack) }),
+            },
+          }),
+    };
+  }
+
+  #now(): string {
+    return (this.#options.now?.() ?? new Date()).toISOString();
+  }
+}

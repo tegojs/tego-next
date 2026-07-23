@@ -436,7 +436,7 @@ const runtimeStatusSchema = {
         additionalProperties: false,
         required: ["name", "health"],
         properties: {
-          name: { enum: ["artifacts", "coordination", "state"] },
+          name: { enum: ["artifacts", "coordination", "secrets", "state"] },
           health: { $ref: driverHealthSchema.$id },
         },
       },

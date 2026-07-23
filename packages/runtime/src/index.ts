@@ -49,6 +49,10 @@ export {
   type PermissionGateDecision,
 } from "./permissions/gate.js";
 export {
+  createComponentBoundaries,
+  type CreateComponentBoundariesOptions,
+} from "./permissions/component-boundary.js";
+export {
   canonicalizePermissionSet,
   containsLogicalPath,
   type PermissionDecision,

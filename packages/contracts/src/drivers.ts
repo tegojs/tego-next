@@ -2,6 +2,7 @@ import type { Clock } from "./clock.js";
 import type { ArtifactDigest, FencingEpoch, Revision } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { DriverHealth, StateStore, StorageScope } from "./state.js";
+import type { SecretProvider } from "./secrets.js";
 
 export interface ManagedDriver {
   open(): Promise<void>;
@@ -73,5 +74,6 @@ export interface RuntimeDrivers {
   readonly state: StateStore;
   readonly coordination: CoordinationProvider;
   readonly artifacts: ArtifactStore;
+  readonly secrets: SecretProvider;
   readonly clock: Clock;
 }

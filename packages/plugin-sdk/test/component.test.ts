@@ -10,7 +10,7 @@ import {
 
 test("defineComponent snapshots and deeply freezes a functional definition", () => {
   const metadata = { nested: { label: "original" } };
-  const run = async (_context: ComponentContext, input: unknown) => input;
+  const run = async (_context: ComponentContext, input: JsonValue) => input;
   const definition = defineComponent({
     kind: "task",
     metadata,

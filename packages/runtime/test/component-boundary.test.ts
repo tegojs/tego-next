@@ -80,11 +80,11 @@ test("component boundaries adapt the Task 7 registry and permission gates withou
   assert.deepEqual(
     capability.response(
       definition.identity,
-      await capability.invoke({
+      (await capability.invoke({
         identity: definition.identity,
         method: "echo",
         input: request.value ?? null,
-      }),
+      })) as JsonValue,
     ),
     {
       allowed: true,
@@ -98,8 +98,5 @@ test("component boundaries adapt the Task 7 registry and permission gates withou
   assert.equal(invalidResponse.allowed, false);
   assert.equal(invalidResponse.diagnostics[0]?.code, "CAPABILITY_RESPONSE_INVALID");
   capability.clear();
-  assert.equal(
-    capability.request(definition.identity, { message: "after-clear" }).allowed,
-    false,
-  );
+  assert.equal(capability.request(definition.identity, { message: "after-clear" }).allowed, false);
 });

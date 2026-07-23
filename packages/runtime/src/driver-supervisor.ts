@@ -22,6 +22,7 @@ export class DriverSupervisor {
       { name: "state", driver: drivers.state },
       { name: "coordination", driver: drivers.coordination },
       { name: "artifacts", driver: drivers.artifacts },
+      { name: "secrets", driver: drivers.secrets },
     ];
   }
 

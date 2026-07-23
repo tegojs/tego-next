@@ -190,7 +190,7 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-confined
       const source = [
         'import { pathToFileURL } from "node:url";',
         "const url = pathToFileURL(entrypoint);",
-        "const namespace = await import(url.href);",
+        "const namespace = (await import(url.href));",
       ].join("\n");
       await writeFile(new URL("component-loader.js", loaderDirectory), source);
       await writeFile(new URL("unsafe-loader.js", runtimeDirectory), source);
@@ -222,6 +222,28 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-im
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
         "@tegojs/runtime -> [unsupported import specifier]",
       ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/ignores-private-methods-named-import", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/executor-node": {
+        name: "@tegojs/executor-node",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/executor-node/dist/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("component-host.js", outputDirectory),
+        "class ComponentHost { async #import(command) { return command; } }",
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), []);
     },
   );
 });

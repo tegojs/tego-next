@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
@@ -42,7 +41,7 @@ async function artifactFixture(
     readonly permissions?: PluginManifest["permissions"];
   } = {},
 ): Promise<ArtifactFixture> {
-  const directory = await mkdtemp(join(tmpdir(), "tego-component-host-"));
+  const directory = await mkdtemp(join(process.cwd(), ".tego-component-host-"));
   t.after(() => rm(directory, { force: true, recursive: true }));
   const entrypoint = options.entrypoint ?? "components/component.js";
   const path = join(directory, ...entrypoint.split("/"));
@@ -114,9 +113,7 @@ function command(
   } as ComponentHostCommand;
 }
 
-function allowedOptions(
-  overrides: Partial<ComponentHostOptions> = {},
-): ComponentHostOptions {
+function allowedOptions(overrides: Partial<ComponentHostOptions> = {}): ComponentHostOptions {
   return {
     logger: {
       debug() {},
@@ -127,6 +124,21 @@ function allowedOptions(
     events: { emit: async () => {} },
     permissionBoundary: {
       authorize: () => ({ allowed: true, diagnostics: [] }),
+      validateGrant: (requested, granted) => {
+        const requestedValues = new Set(requested.map((value) => JSON.stringify(value)));
+        return granted.every((value) => requestedValues.has(JSON.stringify(value)))
+          ? { allowed: true, diagnostics: [], granted }
+          : {
+              allowed: false,
+              diagnostics: [
+                {
+                  code: "PERMISSION_GRANT_EXCEEDS_REQUEST",
+                  message: "Grant exceeds request",
+                  path: "$/permissionGrants",
+                },
+              ],
+            };
+      },
     },
     capabilityBoundary: {
       register: () => ({ ok: true, diagnostics: [] }),
@@ -156,18 +168,9 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
     payload: { artifactDigest: digest },
   };
   assert.deepEqual(parseComponentHostCommand(valid), valid);
-  assert.throws(
-    () => parseComponentHostCommand({ ...valid, protocol: "2.0" }),
-    /unsupported/u,
-  );
-  assert.throws(
-    () => parseComponentHostCommand({ ...valid, extra: true }),
-    /fields/u,
-  );
-  assert.throws(
-    () => parseComponentHostCommand({ ...valid, deadline: "not-a-date" }),
-    /deadline/u,
-  );
+  assert.throws(() => parseComponentHostCommand({ ...valid, protocol: "2.0" }), /unsupported/u);
+  assert.throws(() => parseComponentHostCommand({ ...valid, extra: true }), /fields/u);
+  assert.throws(() => parseComponentHostCommand({ ...valid, deadline: "not-a-date" }), /deadline/u);
   assert.throws(
     () =>
       parseComponentHostCommand({
@@ -231,13 +234,13 @@ test("prepare has no module side effects and import is confined to the prepared 
       entrypoint: "components/component.js",
     }),
   );
-  assert.equal(imported.ok, true);
+  assert.equal(imported.ok, true, JSON.stringify(imported));
   assert.equal(Reflect.get(globalThis, marker), 1);
 });
 
 test("loader rejects path escape, symlink escape, and CommonJS before import side effects", async (t) => {
   const escapedMarker = `__tegoEscapedSideEffect_${Date.now().toString(36)}`;
-  const directory = await mkdtemp(join(tmpdir(), "tego-component-confined-"));
+  const directory = await mkdtemp(join(process.cwd(), ".tego-component-confined-"));
   t.after(() => rm(directory, { force: true, recursive: true }));
   const outside = join(directory, "..", `${escapedMarker}.js`);
   await writeFile(outside, `globalThis.${escapedMarker} = true; export default {};`);
@@ -270,22 +273,44 @@ test("loader rejects path escape, symlink escape, and CommonJS before import sid
   assert.equal(escaped.ok, false);
   assert.equal(Reflect.get(globalThis, escapedMarker), undefined);
 
-  const commonJsMarker = `__tegoCommonJsSideEffect_${Date.now().toString(36)}`;
-  const commonJs = await artifactFixture(
-    t,
-    `globalThis.${commonJsMarker} = true; module.exports = {};`,
-    { entrypoint: "components/component.cjs" },
-  );
-  const commonJsHost = new ComponentHost(allowedOptions());
-  assert.equal((await commonJsHost.handle(prepareCommand(commonJs))).ok, true);
-  const importResult = await commonJsHost.handle(
-    command("import", "import-cjs", {
+  const symlinkFixture = await artifactFixture(t, "export default {};", {
+    entrypoint: "components/link.js",
+  });
+  await rm(join(symlinkFixture.directory, "components/link.js"));
+  await symlink(outside, join(symlinkFixture.directory, "components/link.js"));
+  const symlinkHost = new ComponentHost(allowedOptions());
+  assert.equal((await symlinkHost.handle(prepareCommand(symlinkFixture))).ok, true);
+  const symlinkResult = await symlinkHost.handle(
+    command("import", "import-symlink", {
       artifactDigest: digest,
-      entrypoint: "components/component.cjs",
+      entrypoint: "components/link.js",
     }),
   );
-  assert.equal(importResult.ok, false);
-  assert.equal(importResult.diagnostics[0]?.code, "ARTIFACT_MODULE_FORMAT_INVALID");
+  assert.equal(symlinkResult.ok, false);
+  assert.equal(symlinkResult.diagnostics[0]?.code, "ARTIFACT_ENTRY_OUTSIDE_ROOT");
+  assert.equal(Reflect.get(globalThis, escapedMarker), undefined);
+
+  const commonJsMarker = `__tegoCommonJsSideEffect_${Date.now().toString(36)}`;
+  const commonJs = await artifactFixture(t, "export default {};");
+  await writeFile(
+    join(commonJs.directory, "components/component.cjs"),
+    `globalThis.${commonJsMarker} = true; module.exports = {};`,
+  );
+  const commonJsManifest = {
+    ...commonJs.manifest,
+    components: [
+      {
+        ...commonJs.manifest.components[0],
+        entrypoint: "components/component.cjs",
+      },
+    ],
+  } as unknown as PluginManifest;
+  const commonJsHost = new ComponentHost(allowedOptions());
+  const commonJsResult = await commonJsHost.handle(
+    prepareCommand({ ...commonJs, manifest: commonJsManifest }, { manifest: commonJsManifest }),
+  );
+  assert.equal(commonJsResult.ok, false);
+  assert.equal(commonJsResult.diagnostics[0]?.code, "ARTIFACT_MANIFEST_INVALID");
   assert.equal(Reflect.get(globalThis, commonJsMarker), undefined);
 });
 
@@ -342,21 +367,15 @@ test("component lifecycle order and command idempotency are enforced without dup
   assert.deepEqual(duplicateStart, firstStart);
   assert.equal(idempotentStart.ok, true);
   assert.equal(
-    events.filter(
-      (event) => (event.payload as { readonly name?: string }).name === "start",
-    ).length,
+    events.filter((event) => (event.payload as { readonly name?: string }).name === "start").length,
     1,
   );
 
-  const conflict = await host.handle(
-    command("health", "start-01", { artifactDigest: digest }),
-  );
+  const conflict = await host.handle(command("health", "start-01", { artifactDigest: digest }));
   assert.equal(conflict.ok, false);
   assert.equal(conflict.diagnostics[0]?.code, "PROTOCOL_IDEMPOTENCY_CONFLICT");
 
-  const health = await host.handle(
-    command("health", "health-01", { artifactDigest: digest }),
-  );
+  const health = await host.handle(command("health", "health-01", { artifactDigest: digest }));
   assert.equal(health.ok, true);
   assert.deepEqual(health.value, { status: "healthy" });
 
@@ -408,10 +427,12 @@ test("capability calls are forced through permission, request, invoke, and respo
   const host = new ComponentHost(
     allowedOptions({
       permissionBoundary: {
-        authorize: (
-          _grants: unknown,
-          attempt: { readonly kind: string },
-        ) => {
+        validateGrant: (_requested, granted) => ({
+          allowed: true,
+          diagnostics: [],
+          granted,
+        }),
+        authorize: (_grants: unknown, attempt: { readonly kind: string }) => {
           order.push(`permission:${attempt.kind}`);
           return { allowed: true, diagnostics: [] };
         },
@@ -443,9 +464,7 @@ test("capability calls are forced through permission, request, invoke, and respo
             ? { allowed: true, diagnostics: [], value: input }
             : {
                 allowed: false,
-                diagnostics: [
-                  { code: "CAPABILITY_RESPONSE_INVALID", message: "invalid response" },
-                ],
+                diagnostics: [{ code: "CAPABILITY_RESPONSE_INVALID", message: "invalid response" }],
               };
         },
         clear() {},
@@ -498,10 +517,7 @@ test("capability calls are forced through permission, request, invoke, and respo
   );
   assert.equal(invalidResponse.ok, false);
   assert.deepEqual(order, ["permission:capability", "request", "invoke", "response"]);
-  assert.equal(
-    invalidResponse.diagnostics[0]?.code,
-    "CAPABILITY_RESPONSE_INVALID",
-  );
+  assert.equal(invalidResponse.diagnostics[0]?.code, "CAPABILITY_RESPONSE_INVALID");
 });
 
 test("duplicate task attempts execute once and cooperative cancellation reaches the hook", async (t) => {
@@ -622,10 +638,7 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
     ),
   );
   assert.equal(result.ok, true);
-  assert.equal(
-    (result.value as { readonly status?: string } | undefined)?.status,
-    "timed-out",
-  );
+  assert.equal((result.value as { readonly status?: string } | undefined)?.status, "timed-out");
   assert.equal(JSON.stringify(result).includes("late-output"), false);
 });
 
@@ -671,6 +684,11 @@ test("secret access requires manifest request and deployment grant and never lea
       },
       secretProvider: provider,
       permissionBoundary: {
+        validateGrant: (_requested, granted) => ({
+          allowed: true,
+          diagnostics: [],
+          granted,
+        }),
         authorize: (
           _grants: unknown,
           attempt: { readonly kind: string; readonly name?: string },
@@ -729,6 +747,16 @@ test("secret access requires manifest request and deployment grant and never lea
       secretProvider: provider,
       permissionBoundary: {
         authorize: () => ({ allowed: true, diagnostics: [] }),
+        validateGrant: () => ({
+          allowed: false,
+          diagnostics: [
+            {
+              code: "PERMISSION_GRANT_EXCEEDS_REQUEST",
+              message: "Grant exceeds request",
+              path: "$/permissionGrants",
+            },
+          ],
+        }),
       },
     }),
   );
@@ -765,9 +793,7 @@ test("thrown Error and non-Error values become redacted RuntimeDiagnostic result
       entrypoint: "components/component.js",
     }),
   );
-  const result = await host.handle(
-    command("start", "start-01", { artifactDigest: digest }),
-  );
+  const result = await host.handle(command("start", "start-01", { artifactDigest: digest }));
   assert.equal(result.ok, false);
   assert.equal(result.diagnostics[0]?.code, "EXECUTOR_COMPONENT_HOOK_FAILED");
   assert.equal(result.diagnostics[0]?.cause?.name, "UnknownCause");

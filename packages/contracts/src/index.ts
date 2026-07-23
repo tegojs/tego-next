@@ -1,5 +1,6 @@
 export * from "./capability.js";
 export * from "./clock.js";
+export * from "./component-boundary.js";
 export * from "./diagnostic.js";
 export * from "./drivers.js";
 export * from "./execution.js";
@@ -9,5 +10,6 @@ export * from "./permission.js";
 export * from "./plugin.js";
 export * from "./runtime.js";
 export * from "./schema.js";
+export * from "./secrets.js";
 export * from "./state.js";
 export * from "./worker.js";

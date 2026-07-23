@@ -28,7 +28,7 @@ export interface RuntimeIdentity extends JsonObject {
   readonly nodeId: NodeId;
 }
 
-export type RuntimeDriverName = "artifacts" | "coordination" | "state";
+export type RuntimeDriverName = "artifacts" | "coordination" | "secrets" | "state";
 
 export interface RuntimeDriverStatus extends JsonObject {
   readonly name: RuntimeDriverName;

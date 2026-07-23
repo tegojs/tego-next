@@ -5,6 +5,7 @@ import type { Clock, RuntimeDrivers } from "@tegojs/contracts";
 import { FilesystemArtifactStore } from "./filesystem-artifact-store.js";
 import { LocalCoordinationProvider } from "./local-coordination.js";
 import { SqliteStateStore } from "./sqlite/sqlite-state-store.js";
+import { DevelopmentSecretProvider } from "./development-secret-provider.js";
 
 const systemClock: Clock = {
   now: () => new Date(),
@@ -16,6 +17,7 @@ const systemClock: Clock = {
 export interface CreateLocalDriversOptions {
   readonly dataDirectory: string;
   readonly clock?: Clock;
+  readonly developmentSecrets?: Readonly<Record<string, string>>;
 }
 
 export async function createLocalDrivers(
@@ -34,6 +36,10 @@ export async function createLocalDrivers(
     coordination: new LocalCoordinationProvider({ clock }),
     artifacts: new FilesystemArtifactStore({
       rootDirectory: options.dataDirectory,
+      clock,
+    }),
+    secrets: new DevelopmentSecretProvider({
+      values: options.developmentSecrets ?? {},
       clock,
     }),
     clock,

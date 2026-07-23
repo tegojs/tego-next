@@ -285,13 +285,14 @@ function analyzeImports(source) {
   const specifiers = new Set();
   const tokens = javascriptTokens(source);
   let unsupportedSpecifier = false;
+  let fileUrlSpecifier = false;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (
       token.type !== "identifier" ||
       !["import", "export"].includes(token.value) ||
-      tokens[index - 1]?.value === "."
+      [".", "#"].includes(tokens[index - 1]?.value)
     ) {
       continue;
     }
@@ -311,6 +312,15 @@ function analyzeImports(source) {
       const delimiter = tokens[index + 3]?.value;
       if (argument?.type === "string" && !argument.escaped && [")", ","].includes(delimiter)) {
         specifiers.add(argument.value);
+      } else if (
+        argument?.type === "identifier" &&
+        argument.value === "url" &&
+        tokens[index + 3]?.value === "." &&
+        tokens[index + 4]?.type === "identifier" &&
+        tokens[index + 4]?.value === "href" &&
+        tokens[index + 5]?.value === ")"
+      ) {
+        fileUrlSpecifier = true;
       } else {
         unsupportedSpecifier = true;
       }
@@ -333,7 +343,16 @@ function analyzeImports(source) {
     }
   }
 
-  return { specifiers, unsupportedSpecifier };
+  return { fileUrlSpecifier, specifiers, unsupportedSpecifier };
+}
+
+function isConfinedComponentFileUrlImport(workspace, file, source) {
+  return (
+    workspace.manifest.name === "@tegojs/executor-node" &&
+    file.pathname.endsWith("/dist/src/host/component-loader.js") &&
+    /import\s*\{\s*pathToFileURL\s*\}\s*from\s*"node:url"/u.test(source) &&
+    /const\s+url\s*=\s*pathToFileURL\(entrypoint\)/u.test(source)
+  );
 }
 
 function referencedWorkspace(specifier, workspaces, importingFile) {
@@ -455,6 +474,13 @@ export async function checkWorkspaceBoundaries(root) {
       const imports = analyzeImports(source);
 
       if (workspace.kind !== "example" && imports.unsupportedSpecifier) {
+        violations.add(`${workspace.manifest.name} -> [unsupported import specifier]`);
+      }
+      if (
+        workspace.kind !== "example" &&
+        imports.fileUrlSpecifier &&
+        !isConfinedComponentFileUrlImport(workspace, file, source)
+      ) {
         violations.add(`${workspace.manifest.name} -> [unsupported import specifier]`);
       }
 
