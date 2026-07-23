@@ -166,3 +166,69 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-dy
     },
   );
 });
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-import-after-postfix-division", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/runtime/dist/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.js", outputDirectory),
+        "x++ / (await import(runtimeSpecifier)) / y;",
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/runtime -> [unsupported import specifier]",
+      ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-self-dependency", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": {
+        name: "@tegojs/contracts",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/contracts -> @tegojs/contracts",
+      ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/preserves-duplicate-dependency-section-entries", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: {
+          "shared-alias": "npm:@tegojs/executor-node@0.0.0",
+        },
+        devDependencies: {
+          "shared-alias": "npm:@tegojs/contracts@0.0.0",
+        },
+      },
+      "packages/executor-node": {
+        name: "@tegojs/executor-node",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/runtime -> @tegojs/executor-node",
+      ]);
+    },
+  );
+});
