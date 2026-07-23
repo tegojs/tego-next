@@ -13,6 +13,7 @@ import {
   parsePluginId,
   parsePluginManifest,
   parseTaskId,
+  type Clock,
   type DriverHealth,
   type ExecutionRequest,
   type HostedProcess,
@@ -384,6 +385,38 @@ test("active cancellation is cooperative before fake-clock grace forces process 
   await executor.drain({});
 });
 
+test("duplicate cancellation shares one escalation timer", async () => {
+  const started = Promise.withResolvers<void>();
+  let graceSleeps = 0;
+  const countingClock: Clock = {
+    now: () => clock.now(),
+    sleep(delay, signal) {
+      if (delay === 100) graceSleeps += 1;
+      return clock.sleep(delay, signal);
+    },
+  };
+  const executor = new ProcessExecutor(
+    await options({
+      clock: countingClock,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "duplicate-cancel");
+  const handle = await executor.submit(execution);
+  await started.promise;
+  await Promise.all(
+    Array.from({ length: 20 }, () => executor.cancel(execution.taskId, execution.attemptId)),
+  );
+  assert.equal(graceSleeps, 1);
+  clock.advanceBy(100);
+  await handle.result;
+  await executor.drain({});
+});
+
 test("an active deadline uses the shared clock and cannot be overwritten by a late exit", async () => {
   const started = Promise.withResolvers<void>();
   const processHost = new TestProcessHost();
@@ -554,6 +587,46 @@ test("graceful cleanup is bounded when a returned component ignores SIGTERM", as
   } finally {
     await processHost.close();
     await executor.drain({});
+  }
+});
+
+test("drain deadline cancels accepted work and bounds shutdown", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new TestProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "drain-deadline");
+  const handle = await executor.submit(execution);
+  try {
+    await started.promise;
+    let drained = false;
+    const draining = executor
+      .drain({
+        deadline: new Date(clock.now().getTime() + 50).toISOString(),
+      })
+      .then(() => {
+        drained = true;
+      });
+    clock.advanceBy(50);
+    await Promise.resolve();
+    await Promise.resolve();
+    clock.advanceBy(100);
+    await eventually(() => assert.equal(drained, true), {
+      attempts: 1_000,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    assert.equal((await handle.result).status, "cancelled");
+    await draining;
+  } finally {
+    await processHost.close();
   }
 });
 
