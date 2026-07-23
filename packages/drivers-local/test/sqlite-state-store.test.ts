@@ -217,6 +217,38 @@ test("an outbox claim survives restart, expires, rejects stale acknowledgement, 
   await second.close();
 });
 
+test("same-transaction outbox enqueue order survives restart", async () => {
+  const databasePath = await temporaryDatabase("outbox-order-restart");
+  const first = await openStore(databasePath);
+  const createdAt = new Date().toISOString();
+  await first.transact({}, async (transaction) => {
+    for (const suffix of ["z-first", "a-second"] as const) {
+      await transaction.enqueueOutbox({
+        availableAt: createdAt,
+        createdAt,
+        messageId: parseMessageId(`restart-${suffix}`),
+        operationId: parseOperationId(`restart-${suffix}`),
+        payload: { suffix },
+        topic: "component.lifecycle",
+      });
+    }
+    return null;
+  });
+  await first.close();
+
+  const second = await openStore(databasePath);
+  const claims = await second.claimOutbox({
+    leaseDurationMs: 30_000,
+    limit: 2,
+    owner: "restart-order",
+  });
+  assert.deepEqual(
+    claims.map((claim) => claim.message.messageId),
+    [parseMessageId("restart-z-first"), parseMessageId("restart-a-second")],
+  );
+  await second.close();
+});
+
 test("migrations are idempotent and configure WAL mode", async () => {
   const databasePath = await temporaryDatabase("migrations");
   await (await openStore(databasePath)).close();
@@ -228,7 +260,7 @@ test("migrations are idempotent and configure WAL mode", async () => {
       .prepare("SELECT version FROM schema_migrations ORDER BY version")
       .all()
       .map((row) => row.version);
-    assert.deepEqual(migrations, [1, 2]);
+    assert.deepEqual(migrations, [1, 2, 3]);
     assert.equal(database.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
     const tables = database
       .prepare(

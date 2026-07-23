@@ -32,6 +32,10 @@ function key(namespace: string, id: string): StateKey<ExampleRecord> {
   return { namespace, collection: "examples", id };
 }
 
+function jsonKey(namespace: string, id: string): StateKey<JsonValue> {
+  return { namespace, collection: "examples", id };
+}
+
 async function withStore<T>(
   factory: StateStoreFactory,
   run: (store: StateStore) => Promise<T>,
@@ -587,11 +591,11 @@ export function stateStoreConformance(
     test("outbox claims preserve journal enqueue order instead of message-id order", async () => {
       await withStore(factory, async (store) => {
         const createdAt = new Date().toISOString();
-        for (const [messageId, operationId] of [
-          ["z-first", "operation-first"],
-          ["a-second", "operation-second"],
-        ] as const) {
-          await store.transact({}, async (transaction) => {
+        await store.transact({}, async (transaction) => {
+          for (const [messageId, operationId] of [
+            ["z-first", "operation-first"],
+            ["a-second", "operation-second"],
+          ] as const) {
             await transaction.enqueueOutbox({
               availableAt: createdAt,
               createdAt,
@@ -600,9 +604,9 @@ export function stateStoreConformance(
               payload: { messageId },
               topic: "component.lifecycle",
             });
-            return null;
-          });
-        }
+          }
+          return null;
+        });
 
         const claims = await store.claimOutbox({
           leaseDurationMs: 30_000,
@@ -613,6 +617,92 @@ export function stateStoreConformance(
           claims.map((claim) => claim.message.messageId),
           [parseMessageId("z-first"), parseMessageId("a-second")],
         );
+      });
+    });
+
+    test("state and outbox values use canonical JSON boundaries without invoking accessors", async () => {
+      await withStore(factory, async (store) => {
+        let getterCalls = 0;
+        const accessor = {};
+        Object.defineProperty(accessor, "secret", {
+          enumerable: true,
+          get() {
+            getterCalls += 1;
+            return "leaked";
+          },
+        });
+        await assert.rejects(
+          store.transact({}, async (transaction) => {
+            await transaction.put(jsonKey("wire", "accessor"), accessor as JsonValue, {
+              expectedRevision: "absent",
+            });
+            return null;
+          }),
+          expectDiagnostic("PROTOCOL_WIRE_VALUE_INVALID"),
+        );
+        assert.equal(getterCalls, 0);
+
+        await store.transact({}, async (transaction) => {
+          await transaction.put(
+            jsonKey("wire", "canonical"),
+            { zebra: 1, alpha: 2 },
+            { expectedRevision: "absent" },
+          );
+          return null;
+        });
+        const canonical = await store.read(jsonKey("wire", "canonical"));
+        assert.deepEqual(Object.keys(canonical?.value ?? {}), ["alpha", "zebra"]);
+
+        const createdAt = new Date().toISOString();
+        const messageId = parseMessageId("canonical-payload");
+        const operationId = parseOperationId("canonical-operation");
+        await store.transact({}, async (transaction) => {
+          await transaction.enqueueOutbox({
+            availableAt: createdAt,
+            createdAt,
+            messageId,
+            operationId,
+            payload: { zebra: 1, alpha: 2 },
+            topic: "component.lifecycle",
+          });
+          return null;
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.enqueueOutbox({
+            availableAt: createdAt,
+            createdAt,
+            messageId,
+            operationId,
+            payload: { alpha: 2, zebra: 1 },
+            topic: "component.lifecycle",
+          });
+          return null;
+        });
+      });
+    });
+
+    test("outbox topic and payload bounds are enforced at enqueue", async () => {
+      await withStore(factory, async (store) => {
+        const createdAt = new Date().toISOString();
+        for (const [suffix, topic, payload] of [
+          ["topic", "x".repeat(129), {}],
+          ["payload", "component.lifecycle", { data: "x".repeat(1_048_577) }],
+        ] as const) {
+          await assert.rejects(
+            store.transact({}, async (transaction) => {
+              await transaction.enqueueOutbox({
+                availableAt: createdAt,
+                createdAt,
+                messageId: parseMessageId(`bounded-${suffix}`),
+                operationId: parseOperationId(`bounded-${suffix}`),
+                payload,
+                topic,
+              });
+              return null;
+            }),
+            expectDiagnostic("STATE_DATA_INVALID"),
+          );
+        }
       });
     });
 
