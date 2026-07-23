@@ -192,6 +192,67 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
   assert.equal(calls, 0);
 });
 
+test("prepare and import commands cannot nominate replaceable artifact locations", () => {
+  const prepare = {
+    protocol: "1.0",
+    commandId: "prepare-trusted-artifact",
+    deadline: futureDeadline,
+    type: "prepare",
+    payload: {
+      artifactDigest: digest,
+      componentId: parseComponentId("component"),
+      identity: {
+        runtimeId: parseRuntimeId("runtime-01"),
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        instanceId: "instance-01",
+      },
+      configuration: { greeting: "hello" },
+      permissionGrants: [],
+      capabilityDefinitions: [],
+      runtime: { executor: "process", mode: "single-main" },
+    },
+  };
+
+  assert.deepEqual(parseComponentHostCommand(prepare), prepare);
+  assert.throws(
+    () =>
+      parseComponentHostCommand({
+        ...prepare,
+        payload: { ...prepare.payload, artifactRoot: "/replaceable/root" },
+      }),
+    /fields/u,
+  );
+  assert.deepEqual(
+    parseComponentHostCommand({
+      protocol: "1.0",
+      commandId: "import-trusted-artifact",
+      deadline: futureDeadline,
+      type: "import",
+      payload: { artifactDigest: digest },
+    }),
+    {
+      protocol: "1.0",
+      commandId: "import-trusted-artifact",
+      deadline: futureDeadline,
+      type: "import",
+      payload: { artifactDigest: digest },
+    },
+  );
+  assert.throws(
+    () =>
+      parseComponentHostCommand({
+        protocol: "1.0",
+        commandId: "import-untrusted-entry",
+        deadline: futureDeadline,
+        type: "import",
+        payload: { artifactDigest: digest, entrypoint: "components/replacement.js" },
+      }),
+    /fields/u,
+  );
+});
+
 test("prepare has no module side effects and import is confined to the prepared digest and declared ESM entry", async (t) => {
   const marker = `__tegoPreparedSideEffect_${Date.now().toString(36)}`;
   const fixture = await artifactFixture(
