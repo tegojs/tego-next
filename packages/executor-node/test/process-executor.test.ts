@@ -227,6 +227,37 @@ class StalledCloseDelayedSpawnProcessHost extends DelayedSpawnProcessHost {
   }
 }
 
+class FatalThenDelayedSpawnProcessHost extends TestProcessHost {
+  readonly delayedStarted = Promise.withResolvers<void>();
+  readonly delayedGate = Promise.withResolvers<void>();
+  readonly delayedReturned = Promise.withResolvers<void>();
+  spawnCount = 0;
+
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    this.spawnCount += 1;
+    const index = this.spawnCount;
+    if (index === 2) {
+      this.delayedStarted.resolve();
+      await this.delayedGate.promise;
+    }
+    const hosted = await super.spawn(request);
+    if (index === 2) {
+      this.delayedReturned.resolve();
+      return hosted;
+    }
+    return {
+      pid: hosted.pid,
+      stdin: hosted.stdin,
+      stdout: hosted.stdout,
+      stderr: hosted.stderr,
+      signal: (signal) => hosted.signal(signal),
+      kill: () => Promise.reject(new Error("SIGKILL delivery failed")),
+      wait: () => new Promise<HostedProcessExit>(() => {}),
+      close: () => new Promise<void>(() => {}),
+    };
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -1360,9 +1391,9 @@ test("throwing quarantine logger cannot prevent terminal failure containment", a
   }
 });
 
-test("fatal quarantine stops an already-dequeued delayed resolution before spawn", async () => {
+test("fatal quarantine aborts an already-dequeued resolver that never returns", async () => {
   const started = Promise.withResolvers<void>();
-  const resolverGate = Promise.withResolvers<void>();
+  const resolverStarted = Promise.withResolvers<void>();
   const processHost = new RejectingKillProcessHost();
   const base = await options({ processHost });
   const executor = new ProcessExecutor({
@@ -1370,7 +1401,8 @@ test("fatal quarantine stops an already-dequeued delayed resolution before spawn
     maxConcurrency: 2,
     async resolveComponent(execution) {
       if (execution.attemptId === "attempt-quarantine-delayed") {
-        await resolverGate.promise;
+        resolverStarted.resolve();
+        await new Promise<void>(() => {});
       }
       return base.resolveComponent(execution);
     },
@@ -1385,18 +1417,82 @@ test("fatal quarantine stops an already-dequeued delayed resolution before spawn
   const runningHandle = await executor.submit(running);
   await started.promise;
   const delayedHandle = await executor.submit(delayed);
+  await resolverStarted.promise;
   try {
     await executor.cancel(running.taskId, running.attemptId);
     clock.advanceBy(100);
     assert.equal((await runningHandle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
-    resolverGate.resolve();
-    await new Promise((resolve) => setImmediate(resolve));
+    let delayedResult: Awaited<typeof delayedHandle.result> | undefined;
+    let drained = false;
+    void delayedHandle.result.then((result) => {
+      delayedResult = result;
+    });
+    void executor.drain({}).then(() => {
+      drained = true;
+    });
+    await eventually(
+      () => {
+        assert.equal(delayedResult?.status, "failed");
+        assert.equal(delayedResult?.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+        assert.equal(drained, true);
+      },
+      {
+        attempts: 100,
+        advance: () => new Promise((resolve) => setImmediate(resolve)),
+      },
+    );
     assert.equal(processHost.spawnCount, 1);
-    const delayedResult = await delayedHandle.result;
-    assert.equal(delayedResult.status, "failed");
-    assert.equal(delayedResult.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    assert.equal((await executor.health()).active, 1);
   } finally {
-    resolverGate.resolve();
+    await processHost.close();
+  }
+});
+
+test("fatal quarantine settles delayed spawn while drain tracks its late child cleanup", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new FatalThenDelayedSpawnProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      maxConcurrency: 2,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const running = request({ mode: "ignore-cancel" }, "fatal-delayed-running");
+  const delayed = request({ mode: "echo", value: "must-not-bootstrap" }, "fatal-delayed-spawn");
+  const runningHandle = await executor.submit(running);
+  await started.promise;
+  const delayedHandle = await executor.submit(delayed);
+  await processHost.delayedStarted.promise;
+  try {
+    await executor.cancel(running.taskId, running.attemptId);
+    clock.advanceBy(100);
+    assert.equal((await runningHandle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    let delayedResult: Awaited<typeof delayedHandle.result> | undefined;
+    let drained = false;
+    void delayedHandle.result.then((result) => {
+      delayedResult = result;
+    });
+    const draining = executor.drain({}).then(() => {
+      drained = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(delayedResult?.status, "failed");
+    assert.equal(delayedResult?.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    assert.equal(drained, false);
+
+    processHost.delayedGate.resolve();
+    await processHost.delayedReturned.promise;
+    await draining;
+    assert.equal(processHost.spawnCount, 2);
+    assert.equal(processHost.activeProcessCount, 1);
+    assert.equal((await executor.health()).active, 1);
+  } finally {
+    processHost.delayedGate.resolve();
     await processHost.close();
   }
 });
