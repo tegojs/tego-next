@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
 
 export interface BuildPluginOptions {
@@ -37,6 +37,22 @@ function isContained(root: string, candidate: string): boolean {
   );
 }
 
+async function assertNoSymlinkAncestors(pluginRoot: string, candidate: string): Promise<void> {
+  let current = pluginRoot;
+  for (const segment of relative(pluginRoot, candidate)
+    .split(sep)
+    .filter((value) => value.length > 0)) {
+    current = join(current, segment);
+    if ((await lstat(current)).isSymbolicLink()) {
+      throw buildError(
+        "ARTIFACT_BUILD_PATH_UNSAFE",
+        "Build path cannot contain symbolic links",
+        current,
+      );
+    }
+  }
+}
+
 async function assertRegularPathWithin(
   pluginRoot: string,
   candidate: string,
@@ -50,6 +66,7 @@ async function assertRegularPathWithin(
       absolute,
     );
   }
+  await assertNoSymlinkAncestors(pluginRoot, absolute);
   const metadata = await lstat(absolute);
   if (
     metadata.isSymbolicLink() ||
@@ -212,6 +229,7 @@ export async function buildPlugin(options: BuildPluginOptions): Promise<BuiltPlu
     "file",
   );
   const temporaryRoot = await mkdtemp(join(pluginRoot, ".tego-build-"));
+  await chmod(temporaryRoot, 0o700);
   const outputDirectory = join(temporaryRoot, "components");
   let cleaned = false;
   const cleanup = async () => {
