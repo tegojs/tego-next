@@ -374,6 +374,30 @@ test("JSON-bearing contract fields reject non-JSON values recursively", () => {
   );
 });
 
+test("execution request validation rejects accessor-backed arrays without invoking getters", () => {
+  let getterInvoked = false;
+  const accessorArray: unknown[] = [];
+  Object.defineProperty(accessorArray, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterInvoked = true;
+      return "must-not-run";
+    },
+  });
+  accessorArray.length = 1;
+
+  let validationError: unknown;
+  try {
+    parseExecutionRequest({ ...validExecutionRequest, input: accessorArray });
+  } catch (error) {
+    validationError = error;
+  }
+
+  assert.equal(getterInvoked, false);
+  assert.equal(diagnosticCode(validationError), "EXECUTOR_REQUEST_INVALID");
+});
+
 test("WorkerEnvelope payloads are statically constrained to JsonValue", () => {
   // @ts-expect-error bigint is not a valid wire payload
   const invalidEnvelope = null as unknown as WorkerEnvelope<{ revision: bigint }>;
@@ -397,4 +421,19 @@ test("serializeWireValue preserves an own __proto__ property without prototype p
   assert.deepEqual(JSON.parse(JSON.stringify(serialized)), {
     ["__proto__"]: { polluted: true },
   });
+});
+
+test("serializeWireValue rejects sparse and extended arrays", () => {
+  const sparseArray = new Array(1);
+  const extendedArray: unknown[] & { extra?: boolean } = ["value"];
+  extendedArray.extra = true;
+
+  assert.throws(
+    () => serializeWireValue(sparseArray),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_WIRE_VALUE_INVALID",
+  );
+  assert.throws(
+    () => serializeWireValue(extendedArray),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_WIRE_VALUE_INVALID",
+  );
 });
