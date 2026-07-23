@@ -48,9 +48,15 @@ class TestHostedProcess implements HostedProcess {
   readonly stderr: AsyncIterable<Uint8Array>;
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #exit: Promise<HostedProcessExit>;
+  readonly #signalled: () => void;
 
-  constructor(child: ChildProcessWithoutNullStreams, exited: () => void) {
+  constructor(
+    child: ChildProcessWithoutNullStreams,
+    exited: () => void,
+    signalled: () => void,
+  ) {
     this.#child = child;
+    this.#signalled = signalled;
     this.pid = child.pid;
     this.stdout = child.stdout as AsyncIterable<Uint8Array>;
     this.stderr = child.stderr as AsyncIterable<Uint8Array>;
@@ -79,6 +85,7 @@ class TestHostedProcess implements HostedProcess {
   }
 
   async signal(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+    this.#signalled();
     this.#child.kill(signal);
   }
 
@@ -99,9 +106,14 @@ class TestHostedProcess implements HostedProcess {
 class TestProcessHost implements ProcessHost {
   readonly #processes = new Set<TestHostedProcess>();
   #open = false;
+  #signalCount = 0;
 
   get activeProcessCount(): number {
     return this.#processes.size;
+  }
+
+  get signalCount(): number {
+    return this.#signalCount;
   }
 
   async open(): Promise<void> {
@@ -122,7 +134,13 @@ class TestProcessHost implements ProcessHost {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let hosted!: TestHostedProcess;
-    hosted = new TestHostedProcess(child, () => this.#processes.delete(hosted));
+    hosted = new TestHostedProcess(
+      child,
+      () => this.#processes.delete(hosted),
+      () => {
+        this.#signalCount += 1;
+      },
+    );
     this.#processes.add(hosted);
     return hosted;
   }
@@ -519,6 +537,50 @@ test("duplicate cancellation shares one escalation timer", async () => {
   await executor.drain({});
 });
 
+test("queued terminal attempts release their deadline sleeper", async () => {
+  const started = Promise.withResolvers<void>();
+  let activeSleeps = 0;
+  const countingClock: Clock = {
+    now: () => clock.now(),
+    async sleep(delay, signal) {
+      activeSleeps += 1;
+      try {
+        await clock.sleep(delay, signal);
+      } finally {
+        activeSleeps -= 1;
+      }
+    },
+  };
+  const executor = new ProcessExecutor(
+    await options({
+      clock: countingClock,
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const running = request({ mode: "wait" }, "deadline-sleeper-running");
+  const queued = request({ mode: "wait" }, "deadline-sleeper-queued");
+  const runningHandle = await executor.submit(running);
+  await started.promise;
+  const queuedHandle = await executor.submit(queued);
+  try {
+    assert.equal(activeSleeps, 2);
+    await executor.cancel(queued.taskId, queued.attemptId);
+    await queuedHandle.result;
+    assert.equal(activeSleeps, 1);
+  } finally {
+    await executor.cancel(running.taskId, running.attemptId);
+    clock.advanceBy(100);
+    await runningHandle.result;
+    await executor.drain({});
+  }
+  assert.equal(activeSleeps, 0);
+});
+
 test("an active deadline uses the shared clock and cannot be overwritten by a late exit", async () => {
   const started = Promise.withResolvers<void>();
   const processHost = new TestProcessHost();
@@ -689,6 +751,10 @@ test("graceful cleanup is bounded when a returned component ignores SIGTERM", as
   );
   try {
     await finished.promise;
+    await eventually(() => assert.equal(processHost.signalCount, 1), {
+      attempts: 1_000,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
     clock.advanceBy(100);
     let settled = false;
     void handle.result.then(() => {
