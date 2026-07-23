@@ -449,7 +449,7 @@ async function handle(message: ParentMessage): Promise<void> {
     respond(message.id, { ok: false, message: "Thread component host is not bootstrapped" });
     return;
   }
-  respond(message.id, await host.handle(message.command));
+  respond(message.id, await host.handle(message.command, message.attachments));
 }
 
 function connect(value: unknown): void {

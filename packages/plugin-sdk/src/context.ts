@@ -183,7 +183,18 @@ export interface ComponentConfigReader {
   get(key: string): JsonValue | undefined;
 }
 
+export interface ComponentAttachment {
+  readonly byteLength: number;
+  bytes(): Uint8Array;
+}
+
+export interface ComponentAttachments {
+  readonly length: number;
+  get(index: number): ComponentAttachment | undefined;
+}
+
 export interface ComponentContext {
+  readonly attachments: ComponentAttachments;
   readonly identity: ComponentIdentity;
   readonly config: ComponentConfigReader;
   readonly logger: ComponentLogger;
@@ -197,6 +208,7 @@ export interface ComponentContext {
 }
 
 export interface CreateComponentContextInput {
+  readonly attachments?: readonly (ArrayBuffer | ArrayBufferView)[];
   readonly identity: ComponentIdentity;
   readonly configuration: JsonValue;
   readonly logger: ComponentLogger;
@@ -210,7 +222,7 @@ export interface CreateComponentContextInput {
 }
 
 export function createComponentContext(input: CreateComponentContextInput): ComponentContext {
-  const envelope = dataFields(input, "Component context input", [
+  const inputFields = [
     "identity",
     "configuration",
     "logger",
@@ -221,7 +233,35 @@ export function createComponentContext(input: CreateComponentContextInput): Comp
     "cancellation",
     "disposables",
     "secrets",
-  ]);
+  ];
+  if (Object.hasOwn(input, "attachments")) inputFields.push("attachments");
+  const envelope = dataFields(input, "Component context input", inputFields);
+  const attachmentInput = envelope.get("attachments") ?? [];
+  if (
+    !Array.isArray(attachmentInput) ||
+    Object.getPrototypeOf(attachmentInput) !== Array.prototype
+  ) {
+    throw new TypeError("Component attachments must be a standard array");
+  }
+  const attachmentBytes = attachmentInput.map((value, index) => {
+    if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+    }
+    throw new TypeError(`Component attachment at index ${index} must be binary data`);
+  });
+  const attachmentValues = attachmentBytes.map((value) =>
+    Object.freeze({
+      byteLength: value.byteLength,
+      bytes: () => value.slice(),
+    }),
+  );
+  const attachments = Object.freeze({
+    length: attachmentValues.length,
+    get(index: number): ComponentAttachment | undefined {
+      return Number.isSafeInteger(index) && index >= 0 ? attachmentValues[index] : undefined;
+    },
+  });
   const configuration = snapshotJson(envelope.get("configuration"));
   const identity = snapshotObject(
     envelope.get("identity") as ComponentIdentity,
@@ -296,6 +336,7 @@ export function createComponentContext(input: CreateComponentContextInput): Comp
     },
   });
   return Object.freeze({
+    attachments,
     identity,
     config,
     logger,

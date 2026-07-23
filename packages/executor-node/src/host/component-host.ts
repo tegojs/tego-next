@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
   DiagnosticError,
@@ -110,6 +111,20 @@ interface ActiveTransition {
   readonly result: Promise<ComponentHostResult>;
 }
 
+interface RunAttachmentLease {
+  readonly fingerprint: string;
+  readonly reader: {
+    readonly length: number;
+    get(index: number):
+      | {
+          readonly byteLength: number;
+          bytes(): Uint8Array;
+        }
+      | undefined;
+  };
+  revoke(): void;
+}
+
 type HookName = "drain" | "health" | "run" | "start" | "stop";
 
 const SENSITIVE_KEY = /(?:credential|password|secret|token)/iu;
@@ -193,24 +208,44 @@ export class ComponentHost {
     this.#clock = options.clock ?? SYSTEM_CLOCK;
   }
 
-  async handle(input: unknown): Promise<ComponentHostResult> {
+  async handle(
+    input: unknown,
+    attachmentInput: readonly ArrayBuffer[] = [],
+  ): Promise<ComponentHostResult> {
     let command: ComponentHostCommand;
     try {
       command = parseComponentHostCommand(input);
     } catch (error) {
       return this.#failure("invalid", "invalid", error);
     }
-    const fingerprint = JSON.stringify(command);
+    let attachments: RunAttachmentLease;
+    try {
+      if (
+        !Array.isArray(attachmentInput) ||
+        attachmentInput.some((item) => !(item instanceof ArrayBuffer))
+      ) {
+        throw new TypeError("Component host attachments must be ArrayBuffers");
+      }
+      if (command.type !== "run" && attachmentInput.length > 0) {
+        throw new TypeError("Component host attachments are only valid for run commands");
+      }
+      attachments = this.#attachments(attachmentInput);
+    } catch (error) {
+      return this.#failure(command.commandId, command.type, error);
+    }
+    const fingerprint = `${JSON.stringify(command)}:${attachments.fingerprint}`;
     const cached =
       this.#commands.get(command.commandId) ?? this.#controlCommands.get(command.commandId);
     if (cached !== undefined) {
       if (cached.fingerprint === fingerprint) {
+        attachments.revoke();
         const cache = this.#commands.has(command.commandId)
           ? this.#commands
           : this.#controlCommands;
         this.#touch(cache, command.commandId, cached);
         return cached.result;
       }
+      attachments.revoke();
       return this.#failure(
         command.commandId,
         command.type,
@@ -230,6 +265,7 @@ export class ComponentHost {
       ? COMPONENT_HOST_CONTROL_COMMAND_RETENTION_LIMIT
       : COMPONENT_HOST_COMMAND_RETENTION_LIMIT;
     if (!this.#makeRoom(cache, limit)) {
+      attachments.revoke();
       return this.#failure(
         command.commandId,
         command.type,
@@ -241,7 +277,7 @@ export class ComponentHost {
     }
     const dispatched = TRANSITION_COMMANDS.has(command.type)
       ? this.#submitTransition(command)
-      : this.#dispatch(command);
+      : this.#dispatch(command, attachments);
     const result = dispatched.then((value) => this.#validateResult(value));
     const entry: CachedCommand = { fingerprint, result, settled: false };
     cache.set(command.commandId, entry);
@@ -253,6 +289,7 @@ export class ComponentHost {
         entry.settled = true;
       },
     );
+    void result.finally(() => attachments.revoke()).catch(() => undefined);
     return result;
   }
 
@@ -321,7 +358,10 @@ export class ComponentHost {
     return result;
   }
 
-  async #dispatch(command: ComponentHostCommand): Promise<ComponentHostResult> {
+  async #dispatch(
+    command: ComponentHostCommand,
+    attachments?: RunAttachmentLease,
+  ): Promise<ComponentHostResult> {
     if (Date.parse(command.deadline) <= Date.parse(this.#now())) {
       return this.#failure(
         command.commandId,
@@ -347,7 +387,7 @@ export class ComponentHost {
         case "health":
           return await this.#health(command);
         case "run":
-          return await this.#run(command);
+          return await this.#run(command, attachments ?? this.#attachments([]));
         case "drain":
           return await this.#drain(command);
         case "stop":
@@ -474,7 +514,10 @@ export class ComponentHost {
     return this.#success(command, this.#wireOutput(value));
   }
 
-  async #run(command: RunComponentHostCommand): Promise<ComponentHostResult> {
+  async #run(
+    command: RunComponentHostCommand,
+    attachments: RunAttachmentLease,
+  ): Promise<ComponentHostResult> {
     this.#assertDigest(command.payload.artifactDigest);
     if (!this.#acceptingRuns) {
       if (this.#activeTransition !== undefined) {
@@ -503,6 +546,7 @@ export class ComponentHost {
       artifactDigest: command.payload.artifactDigest,
       execution,
       generation: this.#prepared.generation,
+      attachments: attachments.fingerprint,
     });
     const existing = this.#runs.get(key);
     if (existing !== undefined) {
@@ -534,7 +578,7 @@ export class ComponentHost {
       result: Promise.resolve(null),
       settled: false,
     };
-    active.result = this.#executeRun(command, active);
+    active.result = this.#executeRun(command, active, attachments);
     this.#runs.set(key, active);
     void active.result.then(
       () => {
@@ -547,13 +591,17 @@ export class ComponentHost {
     return this.#success(command, await active.result);
   }
 
-  async #executeRun(command: RunComponentHostCommand, active: ActiveRun): Promise<JsonValue> {
+  async #executeRun(
+    command: RunComponentHostCommand,
+    active: ActiveRun,
+    attachments: RunAttachmentLease,
+  ): Promise<JsonValue> {
     const execution = command.payload.execution;
     const clearDeadline = armDeadline(execution.deadline, this.#clock, () => {
       active.cancellation = "timed-out";
       active.controller.abort("deadline");
     });
-    const context = this.#context(active.controller.signal, "started");
+    const context = this.#context(active.controller.signal, "started", attachments.reader);
     const hook = Promise.resolve()
       .then(() => this.#definition?.run?.(context, execution.input))
       .then(
@@ -682,7 +730,11 @@ export class ComponentHost {
     return outcome.value;
   }
 
-  #context(signal: AbortSignal, lifecycle: ComponentHostState): object {
+  #context(
+    signal: AbortSignal,
+    lifecycle: ComponentHostState,
+    attachments: RunAttachmentLease["reader"] = this.#attachments([]).reader,
+  ): object {
     const prepared = this.#prepared;
     const disposables = this.#disposables;
     if (prepared === undefined || disposables === undefined) {
@@ -704,6 +756,7 @@ export class ComponentHost {
       },
     });
     return Object.freeze({
+      attachments,
       identity: prepared.payload.identity,
       config,
       logger: this.#logger(),
@@ -732,6 +785,44 @@ export class ComponentHost {
         get: (name: string) => this.#secret(name),
       }),
     });
+  }
+
+  #attachments(input: readonly ArrayBuffer[]): RunAttachmentLease {
+    const values = input.map((buffer) => new Uint8Array(buffer).slice());
+    const hash = createHash("sha256");
+    const count = Buffer.allocUnsafe(4);
+    count.writeUInt32BE(values.length);
+    hash.update(count);
+    for (const value of values) {
+      const length = Buffer.allocUnsafe(4);
+      length.writeUInt32BE(value.byteLength);
+      hash.update(length);
+      hash.update(value);
+    }
+    let active = true;
+    const items = values.map((value) =>
+      Object.freeze({
+        byteLength: value.byteLength,
+        bytes(): Uint8Array {
+          if (!active) throw new Error("Component run attachments are no longer available");
+          return value.slice();
+        },
+      }),
+    );
+    return {
+      fingerprint: hash.digest("hex"),
+      reader: Object.freeze({
+        length: items.length,
+        get(index: number) {
+          if (!active) throw new Error("Component run attachments are no longer available");
+          return Number.isSafeInteger(index) && index >= 0 ? items[index] : undefined;
+        },
+      }),
+      revoke() {
+        active = false;
+        for (const value of values) value.fill(0);
+      },
+    };
   }
 
   async #capabilityCall(input: unknown): Promise<JsonValue> {
