@@ -169,37 +169,98 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-dy
   );
 });
 
-test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-confined-component-loader-file-url-import", async () => {
-  await withWorkspace(
-    {
-      "packages/contracts": { name: "@tegojs/contracts" },
-      "packages/runtime": {
-        name: "@tegojs/runtime",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
-      },
-      "packages/executor-node": {
-        name: "@tegojs/executor-node",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
-      },
+test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-direct-scoped-component-file-url-import", async (t) => {
+  const workspaces = {
+    "packages/contracts": { name: "@tegojs/contracts" },
+    "packages/runtime": {
+      name: "@tegojs/runtime",
+      dependencies: { "@tegojs/contracts": "0.0.0" },
     },
-    async (root) => {
+    "packages/executor-node": {
+      name: "@tegojs/executor-node",
+      dependencies: { "@tegojs/contracts": "0.0.0" },
+    },
+  };
+  const directLoader = [
+    'import { pathToFileURL } from "node:url";',
+    "export async function loadPreparedComponent(input) {",
+    "  const entrypoint = input.entrypoint;",
+    "  return import(pathToFileURL(entrypoint).href);",
+    "}",
+  ].join("\n");
+
+  await t.test("accepts the unique direct expression in the target loader", async () => {
+    await withWorkspace(workspaces, async (root) => {
       const loaderDirectory = new URL("packages/executor-node/dist/src/host/", root);
-      const runtimeDirectory = new URL("packages/runtime/dist/", root);
       await mkdir(loaderDirectory, { recursive: true });
-      await mkdir(runtimeDirectory, { recursive: true });
-      const source = [
+      await writeFile(new URL("component-loader.js", loaderDirectory), directLoader);
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), []);
+    });
+  });
+
+  for (const [name, source] of [
+    [
+      "rejects a second computed import in the same loader",
+      `${directLoader}\nconst url = pathToFileURL(entrypoint);\nawait import(url.href);`,
+    ],
+    [
+      "rejects a shadowed pathToFileURL binding",
+      [
         'import { pathToFileURL } from "node:url";',
-        "const url = pathToFileURL(entrypoint);",
-        "const namespace = (await import(url.href));",
-      ].join("\n");
-      await writeFile(new URL("component-loader.js", loaderDirectory), source);
-      await writeFile(new URL("unsafe-loader.js", runtimeDirectory), source);
+        "export async function loadPreparedComponent(pathToFileURL) {",
+        "  return import(pathToFileURL(entrypoint).href);",
+        "}",
+      ].join("\n"),
+    ],
+    [
+      "rejects an aliased pathToFileURL binding",
+      [
+        'import { pathToFileURL as fileUrl } from "node:url";',
+        "export async function loadPreparedComponent(input) {",
+        "  const entrypoint = input.entrypoint;",
+        "  return import(fileUrl(entrypoint).href);",
+        "}",
+      ].join("\n"),
+    ],
+    [
+      "rejects the expression from a nested scope",
+      [
+        'import { pathToFileURL } from "node:url";',
+        "export async function loadPreparedComponent(input) {",
+        "  const entrypoint = input.entrypoint;",
+        "  const nested = async () => {",
+        "    return import(pathToFileURL(entrypoint).href);",
+        "  };",
+        "  return nested();",
+        "}",
+      ].join("\n"),
+    ],
+  ]) {
+    await t.test(name, async () => {
+      await withWorkspace(workspaces, async (root) => {
+        const loaderDirectory = new URL("packages/executor-node/dist/src/host/", root);
+        await mkdir(loaderDirectory, { recursive: true });
+        await writeFile(new URL("component-loader.js", loaderDirectory), source);
+
+        assert.deepEqual(await checkWorkspaceBoundaries(root), [
+          "@tegojs/executor-node -> [unsupported import specifier]",
+        ]);
+      });
+    });
+  }
+
+  await t.test("rejects the same direct expression outside the target loader", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const runtimeDirectory = new URL("packages/runtime/dist/", root);
+      await mkdir(runtimeDirectory, { recursive: true });
+      await writeFile(new URL("unsafe-loader.js", runtimeDirectory), directLoader);
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
         "@tegojs/runtime -> [unsupported import specifier]",
       ]);
-    },
-  );
+    });
+  });
 });
 
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-import-after-postfix-division", async () => {
