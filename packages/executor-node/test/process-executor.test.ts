@@ -44,10 +44,20 @@ export default {
   kind: "task",
   async run(context, input) {
     if (input.mode === "wait") {
-      while (!context.cancellation.aborted) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      return { cancelled: true };
+      await context.events.emit("run.started", { mode: input.mode });
+      if (context.cancellation.aborted) return { cancelled: true };
+      return new Promise((resolve) => {
+        context.cancellation.addEventListener(
+          "abort",
+          () => resolve({ cancelled: true }),
+          { once: true }
+        );
+      });
+    }
+    if (input.mode === "ignore-cancel") {
+      await context.events.emit("run.started", { mode: input.mode });
+      setInterval(() => {}, 1000);
+      return new Promise(() => {});
     }
     if (input.mode === "crash") process.exit(42);
     if (input.mode === "stderr") {
@@ -203,6 +213,85 @@ test("@spec:executor-runtime/executor-failure-containment/crash-replacement", as
   } finally {
     await executor.drain({});
   }
+});
+
+test("active cancellation is cooperative before fake-clock grace forces process termination", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new NodeProcessHost({ clock });
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "force-cancel");
+  const handle = await executor.submit(execution);
+  await started.promise;
+  await executor.cancel(execution.taskId, execution.attemptId);
+  assert.equal(processHost.activeProcessCount, 1);
+  clock.advanceBy(100);
+  assert.equal((await handle.result).status, "cancelled");
+  assert.equal(processHost.activeProcessCount, 0);
+  await executor.drain({});
+});
+
+test("an active deadline uses the shared clock and cannot be overwritten by a late exit", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new NodeProcessHost({ clock });
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = {
+    ...request({ mode: "ignore-cancel" }, "active-deadline"),
+    deadline: new Date(clock.now().getTime() + 50).toISOString(),
+  };
+  const handle = await executor.submit(execution);
+  await started.promise;
+  clock.advanceBy(50);
+  await Promise.resolve();
+  clock.advanceBy(100);
+  const first = await handle.result;
+  assert.equal(first.status, "timed-out");
+  assert.deepEqual(await executor.observe(execution.taskId, execution.attemptId), {
+    state: "terminal",
+    result: first,
+  });
+  await executor.cancel(execution.taskId, execution.attemptId);
+  const afterDuplicateCancel = await executor.observe(execution.taskId, execution.attemptId);
+  assert.equal(afterDuplicateCancel?.state, "terminal");
+  if (afterDuplicateCancel?.state === "terminal") {
+    assert.deepEqual(afterDuplicateCancel.result, first);
+  }
+  await executor.drain({});
+});
+
+test("active and queued attempts are hard bounded before asynchronous spawn begins", async () => {
+  const executor = new ProcessExecutor(
+    await options({ maxConcurrency: 1, maxQueue: 0 }),
+  );
+  const firstRequest = request({ mode: "wait" }, "bounded-first");
+  const first = await executor.submit(firstRequest);
+  await assert.rejects(
+    executor.submit(request({ mode: "echo", value: "overflow" }, "bounded-second")),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_QUEUE_CAPACITY_EXCEEDED",
+  );
+  await executor.cancel(firstRequest.taskId, firstRequest.attemptId);
+  clock.advanceBy(100);
+  await first.result;
+  await executor.drain({});
 });
 
 test("input and output wire sizes are bounded", async () => {
