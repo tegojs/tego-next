@@ -120,6 +120,94 @@ class GatedTerminationFactory extends TrackingWorkerFactory {
   }
 }
 
+class ExitFirstTerminationFactory extends TrackingWorkerFactory {
+  readonly lateTermination = Promise.withResolvers<number>();
+  readonly exited = Promise.withResolvers<void>();
+
+  override create(entrypoint: string): ThreadWorker {
+    const worker = super.create(entrypoint);
+    return {
+      ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
+      postMessage: (value, transferList) => worker.postMessage(value, transferList),
+      on(event, listener) {
+        worker.on(event, listener);
+        return this;
+      },
+      once(event, listener) {
+        worker.once(event, listener);
+        return this;
+      },
+      terminate: () => {
+        void worker.terminate().then(() => this.exited.resolve());
+        return this.lateTermination.promise;
+      },
+    };
+  }
+}
+
+class RejectingTerminationFactory extends TrackingWorkerFactory {
+  readonly terminationStarted = Promise.withResolvers<void>();
+  #worker: ThreadWorker | undefined;
+
+  override create(entrypoint: string): ThreadWorker {
+    const worker = super.create(entrypoint);
+    this.#worker = worker;
+    return {
+      ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
+      postMessage: (value, transferList) => worker.postMessage(value, transferList),
+      on(event, listener) {
+        worker.on(event, listener);
+        return this;
+      },
+      once(event, listener) {
+        worker.once(event, listener);
+        return this;
+      },
+      terminate: () => {
+        this.terminationStarted.resolve();
+        return Promise.reject(new Error("thread termination rejected"));
+      },
+    };
+  }
+
+  forceExit(): Promise<number> {
+    if (this.#worker === undefined) throw new Error("Worker has not started");
+    return this.#worker.terminate();
+  }
+}
+
+class HangingTerminationFactory extends TrackingWorkerFactory {
+  readonly terminationStarted = Promise.withResolvers<void>();
+  readonly termination = Promise.withResolvers<number>();
+  #worker: ThreadWorker | undefined;
+
+  override create(entrypoint: string): ThreadWorker {
+    const worker = super.create(entrypoint);
+    this.#worker = worker;
+    return {
+      ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
+      postMessage: (value, transferList) => worker.postMessage(value, transferList),
+      on(event, listener) {
+        worker.on(event, listener);
+        return this;
+      },
+      once(event, listener) {
+        worker.once(event, listener);
+        return this;
+      },
+      terminate: () => {
+        this.terminationStarted.resolve();
+        return this.termination.promise;
+      },
+    };
+  }
+
+  forceExit(): Promise<number> {
+    if (this.#worker === undefined) throw new Error("Worker has not started");
+    return this.#worker.terminate();
+  }
+}
+
 class ConnectFailureFactory extends TrackingWorkerFactory {
   override create(entrypoint: string): ThreadWorker {
     const worker = super.create(entrypoint);
@@ -889,6 +977,105 @@ test("failed component output remains non-terminal until worker cleanup settles"
   } finally {
     factory.gate.resolve();
     await executor.drain({});
+  }
+});
+
+test("worker exit releases cleanup even when terminate remains pending and later rejects", async () => {
+  const factory = new ExitFirstTerminationFactory();
+  const executor = new ThreadExecutor(await options(factory, { maxConcurrency: 1 }));
+  const handle = await executor.submit(
+    request({ mode: "echo", value: "exit-authoritative" }, "exit-authoritative"),
+  );
+  await factory.exited.promise;
+  let result: Awaited<typeof handle.result> | undefined;
+  void handle.result.then((value) => {
+    result = value;
+  });
+  await eventually(() => assert.notEqual(result, undefined), {
+    attempts: 20,
+    advance: () => new Promise((resolve) => setImmediate(resolve)),
+  });
+  factory.lateTermination.reject(new Error("late terminate rejection"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(result?.status, "succeeded");
+  assert.equal((await executor.health()).status, "healthy");
+  assert.equal((await executor.probe()).availableCapacity, 1);
+  await executor.drain({});
+});
+
+test("terminate rejection transfers custody to quarantine without double-counting active", async () => {
+  const factory = new RejectingTerminationFactory();
+  const executor = new ThreadExecutor(await options(factory, { maxConcurrency: 1 }));
+  const handle = await executor.submit(
+    request({ mode: "echo", value: "termination-reject" }, "termination-reject"),
+  );
+  await factory.terminationStarted.promise;
+  let drained = false;
+  const draining = executor.drain({}).then(() => {
+    drained = true;
+  });
+  let result: Awaited<typeof handle.result> | undefined;
+  void handle.result.then((value) => {
+    result = value;
+  });
+  try {
+    await eventually(() => assert.notEqual(result, undefined), {
+      attempts: 20,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    if (result === undefined) throw new Error("Termination rejection result is missing");
+    assert.equal(result.status, "failed");
+    assert.equal(result.diagnostic?.code, "EXECUTOR_THREAD_TERMINATION_FAILED");
+    assert.equal((await executor.health()).active, 1);
+    assert.equal((await executor.health()).status, "unhealthy");
+    assert.equal((await executor.probe()).availableCapacity, 0);
+    assert.equal(drained, false);
+
+    await factory.forceExit();
+    await draining;
+    assert.equal((await executor.health()).active, 0);
+  } finally {
+    await factory.forceExit().catch(() => undefined);
+  }
+});
+
+test("terminate and exit timeout enters bounded quarantine until authoritative exit", async () => {
+  const factory = new HangingTerminationFactory();
+  const executor = new ThreadExecutor(
+    await options(factory, { cleanupGraceMs: 100, maxConcurrency: 1 }),
+  );
+  const handle = await executor.submit(
+    request({ mode: "echo", value: "termination-timeout" }, "termination-timeout"),
+  );
+  await factory.terminationStarted.promise;
+  clock.advanceBy(100);
+  let drained = false;
+  const draining = executor.drain({}).then(() => {
+    drained = true;
+  });
+  let result: Awaited<typeof handle.result> | undefined;
+  void handle.result.then((value) => {
+    result = value;
+  });
+  try {
+    await eventually(() => assert.notEqual(result, undefined), {
+      attempts: 20,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    if (result === undefined) throw new Error("Termination timeout result is missing");
+    assert.equal(result.status, "failed");
+    assert.equal(result.diagnostic?.code, "EXECUTOR_THREAD_TERMINATION_FAILED");
+    assert.equal((await executor.health()).active, 1);
+    assert.equal((await executor.health()).status, "unhealthy");
+    assert.equal((await executor.probe()).availableCapacity, 0);
+    assert.equal(drained, false);
+
+    await factory.forceExit();
+    await draining;
+    assert.equal((await executor.health()).active, 0);
+  } finally {
+    factory.termination.resolve(0);
+    await factory.forceExit().catch(() => undefined);
   }
 });
 
