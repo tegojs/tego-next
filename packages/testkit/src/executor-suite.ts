@@ -9,6 +9,14 @@ export interface ExecutorConformanceFixture {
   readonly echoInput: JsonValue;
   readonly echoOutput: JsonValue;
   readonly waitingInput: JsonValue;
+  readonly crashInput: JsonValue;
+  readonly replacementInput: JsonValue;
+  readonly replacementOutput: JsonValue;
+  readonly oversizedInput: JsonValue;
+  readonly oversizedOutputInput: JsonValue;
+  activeResourceCount(): number;
+  spawnFailureFactory(): Executor | Promise<Executor>;
+  shutdownHostTwice(): Promise<void>;
   advanceClock(milliseconds: number): Promise<void> | void;
 }
 
@@ -106,6 +114,59 @@ export function executorConformance(
       } finally {
         await executor.drain({});
       }
+    });
+
+    test("@spec:executor-runtime/executor-failure-containment/crash-replacement", async () => {
+      const executor = await factory();
+      try {
+        const crashed = await terminal(executor, fixture.request(fixture.crashInput, "crash"));
+        assert.equal(crashed.status, "failed");
+        assert.equal(fixture.activeResourceCount(), 0);
+
+        const replacement = await terminal(
+          executor,
+          fixture.request(fixture.replacementInput, "replacement"),
+        );
+        assert.equal(replacement.status, "succeeded");
+        assert.deepEqual(replacement.output, fixture.replacementOutput);
+        assert.equal(fixture.activeResourceCount(), 0);
+      } finally {
+        await executor.drain({});
+      }
+    });
+
+    test("executor input and output limits fail closed without leaking resources", async () => {
+      const executor = await factory();
+      try {
+        await assert.rejects(
+          executor.submit(fixture.request(fixture.oversizedInput, "oversized-input")),
+        );
+        const output = await terminal(
+          executor,
+          fixture.request(fixture.oversizedOutputInput, "oversized-output"),
+        );
+        assert.equal(output.status, "failed");
+        assert.equal(fixture.activeResourceCount(), 0);
+      } finally {
+        await executor.drain({});
+      }
+    });
+
+    test("spawn failure releases executor capacity and process resources", async () => {
+      const executor = await fixture.spawnFailureFactory();
+      try {
+        const failure = await terminal(executor, fixture.request(fixture.echoInput, "spawn-failure"));
+        assert.equal(failure.status, "failed");
+        assert.equal((await executor.health()).active, 0);
+        assert.equal(fixture.activeResourceCount(), 0);
+      } finally {
+        await executor.drain({});
+      }
+    });
+
+    test("process-host shutdown is idempotent", async () => {
+      await fixture.shutdownHostTwice();
+      assert.equal(fixture.activeResourceCount(), 0);
     });
 
     test("observe returns running and cached terminal attempts", async () => {

@@ -276,6 +276,26 @@ const conformanceFixture: ExecutorConformanceFixture = {
   echoInput: { mode: "echo", value: { echoed: true } },
   echoOutput: { echoed: true },
   waitingInput: { mode: "wait", generation: 0 },
+  crashInput: { mode: "crash" },
+  replacementInput: { mode: "echo", value: "replacement" },
+  replacementOutput: "replacement",
+  oversizedInput: { value: "x".repeat(PROCESS_EXECUTOR_MAX_FRAME_BYTES) },
+  oversizedOutputInput: { mode: "large-output" },
+  activeResourceCount: () => conformanceProcessHost?.activeProcessCount ?? 0,
+  async spawnFailureFactory() {
+    conformanceProcessHost = new TestProcessHost();
+    return new ProcessExecutor(
+      await options({
+        processHost: conformanceProcessHost,
+        processEntrypoint: join(process.cwd(), "missing-process-entry.js"),
+      }),
+    );
+  },
+  async shutdownHostTwice() {
+    conformanceProcessHost = new TestProcessHost();
+    await Promise.all([conformanceProcessHost.open(), conformanceProcessHost.open()]);
+    await Promise.all([conformanceProcessHost.close(), conformanceProcessHost.close()]);
+  },
   async advanceClock(milliseconds) {
     clock.advanceBy(milliseconds);
     await Promise.resolve();
@@ -283,7 +303,77 @@ const conformanceFixture: ExecutorConformanceFixture = {
   },
 };
 
-executorConformance(async () => new ProcessExecutor(await options()), conformanceFixture);
+let conformanceProcessHost: TestProcessHost | undefined;
+
+executorConformance(async () => {
+  conformanceProcessHost = new TestProcessHost();
+  return new ProcessExecutor(await options({ processHost: conformanceProcessHost }));
+}, conformanceFixture);
+
+test("attempt fingerprints canonicalize nested object key order", async () => {
+  const executor = new ProcessExecutor(await options());
+  const original = request(
+    { mode: "echo", value: { first: 1, nested: { left: true, right: false } } },
+    "canonical-fingerprint",
+  );
+  try {
+    const first = await executor.submit(original);
+    const duplicate = await executor.submit({
+      ...original,
+      input: {
+        value: { nested: { right: false, left: true }, first: 1 },
+        mode: "echo",
+      },
+    });
+    assert.strictEqual(duplicate, first);
+    assert.equal((await first.result).status, "succeeded");
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("submit snapshots mutable request data at admission", async () => {
+  const gate = Promise.withResolvers<void>();
+  const base = await options();
+  const executor = new ProcessExecutor({
+    ...base,
+    async resolveComponent(execution) {
+      await gate.promise;
+      return base.resolveComponent(execution);
+    },
+  });
+  const mutable = { nested: { value: "original" } };
+  const execution = request({ mode: "echo", value: mutable }, "request-snapshot");
+  const handle = await executor.submit(execution);
+  mutable.nested.value = "mutated";
+  gate.resolve();
+  try {
+    assert.deepEqual((await handle.result).output, { nested: { value: "original" } });
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("terminal results are deeply immutable cached snapshots", async () => {
+  const executor = new ProcessExecutor(await options());
+  const execution = request(
+    { mode: "echo", value: { nested: { value: "original" } } },
+    "result-snapshot",
+  );
+  try {
+    const result = await (await executor.submit(execution)).result;
+    assert.throws(() => {
+      (result.output as { nested: { value: string } }).nested.value = "mutated";
+    }, TypeError);
+    const observed = await executor.observe(execution.taskId, execution.attemptId);
+    assert.equal(observed?.state, "terminal");
+    if (observed?.state === "terminal") {
+      assert.deepEqual(observed.result.output, { nested: { value: "original" } });
+    }
+  } finally {
+    await executor.drain({});
+  }
+});
 
 test("process framing handles partial, coalesced, truncated, and invalid frames", () => {
   const first = encodeProcessFrame({ sequence: 1 });
