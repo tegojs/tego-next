@@ -622,6 +622,87 @@ export function stateStoreConformance(
       });
     });
 
+    test("same-transaction outbox identities are idempotent or conflict atomically", async () => {
+      await withStore(factory, async (store) => {
+        const createdAt = new Date().toISOString();
+        const identical = {
+          availableAt: createdAt,
+          createdAt,
+          messageId: parseMessageId("same-transaction-identical"),
+          operationId: parseOperationId("same-transaction-operation"),
+          payload: { alpha: 1, zebra: 2 },
+          topic: "component.lifecycle",
+        };
+        await store.transact({}, async (transaction) => {
+          await transaction.enqueueOutbox(identical);
+          await transaction.enqueueOutbox({
+            ...identical,
+            payload: { zebra: 2, alpha: 1 },
+          });
+          return null;
+        });
+        const identicalClaims = await store.claimOutbox({
+          leaseDurationMs: 30_000,
+          limit: 2,
+          owner: "same-transaction-owner",
+        });
+        assert.deepEqual(
+          identicalClaims.map((claim) => claim.message.messageId),
+          [identical.messageId],
+        );
+
+        for (const scenario of [
+          {
+            name: "operation",
+            change: {
+              operationId: parseOperationId("same-transaction-operation-changed"),
+            },
+          },
+          {
+            name: "topic",
+            change: {
+              topic: "component.lifecycle.changed",
+            },
+          },
+          {
+            name: "payload",
+            change: {
+              payload: { alpha: 1, zebra: 3 },
+            },
+          },
+        ] as const) {
+          const messageId = parseMessageId(`same-transaction-conflict-${scenario.name}`);
+          await assert.rejects(
+            store.transact({}, async (transaction) => {
+              const original = {
+                availableAt: createdAt,
+                createdAt,
+                messageId,
+                operationId: parseOperationId(
+                  `same-transaction-conflict-operation-${scenario.name}`,
+                ),
+                payload: { alpha: 1, zebra: 2 },
+                topic: "component.lifecycle",
+              };
+              await transaction.enqueueOutbox(original);
+              await transaction.enqueueOutbox({
+                ...original,
+                ...scenario.change,
+              });
+              return null;
+            }),
+            expectDiagnostic("STATE_IDEMPOTENCY_CONFLICT"),
+          );
+        }
+        const conflictClaims = await store.claimOutbox({
+          leaseDurationMs: 30_000,
+          limit: 10,
+          owner: "same-transaction-conflict-owner",
+        });
+        assert.deepEqual(conflictClaims, []);
+      });
+    });
+
     test("state and outbox values use canonical JSON boundaries without invoking accessors", async () => {
       await withStore(factory, async (store) => {
         let getterCalls = 0;
