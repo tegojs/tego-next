@@ -120,6 +120,32 @@ class GatedTerminationFactory extends TrackingWorkerFactory {
   }
 }
 
+class ConnectFailureFactory extends TrackingWorkerFactory {
+  override create(entrypoint: string): ThreadWorker {
+    const worker = super.create(entrypoint);
+    let connected = false;
+    return {
+      ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
+      postMessage(value, transferList) {
+        if (!connected) {
+          connected = true;
+          throw new Error("connect transfer failed");
+        }
+        worker.postMessage(value, transferList);
+      },
+      on(event, listener) {
+        worker.on(event, listener);
+        return this;
+      },
+      once(event, listener) {
+        worker.once(event, listener);
+        return this;
+      },
+      terminate: () => worker.terminate(),
+    };
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -127,6 +153,15 @@ after(async () => {
 });
 
 const componentSource = `
+import { MessagePort } from "node:worker_threads";
+
+let capturedBroker;
+const nativePostMessage = MessagePort.prototype.postMessage;
+MessagePort.prototype.postMessage = function (...arguments_) {
+  capturedBroker ??= this;
+  return Reflect.apply(nativePostMessage, this, arguments_);
+};
+
 export default {
   protocol: "tego.component/1.0",
   kind: "task",
@@ -156,6 +191,23 @@ export default {
         payload: { name: "api" }
       });
       return "safe";
+    }
+    if (input.mode === "forge-private-port") {
+      if (capturedBroker !== undefined) {
+        Reflect.apply(nativePostMessage, capturedBroker, [{
+          kind: "rpc-request",
+          id: "forged-private",
+          type: "secret",
+          payload: { name: "api" }
+        }]);
+      }
+      return capturedBroker === undefined ? "safe" : "captured";
+    }
+    if (input.mode === "flood-events") {
+      for (let index = 0; index < 1000; index += 1) {
+        void context.events.emit("flood", { index });
+      }
+      return "flooded";
     }
     if (input.mode === "finish-gate") {
       await context.events.emit("run.finished", { mode: input.mode });
@@ -449,6 +501,62 @@ test("plugin parentPort messages cannot forge privileged broker RPC", async () =
   }
 });
 
+test("plugin cannot capture the private broker by patching MessagePort.prototype", async () => {
+  const factory = new TrackingWorkerFactory();
+  let secretCalls = 0;
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      secretProvider: {
+        developmentOnly: false,
+        open: async () => {},
+        close: async () => {},
+        health: async () => ({ status: "healthy", checkedAt: clock.now().toISOString() }),
+        async get() {
+          secretCalls += 1;
+          return "must-not-return";
+        },
+      },
+    }),
+  );
+  try {
+    const result = await (
+      await executor.submit(request({ mode: "forge-private-port" }, "forge-private-port"))
+    ).result;
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.output, "safe");
+    assert.equal(secretCalls, 0);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("unawaited event floods are backpressured and cannot exhaust the parent", async () => {
+  const factory = new TrackingWorkerFactory();
+  const eventGate = Promise.withResolvers<void>();
+  let eventCalls = 0;
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      events: {
+        async emit() {
+          eventCalls += 1;
+          await eventGate.promise;
+        },
+      },
+    }),
+  );
+  try {
+    const result = await (
+      await executor.submit(request({ mode: "flood-events" }, "flood-events"))
+    ).result;
+    assert.equal(result.status, "failed");
+    assert.ok(eventCalls <= 64, `event sink received ${eventCalls} unbounded calls`);
+    assert.equal(factory.active, 0);
+  } finally {
+    eventGate.resolve();
+    await executor.drain({});
+  }
+});
+
 test("transferable duplicate submission replays the existing handle after ownership moves", async () => {
   const factory = new TrackingWorkerFactory();
   const executor = new ThreadExecutor(await options(factory));
@@ -487,6 +595,78 @@ test("oversized transferable payload is rejected before ownership or worker star
     assert.equal(first.byteLength > 0, true);
     assert.equal(second.byteLength > 0, true);
     assert.equal(factory.created, 0);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("the exact run envelope is bounded before transferable ownership moves", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executor = new ThreadExecutor(await options(factory));
+  const buffer = new ArrayBuffer(700_000);
+  try {
+    await assert.rejects(
+      executor.submit(
+        threadExecutionRequest(
+          request(
+            { mode: "echo", value: "x".repeat(700_000) },
+            "combined-transfer-limit",
+          ),
+          { buffers: [buffer], ownership: "transfer" },
+        ),
+      ),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_INPUT_LIMIT_EXCEEDED",
+    );
+    assert.equal(buffer.byteLength, 700_000);
+    assert.equal(factory.created, 0);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("clone fingerprints are recomputed after caller buffer mutation", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executor = new ThreadExecutor(await options(factory));
+  const buffer = new Uint8Array([1, 2, 3]).buffer;
+  const execution = threadExecutionRequest(
+    request({ mode: "echo", value: "clone-mutation" }, "clone-mutation"),
+    { buffers: [buffer], ownership: "clone" },
+  );
+  try {
+    await executor.submit(execution);
+    new Uint8Array(buffer)[0] = 9;
+    await assert.rejects(
+      executor.submit(execution),
+      (error: unknown) => diagnosticCode(error) === "PROTOCOL_IDEMPOTENCY_CONFLICT",
+    );
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("transfer fingerprints frame attachment count and individual lengths", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executor = new ThreadExecutor(await options(factory));
+  const execution = request(
+    { mode: "echo", value: "fingerprint-framing" },
+    "fingerprint-framing",
+  );
+  try {
+    await executor.submit(
+      threadExecutionRequest(execution, {
+        buffers: [Uint8Array.of(1).buffer, Uint8Array.of(2).buffer],
+        ownership: "clone",
+      }),
+    );
+    await assert.rejects(
+      executor.submit(
+        threadExecutionRequest(execution, {
+          buffers: [Uint8Array.of(1, 2).buffer],
+          ownership: "clone",
+        }),
+      ),
+      (error: unknown) => diagnosticCode(error) === "PROTOCOL_IDEMPOTENCY_CONFLICT",
+    );
   } finally {
     await executor.drain({});
   }
@@ -599,4 +779,82 @@ test("successful component output remains non-terminal until worker cleanup sett
   assert.equal(resultSettled, true);
   assert.equal(drainSettled, true);
   assert.equal((await executor.health()).active, 0);
+});
+
+test("cancellation during worker cleanup wins the single terminal decision", async () => {
+  const factory = new GatedTerminationFactory();
+  const componentFinished = Promise.withResolvers<void>();
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.finished") componentFinished.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "finish-gate", value: "too-late" }, "cleanup-cancel");
+  const handle = await executor.submit(execution);
+  await componentFinished.promise;
+  await factory.terminationStarted.promise;
+  await executor.cancel(execution.taskId, execution.attemptId);
+  factory.gate.resolve();
+  try {
+    assert.equal((await handle.result).status, "cancelled");
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("deadline during worker cleanup wins the single terminal decision", async () => {
+  const factory = new GatedTerminationFactory();
+  const componentFinished = Promise.withResolvers<void>();
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.finished") componentFinished.resolve();
+        },
+      },
+    }),
+  );
+  const execution = {
+    ...request({ mode: "finish-gate", value: "too-late" }, "cleanup-deadline"),
+    deadline: new Date(clock.now().getTime() + 100).toISOString(),
+  };
+  const handle = await executor.submit(execution);
+  await componentFinished.promise;
+  await factory.terminationStarted.promise;
+  clock.advanceBy(100);
+  await Promise.resolve();
+  factory.gate.resolve();
+  try {
+    assert.equal((await handle.result).status, "timed-out");
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("connect transfer failure closes both private ports and the worker", async () => {
+  const factory = new ConnectFailureFactory();
+  const before = process
+    .getActiveResourcesInfo()
+    .filter((resource) => resource === "MessagePort").length;
+  const executor = new ThreadExecutor(await options(factory));
+  try {
+    const result = await (
+      await executor.submit(request({ mode: "echo", value: "never" }, "connect-failure"))
+    ).result;
+    assert.equal(result.status, "failed");
+    assert.equal(factory.active, 0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const after = process
+      .getActiveResourcesInfo()
+      .filter((resource) => resource === "MessagePort").length;
+    assert.equal(after, before);
+  } finally {
+    await executor.drain({});
+  }
 });
