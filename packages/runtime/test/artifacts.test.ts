@@ -273,6 +273,9 @@ for (const [name, unsafePath] of [
   ["drive path", "C:/escape.js"],
   ["UNC path", String.raw`\\server\share\escape.js`],
   ["non-normal path", "components//component.js"],
+  ["non-NFC path", "components/e\u0301.js"],
+  ["Windows device path", "components/CON.js"],
+  ["Windows alternate stream path", "components/component.js:stream"],
 ] as const) {
   test(`rejects ${name}`, async () => {
     const archive = tar([{ name: unsafePath, bytes: encoder.encode("x") }]);
@@ -357,6 +360,57 @@ test("rejects malformed, truncated, checksum-mismatched, and oversized archives"
     });
     await rejectsCode(() => limited.validate({ digest }), "ARTIFACT_ARCHIVE_TOO_LARGE");
   });
+  await context.test("entry size limit", async () => {
+    const archive = tar(validEntries());
+    const { digest, store } = await serviceFor(archive);
+    const limited = new ArtifactService({
+      artifacts: store,
+      clock: new FakeClock(),
+      compatibility: {
+        architecture: "x64",
+        nodeVersion: "26.5.0",
+        platform: "linux",
+        tegoContractVersion: "2.0.0",
+      },
+      limits: { maxEntryBytes: 8 },
+      state: {} as never,
+    });
+    await rejectsCode(() => limited.validate({ digest }), "ARTIFACT_ENTRY_TOO_LARGE");
+  });
+  await context.test("entry count limit", async () => {
+    const archive = tar(validEntries());
+    const { digest, store } = await serviceFor(archive);
+    const limited = new ArtifactService({
+      artifacts: store,
+      clock: new FakeClock(),
+      compatibility: {
+        architecture: "x64",
+        nodeVersion: "26.5.0",
+        platform: "linux",
+        tegoContractVersion: "2.0.0",
+      },
+      limits: { maxEntries: 2 },
+      state: {} as never,
+    });
+    await rejectsCode(
+      () => limited.validate({ digest }),
+      "ARTIFACT_ENTRY_COUNT_EXCEEDED",
+    );
+  });
+});
+
+test("rejects manifest entrypoints that escape portable archive paths", async () => {
+  const unsafeManifest = {
+    ...manifest,
+    components: [
+      {
+        ...manifest.components[0],
+        entrypoint: String.raw`components\component.js`,
+      },
+    ],
+  };
+  const { digest, service } = await serviceFor(tar(validEntries(unsafeManifest)));
+  await rejectsCode(() => service.validate({ digest }), "ARTIFACT_PATH_UNSAFE");
 });
 
 test("returns structured compatibility diagnostics", async (context) => {
