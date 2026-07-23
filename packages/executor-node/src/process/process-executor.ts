@@ -134,6 +134,11 @@ interface IncomingMessage {
   readonly values?: readonly unknown[];
 }
 
+interface TerminationOutcome {
+  readonly exit?: Awaited<ReturnType<HostedProcess["kill"]>>;
+  readonly diagnostic?: RuntimeDiagnostic;
+}
+
 function attemptKey(taskId: TaskId, attemptId: AttemptId): string {
   return `${taskId.length}:${taskId}${attemptId}`;
 }
@@ -263,6 +268,10 @@ class ProcessChannel {
     return boundedStderr(this.#stderr, this.#secretValues);
   }
 
+  abort(error: Error): void {
+    this.#fail(error);
+  }
+
   request(message: Record<string, unknown>): Promise<unknown> {
     if (this.#closedError !== undefined) return Promise.reject(this.#closedError);
     if (this.#pending.size >= PROCESS_CHANNEL_MAX_PENDING) {
@@ -309,7 +318,6 @@ class ProcessChannel {
       this.#fail(new Error("Child process stdout closed"));
     } catch (error) {
       this.#fail(error instanceof Error ? error : new Error(String(error)));
-      await this.#process.kill().catch(() => undefined);
     }
   }
 
@@ -511,12 +519,14 @@ export class ProcessExecutor implements Executor {
   readonly #processEntrypoint: string;
   readonly #attempts = new Map<string, AttemptEntry>();
   readonly #queue: AttemptEntry[] = [];
+  readonly #quarantinedProcesses = new Set<HostedProcess>();
   #active = 0;
   #accepting = true;
   #opened = false;
   #openPromise: Promise<void> | undefined;
   #drainPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
+  #fatalDiagnostic: RuntimeDiagnostic | undefined;
 
   constructor(options: ProcessExecutorOptions) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(options.id)) {
@@ -556,12 +566,14 @@ export class ProcessExecutor implements Executor {
   async probe(): Promise<ExecutorCapabilities> {
     await this.#ensureOpen();
     const health = await this.#options.processHost.health();
+    const available =
+      this.#accepting && this.#fatalDiagnostic === undefined && health.status !== "unhealthy";
     return {
       id: this.id,
       type: this.type,
-      available: this.#accepting && health.status !== "unhealthy",
+      available,
       maxConcurrency: this.#maxConcurrency,
-      availableCapacity: Math.max(0, this.#maxConcurrency - this.#active),
+      availableCapacity: available ? Math.max(0, this.#maxConcurrency - this.#active) : 0,
       securityIsolation: true,
     };
   }
@@ -686,13 +698,19 @@ export class ProcessExecutor implements Executor {
   async health(): Promise<ExecutorHealth> {
     const hostHealth = await this.#options.processHost.health();
     return {
-      status: hostHealth.status,
+      status: this.#fatalDiagnostic === undefined ? hostHealth.status : "unhealthy",
       checkedAt: this.#clock.now().toISOString(),
-      ...(hostHealth.message === undefined ? {} : { message: hostHealth.message }),
+      ...(this.#fatalDiagnostic === undefined
+        ? hostHealth.message === undefined
+          ? {}
+          : { message: hostHealth.message }
+        : {
+            message: `${this.#fatalDiagnostic.code}: ${this.#fatalDiagnostic.message}`,
+          }),
       id: this.id,
       type: this.type,
       accepting: this.#accepting,
-      active: this.#active,
+      active: this.#active + this.#quarantinedProcesses.size,
       queued: this.#queue.length,
       retainedAttempts: this.#attempts.size,
     };
@@ -852,28 +870,36 @@ export class ProcessExecutor implements Executor {
       await this.#shutdownChild(channel, process_, component.artifactDigest, controlDeadline);
     } catch (error) {
       if (entry.state !== "terminal") {
-        const exit =
-          process_ === undefined ? undefined : await process_.kill().catch(() => undefined);
+        const termination = process_ === undefined ? undefined : await this.#terminate(process_);
         const code =
-          error instanceof DiagnosticError
-            ? error.diagnostic.code
-            : process_ === undefined
-              ? "EXECUTOR_PROCESS_SPAWN_FAILED"
-              : "EXECUTOR_PROCESS_EXIT";
+          termination?.diagnostic !== undefined
+            ? termination.diagnostic.code
+            : error instanceof DiagnosticError
+              ? error.diagnostic.code
+              : process_ === undefined
+                ? "EXECUTOR_PROCESS_SPAWN_FAILED"
+                : "EXECUTOR_PROCESS_EXIT";
         const message =
-          error instanceof Error ? error.message : "Process executor attempt failed unexpectedly";
+          termination?.diagnostic?.message ??
+          (error instanceof Error ? error.message : "Process executor attempt failed unexpectedly");
         this.#settle(entry, {
           taskId: entry.request.taskId,
           attemptId: entry.request.attemptId,
-          status: entry.cancellation ?? "failed",
+          status:
+            termination?.diagnostic === undefined ? (entry.cancellation ?? "failed") : "failed",
           diagnostic:
-            error instanceof DiagnosticError
+            termination?.diagnostic ??
+            (error instanceof DiagnosticError
               ? error.diagnostic
               : diagnostic(code, message, this.#clock.now(), {
-                  ...(exit?.code === undefined ? {} : { exitCode: exit.code }),
-                  ...(exit?.signal === undefined ? {} : { signal: exit.signal }),
+                  ...(termination?.exit?.code === undefined
+                    ? {}
+                    : { exitCode: termination.exit.code }),
+                  ...(termination?.exit?.signal === undefined
+                    ? {}
+                    : { signal: termination.exit.signal }),
                   ...(channel?.stderr.length === 0 ? {} : { stderr: channel?.stderr ?? "" }),
-                }),
+                })),
           executor: this.#executorMetadata(process_, channel),
           startedAt,
           completedAt: this.#clock.now().toISOString(),
@@ -883,7 +909,7 @@ export class ProcessExecutor implements Executor {
       entry.deadlineController.abort("terminal");
       if (process_ !== undefined) {
         await process_.stdin.close().catch(() => undefined);
-        await process_.kill().catch(() => undefined);
+        await this.#terminate(process_);
       }
       delete entry.process;
       delete entry.channel;
@@ -1004,13 +1030,13 @@ export class ProcessExecutor implements Executor {
       ).catch(() => undefined);
     })();
     if (!(await this.#withinCleanupGrace(lifecycle))) {
-      await process_.kill().catch(() => undefined);
+      await this.#terminate(process_);
       return;
     }
     await process_.stdin.close().catch(() => undefined);
     await process_.signal("SIGTERM").catch(() => undefined);
     if (!(await this.#withinCleanupGrace(process_.wait()))) {
-      await process_.kill().catch(() => undefined);
+      await this.#terminate(process_);
     }
   }
 
@@ -1081,7 +1107,11 @@ export class ProcessExecutor implements Executor {
     entry.cancellationEscalation ??= this.#clock
       .sleep(this.#cancellationGraceMs, entry.deadlineController.signal)
       .then(async () => {
-        if (entry.state !== "terminal") await entry.process?.kill().catch(() => undefined);
+        if (entry.state === "terminal" || entry.process === undefined) return;
+        const termination = await this.#terminate(entry.process);
+        if (termination.diagnostic !== undefined) {
+          entry.channel?.abort(new DiagnosticError(termination.diagnostic));
+        }
       })
       .catch(() => undefined);
   }
@@ -1104,6 +1134,37 @@ export class ProcessExecutor implements Executor {
     entry.deadlineController.abort("terminal");
     entry.terminal = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
     return true;
+  }
+
+  async #terminate(process_: HostedProcess): Promise<TerminationOutcome> {
+    if (this.#quarantinedProcesses.has(process_)) {
+      return {
+        ...(this.#fatalDiagnostic === undefined ? {} : { diagnostic: this.#fatalDiagnostic }),
+      };
+    }
+    try {
+      return { exit: await process_.kill() };
+    } catch (error) {
+      const failure =
+        error instanceof DiagnosticError && error.diagnostic.code === "EXECUTOR_PROCESS_KILL_FAILED"
+          ? error.diagnostic
+          : diagnostic(
+              "EXECUTOR_PROCESS_KILL_FAILED",
+              error instanceof Error ? error.message : "Forced process termination failed",
+              this.#clock.now(),
+            );
+      this.#fatalDiagnostic ??= failure;
+      this.#accepting = false;
+      this.#quarantinedProcesses.add(process_);
+      this.#options.logger?.error(failure.message, failure);
+      void process_
+        .wait()
+        .then(() => {
+          this.#quarantinedProcesses.delete(process_);
+        })
+        .catch(() => undefined);
+      return { diagnostic: failure };
+    }
   }
 
   #executorMetadata(

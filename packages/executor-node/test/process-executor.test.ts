@@ -924,13 +924,21 @@ test("failed final kill quarantines the executor and reports unhealthy capacity"
     assert.deepEqual(await executor.health(), {
       status: "unhealthy",
       checkedAt: clock.now().toISOString(),
-      message: "SIGKILL delivery failed",
+      message: "EXECUTOR_PROCESS_KILL_FAILED: SIGKILL delivery failed",
       id: "process-local",
       type: "process",
       accepting: false,
       active: 1,
       queued: 0,
       retainedAttempts: 1,
+    });
+    assert.deepEqual(await executor.probe(), {
+      id: "process-local",
+      type: "process",
+      available: false,
+      maxConcurrency: 2,
+      availableCapacity: 0,
+      securityIsolation: true,
     });
     await assert.rejects(
       executor.submit(request({ mode: "echo", value: "blocked" }, "after-rejected-kill")),
