@@ -648,7 +648,7 @@ Commit: `git add packages/plugin-sdk packages/executor-node && git commit -m "fe
 - Produces: `ProcessHost`; after this task `createLocalDrivers` satisfies the
   complete phase-one `RuntimeDrivers` contract without placeholder members.
 
-- [ ] **Step 1: Write and commit failing executor conformance**
+- [x] **Step 1: Write and commit failing executor conformance**
 
 Cover probe, echo, duplicate attempt, cancellation, deadline, crash, replacement,
 drain, health, input limit, output limit, no leaked child process, spawn failure,
@@ -660,19 +660,19 @@ Expected: FAIL because `ProcessExecutor` is not exported.
 
 Commit: `git add packages/testkit packages/executor-node/test && git commit -m "test: define process executor behavior"`
 
-- [ ] **Step 2: Implement IPC framing and attempt registry**
+- [x] **Step 2: Implement IPC framing and attempt registry**
 
 Fork one ComponentHost entry per active slot. Track attempts by
 `taskId/attemptId`. A duplicate returns the current handle or cached terminal
 result. Reject oversized frames before JSON parsing.
 
-- [ ] **Step 3: Implement cancellation, deadlines, crash replacement, and selection**
+- [x] **Step 3: Implement cancellation, deadlines, crash replacement, and selection**
 
 Send cooperative cancel, wait on fake-clock-compatible grace timer, then kill.
 Record a structured process-exit result before returning capacity. Selection
 filters support, permissions, resources, and health before applying preference.
 
-- [ ] **Step 4: Run conformance and commit**
+- [x] **Step 4: Run conformance and commit**
 
 Run: `npm run build -w @tegojs/testkit -w @tegojs/executor-node && node --test packages/executor-node/dist/test/process-executor.test.js`
 

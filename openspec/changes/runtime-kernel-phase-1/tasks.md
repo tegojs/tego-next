@@ -60,11 +60,11 @@
 
 ## 8. Local Executors
 
-- [ ] 8.1 Define and run an executor conformance suite for probe, submit, observe, deduplicate, cancel, deadline, drain, health, and replacement
+- [x] 8.1 Define and run an executor conformance suite for probe, submit, observe, deduplicate, cancel, deadline, drain, health, and replacement
 - [ ] 8.2 Write Worker Thread fixture tests and implement `ThreadExecutor` with transferable binary support
-- [ ] 8.3 Write child-process fixture tests and implement `ProcessExecutor` with IPC framing and crash replacement
-- [ ] 8.4 Write executor-selection tests and implement support, permission, resource, availability, preference, and fallback evaluation
-- [ ] 8.5 Write task journal tests and implement stable task/attempt identity, terminal result recording, and retry policy
+- [x] 8.3 Write child-process fixture tests and implement `ProcessExecutor` with IPC framing and crash replacement
+- [x] 8.4 Write executor-selection tests and implement support, permission, resource, availability, preference, and fallback evaluation
+- [x] 8.5 Write task journal tests and implement stable task/attempt identity, terminal result recording, and retry policy
 - [ ] 8.6 Run the same echo, cancellation, timeout, crash, duplicate, and drain scenarios against thread and process executors
 
 ## 9. Remote Worker and WebSocket Transport
