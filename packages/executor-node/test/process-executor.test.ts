@@ -523,6 +523,19 @@ test("drain and close leave no active child process", async () => {
   assert.equal((await executor.health()).active, 0);
 });
 
+test("executor drain releases owned children without closing the injected process driver", async () => {
+  const processHost = new TestProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost }));
+  const handled = await executor.submit(
+    request({ mode: "echo", value: "done" }, "driver-ownership"),
+  );
+  await handled.result;
+  await executor.drain({});
+  assert.equal(processHost.activeProcessCount, 0);
+  assert.equal((await processHost.health()).status, "healthy");
+  await processHost.close();
+});
+
 test("a task that leaves handles behind cannot retain its child slot after returning", async () => {
   const finished = Promise.withResolvers<void>();
   const processHost = new TestProcessHost();
