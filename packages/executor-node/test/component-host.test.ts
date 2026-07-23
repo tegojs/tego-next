@@ -159,6 +159,17 @@ function allowedOptions(overrides: Partial<ComponentHostOptions> = {}): Componen
   };
 }
 
+function deferred(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+} {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 test("host command protocol is versioned, strict, JSON-safe, and bounded", () => {
   const valid = {
     protocol: "1.0",
@@ -457,6 +468,291 @@ test("component lifecycle order and command idempotency are enforced without dup
     events.map((event) => (event.payload as { readonly name?: string }).name),
     ["start", "drain", "stop"],
   );
+});
+
+test("concurrent lifecycle transitions serialize and invoke each hook once", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        start: async (context) => context.events.emit("start.blocked", null)
+      });
+    `,
+  );
+  const gate = deferred();
+  let starts = 0;
+  const host = new ComponentHost(
+    allowedOptions({
+      events: {
+        emit: async () => {
+          starts += 1;
+          await gate.promise;
+        },
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(
+    command("import", "import-serialize", {
+      artifactDigest: digest,
+      entrypoint: "components/component.js",
+    }),
+  );
+
+  const commands = Array.from({ length: 270 }, (_, index) =>
+    command("start", `start-concurrent-${index}`, { artifactDigest: digest }),
+  );
+  const pending = commands.map((value) => host.handle(value));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const pendingRetention = (
+    host as unknown as { retention(): { readonly commands: number; readonly runs: number } }
+  ).retention();
+  assert.ok(pendingRetention.commands > 256);
+  const duplicate = host.handle(commands[0]);
+  assert.equal(starts, 1);
+
+  gate.resolve();
+  const [results, duplicateResult] = await Promise.all([Promise.all(pending), duplicate]);
+  assert.ok(results.every((result) => result.ok));
+  assert.deepEqual(duplicateResult, results[0]);
+  assert.equal(starts, 1);
+  assert.ok(
+    (
+      host as unknown as { retention(): { readonly commands: number; readonly runs: number } }
+    ).retention().commands <= 256,
+  );
+});
+
+test("failed drain and stop transitions preserve state and remain retryable", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        drain: async (context) => context.events.emit("drain", null),
+        stop: async (context) => context.events.emit("stop", null)
+      });
+    `,
+  );
+  const calls = { drain: 0, stop: 0 };
+  const host = new ComponentHost(
+    allowedOptions({
+      events: {
+        emit: async (type) => {
+          if (type !== "drain" && type !== "stop") return;
+          calls[type] += 1;
+          if (calls[type] === 1) throw new Error(`${type} failed`);
+        },
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(
+    command("import", "import-retry", {
+      artifactDigest: digest,
+      entrypoint: "components/component.js",
+    }),
+  );
+  await host.handle(command("start", "start-retry", { artifactDigest: digest }));
+
+  const firstDrain = await host.handle(
+    command("drain", "drain-failed", { artifactDigest: digest }),
+  );
+  assert.equal(firstDrain.ok, false);
+  assert.equal(firstDrain.state, "started");
+  const secondDrain = await host.handle(
+    command("drain", "drain-retry", { artifactDigest: digest }),
+  );
+  assert.equal(secondDrain.ok, true);
+  assert.equal(secondDrain.state, "draining");
+  assert.equal(calls.drain, 2);
+
+  const firstStop = await host.handle(
+    command("stop", "stop-failed", { artifactDigest: digest }),
+  );
+  assert.equal(firstStop.ok, false);
+  assert.equal(firstStop.state, "draining");
+  const secondStop = await host.handle(
+    command("stop", "stop-retry", { artifactDigest: digest }),
+  );
+  assert.equal(secondStop.ok, true);
+  assert.equal(secondStop.state, "stopped");
+  assert.equal(calls.stop, 2);
+});
+
+test("duplicate prepare compares the complete canonical deployment fingerprint", async (t) => {
+  const fixture = await artifactFixture(t, 'export default { protocol: "tego.component/1.0", kind: "task" };');
+  const host = new ComponentHost(allowedOptions());
+  assert.equal((await host.handle(prepareCommand(fixture))).ok, true);
+
+  const changedConfiguration = prepareCommand(fixture, {
+    configuration: { greeting: "changed" },
+  });
+  const firstConflict = await host.handle({
+    ...changedConfiguration,
+    commandId: "prepare-changed-configuration",
+  });
+  assert.equal(firstConflict.ok, false);
+  assert.equal(firstConflict.diagnostics[0]?.code, "PROTOCOL_IDEMPOTENCY_CONFLICT");
+
+  const changedRuntime = prepareCommand(fixture, {
+    runtime: { executor: "thread", mode: "single-main" },
+  });
+  const secondConflict = await host.handle({
+    ...changedRuntime,
+    commandId: "prepare-changed-runtime",
+  });
+  assert.equal(secondConflict.ok, false);
+  assert.equal(secondConflict.diagnostics[0]?.code, "PROTOCOL_IDEMPOTENCY_CONFLICT");
+});
+
+test("duplicate task attempts compare full execution fingerprints and completed caches stay bounded", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({ kind: "task", run: async (_context, input) => input });
+    `,
+  );
+  const host = new ComponentHost(allowedOptions());
+  await host.handle(prepareCommand(fixture));
+  await host.handle(
+    command("import", "import-run-retention", {
+      artifactDigest: digest,
+      entrypoint: "components/component.js",
+    }),
+  );
+  await host.handle(command("start", "start-run-retention", { artifactDigest: digest }));
+
+  const execution = {
+    taskId: parseTaskId("task-fingerprint"),
+    attemptId: parseAttemptId("attempt-fingerprint"),
+    applicationId: parseApplicationId("app-01"),
+    pluginId: parsePluginId("org.example.component"),
+    componentId: parseComponentId("component"),
+    input: { version: 1 },
+    deadline: futureDeadline,
+    orphanPolicy: "cancel",
+  } as const;
+  const first = await host.handle(
+    command("run", "run-fingerprint-first", { artifactDigest: digest, execution }),
+  );
+  assert.equal(first.ok, true);
+
+  for (const [commandId, changed] of [
+    ["run-fingerprint-input", { ...execution, input: { version: 2 } }],
+    ["run-fingerprint-orphan", { ...execution, orphanPolicy: "finish-and-buffer" }],
+  ] as const) {
+    const conflict = await host.handle(
+      command("run", commandId, { artifactDigest: digest, execution: changed }),
+    );
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.diagnostics[0]?.code, "PROTOCOL_IDEMPOTENCY_CONFLICT");
+  }
+
+  for (let index = 0; index < 300; index += 1) {
+    const result = await host.handle(
+      command("run", `run-retained-${index}`, {
+        artifactDigest: digest,
+        execution: {
+          ...execution,
+          taskId: parseTaskId(`task-retained-${index}`),
+          attemptId: parseAttemptId(`attempt-retained-${index}`),
+          input: index,
+        },
+      }),
+    );
+    assert.equal(result.ok, true);
+  }
+  const retention = (
+    host as unknown as { retention(): { readonly commands: number; readonly runs: number } }
+  ).retention();
+  assert.ok(retention.commands <= 256);
+  assert.ok(retention.runs <= 256);
+});
+
+test("deadline acceptance and chunked timers use the same injected clock", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async (context) => new Promise((resolve) => {
+          context.cancellation.addEventListener("abort", () => resolve("late"), { once: true });
+        })
+      });
+    `,
+  );
+  const timers: Array<{
+    readonly callback: () => void;
+    readonly delay: number;
+    cancelled: boolean;
+  }> = [];
+  let now = Date.parse("2090-01-01T00:00:00.000Z");
+  const clock = {
+    now: () => new Date(now),
+    setTimeout(callback: () => void, delay: number) {
+      const timer = { callback, delay, cancelled: false };
+      timers.push(timer);
+      return Object.freeze({
+        cancel: () => {
+          timer.cancelled = true;
+        },
+      });
+    },
+  };
+  const host = new ComponentHost(allowedOptions({ clock } as never));
+  await host.handle(prepareCommand(fixture));
+  await host.handle(
+    command("import", "import-clock", {
+      artifactDigest: digest,
+      entrypoint: "components/component.js",
+    }),
+  );
+  await host.handle(command("start", "start-clock", { artifactDigest: digest }));
+
+  const maximumDelay = 2_147_483_647;
+  const deadline = new Date(now + maximumDelay * 2 + 500).toISOString();
+  const pending = host.handle(
+    command(
+      "run",
+      "run-clock",
+      {
+        artifactDigest: digest,
+        execution: {
+          taskId: parseTaskId("task-clock"),
+          attemptId: parseAttemptId("attempt-clock"),
+          applicationId: parseApplicationId("app-01"),
+          pluginId: parsePluginId("org.example.component"),
+          componentId: parseComponentId("component"),
+          input: null,
+          deadline,
+          orphanPolicy: "cancel",
+        },
+      },
+      deadline,
+    ),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(timers[0]?.delay, maximumDelay);
+
+  now += maximumDelay;
+  timers[0]?.callback();
+  assert.equal(timers[1]?.delay, maximumDelay);
+  now += maximumDelay;
+  timers[1]?.callback();
+  assert.equal(timers[2]?.delay, 500);
+  now += 500;
+  timers[2]?.callback();
+
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.equal((result.value as { readonly status?: string } | undefined)?.status, "timed-out");
 });
 
 test("capability calls are forced through permission, request, invoke, and response gates", async (t) => {
