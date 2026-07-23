@@ -145,6 +145,25 @@ function isCanonicalInstance(record: LoadedComponentInstance): boolean {
   );
 }
 
+function isInstanceContextConsistent(
+  record: LoadedComponentInstance,
+  deployments: readonly PluginDeployment[],
+): boolean {
+  if (!isCanonicalInstance(record)) return false;
+  const instance = record.value;
+  const current = deployments.find(
+    (deployment) =>
+      deployment.applicationId === instance.applicationId &&
+      deployment.pluginId === instance.pluginId &&
+      deployment.generation === instance.deploymentGeneration,
+  );
+  return (
+    current === undefined ||
+    (instance.artifactDigest === current.artifactDigest &&
+      instance.observedGeneration === current.generation)
+  );
+}
+
 function observationKey(deployment: PluginDeployment): StateKey<DeploymentObservation> {
   return {
     namespace,
@@ -349,7 +368,7 @@ export class Reconciler {
           : 0,
     );
     const canonicalInstances = loadedInstances
-      .filter(isCanonicalInstance)
+      .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value);
     const invalidByDeployment = new Map<string, readonly ComponentInstance[]>();
     const gates = new Map<string, ArtifactDeploymentGate | DiagnosticError>();
@@ -360,7 +379,7 @@ export class Reconciler {
           (record) =>
             record.value.applicationId === deployment.applicationId &&
             record.value.pluginId === deployment.pluginId &&
-            !isCanonicalInstance(record),
+            !isInstanceContextConsistent(record, deployments),
         )
         .map((record) => record.value);
       if (invalidInstances.length > 0) {
@@ -412,13 +431,15 @@ export class Reconciler {
           invalidInstances.map((instance) =>
             runtimeDiagnostic({
               code: "DEPLOYMENT_INSTANCE_INCONSISTENT",
-              message: "Persisted component instance identity is not canonical",
+              message: "Persisted component instance identity or deployment context is inconsistent",
               source: { kind: "deployment", id: deploymentKey(deployment) },
               details: {
                 applicationId: instance.applicationId,
+                artifactDigest: instance.artifactDigest ?? null,
                 componentId: instance.componentId,
                 deploymentGeneration: instance.deploymentGeneration,
                 instanceId: instance.instanceId,
+                observedGeneration: instance.observedGeneration,
                 pluginId: instance.pluginId,
               },
               observedAt: this.#options.clock.now().toISOString(),
@@ -923,6 +944,7 @@ export class Reconciler {
       instance.pluginId !== effect.pluginId ||
       instance.componentId !== effect.componentId ||
       instance.deploymentGeneration !== effect.deploymentGeneration ||
+      instance.observedGeneration !== effect.deploymentGeneration ||
       instance.artifactDigest !== effect.artifactDigest ||
       instance.executor !== effect.executor ||
       instance.workerId !== effect.workerId
@@ -949,7 +971,9 @@ export class Reconciler {
       this.#loadInstallations(),
       this.#loadInstances(),
     ]);
-    const instances = loadedInstances.filter(isCanonicalInstance).map((record) => record.value);
+    const instances = loadedInstances
+      .filter((record) => isInstanceContextConsistent(record, deployments))
+      .map((record) => record.value);
     let currentGate: ArtifactDeploymentGate | DiagnosticError | undefined;
     if (desired !== undefined) {
       currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
@@ -1239,7 +1263,7 @@ export class Reconciler {
 
   async #refreshReadiness(): Promise<void> {
     const instances = (await this.#loadInstances())
-      .filter(isCanonicalInstance)
+      .filter((record) => isInstanceContextConsistent(record, this.#deployments))
       .map((record) => record.value);
     for (const deployment of this.#deployments) {
       if (deployment.state !== "active") continue;
