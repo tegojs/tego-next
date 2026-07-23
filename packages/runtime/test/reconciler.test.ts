@@ -955,6 +955,33 @@ test("restart after observed commit but before acknowledgement does not repeat t
   await second.stop();
 });
 
+test("completed-operation history prevents an old prepare replay after start completes", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const effects = new RecordingEffects();
+  const options = {
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  };
+  state.failNextAcknowledgement = true;
+  const first = new Reconciler(options);
+  await assert.rejects(first.start(), /acknowledgement unavailable/u);
+  await first.stop();
+
+  const second = new Reconciler(options);
+  await second.start();
+  clock.advance(31_000);
+  await second.wake();
+
+  assert.equal(effects.calls.filter((effect) => effect.kind === "prepare").length, 1);
+  assert.equal(effects.calls.filter((effect) => effect.kind === "start").length, 1);
+  await second.stop();
+});
+
 test("a queued startup effect is discarded when desired state becomes disabled", async () => {
   const clock = new ManualClock();
   const state = await createHarnessStore(clock);
@@ -976,8 +1003,10 @@ test("a queued startup effect is discarded when desired state becomes disabled",
   clock.advance(31_000);
   const second = new Reconciler(options);
   await second.start();
+  await second.wake();
 
-  assert.equal(effects.calls.length, 1);
+  assert.equal(effects.calls.filter((effect) => effect.kind === "prepare").length, 1);
+  assert.equal(effects.calls.at(-1)?.kind, "drain");
   assert.equal(second.replanCount, 1);
   await second.stop();
 });

@@ -44,6 +44,7 @@ export interface ComponentInstance extends JsonObject {
   readonly retryEffect?: ReconcileEffectKind;
   readonly diagnostic?: RuntimeDiagnostic;
   readonly completedOperationId?: OperationId;
+  readonly completedOperationIds?: readonly OperationId[];
   readonly revision: Revision;
 }
 

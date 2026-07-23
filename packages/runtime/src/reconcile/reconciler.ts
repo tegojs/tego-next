@@ -1,6 +1,13 @@
 import {
   DiagnosticError,
   diagnosticCode,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseComponentId,
+  parseGeneration,
+  parseMessageId,
+  parseOperationId,
+  parsePluginId,
   parsePluginDeployment,
   parsePluginInstallation,
   runtimeDiagnostic,
@@ -82,6 +89,7 @@ interface PersistedComponentInstance extends JsonObject {
   readonly retryEffect?: ReconcileEffectKind;
   readonly diagnostic?: RuntimeDiagnostic;
   readonly completedOperationId?: OperationId;
+  readonly completedOperationIds?: readonly OperationId[];
 }
 
 interface DeploymentObservation extends JsonObject {
@@ -151,6 +159,66 @@ function effectDiagnostic(
     cause: serializeCause(error),
     observedAt,
   });
+}
+
+function invalidMessageDiagnostic(claim: OutboxClaim, error: unknown, observedAt: string) {
+  return runtimeDiagnostic({
+    code: "PROTOCOL_MESSAGE_INVALID",
+    message: "Lifecycle outbox message payload is invalid",
+    source: { kind: "runtime", id: claim.message.messageId },
+    details: {
+      messageId: claim.message.messageId,
+      operationId: claim.message.operationId,
+      topic: claim.message.topic,
+    },
+    cause: serializeCause(error),
+    observedAt,
+  });
+}
+
+function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
+  const payload = claim.message.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new TypeError("Lifecycle payload must be an object");
+  }
+  const value = payload as Record<string, unknown>;
+  if (
+    value.kind !== "prepare" &&
+    value.kind !== "start" &&
+    value.kind !== "drain" &&
+    value.kind !== "stop"
+  ) {
+    throw new TypeError("Lifecycle effect kind is invalid");
+  }
+  if (typeof value.instanceId !== "string" || value.instanceId.length === 0) {
+    throw new TypeError("Lifecycle instance identity is invalid");
+  }
+  if (value.executor !== "process" && value.executor !== "thread" && value.executor !== "remote") {
+    throw new TypeError("Lifecycle executor is invalid");
+  }
+  if (value.workerId !== undefined && typeof value.workerId !== "string") {
+    throw new TypeError("Lifecycle worker identity is invalid");
+  }
+  const effect: ReconcileEffect = {
+    kind: value.kind,
+    applicationId: parseApplicationId(value.applicationId),
+    artifactDigest: parseArtifactDigest(value.artifactDigest),
+    componentId: parseComponentId(value.componentId),
+    deploymentGeneration: parseGeneration(value.deploymentGeneration),
+    executor: value.executor,
+    instanceId: value.instanceId,
+    messageId: parseMessageId(value.messageId),
+    operationId: parseOperationId(value.operationId),
+    pluginId: parsePluginId(value.pluginId),
+    ...(value.workerId === undefined ? {} : { workerId: value.workerId }),
+  };
+  if (
+    effect.messageId !== claim.message.messageId ||
+    effect.operationId !== claim.message.operationId
+  ) {
+    throw new TypeError("Lifecycle payload identity does not match its envelope");
+  }
+  return effect;
 }
 
 export class Reconciler {
@@ -341,6 +409,38 @@ export class Reconciler {
         candidate.version === deployment.version &&
         candidate.digest === deployment.artifactDigest,
     );
+    if (installation === undefined && deployment.state === "disabled") {
+      return {
+        artifact: {
+          digest: deployment.artifactDigest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: {
+            schemaVersion: "1.0",
+            pluginId: deployment.pluginId,
+            version: deployment.version,
+            contractRange: ">=0.0.0",
+            nodeRange: ">=0.0.0",
+            moduleFormat: "esm",
+            components: [],
+            permissions: [],
+            capabilities: { provides: [], requires: [] },
+          },
+        },
+        capabilityResolution: {
+          ok: true,
+          diagnostics: [],
+          providerLossActions: [],
+          bindings: [],
+          order: [],
+        },
+        permissionDecision: {
+          allowed: true,
+          diagnostics: [],
+          requested: [],
+          granted: deployment.permissionGrants,
+        },
+      };
+    }
     if (installation === undefined) {
       return new DiagnosticError(
         runtimeDiagnostic({
@@ -480,6 +580,14 @@ export class Reconciler {
     diagnostics: readonly RuntimeDiagnostic[],
   ): Promise<void> {
     this.#diagnosticsByDeployment.set(deploymentKey(deployment), diagnostics);
+    await this.#recordObservation(deployment, "blocked", diagnostics);
+  }
+
+  async #recordObservation(
+    deployment: PluginDeployment,
+    status: DeploymentObservation["status"],
+    diagnostics: readonly RuntimeDiagnostic[],
+  ): Promise<void> {
     const key = observationKey(deployment);
     const current = await this.#options.state.read(key);
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -489,7 +597,7 @@ export class Reconciler {
           applicationId: deployment.applicationId,
           pluginId: deployment.pluginId,
           generation: deployment.generation,
-          status: "blocked",
+          status,
           diagnostics,
           updatedAt: this.#options.clock.now().toISOString(),
         },
@@ -610,11 +718,81 @@ export class Reconciler {
   }
 
   async #executeClaim(claim: OutboxClaim): Promise<void> {
-    const effect = claim.message.payload as ReconcileEffect;
-    const current = await this.#options.state.read(instanceKey(effect.instanceId));
-    if (current?.value.completedOperationId === effect.operationId) {
+    let effect: ReconcileEffect;
+    try {
+      effect = parseReconcileEffect(claim);
+    } catch (error) {
+      const observedAt = this.#options.clock.now().toISOString();
+      const diagnostic = invalidMessageDiagnostic(claim, error, observedAt);
+      this.#diagnosticsByDeployment.set(`outbox/${claim.message.messageId}`, [diagnostic]);
+      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+        await transaction.appendOperation({
+          operationId: claim.message.operationId,
+          kind: "component.lifecycle",
+          status: "failed",
+          state: { diagnostic },
+          updatedAt: observedAt,
+        });
+        return null;
+      });
       await this.#acknowledge(claim, "completed");
       return;
+    }
+    const current = await this.#options.state.read(instanceKey(effect.instanceId));
+    if (
+      current?.value.completedOperationId === effect.operationId ||
+      current?.value.completedOperationIds?.includes(effect.operationId)
+    ) {
+      await this.#acknowledge(claim, "completed");
+      return;
+    }
+    if (effect.kind === "prepare" || effect.kind === "start") {
+      const [deployments, installations, instances] = await Promise.all([
+        this.#loadDeployments(),
+        this.#loadInstallations(),
+        this.#loadInstances(),
+      ]);
+      const desired = deployments.find(
+        (candidate) =>
+          candidate.applicationId === effect.applicationId &&
+          candidate.pluginId === effect.pluginId,
+      );
+      if (
+        desired === undefined ||
+        desired.state !== "active" ||
+        desired.generation !== effect.deploymentGeneration ||
+        desired.artifactDigest !== effect.artifactDigest
+      ) {
+        this.#replanCount += 1;
+        await this.#acknowledge(claim, "completed");
+        return;
+      }
+      const gate = await this.#gateDeployment(desired, deployments, installations, instances);
+      if (
+        gate instanceof DiagnosticError ||
+        !gate.capabilityResolution.ok ||
+        !gate.permissionDecision.allowed
+      ) {
+        this.#replanCount += 1;
+        const diagnostics =
+          gate instanceof DiagnosticError
+            ? [gate.diagnostic]
+            : [
+                ...gate.capabilityResolution.diagnostics,
+                ...gate.permissionDecision.diagnostics,
+              ].map((diagnostic) =>
+                runtimeDiagnostic({
+                  code: diagnostic.code as `CAPABILITY_${string}` | `PERMISSION_${string}`,
+                  message: diagnostic.message,
+                  source: { kind: "deployment", id: deploymentKey(desired) },
+                  details: diagnostic,
+                  observedAt: this.#options.clock.now().toISOString(),
+                }),
+              );
+        await this.#recordBlocked(desired, diagnostics);
+        await this.#acknowledge(claim, "completed");
+        return;
+      }
     }
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
       await transaction.appendOperation({
@@ -651,13 +829,29 @@ export class Reconciler {
       const lifecycle = this.#successfulLifecycle(effect.kind, current.value);
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          const {
+            attempt: _attempt,
+            diagnostic: _diagnostic,
+            retryAt: _retryAt,
+            retryEffect: _retryEffect,
+            ...stable
+          } = current.value;
+          void _attempt;
+          void _diagnostic;
+          void _retryAt;
+          void _retryEffect;
+          const completedOperationIds = [
+            ...(current.value.completedOperationIds ?? []),
+            effect.operationId,
+          ].filter((operationId, index, all) => all.indexOf(operationId) === index);
           await transaction.put(
             key,
             {
-              ...current.value,
+              ...stable,
               lifecycle,
               observedGeneration: effect.deploymentGeneration,
               completedOperationId: effect.operationId,
+              completedOperationIds,
             },
             { expectedRevision: current.revision },
           );
@@ -797,6 +991,7 @@ export class Reconciler {
       );
       if (failedDiagnostics.length > 0) {
         this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
+        await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
       const installation = (await this.#loadInstallations()).find(
         (candidate) =>
@@ -813,6 +1008,9 @@ export class Reconciler {
       if (ready) {
         this.#readyDeployments.add(deploymentKey(deployment));
         this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
+        await this.#recordObservation(deployment, "ready", []);
+      } else if (failedDiagnostics.length === 0) {
+        await this.#recordObservation(deployment, "converging", []);
       }
     }
   }
