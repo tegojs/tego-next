@@ -262,8 +262,11 @@ class ProcessChannel {
   async #readStderr(): Promise<void> {
     try {
       for await (const chunk of this.#process.stderr) {
-        if (Buffer.byteLength(this.#stderr, "utf8") >= PROCESS_EXECUTOR_MAX_STDERR_BYTES) continue;
-        this.#stderr += Buffer.from(chunk).toString("utf8");
+        const used = Buffer.byteLength(this.#stderr, "utf8");
+        if (used >= PROCESS_EXECUTOR_MAX_STDERR_BYTES) continue;
+        this.#stderr += Buffer.from(chunk)
+          .subarray(0, PROCESS_EXECUTOR_MAX_STDERR_BYTES - used)
+          .toString("utf8");
       }
     } catch {
       // stderr is diagnostic-only; process exit remains authoritative.
@@ -840,6 +843,7 @@ export class ProcessExecutor implements Executor {
       this.#artifactCommand("stop", "stop", deadline, artifactDigest),
     ).catch(() => undefined);
     await process_.stdin.close().catch(() => undefined);
+    await process_.signal("SIGTERM").catch(() => undefined);
   }
 
   #armDeadline(entry: AttemptEntry): void {

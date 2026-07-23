@@ -21,7 +21,12 @@ import {
   type ProcessHost,
   type ProcessSpawnRequest,
 } from "@tegojs/contracts";
-import { executorConformance, FakeClock, type ExecutorConformanceFixture } from "@tegojs/testkit";
+import {
+  eventually,
+  executorConformance,
+  FakeClock,
+  type ExecutorConformanceFixture,
+} from "@tegojs/testkit";
 import {
   PROCESS_EXECUTOR_MAX_FRAME_BYTES,
   ProcessFrameDecoder,
@@ -487,10 +492,10 @@ test("a task that leaves handles behind cannot retain its child slot after retur
     void handle.result.then(() => {
       settled = true;
     });
-    for (let turn = 0; turn < 10 && !settled; turn += 1) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    assert.equal(settled, true);
+    await eventually(() => assert.equal(settled, true), {
+      attempts: 1_000,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
     assert.equal(processHost.activeProcessCount, 0);
   } finally {
     await processHost.close();

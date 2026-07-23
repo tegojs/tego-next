@@ -2,6 +2,8 @@ import { DiagnosticError, runtimeDiagnostic, type DiagnosticCode } from "@tegojs
 
 export const PROCESS_EXECUTOR_MAX_FRAME_BYTES = 1024 * 1024;
 export const PROCESS_EXECUTOR_MAX_BUFFERED_BYTES = PROCESS_EXECUTOR_MAX_FRAME_BYTES + 4;
+export const PROCESS_EXECUTOR_MAX_FRAME_DEPTH = 64;
+export const PROCESS_EXECUTOR_MAX_FRAME_NODES = 100_000;
 
 function framingError(code: DiagnosticCode, message: string): DiagnosticError {
   return new DiagnosticError(
@@ -11,6 +13,31 @@ function framingError(code: DiagnosticCode, message: string): DiagnosticError {
       source: { kind: "protocol", id: "process-executor" },
     }),
   );
+}
+
+function validateComplexity(value: unknown): void {
+  const pending: Array<{ readonly value: unknown; readonly depth: number }> = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) break;
+    nodes += 1;
+    if (
+      nodes > PROCESS_EXECUTOR_MAX_FRAME_NODES ||
+      current.depth > PROCESS_EXECUTOR_MAX_FRAME_DEPTH
+    ) {
+      throw framingError(
+        "PROTOCOL_PROCESS_FRAME_COMPLEXITY_EXCEEDED",
+        "Process frame exceeds the configured depth or node limit",
+      );
+    }
+    if (typeof current.value !== "object" || current.value === null) continue;
+    for (const child of Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value as Record<string, unknown>)) {
+      pending.push({ value: child, depth: current.depth + 1 });
+    }
+  }
 }
 
 export function encodeProcessFrame(
@@ -78,8 +105,11 @@ export class ProcessFrameDecoder {
         throw framingError("PROTOCOL_PROCESS_FRAME_INVALID", "Process frame is not valid UTF-8");
       }
       try {
-        values.push(JSON.parse(text));
-      } catch {
+        const value: unknown = JSON.parse(text);
+        validateComplexity(value);
+        values.push(value);
+      } catch (error) {
+        if (error instanceof DiagnosticError) throw error;
         throw framingError("PROTOCOL_PROCESS_FRAME_INVALID", "Process frame is not valid JSON");
       }
     }
