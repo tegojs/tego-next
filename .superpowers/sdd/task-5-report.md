@@ -196,3 +196,23 @@ unimplemented later-task workspaces remains unchanged.
 Operation-specific resume/terminal handling and `StopOptions.deadlineMs`
 enforcement remain deliberately staged. OpenSpec item 4.3 must remain
 incomplete until operation owners implement idempotent resume/termination.
+
+## Leadership Resource Re-review Fix
+
+The second formal review found one remaining semantic boundary: a structurally
+valid `Leadership` could name a different resource than the campaign request.
+This was fixed with another focused TDD cycle:
+
+- RED `9b0abc2` — `test: reject mismatched leadership resources`
+- GREEN `6446f5d` — `fix: bind leadership to campaign resource`
+- formatting-only `0a0ccb7` — `chore: format leadership regression`
+
+Immediately after parsing the campaign result, runtime now compares the returned
+resource with `runtime:<runtimeId>`. A mismatch fails bootstrap with
+`COORDINATION_LEADERSHIP_RESOURCE_MISMATCH`, records JSON-safe
+`expectedResource` and `actualResource` details, keeps operations closed, and
+closes all opened drivers in reverse order before the runtime becomes failed.
+
+The final combined verification increased to 112 passing tests with zero
+failures. Affected-package type checks, real SQLite integration, architecture,
+format, lint, and diff checks all remained green.
