@@ -405,19 +405,24 @@ export class MemoryStateStore implements StateStore {
       }
     }
 
-    const execution = this.#executeTransaction(options, identity, work);
     if (identity === undefined) {
-      return execution;
+      return this.#executeTransaction(options, identity, work);
     }
 
-    this.#inFlightIdempotency.set(identity.key, {
+    const deferred = Promise.withResolvers<JsonValue>();
+    const inFlight = {
       fingerprint: identity.fingerprint,
-      result: execution as Promise<JsonValue>,
-    });
+      result: deferred.promise,
+    };
+    this.#inFlightIdempotency.set(identity.key, inFlight);
+    const execution = this.#executeTransaction(options, identity, work);
+    void execution.then(deferred.resolve, deferred.reject);
     try {
-      return await execution;
+      return cloneJson(await deferred.promise) as T;
     } finally {
-      this.#inFlightIdempotency.delete(identity.key);
+      if (this.#inFlightIdempotency.get(identity.key) === inFlight) {
+        this.#inFlightIdempotency.delete(identity.key);
+      }
     }
   }
 
