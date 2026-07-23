@@ -262,3 +262,109 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-rel
     },
   );
 });
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/allows-testkit-conformance-edges", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/testkit": {
+        name: "@tegojs/testkit",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+      "packages/drivers-local": {
+        name: "@tegojs/drivers-local",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+        devDependencies: { "@tegojs/testkit": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/drivers-local/dist/test/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("conformance.test.js", outputDirectory),
+        'import { runStateStoreSuite } from "@tegojs/testkit";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), []);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-dependency", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/testkit": {
+        name: "@tegojs/testkit",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+      "packages/drivers-local": {
+        name: "@tegojs/drivers-local",
+        dependencies: {
+          "@tegojs/contracts": "0.0.0",
+          "@tegojs/testkit": "0.0.0",
+        },
+      },
+    },
+    async (root) => {
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/drivers-local -> @tegojs/testkit",
+      ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-import", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/testkit": {
+        name: "@tegojs/testkit",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+      "packages/drivers-local": {
+        name: "@tegojs/drivers-local",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/drivers-local/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.js", outputDirectory),
+        'import { runStateStoreSuite } from "@tegojs/testkit";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/drivers-local -> @tegojs/testkit",
+      ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-testkit-edges", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": {
+        name: "@tegojs/contracts",
+        devDependencies: { "@tegojs/testkit": "0.0.0" },
+      },
+      "packages/testkit": {
+        name: "@tegojs/testkit",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/contracts/dist/test/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("contracts.test.js", outputDirectory),
+        'import { runStateStoreSuite } from "@tegojs/testkit";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/contracts -> @tegojs/testkit",
+      ]);
+    },
+  );
+});
