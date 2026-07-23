@@ -186,6 +186,19 @@ class RejectingKillProcessHost extends TestProcessHost {
   }
 }
 
+class DelayedSpawnProcessHost extends TestProcessHost {
+  readonly started = Promise.withResolvers<void>();
+  readonly gate = Promise.withResolvers<void>();
+  spawnCount = 0;
+
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    this.spawnCount += 1;
+    this.started.resolve();
+    await this.gate.promise;
+    return super.spawn(request);
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -612,6 +625,88 @@ test("active cancellation is cooperative before fake-clock grace forces process 
   assert.equal((await handle.result).status, "cancelled");
   assert.equal(processHost.activeProcessCount, 0);
   await executor.drain({});
+});
+
+test("cancellation races a delayed resolver so result and drain converge", async () => {
+  const resolverStarted = Promise.withResolvers<void>();
+  const resolverGate = Promise.withResolvers<void>();
+  const processHost = new TestProcessHost();
+  const base = await options({ processHost });
+  const executor = new ProcessExecutor({
+    ...base,
+    async resolveComponent(execution) {
+      resolverStarted.resolve();
+      await resolverGate.promise;
+      return base.resolveComponent(execution);
+    },
+  });
+  const execution = request({ mode: "echo", value: "late-resolver" }, "cancel-resolver");
+  const handle = await executor.submit(execution);
+  await resolverStarted.promise;
+  try {
+    await executor.cancel(execution.taskId, execution.attemptId);
+    let result: Awaited<typeof handle.result> | undefined;
+    let drained = false;
+    void handle.result.then((value) => {
+      result = value;
+    });
+    void executor.drain({}).then(() => {
+      drained = true;
+    });
+    await eventually(
+      () => {
+        assert.equal(result?.status, "cancelled");
+        assert.equal(drained, true);
+      },
+      {
+        attempts: 100,
+        advance: () => new Promise((resolve) => setImmediate(resolve)),
+      },
+    );
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    resolverGate.resolve();
+    await processHost.close();
+  }
+});
+
+test("cancellation races delayed spawn and terminates the late child before bootstrap", async () => {
+  const processHost = new DelayedSpawnProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost }));
+  const execution = request({ mode: "echo", value: "late-spawn" }, "cancel-spawn");
+  const handle = await executor.submit(execution);
+  await processHost.started.promise;
+  try {
+    await executor.cancel(execution.taskId, execution.attemptId);
+    clock.advanceBy(100);
+    let result: Awaited<typeof handle.result> | undefined;
+    let drained = false;
+    void handle.result.then((value) => {
+      result = value;
+    });
+    void executor.drain({}).then(() => {
+      drained = true;
+    });
+    await eventually(
+      () => {
+        assert.equal(result?.status, "cancelled");
+        assert.equal(drained, true);
+      },
+      {
+        attempts: 100,
+        advance: () => new Promise((resolve) => setImmediate(resolve)),
+      },
+    );
+    processHost.gate.resolve();
+    await eventually(() => assert.equal(processHost.activeProcessCount, 0), {
+      attempts: 1_000,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    assert.equal(processHost.spawnCount, 1);
+  } finally {
+    processHost.gate.resolve();
+    await processHost.close();
+  }
 });
 
 test("duplicate cancellation shares one escalation timer", async () => {
