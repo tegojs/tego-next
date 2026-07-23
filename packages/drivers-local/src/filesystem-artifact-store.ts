@@ -45,6 +45,20 @@ export interface AtomicPublishOptions {
   readonly removeTemporary: () => Promise<void>;
 }
 
+export interface ArtifactPublishSyncDirectoriesOptions {
+  readonly artifactDirectory: string;
+  readonly shardDirectory: string;
+  readonly shardCreated: boolean;
+}
+
+export function artifactPublishSyncDirectories(
+  options: ArtifactPublishSyncDirectoriesOptions,
+): readonly string[] {
+  return options.shardCreated
+    ? [options.shardDirectory, options.artifactDirectory]
+    : [options.shardDirectory];
+}
+
 function publishCollision(error: unknown, platform: NodeJS.Platform): boolean {
   if (!(error instanceof Error) || !("code" in error)) {
     return false;
@@ -135,7 +149,10 @@ export class FilesystemArtifactStore implements ArtifactStore {
 
   async #openArtifactDirectory(): Promise<void> {
     try {
-      await mkdir(this.#artifactDirectory, { recursive: true });
+      const created = await mkdir(this.#artifactDirectory, { recursive: true });
+      if (created !== undefined) {
+        await this.#syncDirectory(this.#rootDirectory);
+      }
       if (this.#lifecycle !== "opening") {
         throw this.#closedError();
       }
@@ -213,7 +230,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
   async #put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void> {
     const targetPath = this.pathFor(digest);
     const targetDirectory = join(this.#artifactDirectory, digestHex(digest).slice(0, 2));
-    await mkdir(targetDirectory, { recursive: true });
+    const shardCreated = (await mkdir(targetDirectory, { recursive: true })) !== undefined;
     const temporaryPath = join(targetDirectory, `.${digestHex(digest)}.${randomUUID()}.temporary`);
     const hash = createHash("sha256");
     let handle: FileHandle | undefined;
@@ -248,7 +265,13 @@ export class FilesystemArtifactStore implements ArtifactStore {
         targetMatches: async () => this.#fileMatches(targetPath, digest),
         removeTemporary: async () => removeIfPresent(temporaryPath),
       });
-      await this.#syncDirectory(targetDirectory);
+      for (const directory of artifactPublishSyncDirectories({
+        artifactDirectory: this.#artifactDirectory,
+        shardDirectory: targetDirectory,
+        shardCreated,
+      })) {
+        await this.#syncDirectory(directory);
+      }
     } finally {
       await handle?.close();
       await removeIfPresent(temporaryPath);
