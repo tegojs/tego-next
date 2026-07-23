@@ -421,6 +421,17 @@ test("returns structured compatibility diagnostics", async (context) => {
   }
 });
 
+test("accepts common partial semver comparators without evaluating plugin code", async () => {
+  const compatibleManifest = {
+    ...manifest,
+    contractRange: "^2.0.0",
+    nodeRange: ">=26 <27",
+  };
+  const { digest, service } = await serviceFor(tar(validEntries(compatibleManifest)));
+  const validated = await service.validate({ digest });
+  assert.equal(validated.manifest.nodeRange, ">=26 <27");
+});
+
 test("verifies Ed25519 signature envelopes over raw digest bytes", async (context) => {
   const archive = tar(validEntries());
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
