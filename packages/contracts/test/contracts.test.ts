@@ -347,6 +347,17 @@ test("plugin permission contracts are structured and empty arrays remain valid",
       }),
     (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
   );
+  for (const path of ["/.", "/../etc", "/data/../etc"]) {
+    assert.throws(
+      () =>
+        parsePluginManifest({
+          ...validManifest,
+          permissions: [{ kind: "filesystem", roots: [{ path, access: ["read"] }] }],
+        }),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+      path,
+    );
+  }
 });
 
 test("execution request validation preserves JsonValue payloads", () => {
