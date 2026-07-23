@@ -596,7 +596,7 @@ Commit: `git add packages/runtime && git commit -m "feat: reconcile plugin deplo
   implementation; secret values never enter plugin manifests or persisted
   deployment configuration.
 
-- [ ] **Step 1: Write and commit failing SDK and host tests**
+- [x] **Step 1: Write and commit failing SDK and host tests**
 
 Verify functional definitions, disposable reverse cleanup, rejected decorator or
 class assumptions, manifest entry confinement, ESM import, serialized hook
@@ -609,19 +609,19 @@ Expected: FAIL because SDK and host exports are absent.
 
 Commit: `git add packages/plugin-sdk packages/executor-node/test && git commit -m "test: define plugin SDK and component host"`
 
-- [ ] **Step 2: Implement the minimal SDK**
+- [x] **Step 2: Implement the minimal SDK**
 
 Freeze component definitions and contexts. The context exposes only identity,
 config reader, logger, events, capability client, cancellation signal, runtime
 information, and disposables.
 
-- [ ] **Step 3: Implement ComponentHost in-process protocol handling**
+- [x] **Step 3: Implement ComponentHost in-process protocol handling**
 
 Validate every command and result with contracts. Import only a previously
 prepared digest and declared entry. Convert all thrown values into
 `RuntimeDiagnostic`.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `npm run build -w @tegojs/plugin-sdk -w @tegojs/executor-node && node --test packages/plugin-sdk/dist/test/component.test.js packages/executor-node/dist/test/component-host.test.js`
 
