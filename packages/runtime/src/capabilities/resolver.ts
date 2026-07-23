@@ -228,6 +228,7 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
   const requiredOutgoing = new Map<string, Set<string>>(
     deployments.map((deployment) => [identityKey(deployment.identity), new Set<string>()]),
   );
+  const optionalEdges: Array<readonly [string, string]> = [];
 
   for (const consumer of deployments) {
     for (const sourceRequirement of [...consumer.requires].sort((left, right) =>
@@ -354,6 +355,8 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
       });
       if (!requirement.optional) {
         requiredOutgoing.get(identityKey(provider.identity))?.add(identityKey(consumer.identity));
+      } else {
+        optionalEdges.push([identityKey(provider.identity), identityKey(consumer.identity)]);
       }
     }
   }
@@ -381,6 +384,27 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
 
   diagnostics.sort(compareDiagnostic);
   if (diagnostics.length > 0) return { ok: false, diagnostics };
+
+  const reachable = (start: string, target: string): boolean => {
+    const pending = [start];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (current === undefined) break;
+      if (current === target) return true;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      pending.push(...(requiredOutgoing.get(current) ?? []));
+    }
+    return false;
+  };
+  for (const [provider, consumer] of optionalEdges.sort(
+    (left, right) => compareText(left[0], right[0]) || compareText(left[1], right[1]),
+  )) {
+    if (provider !== consumer && !reachable(consumer, provider)) {
+      requiredOutgoing.get(provider)?.add(consumer);
+    }
+  }
 
   const order = topologicalOrder(graph, compareText);
   if (order === undefined) {
