@@ -16,6 +16,7 @@ import {
   type PluginDeployment,
   type PluginInstallation,
   type PluginManifest,
+  type Permission,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
@@ -69,7 +70,22 @@ const validManifest = {
       executors: ["thread", "process", "remote"],
     },
   ],
-  permissions: [],
+  permissions: [
+    {
+      kind: "capability",
+      capabilities: [{ name: "org.example.echo", methods: ["read", "write"] }],
+    },
+    { kind: "executor", executors: ["process", "remote", "thread"] },
+    { kind: "network", hosts: ["example.com"], ports: [443], methods: ["GET", "POST"] },
+    { kind: "filesystem", roots: [{ path: "/data", access: ["read", "write"] }] },
+    { kind: "secret", names: ["api-key"] },
+    { kind: "environment", names: ["TEGO_MODE"] },
+    {
+      kind: "worker",
+      labels: { zone: "edge-a" },
+      resources: { cpuMillis: 1_000, memoryBytes: 1_048_576, storageBytes: 1_048_576 },
+    },
+  ] satisfies readonly Permission[],
   capabilities: {
     provides: [],
     requires: [],
@@ -171,13 +187,23 @@ const validDeployment = {
   state: "active",
   essential: true,
   configuration: { threshold: 0.75 },
-  permissionGrants: [],
-  capabilityBindings: { "org.example.echo": validManifest.pluginId },
+  permissionGrants: [
+    {
+      kind: "capability",
+      capabilities: [{ name: "org.example.echo", methods: ["read"] }],
+    },
+  ],
+  capabilityBindings: {
+    "org.example.echo": {
+      applicationId: validExecutionRequest.applicationId,
+      pluginId: validManifest.pluginId,
+    },
+  },
 } satisfies PluginDeployment;
 
 const validCapabilityIdentity = {
   name: parseCapabilityName("org.example.echo"),
-  protocolVersion: "1.0",
+  protocolVersion: "1.0.0",
 } satisfies CapabilityIdentity;
 
 const validCapabilityDefinition = {
@@ -198,7 +224,10 @@ const validCapabilityDefinition = {
 
 const validCapabilityBinding = {
   capability: validCapabilityIdentity,
-  providerPluginId: validManifest.pluginId,
+  providerDeployment: {
+    applicationId: validExecutionRequest.applicationId,
+    pluginId: validManifest.pluginId,
+  },
 } satisfies CapabilityBinding;
 
 const validDiagnostic = {
@@ -292,6 +321,23 @@ test("plugin manifest validation reports deterministically sorted Ajv issues", (
       });
       return true;
     },
+  );
+});
+
+test("plugin permission contracts are structured and empty arrays remain valid", () => {
+  assert.deepEqual(parsePluginManifest(validManifest), validManifest);
+  assert.deepEqual(parsePluginManifest({ ...validManifest, permissions: [] }).permissions, []);
+  assert.deepEqual(
+    parsePluginDeployment({ ...validDeployment, permissionGrants: [] }).permissionGrants,
+    [],
+  );
+  assert.throws(
+    () => parsePluginManifest({ ...validManifest, permissions: ["network:*"] }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
+  assert.throws(
+    () => parsePluginDeployment({ ...validDeployment, permissionGrants: ["network:*"] }),
+    (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_RECORD_INVALID",
   );
 });
 
