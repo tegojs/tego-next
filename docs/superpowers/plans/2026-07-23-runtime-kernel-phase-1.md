@@ -66,7 +66,7 @@ base-ref: c81e8ab496c3a4d68443ebf9f825abee0f924fd4
 - Produces: root commands `npm run build`, `npm run typecheck`, `npm test`, `npm run verify`, and nine named workspaces.
 - Produces: dependency rule `contracts ← runtime/drivers/executors/transport/sdk/testkit ← cli`.
 
-- [ ] **Step 1: Write and commit the failing architecture test**
+- [x] **Step 1: Write and commit the failing architecture test**
 
 ```js
 import test from "node:test";
@@ -85,7 +85,7 @@ Expected: FAIL with `ERR_MODULE_NOT_FOUND` for `scripts/check-boundaries.mjs`.
 
 Commit: `git add tests/architecture && git commit -m "test: define workspace dependency boundary"`
 
-- [ ] **Step 2: Add pinned workspace configuration**
+- [x] **Step 2: Add pinned workspace configuration**
 
 Use these exact root fields:
 
@@ -113,7 +113,7 @@ Use these exact root fields:
 
 Pin development dependencies to TypeScript `7.0.2`, Biome `2.5.5`, and Node types `26.1.1`. Add runtime dependencies only to the workspace that imports them.
 
-- [ ] **Step 3: Implement the boundary checker**
+- [x] **Step 3: Implement the boundary checker**
 
 `checkWorkspaceBoundaries(root)` reads every `packages/*/package.json`, creates a package-name graph, and returns sorted strings such as `@tegojs/contracts -> @tegojs/runtime`. Reject:
 
@@ -121,7 +121,7 @@ Pin development dependencies to TypeScript `7.0.2`, Biome `2.5.5`, and Node type
 - runtime dependencies on concrete drivers, CLI, SDK, examples, or testkit;
 - any first-layer package whose name or import contains `tego/`, `frontend`, `http`, `acl`, `cache`, `workflow`, or `datasource`.
 
-- [ ] **Step 4: Verify and commit the green workspace**
+- [x] **Step 4: Verify and commit the green workspace**
 
 Run:
 
@@ -978,7 +978,7 @@ After each implementation task passes, mark the corresponding items in
 
 | Plan task | OpenSpec task groups |
 | --- | --- |
-| 1 | 1.1, 1.2, 1.4 |
+| 1 | 1.1, 1.2 |
 | 2 | 2.1–2.5 |
 | 3 | 1.3, 3.1, 3.2 |
 | 4 | 3.3, 3.5 |
@@ -993,7 +993,7 @@ After each implementation task passes, mark the corresponding items in
 | 13 | 9.4–9.7 |
 | 14 | 3.4, 3.6, 3.7 |
 | 15 | 11.1–11.5 |
-| 16 | 10.3–10.5, 11.6, 11.7, 12.1–12.6 |
+| 16 | 1.4, 10.3–10.5, 11.6, 11.7, 12.1–12.6 |
 
 Before leaving Build phase:
 

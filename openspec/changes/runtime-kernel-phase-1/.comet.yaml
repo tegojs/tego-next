@@ -1,7 +1,7 @@
 workflow: full
 phase: build
-build_mode: null
-isolation: null
+build_mode: subagent-driven-development
+isolation: branch
 verify_mode: null
 base_ref: null
 design_doc: docs/superpowers/specs/2026-07-23-runtime-kernel-phase-1-design.md

@@ -1,7 +1,7 @@
 ## 1. Repository and Test Harness
 
-- [ ] 1.1 Pin Node.js 26, npm, TypeScript 7, workspace metadata, ESM compiler settings, formatting, linting, and deterministic install configuration
-- [ ] 1.2 Add the package dependency graph and an architecture test that rejects forbidden layer-two, frontend, and Tego 1.x imports
+- [x] 1.1 Pin Node.js 26, npm, TypeScript 7, workspace metadata, ESM compiler settings, formatting, linting, and deterministic install configuration
+- [x] 1.2 Add the package dependency graph and an architecture test that rejects forbidden layer-two, frontend, and Tego 1.x imports
 - [ ] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, eventual assertions, and leak detection
 - [ ] 1.4 Add CI jobs for Node 26 static checks, unit tests, package tests, PostgreSQL integration tests, build, and smoke verification
 
