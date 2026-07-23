@@ -33,7 +33,8 @@ const COMMAND_TYPES = new Set([
   "stop",
   "cancel",
 ] as const);
-const MAX_WIRE_BYTES = 1024 * 1024;
+export const COMPONENT_HOST_WIRE_BYTE_LIMIT = 1024 * 1024;
+export const COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT = 64;
 const MAX_WIRE_DEPTH = 64;
 const MAX_WIRE_NODES = 1_000_000;
 const COMMAND_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -215,7 +216,7 @@ function cloneWire(
 
 export function cloneComponentHostValue(value: unknown): JsonValue {
   const result = cloneWire(value, "$", 0, new Set(), { nodes: 0 });
-  if (Buffer.byteLength(JSON.stringify(result), "utf8") > MAX_WIRE_BYTES) {
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") > COMPONENT_HOST_WIRE_BYTE_LIMIT) {
     throw wireError("Component host value exceeds the bounded wire size limit");
   }
   return result;

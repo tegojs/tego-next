@@ -25,7 +25,9 @@ import {
 } from "./component-loader.js";
 import {
   cloneComponentHostValue,
+  COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT,
   COMPONENT_HOST_PROTOCOL,
+  COMPONENT_HOST_WIRE_BYTE_LIMIT,
   parseComponentHostCommand,
   parseComponentHostResult,
   type ComponentHostCommand,
@@ -224,10 +226,10 @@ export class ComponentHost {
         !Array.isArray(attachmentInput) ||
         attachmentInput.some((item) => !(item instanceof ArrayBuffer))
       ) {
-        throw new TypeError("Component host attachments must be ArrayBuffers");
+        throw this.#protocolError("Component host attachments must be ArrayBuffers");
       }
       if (command.type !== "run" && attachmentInput.length > 0) {
-        throw new TypeError("Component host attachments are only valid for run commands");
+        throw this.#protocolError("Component host attachments are only valid for run commands");
       }
       attachments = this.#attachments(attachmentInput);
     } catch (error) {
@@ -788,6 +790,25 @@ export class ComponentHost {
   }
 
   #attachments(input: readonly ArrayBuffer[]): RunAttachmentLease {
+    if (input.length > COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT) {
+      throw this.#protocolError(
+        `Component host attachments exceed the count limit of ${COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT}`,
+      );
+    }
+    let totalBytes = 0;
+    for (const buffer of input) {
+      if (buffer.byteLength > COMPONENT_HOST_WIRE_BYTE_LIMIT) {
+        throw this.#protocolError(
+          `Component host attachment exceeds the byte limit of ${COMPONENT_HOST_WIRE_BYTE_LIMIT}`,
+        );
+      }
+      totalBytes += buffer.byteLength;
+      if (totalBytes > COMPONENT_HOST_WIRE_BYTE_LIMIT) {
+        throw this.#protocolError(
+          `Component host attachments exceed the aggregate byte limit of ${COMPONENT_HOST_WIRE_BYTE_LIMIT}`,
+        );
+      }
+    }
     const values = input.map((buffer) => new Uint8Array(buffer).slice());
     const hash = createHash("sha256");
     const count = Buffer.allocUnsafe(4);
@@ -1120,6 +1141,17 @@ export class ComponentHost {
         code,
         message,
         source: { kind: "executor", id: "component-host" },
+        observedAt: this.#now(),
+      }),
+    );
+  }
+
+  #protocolError(message: string): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID",
+        message,
+        source: { kind: "protocol", id: "component-host" },
         observedAt: this.#now(),
       }),
     );
