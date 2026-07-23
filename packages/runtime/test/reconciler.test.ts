@@ -851,6 +851,104 @@ test("malformed lifecycle outbox payloads are diagnosed without invoking effects
   await reconciler.stop();
 });
 
+test("canonical lifecycle identities cannot be retargeted to another persisted instance", async () => {
+  const source = (
+    lifecycle: ComponentInstance["lifecycle"],
+    generation = "1",
+  ): ComponentInstance => ({
+    applicationId,
+    componentId,
+    deploymentGeneration: parseGeneration(generation),
+    executor: "process",
+    instanceId: `source-${lifecycle}`,
+    lifecycle,
+    observedGeneration: parseGeneration(generation),
+    pluginId,
+    revision: parseRevision("1"),
+  });
+  const cases = [
+    {
+      desired: deployment(),
+      effect: planReconcile(snapshot()).steps[0]?.effect,
+      lifecycle: "created",
+    },
+    {
+      desired: deployment(),
+      effect: planReconcile(snapshot(deployment(), [source("preparing")])).steps[0]?.effect,
+      lifecycle: "preparing",
+    },
+    {
+      desired: deployment("2", { state: "disabled" }),
+      effect: planReconcile(snapshot(deployment("2", { state: "disabled" }), [source("ready")]))
+        .steps[0]?.effect,
+      lifecycle: "ready",
+    },
+    {
+      desired: deployment("2", { state: "disabled" }),
+      effect: planReconcile(snapshot(deployment("2", { state: "disabled" }), [source("draining")]))
+        .steps[0]?.effect,
+      lifecycle: "draining",
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const effect = item.effect;
+    assert.ok(effect);
+    const clock = new ManualClock();
+    const effects = new RecordingEffects();
+    const state = await createHarnessStore(clock);
+    const retargeted = {
+      ...effect,
+      instanceId: `victim-${effect.kind}`,
+    };
+    const now = clock.now().toISOString();
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: retargeted.instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: effect.artifactDigest,
+          componentId,
+          deploymentGeneration: effect.deploymentGeneration,
+          executor: effect.executor,
+          instanceId: retargeted.instanceId,
+          lifecycle: item.lifecycle,
+          observedGeneration: effect.deploymentGeneration,
+          pluginId,
+        },
+        { expectedRevision: "absent" },
+      );
+      await transaction.enqueueOutbox({
+        availableAt: now,
+        createdAt: now,
+        messageId: effect.messageId,
+        operationId: effect.operationId,
+        payload: retargeted,
+        topic: "component.lifecycle",
+      });
+      return null;
+    });
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [item.desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+
+    assert.deepEqual(effects.calls, [], effect.kind);
+    assert.equal(reconciler.diagnostics()[0]?.code, "PROTOCOL_MESSAGE_INVALID");
+    await reconciler.stop();
+  }
+});
+
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();
