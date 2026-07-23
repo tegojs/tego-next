@@ -1297,6 +1297,8 @@ test("claimed effects revalidate current placement before journaling or performi
   );
   effects.supportedExecutors = ["process"];
   await reconciler.wake();
+  assert.deepEqual(effects.calls, []);
+  await reconciler.wake();
   assert.equal(effects.performed.at(-1)?.kind, "prepare");
   await reconciler.stop();
 });

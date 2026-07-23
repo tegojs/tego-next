@@ -321,7 +321,7 @@ export class Reconciler {
 
   async #reconcilePass(): Promise<void> {
     if (!this.#running) return;
-    const [deployments, installations, loadedInstances] = await Promise.all([
+    let [deployments, installations, loadedInstances] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstallations(),
       this.#loadInstances(),
@@ -329,6 +329,17 @@ export class Reconciler {
     this.#deployments = deployments;
     this.#diagnosticsByDeployment.clear();
     this.#readyDeployments.clear();
+
+    const existingClaim = await this.#claimNext();
+    if (existingClaim !== undefined) {
+      await this.#executeClaim(existingClaim);
+      [deployments, installations, loadedInstances] = await Promise.all([
+        this.#loadDeployments(),
+        this.#loadInstallations(),
+        this.#loadInstances(),
+      ]);
+      this.#deployments = deployments;
+    }
 
     const lexicalDeployments = [...deployments].sort((left, right) =>
       deploymentKey(left) < deploymentKey(right)
@@ -454,6 +465,14 @@ export class Reconciler {
       }
     }
 
+    if (existingClaim === undefined) {
+      const claim = await this.#claimNext();
+      if (claim !== undefined) await this.#executeClaim(claim);
+    }
+    await this.#refreshReadiness();
+  }
+
+  async #claimNext(): Promise<OutboxClaim | undefined> {
     const claims = await this.#options.state.claimOutbox({
       owner: this.#owner,
       leaseDurationMs: claimLeaseMs,
@@ -461,9 +480,7 @@ export class Reconciler {
       topic: "component.lifecycle",
       ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
     });
-    const claim = claims[0];
-    if (claim !== undefined) await this.#executeClaim(claim);
-    await this.#refreshReadiness();
+    return claims[0];
   }
 
   async #loadDeployments(): Promise<readonly PluginDeployment[]> {
@@ -782,6 +799,19 @@ export class Reconciler {
       };
     } else {
       instance = current.value;
+      if (
+        step.effect.kind === "prepare" &&
+        (instance.lifecycle === "created" || instance.lifecycle === "failed")
+      ) {
+        const { workerId: _workerId, ...stable } = instance;
+        void _workerId;
+        instance = {
+          ...stable,
+          artifactDigest: step.effect.artifactDigest,
+          executor: step.effect.executor,
+          ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
+        };
+      }
       const next = this.#preEffectLifecycle(step.effect.kind, instance);
       if (next !== instance.lifecycle) instance = { ...instance, lifecycle: next };
     }
