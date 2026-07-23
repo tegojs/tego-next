@@ -111,3 +111,10 @@ outside Task 8.
 - The aggregate root typecheck has the unrelated placeholder-workspace gap described above.
 - Runtime scheduling/watch integration is a later bootstrap concern; this task exposes deterministic
   `start`, `wake`, and `stop` reconciliation entry points and durable retry visibility.
+
+## Independent Review
+
+The final read-only review returned **PASS** for `aab50aa` with no blocking correctness issues.
+The reviewer independently confirmed canonical identity recomputation, complete persisted-instance
+tuple validation, startup/shutdown desired-state validation, rejection before external effects, a
+fresh 26/26 focused runtime test run, formatting, and `git diff --check`.
