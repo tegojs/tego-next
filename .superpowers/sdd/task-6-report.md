@@ -197,3 +197,54 @@ Final review verification, executed with Node.js `26.5.0`:
   through `FilesystemArtifactStore`, installed through `ArtifactService`, then
   recovered by immutable `(pluginId, version, digest)` identity after reopening
   `SqliteStateStore`.
+
+## Re-review Remediation
+
+The Task 6 re-review identified two additional Important regressions. Both were
+handled as isolated RED-to-GREEN cycles:
+
+| Re-review cycle | RED | GREEN |
+| --- | --- | --- |
+| Iterator and verified-file-handle cleanup | `3a8e0af` | `082e295` |
+| JavaScript lexical module audit | `ff4a9b6` | `53911fb` |
+
+The resource-lifecycle correction adds an idempotent close operation to the
+bounded archive reader and invokes the source iterator's `return()` after both
+successful parsing and every failure. Cleanup errors do not replace the primary
+parse diagnostic. `FilesystemArtifactStore` now tracks verified read handles
+after verification and across the verification-to-first-yield race. Closing the
+store best-effort closes every tracked handle, and suspended or racing reads
+terminate without yielding additional bytes. The regression suite reproduced
+the prior Node.js garbage-collection FileHandle error before the fix and
+completed without asynchronous resource warnings after it.
+
+The module-audit correction replaces the string/regular-expression checks with
+a dependency-free, nesting-bounded lexical scanner. It distinguishes division
+from regular-expression literals, skips comments and inert string, regex, and
+template text, and recursively audits `${...}` template expressions. Actual
+static imports, export-from declarations, dynamic imports, and CommonJS
+expressions remain detectable. The accepted runtime API surface is now exactly:
+
+- relative `./` and `../` imports;
+- real `node:` built-ins;
+- `@tegojs/plugin-sdk`.
+
+Other bare packages and fake `node:` names remain rejected. Accepted runtime
+imports, including the plugin SDK path, are recorded in the generated SBOM.
+
+Supporting formatting and explicit cleanup-control-flow commits are `b61b5ec`
+and `93b5fca`.
+
+Fresh re-review verification with Node.js `26.5.0`:
+
+- iterator and active-handle regression tests: 5/5 PASS;
+- runtime plus local-driver focused suites: 137/137 PASS;
+- CLI focused suite: 30/30 PASS;
+- combined contracts, testkit, runtime, local-driver, and CLI matrix: 185/185
+  PASS;
+- architecture suite: 18/18 PASS;
+- targeted typecheck for all implemented workspaces: PASS;
+- Biome format and lint: PASS;
+- `git diff --check`: PASS;
+- SQLite restart smoke: PASS for pack, content-addressed persistence, install,
+  close, reopen, and immutable installation recovery.
