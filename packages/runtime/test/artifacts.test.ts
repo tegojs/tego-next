@@ -8,7 +8,6 @@ import {
   parsePluginId,
   type ArtifactDigest,
   type ArtifactStore,
-  type Clock,
   type DriverHealth,
   type JsonValue,
   type PluginManifest,
@@ -60,7 +59,10 @@ function writeOctal(target: Uint8Array, offset: number, length: number, value: n
   writeText(target, offset, length, value.toString(8).padStart(length - 1, "0"));
 }
 
-function tar(entries: readonly TarInput[], options: { corruptChecksum?: boolean } = {}): Uint8Array {
+function tar(
+  entries: readonly TarInput[],
+  options: { corruptChecksum?: boolean } = {},
+): Uint8Array {
   const chunks: Uint8Array[] = [];
   for (const entry of entries) {
     const header = new Uint8Array(512);
@@ -142,10 +144,7 @@ class InstallationStateStore implements StateStore {
       scan: async function* <Value extends JsonValue>(
         _query: StateQuery<Value>,
       ): AsyncIterable<ScannedState<Value>> {},
-      put: async <Value extends JsonValue>(
-        key: StateKey<Value>,
-        value: Value,
-      ): Promise<void> => {
+      put: async <Value extends JsonValue>(key: StateKey<Value>, value: Value): Promise<void> => {
         const serialized = JSON.stringify(key);
         if (this.records.has(serialized)) {
           throw new Error("expected absent");
@@ -326,9 +325,7 @@ test("rejects malformed, truncated, checksum-mismatched, and oversized archives"
     const archive = tar(validEntries());
     archive[124] = "z".charCodeAt(0);
     archive.fill(0x20, 148, 156);
-    const checksum = archive
-      .subarray(0, 512)
-      .reduce((sum, byte) => sum + byte, 0);
+    const checksum = archive.subarray(0, 512).reduce((sum, byte) => sum + byte, 0);
     writeOctal(archive, 148, 7, checksum);
     const { digest, service } = await serviceFor(archive);
     await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ARCHIVE_MALFORMED");
@@ -392,10 +389,7 @@ test("rejects malformed, truncated, checksum-mismatched, and oversized archives"
       limits: { maxEntries: 2 },
       state: {} as never,
     });
-    await rejectsCode(
-      () => limited.validate({ digest }),
-      "ARTIFACT_ENTRY_COUNT_EXCEEDED",
-    );
+    await rejectsCode(() => limited.validate({ digest }), "ARTIFACT_ENTRY_COUNT_EXCEEDED");
   });
 });
 
@@ -470,10 +464,7 @@ test("verifies Ed25519 signature envelopes over raw digest bytes", async (contex
     );
   });
   await context.test("required but absent", async () => {
-    await rejectsCode(
-      () => configured.service.validate({ digest }),
-      "ARTIFACT_SIGNATURE_REQUIRED",
-    );
+    await rejectsCode(() => configured.service.validate({ digest }), "ARTIFACT_SIGNATURE_REQUIRED");
   });
 });
 
@@ -486,9 +477,24 @@ test("installs immutable plugin records transactionally and idempotently", async
   const repeated = await first.service.install({ digest: first.digest });
 
   assert.deepEqual(repeated, installed);
-  assert.equal(state.writes, 1);
+  assert.equal(state.writes, 2);
   assert.equal(installed.digest, first.digest);
   assert.equal(installed.installedAt, "2026-01-02T03:04:05.000Z");
+  assert.deepEqual(
+    [...state.records.keys()].map((key) => JSON.parse(key)),
+    [
+      {
+        collection: "installation-versions",
+        id: "org.example.echo@1.0.0",
+        namespace: "tego",
+      },
+      {
+        collection: "installations",
+        id: `org.example.echo@1.0.0@${first.digest}`,
+        namespace: "tego",
+      },
+    ],
+  );
 
   const conflictingArchive = tar(
     validEntries(manifest, [], encoder.encode("export default { changed: true };\n")),
@@ -498,5 +504,5 @@ test("installs immutable plugin records transactionally and idempotently", async
     () => conflicting.service.install({ digest: conflicting.digest }),
     "ARTIFACT_INSTALLATION_CONFLICT",
   );
-  assert.equal(state.writes, 1);
+  assert.equal(state.writes, 2);
 });
