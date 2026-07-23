@@ -584,13 +584,6 @@ export class ProcessExecutor implements Executor {
   }
 
   async submit(input: ExecutionRequest): Promise<ExecutionHandle> {
-    if (!this.#accepting) {
-      throw executorError(
-        "EXECUTOR_DRAINING",
-        "Process executor is draining and refuses new submissions",
-        this.#clock.now(),
-      );
-    }
     const parsed = parseExecutionRequest(input);
     // Validate the public command against the wire limit before resolver or plugin work.
     encodeProcessFrame({ kind: "execution", request: parsed }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
@@ -608,6 +601,13 @@ export class ProcessExecutor implements Executor {
       }
       this.#touch(existing);
       return existing.handle;
+    }
+    if (!this.#accepting) {
+      throw executorError(
+        "EXECUTOR_DRAINING",
+        "Process executor is draining and refuses new submissions",
+        this.#clock.now(),
+      );
     }
     this.#pruneTerminal();
     if (this.#attempts.size >= PROCESS_EXECUTOR_MAX_RETAINED_ATTEMPTS) {
