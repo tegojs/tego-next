@@ -85,8 +85,9 @@ class TestHostedProcess implements HostedProcess {
     this.#child.kill(signal);
   }
 
-  async kill(): Promise<void> {
+  async kill(): Promise<HostedProcessExit> {
     this.#child.kill("SIGKILL");
+    return this.#exit;
   }
 
   wait(): Promise<HostedProcessExit> {

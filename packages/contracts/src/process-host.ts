@@ -29,7 +29,12 @@ export interface HostedProcess {
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array>;
   signal(signal: HostedProcessSignal): Promise<void>;
-  kill(): Promise<void>;
+  /**
+   * Forces termination and resolves only after the process exit has settled.
+   * A host that cannot deliver termination must reject instead of leaving the
+   * returned promise pending.
+   */
+  kill(): Promise<HostedProcessExit>;
   wait(): Promise<HostedProcessExit>;
   close(): Promise<void>;
 }

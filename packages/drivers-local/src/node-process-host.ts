@@ -129,12 +129,20 @@ class NodeHostedProcess implements HostedProcess {
 
   async signal(signal: HostedProcessSignal): Promise<void> {
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) return;
-    this.#child.kill(signal);
+    if (!this.#child.kill(signal)) {
+      throw processHostError("PROCESS_SIGNAL_FAILED", `Failed to deliver ${signal}`);
+    }
   }
 
-  async kill(): Promise<void> {
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) return;
-    this.#child.kill("SIGKILL");
+  async kill(): Promise<HostedProcessExit> {
+    if (
+      this.#child.exitCode === null &&
+      this.#child.signalCode === null &&
+      !this.#child.kill("SIGKILL")
+    ) {
+      throw processHostError("PROCESS_KILL_FAILED", "Failed to deliver SIGKILL");
+    }
+    return this.#exit;
   }
 
   wait(): Promise<HostedProcessExit> {
@@ -227,8 +235,7 @@ export class NodeProcessHost implements ProcessHost {
     this.#closePromise ??= (async () => {
       this.#state = "closing";
       const processes = [...this.#processes];
-      await Promise.all(processes.map((process_) => process_.kill().catch(() => undefined)));
-      await Promise.all(processes.map((process_) => process_.wait().then(() => undefined)));
+      await Promise.all(processes.map((process_) => process_.kill()));
       this.#processes.clear();
       this.#state = "closed";
     })();

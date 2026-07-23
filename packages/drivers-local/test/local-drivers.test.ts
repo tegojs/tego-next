@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -526,6 +527,30 @@ test("NodeProcessHost rejects secret-like bootstrap environment names before spa
     }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_PROCESS_ENVIRONMENT_INVALID",
   );
+  assert.equal(host.activeProcessCount, 0);
+  await host.close();
+});
+
+test("NodeProcessHost reports a failed SIGKILL delivery instead of waiting forever", async () => {
+  const directory = await temporaryDirectory("process-host-kill");
+  const entrypoint = join(directory, "wait.mjs");
+  await writeFile(entrypoint, "setInterval(() => {}, 1000);");
+  const host = new NodeProcessHost({
+    clock: new FakeClock(new Date("2026-07-23T12:00:00.000Z")),
+  });
+  await host.open();
+  const child = await host.spawn({ entrypoint });
+  const originalKill = ChildProcess.prototype.kill;
+  ChildProcess.prototype.kill = () => false;
+  try {
+    await assert.rejects(
+      child.kill(),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_PROCESS_KILL_FAILED",
+    );
+  } finally {
+    ChildProcess.prototype.kill = originalKill;
+  }
+  assert.deepEqual(await child.kill(), { signal: "SIGKILL" });
   assert.equal(host.activeProcessCount, 0);
   await host.close();
 });

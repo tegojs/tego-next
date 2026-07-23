@@ -306,6 +306,7 @@ class ProcessChannel {
         }
       }
       decoder.finish();
+      this.#fail(new Error("Child process stdout closed"));
     } catch (error) {
       this.#fail(error instanceof Error ? error : new Error(String(error)));
       await this.#process.kill().catch(() => undefined);
@@ -646,14 +647,19 @@ export class ProcessExecutor implements Executor {
   }
 
   drain(options: DrainOptions): Promise<void> {
+    let deadline: string | undefined;
+    if (options.deadline !== undefined) {
+      const deadlineTime = Date.parse(options.deadline);
+      if (!Number.isFinite(deadlineTime)) {
+        return Promise.reject(new TypeError("Drain deadline must be an ISO timestamp"));
+      }
+      deadline = new Date(deadlineTime).toISOString();
+    }
     this.#accepting = false;
     this.#drainPromise ??= (async () => {
       const deadlineController = new AbortController();
-      if (options.deadline !== undefined) {
-        if (!Number.isFinite(Date.parse(options.deadline))) {
-          throw new TypeError("Drain deadline must be an ISO timestamp");
-        }
-        void this.#waitUntilDeadline(options.deadline, deadlineController.signal)
+      if (deadline !== undefined) {
+        void this.#waitUntilDeadline(deadline, deadlineController.signal)
           .then(async () => {
             await Promise.all(
               [...this.#attempts.values()].map((entry) =>
@@ -846,9 +852,8 @@ export class ProcessExecutor implements Executor {
       await this.#shutdownChild(channel, process_, component.artifactDigest, controlDeadline);
     } catch (error) {
       if (entry.state !== "terminal") {
-        if (process_ !== undefined) await process_.kill().catch(() => undefined);
         const exit =
-          process_ === undefined ? undefined : await process_.wait().catch(() => undefined);
+          process_ === undefined ? undefined : await process_.kill().catch(() => undefined);
         const code =
           error instanceof DiagnosticError
             ? error.diagnostic.code
@@ -879,8 +884,6 @@ export class ProcessExecutor implements Executor {
       if (process_ !== undefined) {
         await process_.stdin.close().catch(() => undefined);
         await process_.kill().catch(() => undefined);
-        await process_.wait().catch(() => undefined);
-        await process_.close().catch(() => undefined);
       }
       delete entry.process;
       delete entry.channel;
@@ -1002,7 +1005,6 @@ export class ProcessExecutor implements Executor {
     })();
     if (!(await this.#withinCleanupGrace(lifecycle))) {
       await process_.kill().catch(() => undefined);
-      await process_.wait().catch(() => undefined);
       return;
     }
     await process_.stdin.close().catch(() => undefined);
@@ -1010,7 +1012,6 @@ export class ProcessExecutor implements Executor {
     if (!(await this.#withinCleanupGrace(process_.wait()))) {
       await process_.kill().catch(() => undefined);
     }
-    await process_.wait().catch(() => undefined);
   }
 
   async #withinCleanupGrace(operation: Promise<unknown>): Promise<boolean> {
