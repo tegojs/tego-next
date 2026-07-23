@@ -11,7 +11,9 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/architecture-depend
 });
 
 async function withWorkspace(manifests, run) {
-  const directory = await mkdtemp(new URL("tego-workspace-boundaries-", pathToFileURL(`${tmpdir()}/`)));
+  const directory = await mkdtemp(
+    new URL("tego-workspace-boundaries-", pathToFileURL(`${tmpdir()}/`)),
+  );
   const root = pathToFileURL(`${directory}/`);
 
   try {
@@ -117,9 +119,9 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-forbidden-e
           'export { execute } from "@tegojs/executor-node";',
           'import runtime from "legacy/tego/runtime";',
           'await import("../../transport-websocket/dist/index.js", { with: { type: "json" } });',
-          'await import(`@tegojs/executor-node`);',
+          "await import(`@tegojs/executor-node`);",
           "await import(runtimeSpecifier);",
-          'const message = `${await import("../../executor-node/dist/index.js")}`;',
+          `const message = \`${String.fromCharCode(36)}{await import("../../executor-node/dist/index.js")}\`;`,
           String.raw`import "@tegojs/\u0072untime";`,
           'const pattern = /import\\s+from\\s+"@tegojs/testkit"/;',
           "export default runtime;",

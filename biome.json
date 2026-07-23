@@ -5,6 +5,9 @@
     "clientKind": "git",
     "useIgnoreFile": true
   },
+  "files": {
+    "includes": ["**", "!!openspec/changes/**/.comet"]
+  },
   "formatter": {
     "enabled": true,
     "indentStyle": "space",
@@ -13,7 +16,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true
+      "preset": "recommended"
     }
   },
   "javascript": {

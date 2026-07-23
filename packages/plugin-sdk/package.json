@@ -2,7 +2,9 @@
   "name": "@tegojs/plugin-sdk",
   "version": "0.0.0",
   "type": "module",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {

@@ -114,9 +114,27 @@ function canStartRegularExpression(tokens) {
 
   return (
     previous.type === "punctuator" &&
-    ["(", "[", "{", ",", ";", ":", "=", "!", "?", "&", "|", "+", "-", "*", "%", "^", "~", "<", ">"].includes(
-      previous.value,
-    )
+    [
+      "(",
+      "[",
+      "{",
+      ",",
+      ";",
+      ":",
+      "=",
+      "!",
+      "?",
+      "&",
+      "|",
+      "+",
+      "-",
+      "*",
+      "%",
+      "^",
+      "~",
+      "<",
+      ">",
+    ].includes(previous.value)
   );
 }
 
@@ -289,11 +307,7 @@ function analyzeImports(source) {
     if (token.value === "import" && next?.value === "(") {
       const argument = tokens[index + 2];
       const delimiter = tokens[index + 3]?.value;
-      if (
-        argument?.type === "string" &&
-        !argument.escaped &&
-        [")", ","].includes(delimiter)
-      ) {
+      if (argument?.type === "string" && !argument.escaped && [")", ","].includes(delimiter)) {
         specifiers.add(argument.value);
       } else {
         unsupportedSpecifier = true;
@@ -323,8 +337,7 @@ function analyzeImports(source) {
 function referencedWorkspace(specifier, workspaces, importingFile) {
   const packageTarget = workspaces.find(
     (workspace) =>
-      specifier === workspace.manifest.name ||
-      specifier.startsWith(`${workspace.manifest.name}/`),
+      specifier === workspace.manifest.name || specifier.startsWith(`${workspace.manifest.name}/`),
   );
   if (packageTarget || !importingFile || !specifier.startsWith(".")) {
     return packageTarget;
@@ -338,9 +351,13 @@ function referencedWorkspace(specifier, workspaces, importingFile) {
   );
 }
 
-function addEdgeViolation(violations, source, specifier, workspaces, importingFile) {
+function addEdgeViolation(violations, source, specifier, workspaces, importingFile, edgeKind) {
   const target = referencedWorkspace(specifier, workspaces, importingFile);
   if (!target) {
+    return;
+  }
+
+  if (edgeKind === "import" && target.manifest.name === source.manifest.name) {
     return;
   }
 
@@ -372,10 +389,7 @@ export async function checkWorkspaceBoundaries(root) {
   for (const workspace of workspaces) {
     const dependencies = dependencyEntries(workspace.manifest);
 
-    if (
-      workspace.kind === "first-layer" &&
-      containsForbiddenFragment(workspace.manifest.name)
-    ) {
+    if (workspace.kind === "first-layer" && containsForbiddenFragment(workspace.manifest.name)) {
       violations.add(`${workspace.manifest.name} -> ${workspace.manifest.name}`);
     }
 
@@ -392,6 +406,7 @@ export async function checkWorkspaceBoundaries(root) {
         dependency.targetSpecifier,
         workspaces,
         new URL("package.json", workspace.directory),
+        "manifest",
       );
     }
 
@@ -408,7 +423,7 @@ export async function checkWorkspaceBoundaries(root) {
         if (workspace.kind === "first-layer" && containsForbiddenFragment(specifier)) {
           violations.add(`${workspace.manifest.name} -> ${specifier}`);
         }
-        addEdgeViolation(violations, workspace, specifier, workspaces, file);
+        addEdgeViolation(violations, workspace, specifier, workspaces, file, "import");
       }
     }
   }
