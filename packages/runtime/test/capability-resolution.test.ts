@@ -7,8 +7,10 @@ import {
   type PluginDeploymentIdentity,
 } from "@tegojs/contracts";
 import {
+  isValidVersion,
   providerLossAction,
   resolveCapabilities,
+  satisfiesVersionRange,
   type CapabilityResolutionDeployment,
 } from "../src/index.js";
 
@@ -285,7 +287,7 @@ test("duplicate deployments, providers, and requirements are rejected determinis
         deployment("a", {
           provides: [
             { name: echoName, protocolVersion: "1.0.0" },
-            { name: echoName, protocolVersion: "1.0.0" },
+            { name: echoName, protocolVersion: "1.1.0" },
           ],
         }),
       ],
@@ -308,6 +310,13 @@ test("duplicate deployments, providers, and requirements are rejected determinis
     assert.equal(result.ok, false);
     assert.equal(result.diagnostics[0]?.code, item.code);
   }
+});
+
+test("strict versions reject invalid prerelease identifiers and compare prereleases below releases", () => {
+  assert.equal(isValidVersion("1.0.0-01"), false);
+  assert.equal(isValidVersion("1.0.0-alpha.1"), true);
+  assert.equal(satisfiesVersionRange("1.0.0-alpha.1", ">=1.0.0"), false);
+  assert.equal(satisfiesVersionRange("1.0.0+build.1", "=1.0.0"), true);
 });
 
 test("@spec:capability-resolution/provider-loss-propagation/suspend-on-provider-loss", () => {

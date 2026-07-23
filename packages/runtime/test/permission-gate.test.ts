@@ -136,6 +136,36 @@ test("permission inputs reject duplicate entries and invalid canonical forms", (
   }
 });
 
+test("permission canonicalization treats case and IDNA equivalents without widening grants", () => {
+  const decision = validatePermissionGrant(
+    [
+      {
+        kind: "network",
+        hosts: ["bücher.example"],
+        ports: [443],
+        methods: ["GET"],
+      },
+    ],
+    [
+      {
+        kind: "network",
+        hosts: ["XN--BCHER-KVA.EXAMPLE."],
+        ports: [443],
+        methods: ["get"],
+      },
+    ],
+  );
+  assert.equal(decision.allowed, true);
+  assert.deepEqual(decision.granted, [
+    {
+      kind: "network",
+      hosts: ["xn--bcher-kva.example"],
+      methods: ["GET"],
+      ports: [443],
+    },
+  ]);
+});
+
 test("permission call gates enforce all seven boundaries without prefix broadening", () => {
   const valid = validatePermissionGrant(requested, granted);
   assert.equal(valid.allowed, true);
@@ -248,4 +278,21 @@ test("payload gates reject accessors and exotic prototypes without invoking user
   assert.equal(result.allowed, true);
   assert.equal(({} as { polluted?: boolean }).polluted, undefined);
   assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+});
+
+test("permission call gates reject accessors without invoking user code", () => {
+  let invoked = false;
+  const attempt = { kind: "network", host: "example.com", port: 443 };
+  Object.defineProperty(attempt, "method", {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return "GET";
+    },
+  });
+
+  const result = gatePermission(granted, attempt as never);
+  assert.equal(result.allowed, false);
+  assert.equal(result.diagnostics[0]?.code, "PERMISSION_ENVELOPE_INVALID");
+  assert.equal(invoked, false);
 });
