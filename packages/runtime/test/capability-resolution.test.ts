@@ -127,6 +127,58 @@ test("explicit bindings take precedence and never fall back", async (context) =>
   }
 });
 
+test("binding lookup ignores prototypes and rejects unsafe own properties without invoking getters", () => {
+  for (const name of ["constructor", "toString"]) {
+    const capability = parseCapabilityName(name);
+    const result = resolveCapabilities({
+      deployments: [
+        deployment("consumer", {
+          requires: [{ name: capability, protocolRange: "^1.0.0" }],
+        }),
+        deployment("provider", {
+          provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        }),
+      ],
+    });
+    assert.equal(result.ok, true, name);
+    assert.deepEqual(result.bindings?.[0]?.provider?.deployment, identity("provider"));
+  }
+
+  let invoked = false;
+  const accessorBindings = {};
+  Object.defineProperty(accessorBindings, echoName, {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return identity("provider");
+    },
+  });
+  const symbolBindings = { [Symbol("binding")]: identity("provider") };
+  const invalidBindings = [
+    accessorBindings,
+    symbolBindings,
+    new Map([[echoName, identity("provider")]]),
+    { [echoName]: () => identity("provider") },
+  ];
+  for (const bindings of invalidBindings) {
+    const result = resolveCapabilities({
+      deployments: [
+        deployment("consumer", {
+          requires: [{ name: echoName, protocolRange: "^1.0.0" }],
+          bindings: bindings as never,
+        }),
+        deployment("provider", {
+          provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+        }),
+      ],
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostics[0]?.code, "CAPABILITY_BINDING_MAP_INVALID");
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  }
+  assert.equal(invoked, false);
+});
+
 test("@spec:capability-resolution/required-and-optional-dependencies/optional-provider-absent", () => {
   const result = resolveCapabilities({
     deployments: [
@@ -303,7 +355,7 @@ test("duplicate deployments, providers, and requirements are rejected determinis
         deployment("a", {
           provides: [
             { name: echoName, protocolVersion: "1.0.0" },
-            { name: echoName, protocolVersion: "1.1.0" },
+            { name: echoName, protocolVersion: "1.0.0" },
           ],
         }),
       ],
@@ -326,6 +378,24 @@ test("duplicate deployments, providers, and requirements are rejected determinis
     assert.equal(result.ok, false);
     assert.equal(result.diagnostics[0]?.code, item.code);
   }
+});
+
+test("one deployment may expose distinct protocol versions of the same capability", () => {
+  const result = resolveCapabilities({
+    deployments: [
+      deployment("consumer", {
+        requires: [{ name: echoName, protocolRange: "^2.0.0" }],
+      }),
+      deployment("provider", {
+        provides: [
+          { name: echoName, protocolVersion: "1.0.0" },
+          { name: echoName, protocolVersion: "2.1.0" },
+        ],
+      }),
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.bindings?.[0]?.provider?.capability.protocolVersion, "2.1.0");
 });
 
 test("strict versions reject invalid prerelease identifiers and compare prereleases below releases", () => {

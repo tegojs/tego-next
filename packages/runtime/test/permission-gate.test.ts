@@ -90,7 +90,7 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/granted-permissions-
     [
       {
         kind: "worker",
-        labels: { accelerator: "gpu", zone: "edge-b" },
+        labels: { zone: "edge-b" },
         resources: { cpuMillis: 1_000, memoryBytes: 1, storageBytes: 1 },
       },
     ],
@@ -196,7 +196,15 @@ test("permission call gates enforce all seven boundaries without prefix broadeni
     [
       {
         kind: "worker",
-        labels: { zone: "edge-a", accelerator: "gpu", extra: "not-granted" },
+        labels: { zone: "edge-a", accelerator: "gpu", rack: "rack-1" },
+        resources: { cpuMillis: 900, memoryBytes: 500_000_000, storageBytes: 500_000 },
+      },
+      true,
+    ],
+    [
+      {
+        kind: "worker",
+        labels: { zone: "edge-b", accelerator: "gpu" },
         resources: { cpuMillis: 900, memoryBytes: 500_000_000, storageBytes: 500_000 },
       },
       false,
@@ -206,6 +214,43 @@ test("permission call gates enforce all seven boundaries without prefix broadeni
   for (const [attempt, expected] of calls) {
     assert.equal(gatePermission(valid.granted, attempt).allowed, expected, JSON.stringify(attempt));
   }
+});
+
+test("Worker label grants may add exact labels to narrow the manifest selector", () => {
+  const decision = validatePermissionGrant(
+    [
+      {
+        kind: "worker",
+        labels: { zone: "edge-a" },
+        resources: { cpuMillis: 2_000, memoryBytes: 2_000, storageBytes: 2_000 },
+      },
+    ],
+    [
+      {
+        kind: "worker",
+        labels: { zone: "edge-a", accelerator: "gpu" },
+        resources: { cpuMillis: 1_000, memoryBytes: 1_000, storageBytes: 1_000 },
+      },
+    ],
+  );
+  assert.equal(decision.allowed, true);
+  assert.equal(
+    gatePermission(decision.granted, {
+      kind: "worker",
+      labels: { zone: "edge-a", accelerator: "gpu", rack: "rack-1" },
+      resources: { cpuMillis: 500, memoryBytes: 500, storageBytes: 500 },
+    }).allowed,
+    true,
+  );
+});
+
+test("logical filesystem paths use the same portable segment grammar at every boundary", () => {
+  const decision = validatePermissionGrant(
+    [{ kind: "filesystem", roots: [{ path: "/data folder", access: ["read"] }] }],
+    [],
+  );
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.diagnostics[0]?.code, "PERMISSION_ENVELOPE_INVALID");
 });
 
 test("capability request and response payload gates return structured diagnostics", () => {

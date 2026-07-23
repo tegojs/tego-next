@@ -339,6 +339,14 @@ test("plugin permission contracts are structured and empty arrays remain valid",
     () => parsePluginDeployment({ ...validDeployment, permissionGrants: ["network:*"] }),
     (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_RECORD_INVALID",
   );
+  assert.throws(
+    () =>
+      parsePluginManifest({
+        ...validManifest,
+        permissions: [{ kind: "filesystem", roots: [{ path: "/data folder", access: ["read"] }] }],
+      }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
 });
 
 test("execution request validation preserves JsonValue payloads", () => {
