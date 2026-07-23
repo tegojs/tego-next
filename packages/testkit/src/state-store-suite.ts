@@ -8,6 +8,7 @@ import {
   type JsonValue,
   type StateKey,
   type StateStore,
+  type StateTransactionOptions,
 } from "@tegojs/contracts";
 
 export type StateStoreFactory = () => StateStore | Promise<StateStore>;
@@ -158,6 +159,37 @@ export function stateStoreConformance(
       });
     });
 
+    test("@spec:runtime-operations/reusable-conformance-test-kits/code-unit-order", async () => {
+      await withStore(factory, async (store) => {
+        const ids = ["A", "_", "a", "-"];
+        const iterator = store.watch(zero)[Symbol.asyncIterator]();
+        await store.transact({}, async (transaction) => {
+          for (const id of ids) {
+            await transaction.put(key("order", id), { label: id }, {});
+          }
+          return null;
+        });
+
+        const scanned = [];
+        for await (const record of store.scan<ExampleRecord>({
+          namespace: "order",
+          collection: "examples",
+        })) {
+          scanned.push(record.key.id);
+        }
+        const changed = [];
+        for (const _id of ids) {
+          const result = await iterator.next();
+          assert.equal(result.done, false);
+          changed.push(result.value?.key.id);
+        }
+        await iterator.return?.();
+
+        assert.deepEqual(scanned, ["-", "A", "_", "a"]);
+        assert.deepEqual(changed, ["-", "A", "_", "a"]);
+      });
+    });
+
     test("@spec:runtime-operations/reusable-conformance-test-kits/watch-cursor", async () => {
       await withStore(factory, async (store) => {
         const beforeCursor = key("watch", "before");
@@ -194,11 +226,17 @@ export function stateStoreConformance(
         let invocations = 0;
         const recordKey = key("idempotency", "record");
         const run = () =>
-          store.transact<JsonValue>({ idempotencyKey: "stable-key" }, async (transaction) => {
-            invocations += 1;
-            await transaction.put(recordKey, { label: `run-${invocations}` }, {});
-            return { invocation: invocations };
-          });
+          store.transact<JsonValue>(
+            {
+              idempotencyKey: "stable-key",
+              idempotencyFingerprint: "stable-request",
+            },
+            async (transaction) => {
+              invocations += 1;
+              await transaction.put(recordKey, { label: `run-${invocations}` }, {});
+              return { invocation: invocations };
+            },
+          );
 
         const first = await run();
         const replay = await run();
@@ -206,6 +244,58 @@ export function stateStoreConformance(
         assert.deepEqual(replay, first);
         assert.equal(invocations, 1);
         assert.equal((await store.read(recordKey))?.revision, parseRevision("1"));
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/idempotency-conflict", async () => {
+      await withStore(factory, async (store) => {
+        let invocations = 0;
+        await store.transact(
+          {
+            idempotencyKey: "reused-key",
+            idempotencyFingerprint: "request-one",
+          },
+          async () => {
+            invocations += 1;
+            return null;
+          },
+        );
+
+        await assert.rejects(
+          store.transact(
+            {
+              idempotencyKey: "reused-key",
+              idempotencyFingerprint: "request-two",
+            },
+            async () => {
+              invocations += 1;
+              return null;
+            },
+          ),
+          expectDiagnostic("STATE_IDEMPOTENCY_CONFLICT"),
+        );
+        assert.equal(invocations, 1);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/idempotency-options", async () => {
+      await withStore(factory, async (store) => {
+        let invocations = 0;
+        const invalidOptions = [
+          { idempotencyKey: "missing-fingerprint" },
+          { idempotencyFingerprint: "missing-key" },
+        ] as unknown as readonly StateTransactionOptions[];
+
+        for (const options of invalidOptions) {
+          await assert.rejects(
+            store.transact(options, async () => {
+              invocations += 1;
+              return null;
+            }),
+            expectDiagnostic("STATE_IDEMPOTENCY_CONFLICT"),
+          );
+        }
+        assert.equal(invocations, 0);
       });
     });
 
