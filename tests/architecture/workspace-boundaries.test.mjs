@@ -232,3 +232,31 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/preserves-duplicate
     },
   );
 });
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-relative-imports", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/contracts/dist/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(new URL("internal.js", outputDirectory), "export const internal = true;");
+      await writeFile(
+        new URL("index.js", outputDirectory),
+        [
+          'export { internal } from "./internal.js";',
+          'export { runtime } from "../../runtime/dist/index.js";',
+        ].join("\n"),
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/contracts -> ../../runtime/dist/index.js",
+      ]);
+    },
+  );
+});
