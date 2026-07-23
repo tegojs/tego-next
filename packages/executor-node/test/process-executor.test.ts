@@ -199,6 +199,29 @@ class GatedCleanupProcessHost extends TestProcessHost {
   }
 }
 
+class GatedFailureCleanupProcessHost extends TestProcessHost {
+  readonly cleanupStarted = Promise.withResolvers<void>();
+  readonly cleanupGate = Promise.withResolvers<void>();
+
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    const hosted = await super.spawn(request);
+    return {
+      pid: hosted.pid,
+      stdin: hosted.stdin,
+      stdout: hosted.stdout,
+      stderr: hosted.stderr,
+      signal: (signal) => hosted.signal(signal),
+      kill: async () => {
+        this.cleanupStarted.resolve();
+        await this.cleanupGate.promise;
+        return hosted.kill();
+      },
+      wait: () => hosted.wait(),
+      close: () => hosted.close(),
+    };
+  }
+}
+
 class RejectingKillProcessHost extends TestProcessHost {
   spawnCount = 0;
 
@@ -596,6 +619,38 @@ const conformanceFixture: ExecutorConformanceFixture = {
       request: execution,
       cleanupStarted: processHost.cleanupStarted.promise,
       expectedOutput: "cleanup-stable",
+      async trigger() {
+        if (trigger === "cancel") {
+          await executor.cancel(execution.taskId, execution.attemptId);
+        } else {
+          clock.advanceBy(100);
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+      },
+      releaseCleanup: () => processHost.cleanupGate.resolve(),
+    };
+  },
+  async failedCleanupRaceFactory(trigger) {
+    const processHost = new GatedFailureCleanupProcessHost();
+    const executor = new ProcessExecutor(
+      await options({
+        processHost,
+        cleanupGraceMs: 1_000,
+        maxConcurrency: 1,
+      }),
+    );
+    const execution = {
+      ...request({ mode: "large-output" }, `failed-cleanup-${trigger}`),
+      ...(trigger === "deadline"
+        ? { deadline: new Date(clock.now().getTime() + 100).toISOString() }
+        : {}),
+    };
+    return {
+      executor,
+      request: execution,
+      cleanupStarted: processHost.cleanupStarted.promise,
+      expectedOutput: null,
       async trigger() {
         if (trigger === "cancel") {
           await executor.cancel(execution.taskId, execution.attemptId);
