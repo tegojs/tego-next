@@ -209,6 +209,17 @@ export default {
       }
       return "flooded";
     }
+    if (input.mode === "attachments") {
+      return Array.from({ length: context.attachments.length }, (_, index) => {
+        const attachment = context.attachments.get(index);
+        const bytes = attachment.bytes();
+        return {
+          byteLength: attachment.byteLength,
+          bytes: Array.from(bytes),
+          checksum: bytes.reduce((sum, value) => (sum + value) % 65536, 0)
+        };
+      });
+    }
     if (input.mode === "finish-gate") {
       await context.events.emit("run.finished", { mode: input.mode });
       return input.value;
@@ -368,6 +379,50 @@ test("thread transfer ownership detaches only explicitly transferable buffers", 
     );
     assert.equal(transferred.byteLength, 0);
     assert.equal((await transferredHandle.result).status, "succeeded");
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("clone and transfer attachments reach the real plugin in order as read-only bytes", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executor = new ThreadExecutor(await options(factory));
+  const cloneFirst = new Uint8Array([1, 2, 3]).buffer;
+  const cloneSecond = new Uint8Array([10, 20]).buffer;
+  const transferFirst = new Uint8Array([5, 4, 3, 2, 1]).buffer;
+  const transferSecond = new Uint8Array([255]).buffer;
+  try {
+    const cloned = await (
+      await executor.submit(
+        threadExecutionRequest(request({ mode: "attachments" }, "attachments-clone"), {
+          buffers: [cloneFirst, cloneSecond],
+          ownership: "clone",
+        }),
+      )
+    ).result;
+    assert.equal(cloned.status, "succeeded");
+    assert.deepEqual(cloned.output, [
+      { byteLength: 3, bytes: [1, 2, 3], checksum: 6 },
+      { byteLength: 2, bytes: [10, 20], checksum: 30 },
+    ]);
+    assert.equal(cloneFirst.byteLength, 3);
+    assert.equal(cloneSecond.byteLength, 2);
+
+    const transferred = await (
+      await executor.submit(
+        threadExecutionRequest(request({ mode: "attachments" }, "attachments-transfer"), {
+          buffers: [transferFirst, transferSecond],
+          ownership: "transfer",
+        }),
+      )
+    ).result;
+    assert.equal(transferred.status, "succeeded");
+    assert.deepEqual(transferred.output, [
+      { byteLength: 5, bytes: [5, 4, 3, 2, 1], checksum: 15 },
+      { byteLength: 1, bytes: [255], checksum: 255 },
+    ]);
+    assert.equal(transferFirst.byteLength, 0);
+    assert.equal(transferSecond.byteLength, 0);
   } finally {
     await executor.drain({});
   }

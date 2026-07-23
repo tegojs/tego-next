@@ -83,6 +83,8 @@ test("disposables run once in reverse order and continue after failures", async 
 test("component context exposes only the bounded plugin surface and immutable snapshots", async () => {
   const controller = new AbortController();
   const configuration = { nested: { enabled: true }, name: "demo" };
+  const firstAttachment = new Uint8Array([1, 2, 3]);
+  const secondAttachment = new Uint8Array([4, 5]);
   const logged: unknown[] = [];
   const emitted: unknown[] = [];
   const context = createComponentContext({
@@ -115,14 +117,17 @@ test("component context exposes only the bounded plugin surface and immutable sn
     },
     cancellation: controller.signal,
     disposables: createDisposableStack(),
+    attachments: [firstAttachment, secondAttachment.buffer],
     secrets: {
       get: async (name: string) => (name === "API_TOKEN" ? "secret-value" : undefined),
     },
   });
 
   configuration.nested.enabled = false;
+  firstAttachment[0] = 99;
 
   assert.deepEqual(Object.keys(context).sort(), [
+    "attachments",
     "cancellation",
     "capabilities",
     "config",
@@ -155,6 +160,15 @@ test("component context exposes only the bounded plugin surface and immutable sn
   );
   assert.equal(await context.secrets.get("API_TOKEN"), "secret-value");
   assert.equal(context.cancellation, controller.signal);
+  assert.equal(context.attachments.length, 2);
+  const firstBytes = context.attachments.get(0)?.bytes();
+  assert.deepEqual(firstBytes, new Uint8Array([1, 2, 3]));
+  assert.equal(context.attachments.get(0)?.byteLength, 3);
+  assert.equal(context.attachments.get(1)?.byteLength, 2);
+  assert.equal(context.attachments.get(2), undefined);
+  if (firstBytes === undefined) throw new Error("First attachment is missing");
+  firstBytes[0] = 42;
+  assert.deepEqual(context.attachments.get(0)?.bytes(), new Uint8Array([1, 2, 3]));
   context.logger.info("hello");
   await context.events.emit("plugin.ready", { ready: true });
   assert.equal(logged.length, 1);
