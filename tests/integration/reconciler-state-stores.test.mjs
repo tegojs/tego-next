@@ -335,3 +335,48 @@ test("upgrade and rollback tear down old components removed from the current man
     });
   }
 });
+
+test("failed prepare retries after retryAt and converges to ready", async (t) => {
+  await withRealStateStores(t, async (state, clock) => {
+    const desired = deployment();
+    const effects = new RecordingEffects();
+    let prepareAttempts = 0;
+    effects.perform = async (effect) => {
+      effects.calls.push(effect);
+      if (effect.kind === "prepare") {
+        prepareAttempts += 1;
+        if (prepareAttempts === 1) throw new Error("prepare failed once");
+      }
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+    const effect = effects.calls[0];
+    assert.ok(effect);
+    const failed = await readOnlyInstance(state, effect.instanceId);
+    assert.equal(failed?.value.lifecycle, "failed");
+    assert.equal(failed?.value.retryEffect, "prepare");
+    assert.equal(typeof failed?.value.retryAt, "string");
+
+    clock.advance(60_000);
+    await reconciler.wake();
+    await reconciler.wake();
+
+    assert.deepEqual(
+      effects.calls.map((candidate) => candidate.kind),
+      ["prepare", "prepare", "start"],
+    );
+    const ready = await readOnlyInstance(state, effect.instanceId);
+    assert.equal(ready?.value.lifecycle, "ready");
+    assert.equal("retryAt" in (ready?.value ?? {}), false);
+    assert.equal(reconciler.applicationReady(), true);
+    await reconciler.stop();
+  });
+});
