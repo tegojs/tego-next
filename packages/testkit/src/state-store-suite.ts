@@ -4,6 +4,7 @@ import {
   diagnosticCode,
   compareOperationJournalCursors,
   parseFencingEpoch,
+  parseMessageId,
   parseOperationId,
   parseRevision,
   type JsonObject,
@@ -26,6 +27,7 @@ interface ExampleRecord extends JsonObject {
 }
 
 const zero = parseRevision("0");
+const outboxCreatedAt = "2026-07-23T00:00:00.000Z";
 
 function key(namespace: string, id: string): StateKey<ExampleRecord> {
   return { namespace, collection: "examples", id };
@@ -435,6 +437,66 @@ export function stateStoreConformance(
           expectDiagnostic("STATE_FENCE_STALE"),
         );
         assert.equal(await store.read(stale), undefined);
+      });
+    });
+
+    test("outbox claims are unique, fenced, retry-visible, and idempotently acknowledged", async () => {
+      await withStore(factory, async (store) => {
+        const operationId = parseOperationId("operation-outbox");
+        const messageId = parseMessageId("message-outbox");
+        await store.transact({}, async (transaction) => {
+          await transaction.enqueueOutbox({
+            availableAt: outboxCreatedAt,
+            createdAt: outboxCreatedAt,
+            messageId,
+            operationId,
+            payload: { effect: "start" },
+            topic: "component.lifecycle",
+          });
+          return null;
+        });
+
+        const [left, right] = await Promise.all([
+          store.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "owner-left" }),
+          store.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "owner-right" }),
+        ]);
+        assert.equal(left.length + right.length, 1);
+        const claim = left[0] ?? right[0];
+        assert.ok(claim);
+        assert.equal(claim.attempt, 1);
+        assert.equal(claim.claimEpoch, parseFencingEpoch("1"));
+        assert.equal(claim.message.messageId, messageId);
+
+        const retryAt = "2026-07-23T00:01:00.000Z";
+        const retried = await store.acknowledgeOutbox({
+          claimEpoch: claim.claimEpoch,
+          messageId,
+          outcome: "retry",
+          owner: claim.owner,
+          retryAt,
+        });
+        assert.deepEqual(retried, {
+          acknowledgedAt: outboxCreatedAt,
+          attempt: 1,
+          duplicate: false,
+          messageId,
+          outcome: "retry",
+          retryAt,
+        });
+        assert.deepEqual(
+          await store.acknowledgeOutbox({
+            claimEpoch: claim.claimEpoch,
+            messageId,
+            outcome: "retry",
+            owner: claim.owner,
+            retryAt,
+          }),
+          { ...retried, duplicate: true },
+        );
+        assert.deepEqual(
+          await store.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "too-early" }),
+          [],
+        );
       });
     });
 

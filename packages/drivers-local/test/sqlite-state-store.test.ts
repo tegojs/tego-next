@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   diagnosticCode,
   parseFencingEpoch,
+  parseMessageId,
   parseOperationId,
   parseRevision,
   type JsonObject,
@@ -145,6 +146,75 @@ test("a committed transaction survives abrupt process termination without close"
   const reopened = await openStore(databasePath);
   assert.equal((await recoverableOperations(reopened))[0]?.status, "executing");
   await reopened.close();
+});
+
+test("an outbox claim survives restart, expires, rejects stale acknowledgement, and is reclaimed", async () => {
+  const databasePath = await temporaryDatabase("outbox-restart");
+  const messageId = parseMessageId("message-restart");
+  const operationId = parseOperationId("operation-restart-outbox");
+  const first = await openStore(databasePath);
+  await first.transact({}, async (transaction) => {
+    await transaction.enqueueOutbox({
+      availableAt: "2026-07-23T00:00:00.000Z",
+      createdAt: "2026-07-23T00:00:00.000Z",
+      messageId,
+      operationId,
+      payload: { effect: "prepare" },
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const [claim] = await first.claimOutbox({
+    leaseDurationMs: 1,
+    limit: 1,
+    owner: "main-before-restart",
+  });
+  assert.ok(claim);
+  await first.close();
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const second = await openStore(databasePath);
+  const [reclaimed] = await second.claimOutbox({
+    leaseDurationMs: 30_000,
+    limit: 1,
+    owner: "main-after-restart",
+  });
+  assert.ok(reclaimed);
+  assert.equal(reclaimed.message.messageId, messageId);
+  assert.equal(reclaimed.attempt, 2);
+  assert.equal(reclaimed.claimEpoch, parseFencingEpoch("2"));
+  await assert.rejects(
+    second.acknowledgeOutbox({
+      claimEpoch: claim.claimEpoch,
+      messageId,
+      outcome: "completed",
+      owner: claim.owner,
+    }),
+    (error: unknown) => diagnosticCode(error) === "STATE_FENCE_STALE",
+  );
+  const acknowledged = await second.acknowledgeOutbox({
+    claimEpoch: reclaimed.claimEpoch,
+    messageId,
+    outcome: "completed",
+    owner: reclaimed.owner,
+  });
+  assert.equal(acknowledged.duplicate, false);
+  assert.equal(
+    (
+      await second.acknowledgeOutbox({
+        claimEpoch: reclaimed.claimEpoch,
+        messageId,
+        outcome: "completed",
+        owner: reclaimed.owner,
+      })
+    ).duplicate,
+    true,
+  );
+  assert.deepEqual(
+    await second.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "never-again" }),
+    [],
+  );
+  await second.close();
 });
 
 test("migrations are idempotent and configure WAL mode", async () => {
