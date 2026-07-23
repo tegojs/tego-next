@@ -166,6 +166,22 @@ class NonSettlingWaitProcessHost extends TestProcessHost {
   }
 }
 
+class RejectingKillProcessHost extends TestProcessHost {
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    const hosted = await super.spawn(request);
+    return {
+      pid: hosted.pid,
+      stdin: hosted.stdin,
+      stdout: hosted.stdout,
+      stderr: hosted.stderr,
+      signal: (signal) => hosted.signal(signal),
+      kill: () => Promise.reject(new Error("SIGKILL delivery failed")),
+      wait: () => new Promise<HostedProcessExit>(() => {}),
+      close: () => new Promise<void>(() => {}),
+    };
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -870,6 +886,56 @@ test("forced cleanup releases capacity when host wait never settles after kill",
       advance: () => new Promise((resolve) => setImmediate(resolve)),
     });
     assert.equal((await executor.health()).active, 0);
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("failed final kill quarantines the executor and reports unhealthy capacity", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new RejectingKillProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "rejected-kill");
+  const handle = await executor.submit(execution);
+  try {
+    await started.promise;
+    await executor.cancel(execution.taskId, execution.attemptId);
+    clock.advanceBy(100);
+    let result: Awaited<typeof handle.result> | undefined;
+    void handle.result.then((value) => {
+      result = value;
+    });
+    await eventually(() => assert.notEqual(result, undefined), {
+      attempts: 100,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    if (result === undefined) throw new Error("Execution result is missing");
+    assert.equal(result.status, "failed");
+    assert.equal(result.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    assert.deepEqual(await executor.health(), {
+      status: "unhealthy",
+      checkedAt: clock.now().toISOString(),
+      message: "SIGKILL delivery failed",
+      id: "process-local",
+      type: "process",
+      accepting: false,
+      active: 1,
+      queued: 0,
+      retainedAttempts: 1,
+    });
+    await assert.rejects(
+      executor.submit(request({ mode: "echo", value: "blocked" }, "after-rejected-kill")),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_DRAINING",
+    );
   } finally {
     await processHost.close();
   }
