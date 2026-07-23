@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rm, mkdtemp, rename } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -298,4 +298,58 @@ test("close racing with open cannot resurrect the SQLite connection", async () =
     store.health(),
     (error: unknown) => diagnosticCode(error) === "STATE_CLOSED",
   );
+});
+
+test("database-generated revisions remain exact above Number.MAX_SAFE_INTEGER", async () => {
+  const databasePath = await temporaryDatabase("bigint-revision");
+  await (await openStore(databasePath)).close();
+  const database = new DatabaseSync(databasePath);
+  database
+    .prepare("INSERT INTO sqlite_sequence(name, seq) VALUES ('revisions', ?)")
+    .run(9_007_199_254_740_992n);
+  database.close();
+
+  const store = await openStore(databasePath);
+  const recordKey = key("bigint-revision", "record");
+  await store.transact({}, async (transaction) => {
+    await transaction.put(recordKey, { label: "exact" }, {});
+    return null;
+  });
+  assert.equal((await store.read(recordKey))?.revision, parseRevision("9007199254740993"));
+  await store.close();
+});
+
+test("transaction reads use one immutable SQLite snapshot", async () => {
+  const databasePath = await temporaryDatabase("snapshot");
+  const first = await openStore(databasePath);
+  const second = await openStore(databasePath);
+  const recordKey = key("snapshot", "record");
+
+  await first.transact({}, async (transaction) => {
+    assert.equal(await transaction.get(recordKey), undefined);
+    await second.transact({}, async (otherTransaction) => {
+      await otherTransaction.put(recordKey, { label: "concurrent" }, {});
+      return null;
+    });
+    assert.equal(await transaction.get(recordKey), undefined);
+    return null;
+  });
+
+  await first.close();
+  await second.close();
+});
+
+test("a failed SQLite open can be retried after repairing the path", async () => {
+  const unusedDatabasePath = await temporaryDatabase("retry-open");
+  const blockedDirectory = `${unusedDatabasePath}.blocked`;
+  const databasePath = join(blockedDirectory, "state.sqlite");
+  await writeFile(blockedDirectory, "not-a-directory");
+  const store = new SqliteStateStore({ databasePath });
+
+  await assert.rejects(store.open());
+  await rm(blockedDirectory);
+  await mkdir(blockedDirectory);
+  await store.open();
+  assert.equal((await store.health()).status, "healthy");
+  await store.close();
 });
