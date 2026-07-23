@@ -1005,22 +1005,15 @@ export class Reconciler {
       await this.#acknowledge(claim, "completed");
       return;
     }
-    if (currentGate !== undefined && !(currentGate instanceof DiagnosticError)) {
+    if (
+      (effect.kind === "prepare" || effect.kind === "start") &&
+      currentGate !== undefined &&
+      !(currentGate instanceof DiagnosticError)
+    ) {
       const component = currentGate.artifact.manifest.components.find(
         (candidate) => candidate.componentId === effect.componentId,
       );
-      const installationAvailable =
-        desired !== undefined &&
-        installations.some(
-          (candidate) =>
-            candidate.pluginId === desired.pluginId &&
-            candidate.version === desired.version &&
-            candidate.digest === desired.artifactDigest,
-        );
-      if (
-        component === undefined &&
-        (effect.kind === "prepare" || effect.kind === "start" || installationAvailable)
-      ) {
+      if (component === undefined) {
         this.#replanCount += 1;
         await this.#acknowledge(claim, "completed");
         return;
