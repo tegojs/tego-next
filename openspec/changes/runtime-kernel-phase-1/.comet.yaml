@@ -1,10 +1,10 @@
 workflow: full
-phase: open
+phase: build
 build_mode: null
 isolation: null
 verify_mode: null
 base_ref: null
-design_doc: null
+design_doc: docs/superpowers/specs/2026-07-23-runtime-kernel-phase-1-design.md
 plan: null
 verify_result: pending
 verification_report: null
@@ -12,3 +12,5 @@ branch_status: pending
 created_at: 2026-07-23
 verified_at: null
 archived: false
+handoff_context: openspec/changes/runtime-kernel-phase-1/.comet/handoff/design-context.json
+handoff_hash: 195b0851f04a8a71be48e025758464ef1e60341fc2cb4b86cf3da2f3b0d4446a

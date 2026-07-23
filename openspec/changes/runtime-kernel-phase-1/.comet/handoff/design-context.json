@@ -1,0 +1,21 @@
+{
+  "change": "runtime-kernel-phase-1",
+  "phase": "design",
+  "mode": "full",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "195b0851f04a8a71be48e025758464ef1e60341fc2cb4b86cf3da2f3b0d4446a",
+  "files": [
+    { "path": "openspec/changes/runtime-kernel-phase-1/proposal.md", "sha256": "9229c1794434c7af54409b05002a2961e417646db304e14e087f944a3fd76096" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/design.md", "sha256": "7096674ff46890289dc2c060fd5b95fc651f58719d5f0987070a23cac660e44f" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/tasks.md", "sha256": "822e1b4dd8427e6c493e75c7029007ad9b7b02b64d62f61f7cc078c30cb5ae64" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/capability-resolution/spec.md", "sha256": "f4e62ebd745fd0b275a2b4f518e566fce5e1345cab63d3083aada167ecf1f7d3" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/coordination-provider/spec.md", "sha256": "bb383db0aaf8f7beea194deb7fd48061705fbee82c42c164bcc79d57ddd42ad3" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/executor-runtime/spec.md", "sha256": "f4d52bb875b0997c3fbf841b2345c5cdab11d426dc6b2cdf8fcc2aa2f9a086f8" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/plugin-artifacts/spec.md", "sha256": "f10aa57e54e0a4760229ae29a941a8e58d637755a2a1ec3ecd9c2418b9c85feb" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/plugin-deployment/spec.md", "sha256": "7e58876bf5070ae998870a4203ca0e46c4aa651738f2e238dde018316175e37d" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/runtime-bootstrap/spec.md", "sha256": "0fe1eadaa1e6eb153a67c66fd19f8b66d18585b259d5626d9745f0ddd8a4488c" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/runtime-operations/spec.md", "sha256": "a10386ff048f0f94066e92cb0f3e9865e17336d34120cfadedeab113669079b4" },
+    { "path": "openspec/changes/runtime-kernel-phase-1/specs/worker-protocol/spec.md", "sha256": "a97bfa10dcfdf38e7587086f86e4408856d07ccc6a7d3eebdca1953c8d8a17af" }
+  ]
+}
