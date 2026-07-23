@@ -272,6 +272,9 @@ test("payload gates reject accessors and exotic prototypes without invoking user
   assert.equal(gateCapabilityRequest(definition, accessor).allowed, false);
   assert.equal(invoked, false);
   assert.equal(gateCapabilityRequest(definition, new (class Payload {})()).allowed, false);
+  const exoticArray: unknown[] = [];
+  Object.setPrototypeOf(exoticArray, { inherited: true });
+  assert.equal(gateCapabilityRequest(definition, exoticArray).allowed, false);
 
   const polluted = JSON.parse('{"__proto__":{"polluted":true},"safe":"value"}');
   const result = gateCapabilityRequest(definition, polluted);
@@ -295,4 +298,12 @@ test("permission call gates reject accessors without invoking user code", () => 
   assert.equal(result.allowed, false);
   assert.equal(result.diagnostics[0]?.code, "PERMISSION_ENVELOPE_INVALID");
   assert.equal(invoked, false);
+});
+
+test("permission envelopes reject arrays with an exotic prototype", () => {
+  const exotic = structuredClone(granted) as Permission[];
+  Object.setPrototypeOf(exotic, { inherited: true });
+  const result = validatePermissionGrant(requested, exotic);
+  assert.equal(result.allowed, false);
+  assert.equal(result.diagnostics[0]?.code, "PERMISSION_ENVELOPE_INVALID");
 });
