@@ -3,6 +3,7 @@ import {
   diagnosticCode,
   parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseComponentId,
   parseGeneration,
   parseMessageId,
@@ -34,6 +35,7 @@ import type {
 import {
   resolveCapabilities,
   type CapabilityResolutionDeployment,
+  type PreviousCapabilityBinding,
 } from "../capabilities/resolver.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
@@ -96,7 +98,14 @@ interface DeploymentObservation extends JsonObject {
   readonly applicationId: PluginDeployment["applicationId"];
   readonly pluginId: PluginDeployment["pluginId"];
   readonly generation: PluginDeployment["generation"];
-  readonly status: "blocked" | "converging" | "failed" | "ready";
+  readonly status:
+    | "blocked"
+    | "converging"
+    | "degraded"
+    | "failed"
+    | "inconsistent"
+    | "ready"
+    | "unavailable";
   readonly diagnostics: readonly JsonObject[];
   readonly updatedAt: string;
 }
@@ -536,8 +545,19 @@ export class Reconciler {
         bindings: candidate.capabilityBindings,
       });
     }
+    const previousBindings: PreviousCapabilityBinding[] = deployments.flatMap((candidate) =>
+      Object.entries(candidate.capabilityBindings).map(([capability, provider]) => ({
+        consumer: {
+          applicationId: candidate.applicationId,
+          pluginId: candidate.pluginId,
+        },
+        capability: parseCapabilityName(capability),
+        provider,
+      })),
+    );
     const globalCapabilityResolution = resolveCapabilities({
       deployments: capabilityDeployments,
+      previousBindings,
     });
     const matchesDeployment = (identity: {
       readonly applicationId: string;
@@ -580,7 +600,20 @@ export class Reconciler {
     diagnostics: readonly RuntimeDiagnostic[],
   ): Promise<void> {
     this.#diagnosticsByDeployment.set(deploymentKey(deployment), diagnostics);
-    await this.#recordObservation(deployment, "blocked", diagnostics);
+    const codes = diagnostics.map((diagnostic) => diagnostic.code);
+    const status: DeploymentObservation["status"] = codes.some((code) =>
+      code.includes("INCONSISTENT"),
+    )
+      ? "inconsistent"
+      : codes.some(
+            (code) =>
+              code.includes("UNAVAILABLE") ||
+              code === "DEPLOYMENT_INSTALLATION_MISSING" ||
+              code === "DEPLOYMENT_EXECUTOR_UNAVAILABLE",
+          )
+        ? "unavailable"
+        : "blocked";
+    await this.#recordObservation(deployment, status, diagnostics);
   }
 
   async #recordObservation(
@@ -980,6 +1013,18 @@ export class Reconciler {
     const instances = await this.#loadInstances();
     for (const deployment of this.#deployments) {
       if (deployment.state !== "active") continue;
+      const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
+      if (
+        existingDiagnostics?.some(
+          (diagnostic) =>
+            diagnostic.code.startsWith("ARTIFACT_") ||
+            diagnostic.code.startsWith("CAPABILITY_") ||
+            diagnostic.code.startsWith("DEPLOYMENT_") ||
+            diagnostic.code.startsWith("PERMISSION_"),
+        )
+      ) {
+        continue;
+      }
       const deploymentInstances = instances.filter(
         (instance) =>
           instance.applicationId === deployment.applicationId &&
@@ -1009,6 +1054,11 @@ export class Reconciler {
         this.#readyDeployments.add(deploymentKey(deployment));
         this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
         await this.#recordObservation(deployment, "ready", []);
+      } else if (
+        failedDiagnostics.length === 0 &&
+        deploymentInstances.some((instance) => instance.lifecycle === "degraded")
+      ) {
+        await this.#recordObservation(deployment, "degraded", []);
       } else if (failedDiagnostics.length === 0) {
         await this.#recordObservation(deployment, "converging", []);
       }

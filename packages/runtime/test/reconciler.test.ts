@@ -730,6 +730,14 @@ test("Reconciler gates artifact, capabilities, permissions, placement, and execu
   assert.equal(reconciler.kernelRunning, true);
   assert.equal(reconciler.applicationReady(), true);
   assert.equal(reconciler.diagnostics()[0]?.code, "PERMISSION_GRANT_EXCEEDS_REQUEST");
+  assert.equal(
+    (
+      [...state.records.values()].find(
+        (entry) => entry.key.collection === "deployment-observations",
+      )?.value as { readonly status?: string }
+    ).status,
+    "blocked",
+  );
   await reconciler.stop();
 });
 
@@ -1137,6 +1145,65 @@ test("deployment observations progress from converging to ready", async () => {
   await reconciler.wake();
   assert.equal(status(), "ready");
   await reconciler.stop();
+});
+
+test("deployment observations distinguish unavailable, inconsistent, and degraded states", async () => {
+  for (const [expected, instances, installations] of [
+    ["unavailable", [], []],
+    [
+      "inconsistent",
+      [
+        { instanceId: "duplicate-a", lifecycle: "ready" },
+        { instanceId: "duplicate-b", lifecycle: "ready" },
+      ],
+      [installation()],
+    ],
+    ["degraded", [{ instanceId: "degraded", lifecycle: "degraded" }], [installation()]],
+  ] as const) {
+    const clock = new ManualClock();
+    const effects = new RecordingEffects();
+    const state = await createHarnessStore(clock);
+    for (const value of instances) {
+      await state.transact({}, async (transaction) => {
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "component-instances",
+            id: value.instanceId,
+          },
+          {
+            applicationId,
+            artifactDigest: digestOne,
+            componentId,
+            deploymentGeneration: parseGeneration("1"),
+            executor: "process",
+            instanceId: value.instanceId,
+            lifecycle: value.lifecycle,
+            observedGeneration: parseGeneration("1"),
+            pluginId,
+          },
+          { expectedRevision: "absent" },
+        );
+        return null;
+      });
+    }
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [deployment()],
+      loadInstallations: async () => installations,
+    });
+
+    await reconciler.start();
+
+    const observation = [...state.records.values()].find(
+      (entry) => entry.key.collection === "deployment-observations",
+    );
+    assert.equal((observation?.value as { readonly status?: string }).status, expected);
+    await reconciler.stop();
+  }
 });
 
 test("failed effect conditional commits reread after a revision conflict", async () => {
