@@ -8,6 +8,7 @@ import {
   type JsonObject,
   type PluginManifest,
 } from "@tegojs/contracts";
+import { assertPortableArtifactPath } from "./archive-codec.js";
 
 const TAR_BLOCK_SIZE = 512;
 const DEFAULT_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
@@ -15,7 +16,6 @@ const DEFAULT_MAX_ENTRY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES = 1_024;
 const MAX_METADATA_BYTES = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
-const PORTABLE_DRIVE_PATH = /^[A-Za-z]:/u;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface ArtifactReadLimits {
@@ -196,22 +196,6 @@ function validateChecksum(header: Uint8Array): void {
   }
 }
 
-function validatePortablePath(path: string): void {
-  const segments = path.split("/");
-  if (
-    path.length === 0 ||
-    path.startsWith("/") ||
-    path.startsWith("\\\\") ||
-    PORTABLE_DRIVE_PATH.test(path) ||
-    path.includes("\\") ||
-    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
-  ) {
-    throw artifactError("ARTIFACT_PATH_UNSAFE", "Artifact entry path is not portable", {
-      path,
-    });
-  }
-}
-
 interface ParsedHeader {
   readonly path: string;
   readonly size: number;
@@ -240,7 +224,7 @@ function parseHeader(header: Uint8Array): ParsedHeader {
   const name = decodeNullTerminated(header.subarray(0, 100), "name");
   const prefix = decodeNullTerminated(header.subarray(345, 500), "prefix");
   const path = prefix.length === 0 ? name : `${prefix}/${name}`;
-  validatePortablePath(path);
+  assertPortableArtifactPath(path);
   const size = parseOctal(header.subarray(124, 136), "size");
   return { path, size };
 }
@@ -319,7 +303,7 @@ function parseFilesMetadata(input: unknown): ArtifactFilesMetadata {
       );
     }
     const path = (value as { path: string }).path;
-    validatePortablePath(path);
+    assertPortableArtifactPath(path);
     if (path === "metadata/files.json" || seen.has(path)) {
       throw artifactError(
         "ARTIFACT_METADATA_INVALID",
@@ -467,7 +451,7 @@ export async function readPluginArtifact(
     );
   }
   for (const component of manifest.components) {
-    validatePortablePath(component.entrypoint);
+    assertPortableArtifactPath(component.entrypoint);
     if (!entries.has(component.entrypoint)) {
       throw artifactError(
         "ARTIFACT_ENTRYPOINT_MISSING",

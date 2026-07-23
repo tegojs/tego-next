@@ -8,6 +8,7 @@ import {
 const TAR_BLOCK_SIZE = 512;
 const encoder = new TextEncoder();
 const PORTABLE_DRIVE_PATH = /^[A-Za-z]:/u;
+const WINDOWS_DEVICE_SEGMENT = /^(?:aux|com[1-9]|con|lpt[1-9]|nul|prn)(?:\.|$)/iu;
 
 export interface DeterministicArchiveEntry {
   readonly path: string;
@@ -25,15 +26,26 @@ function artifactError(code: `ARTIFACT_${string}`, message: string, path?: strin
   );
 }
 
-function validatePath(path: string): void {
+export function assertPortableArtifactPath(path: string): void {
   const segments = path.split("/");
   if (
     path.length === 0 ||
+    path !== path.normalize("NFC") ||
     path.startsWith("/") ||
     path.startsWith("\\\\") ||
     PORTABLE_DRIVE_PATH.test(path) ||
     path.includes("\\") ||
-    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    /[\u0000-\u001f\u007f]/u.test(path) ||
+    segments.some(
+      (segment) =>
+        segment.length === 0 ||
+        segment === "." ||
+        segment === ".." ||
+        segment.includes(":") ||
+        segment.endsWith(".") ||
+        segment.endsWith(" ") ||
+        WINDOWS_DEVICE_SEGMENT.test(segment),
+    )
   ) {
     throw artifactError("ARTIFACT_PATH_UNSAFE", "Artifact entry path is not portable", path);
   }
@@ -128,7 +140,7 @@ export function createDeterministicArchive(
   const chunks: Uint8Array[] = [];
   let previous: string | undefined;
   for (const entry of entries) {
-    validatePath(entry.path);
+    assertPortableArtifactPath(entry.path);
     if (entry.path === previous) {
       throw artifactError(
         "ARTIFACT_ENTRY_DUPLICATE",

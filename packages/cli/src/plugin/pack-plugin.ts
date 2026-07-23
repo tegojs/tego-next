@@ -11,6 +11,7 @@ import {
   type PluginManifest,
 } from "@tegojs/contracts";
 import {
+  assertPortableArtifactPath,
   canonicalJsonBytes,
   createDeterministicArchive,
   type DeterministicArchiveEntry,
@@ -98,6 +99,7 @@ export async function packPlugin(options: PackPluginOptions): Promise<PackedPlug
   const actualOutput = await listFiles(buildDirectory);
   const declaredOutput = [...new Set(manifest.components.map((component) => component.entrypoint))]
     .sort();
+  for (const path of declaredOutput) assertPortableArtifactPath(path);
   for (const path of actualOutput) {
     if (!declaredOutput.includes(path)) {
       throw artifactError(

@@ -10,6 +10,7 @@ export {
   type ValidatedPluginArtifact,
 } from "./artifacts/artifact-service.js";
 export {
+  assertPortableArtifactPath,
   canonicalJsonBytes,
   createDeterministicArchive,
   type DeterministicArchiveEntry,
