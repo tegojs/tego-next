@@ -1,0 +1,354 @@
+import assert from "node:assert/strict";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import test from "node:test";
+import {
+  DiagnosticError,
+  parseArtifactDigest,
+  parseComponentId,
+  parsePluginId,
+  type ArtifactDigest,
+  type ArtifactStore,
+  type Clock,
+  type DriverHealth,
+  type PluginManifest,
+} from "@tegojs/contracts";
+import { FakeClock } from "@tegojs/testkit";
+import { ArtifactService } from "../src/artifacts/artifact-service.js";
+
+interface TarInput {
+  readonly name: string;
+  readonly bytes: Uint8Array;
+  readonly type?: string;
+}
+
+const encoder = new TextEncoder();
+const manifest = {
+  schemaVersion: "1.0",
+  pluginId: parsePluginId("org.example.echo"),
+  version: "1.0.0",
+  contractRange: ">=2.0.0 <3.0.0",
+  nodeRange: ">=26.0.0 <27.0.0",
+  moduleFormat: "esm",
+  architectures: ["linux-x64"],
+  components: [
+    {
+      componentId: parseComponentId("echo"),
+      kind: "task",
+      entrypoint: "components/component.js",
+      executors: ["process"],
+    },
+  ],
+  permissions: [],
+  capabilities: { provides: [], requires: [] },
+} satisfies PluginManifest;
+
+function writeText(target: Uint8Array, offset: number, length: number, value: string): void {
+  target.set(encoder.encode(value).subarray(0, length), offset);
+}
+
+function writeOctal(target: Uint8Array, offset: number, length: number, value: number): void {
+  writeText(target, offset, length, value.toString(8).padStart(length - 1, "0"));
+}
+
+function tar(entries: readonly TarInput[], options: { corruptChecksum?: boolean } = {}): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  for (const entry of entries) {
+    const header = new Uint8Array(512);
+    writeText(header, 0, 100, entry.name);
+    writeOctal(header, 100, 8, 0o644);
+    writeOctal(header, 108, 8, 0);
+    writeOctal(header, 116, 8, 0);
+    writeOctal(header, 124, 12, entry.bytes.byteLength);
+    writeOctal(header, 136, 12, 0);
+    header.fill(0x20, 148, 156);
+    writeText(header, 156, 1, entry.type ?? "0");
+    writeText(header, 257, 6, "ustar\0");
+    writeText(header, 263, 2, "00");
+    const checksum = header.reduce((sum, byte) => sum + byte, 0);
+    writeOctal(header, 148, 7, checksum + (options.corruptChecksum === true ? 1 : 0));
+    chunks.push(header, entry.bytes);
+    const padding = (512 - (entry.bytes.byteLength % 512)) % 512;
+    if (padding > 0) chunks.push(new Uint8Array(padding));
+  }
+  chunks.push(new Uint8Array(1024));
+  return Buffer.concat(chunks);
+}
+
+function json(value: unknown): Uint8Array {
+  return encoder.encode(`${JSON.stringify(value)}\n`);
+}
+
+function sha256(bytes: Uint8Array): ArtifactDigest {
+  return parseArtifactDigest(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+}
+
+function validEntries(
+  manifestValue: unknown = manifest,
+  extras: readonly TarInput[] = [],
+): readonly TarInput[] {
+  const payload = [
+    { name: "components/component.js", bytes: encoder.encode("export default {};\n") },
+    { name: "manifest.json", bytes: json(manifestValue) },
+    { name: "metadata/sbom.json", bytes: json({ packages: [], schemaVersion: "1.0" }) },
+    ...extras,
+  ].sort((left, right) => left.name.localeCompare(right.name));
+  const files = payload.map((entry) => ({
+    path: entry.name,
+    sha256: sha256(entry.bytes),
+    size: entry.bytes.byteLength,
+  }));
+  return [
+    ...payload,
+    {
+      name: "metadata/files.json",
+      bytes: json({ files, schemaVersion: "1.0" }),
+    },
+  ].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+class MemoryArtifactStore implements ArtifactStore {
+  readonly scope = "local" as const;
+  readonly #artifacts = new Map<ArtifactDigest, Uint8Array>();
+
+  async open(): Promise<void> {}
+  async close(): Promise<void> {}
+  async health(): Promise<DriverHealth> {
+    return { status: "healthy", checkedAt: new Date(0).toISOString() };
+  }
+  async put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void> {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of source) chunks.push(Buffer.from(chunk));
+    const bytes = Buffer.concat(chunks);
+    assert.equal(sha256(bytes), digest);
+    this.#artifacts.set(digest, bytes);
+  }
+  async *read(digest: ArtifactDigest): AsyncIterable<Uint8Array> {
+    const bytes = this.#artifacts.get(digest);
+    if (bytes === undefined) throw new Error("missing artifact");
+    assert.equal(sha256(bytes), digest);
+    for (let offset = 0; offset < bytes.byteLength; offset += 73) {
+      yield bytes.subarray(offset, Math.min(offset + 73, bytes.byteLength));
+    }
+  }
+}
+
+async function source(bytes: Uint8Array): Promise<AsyncIterable<Uint8Array>> {
+  return (async function* () {
+    yield bytes;
+  })();
+}
+
+async function serviceFor(
+  archive: Uint8Array,
+  options: {
+    readonly trust?: ConstructorParameters<typeof ArtifactService>[0]["trust"];
+    readonly state?: ConstructorParameters<typeof ArtifactService>[0]["state"];
+  } = {},
+): Promise<{
+  readonly digest: ArtifactDigest;
+  readonly service: ArtifactService;
+  readonly store: MemoryArtifactStore;
+}> {
+  const store = new MemoryArtifactStore();
+  await store.open();
+  const digest = sha256(archive);
+  await store.put(digest, await source(archive));
+  const fallbackState = {
+    scope: "local" as const,
+    async open() {},
+    async close() {},
+    async health() {
+      return { status: "healthy" as const, checkedAt: new Date(0).toISOString() };
+    },
+  };
+  return {
+    digest,
+    store,
+    service: new ArtifactService({
+      artifacts: store,
+      clock: new FakeClock(new Date("2026-01-02T03:04:05.000Z")),
+      compatibility: {
+        architecture: "x64",
+        nodeVersion: "26.5.0",
+        platform: "linux",
+        tegoContractVersion: "2.0.0",
+      },
+      state: options.state ?? (fallbackState as never),
+      ...(options.trust === undefined ? {} : { trust: options.trust }),
+    }),
+  };
+}
+
+async function rejectsCode(action: () => Promise<unknown>, code: string): Promise<void> {
+  await assert.rejects(action, (error: unknown) => {
+    assert.ok(error instanceof DiagnosticError);
+    assert.equal(error.diagnostic.code, code);
+    return true;
+  });
+}
+
+test("invalid manifest is rejected without evaluating component code", async () => {
+  const marker = "__tegoArtifactSideEffect";
+  delete (globalThis as Record<string, unknown>)[marker];
+  const entries = validEntries({ ...manifest, schemaVersion: "invalid" }).map((entry) =>
+    entry.name === "components/component.js"
+      ? { ...entry, bytes: encoder.encode(`globalThis.${marker} = true;`) }
+      : entry,
+  );
+  const { digest, service } = await serviceFor(tar(entries));
+
+  await rejectsCode(() => service.validate({ digest }), "ARTIFACT_SCHEMA_VERSION_UNSUPPORTED");
+  assert.equal((globalThis as Record<string, unknown>)[marker], undefined);
+});
+
+for (const [name, unsafePath] of [
+  ["parent traversal", "../escape.js"],
+  ["backslash traversal", String.raw`components\..\escape.js`],
+  ["absolute path", "/etc/passwd"],
+  ["drive path", "C:/escape.js"],
+  ["UNC path", String.raw`\\server\share\escape.js`],
+  ["non-normal path", "components//component.js"],
+] as const) {
+  test(`rejects ${name}`, async () => {
+    const archive = tar([{ name: unsafePath, bytes: encoder.encode("x") }]);
+    const { digest, service } = await serviceFor(archive);
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_PATH_UNSAFE");
+  });
+}
+
+for (const [name, type] of [
+  ["symbolic link", "2"],
+  ["hard link", "1"],
+  ["character device", "3"],
+  ["block device", "4"],
+  ["directory", "5"],
+  ["fifo", "6"],
+  ["PAX override", "x"],
+  ["GNU long name", "L"],
+] as const) {
+  test(`rejects ${name} entries`, async () => {
+    const { digest, service } = await serviceFor(
+      tar([{ name: "manifest.json", bytes: json(manifest), type }]),
+    );
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ENTRY_TYPE_UNSUPPORTED");
+  });
+}
+
+test("rejects duplicate normalized names", async () => {
+  const entries = [...validEntries(), { name: "manifest.json", bytes: json(manifest) }];
+  const { digest, service } = await serviceFor(tar(entries));
+  await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ENTRY_DUPLICATE");
+});
+
+test("rejects undeclared and missing declared files", async (context) => {
+  await context.test("undeclared", async () => {
+    const entries = [...validEntries(), { name: "surprise.js", bytes: encoder.encode("x") }];
+    const { digest, service } = await serviceFor(tar(entries));
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_FILE_UNDECLARED");
+  });
+  await context.test("missing", async () => {
+    const entries = validEntries().filter((entry) => entry.name !== "components/component.js");
+    const { digest, service } = await serviceFor(tar(entries));
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_FILE_MISSING");
+  });
+});
+
+test("rejects malformed, truncated, checksum-mismatched, and oversized archives", async (context) => {
+  await context.test("malformed octal", async () => {
+    const archive = tar(validEntries());
+    archive[124] = "z".charCodeAt(0);
+    const { digest, service } = await serviceFor(archive);
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ARCHIVE_MALFORMED");
+  });
+  await context.test("truncated", async () => {
+    const archive = tar(validEntries()).subarray(0, 700);
+    const { digest, service } = await serviceFor(archive);
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ARCHIVE_TRUNCATED");
+  });
+  await context.test("checksum", async () => {
+    const archive = tar(validEntries(), { corruptChecksum: true });
+    const { digest, service } = await serviceFor(archive);
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_HEADER_CHECKSUM_INVALID");
+  });
+  await context.test("size limit", async () => {
+    const archive = tar(validEntries());
+    const { digest, store } = await serviceFor(archive);
+    const limited = new ArtifactService({
+      artifacts: store,
+      clock: new FakeClock(),
+      compatibility: {
+        architecture: "x64",
+        nodeVersion: "26.5.0",
+        platform: "linux",
+        tegoContractVersion: "2.0.0",
+      },
+      limits: { maxArchiveBytes: archive.byteLength - 1 },
+      state: {} as never,
+    });
+    await rejectsCode(() => limited.validate({ digest }), "ARTIFACT_ARCHIVE_TOO_LARGE");
+  });
+});
+
+test("returns structured compatibility diagnostics", async (context) => {
+  for (const [label, patch, code] of [
+    ["CommonJS", { moduleFormat: "commonjs" }, "ARTIFACT_MODULE_FORMAT_UNSUPPORTED"],
+    ["Node", { nodeRange: ">=27.0.0" }, "ARTIFACT_NODE_INCOMPATIBLE"],
+    ["Tego", { contractRange: ">=3.0.0" }, "ARTIFACT_CONTRACT_INCOMPATIBLE"],
+    ["architecture", { architectures: ["darwin-arm64"] }, "ARTIFACT_PLATFORM_INCOMPATIBLE"],
+  ] as const) {
+    await context.test(label, async () => {
+      const { digest, service } = await serviceFor(tar(validEntries({ ...manifest, ...patch })));
+      await rejectsCode(() => service.validate({ digest }), code);
+    });
+  }
+});
+
+test("verifies Ed25519 signature envelopes over raw digest bytes", async (context) => {
+  const archive = tar(validEntries());
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const digest = sha256(archive);
+  const signature = sign(null, Buffer.from(digest.slice(7), "hex"), privateKey).toString("base64");
+  const trust = {
+    mode: "required" as const,
+    keys: [{ keyId: "release", publicKey: publicKey.export({ format: "pem", type: "spki" }) }],
+  };
+  const configured = await serviceFor(archive, { trust });
+
+  const valid = await configured.service.validate({
+    digest,
+    signature: { algorithm: "Ed25519", digest, keyId: "release", signature },
+  });
+  assert.equal(valid.signature?.verified, true);
+
+  await context.test("tampered signature", async () => {
+    await rejectsCode(
+      () =>
+        configured.service.validate({
+          digest,
+          signature: {
+            algorithm: "Ed25519",
+            digest,
+            keyId: "release",
+            signature: Buffer.from(signature, "base64").fill(0).toString("base64"),
+          },
+        }),
+      "ARTIFACT_SIGNATURE_INVALID",
+    );
+  });
+  await context.test("unknown key", async () => {
+    await rejectsCode(
+      () =>
+        configured.service.validate({
+          digest,
+          signature: { algorithm: "Ed25519", digest, keyId: "unknown", signature },
+        }),
+      "ARTIFACT_SIGNATURE_KEY_UNKNOWN",
+    );
+  });
+  await context.test("required but absent", async () => {
+    await rejectsCode(
+      () => configured.service.validate({ digest }),
+      "ARTIFACT_SIGNATURE_REQUIRED",
+    );
+  });
+});

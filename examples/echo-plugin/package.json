@@ -1,0 +1,9 @@
+{
+  "name": "@tegojs/example-echo-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm exec --offline -- tsc -p tsconfig.json"
+  }
+}

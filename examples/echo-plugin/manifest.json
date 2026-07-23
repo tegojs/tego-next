@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "1.0",
+  "pluginId": "org.example.echo",
+  "version": "1.0.0",
+  "contractRange": ">=2.0.0 <3.0.0",
+  "nodeRange": ">=26.0.0 <27.0.0",
+  "moduleFormat": "esm",
+  "architectures": [
+    "darwin-arm64",
+    "linux-x64"
+  ],
+  "components": [
+    {
+      "componentId": "echo",
+      "kind": "task",
+      "entrypoint": "components/component.js",
+      "executors": [
+        "process",
+        "thread"
+      ]
+    }
+  ],
+  "permissions": [],
+  "capabilities": {
+    "provides": [],
+    "requires": []
+  }
+}

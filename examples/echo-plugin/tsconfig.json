@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "outDir": "build/components",
+    "rootDir": "src",
+    "sourceMap": false,
+    "tsBuildInfoFile": null
+  },
+  "include": ["src/component.ts"]
+}

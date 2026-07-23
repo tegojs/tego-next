@@ -14,9 +14,14 @@
   },
   "scripts": {
     "build": "tsc -b",
+    "test:unit": "npm run build && node --test dist/test/*.test.js",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
+    "@tegojs/contracts": "0.0.0",
     "@tegojs/runtime": "0.0.0"
+  },
+  "devDependencies": {
+    "@tegojs/testkit": "0.0.0"
   }
 }
