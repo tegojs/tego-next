@@ -1081,6 +1081,93 @@ test("terminate and exit timeout enters bounded quarantine until authoritative e
   }
 });
 
+test("fatal quarantine publishes stalled resolver attempts without awaiting late outcomes", async () => {
+  const factory = new RejectingTerminationFactory();
+  const neverStarted = Promise.withResolvers<void>();
+  const delayedStarted = Promise.withResolvers<void>();
+  const delayedResolver = Promise.withResolvers<
+    Awaited<ReturnType<ThreadExecutorOptions["resolveComponent"]>>
+  >();
+  const base = await options(factory, { maxConcurrency: 3 });
+  const resolveComponent = base.resolveComponent;
+  const executor = new ThreadExecutor({
+    ...base,
+    async resolveComponent(execution) {
+      const mode =
+        typeof execution.input === "object" &&
+        execution.input !== null &&
+        !Array.isArray(execution.input)
+          ? (execution.input as { readonly mode?: JsonValue }).mode
+          : undefined;
+      if (mode === "resolver-never") {
+        neverStarted.resolve();
+        return new Promise(() => {});
+      }
+      if (mode === "resolver-delayed") {
+        delayedStarted.resolve();
+        return delayedResolver.promise;
+      }
+      return resolveComponent(execution);
+    },
+  });
+  const neverRequest = request({ mode: "resolver-never" }, "fatal-resolver-never");
+  const delayedRequest = request({ mode: "resolver-delayed" }, "fatal-resolver-delayed");
+  const neverHandle = await executor.submit(neverRequest);
+  const delayedHandle = await executor.submit(delayedRequest);
+  await Promise.all([neverStarted.promise, delayedStarted.promise]);
+  const primaryHandle = await executor.submit(
+    request({ mode: "echo", value: "fatal" }, "fatal-resolver-primary"),
+  );
+  await factory.terminationStarted.promise;
+  let neverResult: Awaited<typeof neverHandle.result> | undefined;
+  let delayedResult: Awaited<typeof delayedHandle.result> | undefined;
+  void neverHandle.result.then((value) => {
+    neverResult = value;
+  });
+  void delayedHandle.result.then((value) => {
+    delayedResult = value;
+  });
+  try {
+    assert.equal(
+      (await primaryHandle.result).diagnostic?.code,
+      "EXECUTOR_THREAD_TERMINATION_FAILED",
+    );
+    await eventually(
+      () => {
+        assert.notEqual(neverResult, undefined);
+        assert.notEqual(delayedResult, undefined);
+      },
+      {
+        attempts: 20,
+        advance: () => new Promise((resolve) => setImmediate(resolve)),
+      },
+    );
+    assert.equal(neverResult?.diagnostic?.code, "EXECUTOR_THREAD_TERMINATION_FAILED");
+    assert.equal(delayedResult?.diagnostic?.code, "EXECUTOR_THREAD_TERMINATION_FAILED");
+    assert.deepEqual(await executor.observe(neverRequest.taskId, neverRequest.attemptId), {
+      state: "terminal",
+      result: neverResult,
+    });
+    assert.deepEqual(await executor.observe(delayedRequest.taskId, delayedRequest.attemptId), {
+      state: "terminal",
+      result: delayedResult,
+    });
+    assert.equal(factory.created, 1);
+    assert.equal((await executor.health()).active, 1);
+
+    delayedResolver.resolve(await resolveComponent(delayedRequest));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(factory.created, 1);
+
+    const draining = executor.drain({});
+    await factory.forceExit();
+    await draining;
+  } finally {
+    delayedResolver.resolve(await resolveComponent(delayedRequest));
+    await factory.forceExit().catch(() => undefined);
+  }
+});
+
 test("cancellation during worker cleanup wins the single terminal decision", async () => {
   const factory = new GatedTerminationFactory();
   const componentFinished = Promise.withResolvers<void>();
