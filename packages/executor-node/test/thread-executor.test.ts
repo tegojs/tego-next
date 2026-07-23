@@ -100,7 +100,6 @@ class GatedTerminationFactory extends TrackingWorkerFactory {
 
   override create(entrypoint: string): ThreadWorker {
     const worker = super.create(entrypoint);
-    const owner = this;
     return {
       ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
       postMessage: (value, transferList) => worker.postMessage(value, transferList),
@@ -113,8 +112,8 @@ class GatedTerminationFactory extends TrackingWorkerFactory {
         return this;
       },
       terminate: async () => {
-        owner.terminationStarted.resolve();
-        await owner.gate.promise;
+        this.terminationStarted.resolve();
+        await this.gate.promise;
         return worker.terminate();
       },
     };
