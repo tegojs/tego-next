@@ -15,6 +15,7 @@ import {
   type StateKey,
 } from "@tegojs/contracts";
 import { stateStoreConformance } from "@tegojs/testkit";
+import * as publicApi from "../src/index.js";
 import { SqliteStateStore } from "../src/index.js";
 
 interface ExampleRecord extends JsonObject {
@@ -77,6 +78,11 @@ stateStoreConformance(
   async () => new SqliteStateStore({ databasePath: await temporaryDatabase("conformance") }),
   { name: "SqliteStateStore" },
 );
+
+test("storage-specific migration machinery is not part of the public package API", () => {
+  assert.equal("applySqliteMigrations" in publicApi, false);
+  assert.equal("sqliteSchemaVersion" in publicApi, false);
+});
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/restart-after-an-interrupted-operation", async () => {
   const databasePath = await temporaryDatabase("restart-operation");
