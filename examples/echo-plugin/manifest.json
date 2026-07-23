@@ -14,7 +14,12 @@
       "executors": ["process", "thread"]
     }
   ],
-  "permissions": [],
+  "permissions": [
+    {
+      "kind": "executor",
+      "executors": ["process"]
+    }
+  ],
   "capabilities": {
     "provides": [],
     "requires": []

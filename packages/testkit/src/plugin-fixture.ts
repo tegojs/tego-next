@@ -24,7 +24,7 @@ export function createPluginManifestFixture(
         executors: ["process"],
       },
     ],
-    permissions: [],
+    permissions: [{ kind: "executor", executors: ["process"] }],
     capabilities: { provides: [], requires: [] },
   };
   return parsePluginManifest(structuredClone({ ...base, ...overrides }));
