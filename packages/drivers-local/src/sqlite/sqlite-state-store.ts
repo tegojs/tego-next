@@ -479,32 +479,56 @@ export class SqliteStateStore implements StateStore {
   readonly #executions = new Set<Promise<unknown>>();
   #commitTail: Promise<void> = Promise.resolve();
   #databaseConnection: DatabaseSync | undefined;
-  #lifecycle: "closed" | "closing" | "created" | "open" = "created";
+  #openPromise: Promise<void> | undefined;
+  #closePromise: Promise<void> | undefined;
+  #lifecycle: "closed" | "closing" | "created" | "open" | "opening" = "created";
 
   constructor(options: SqliteStateStoreOptions) {
     this.#databasePath = options.databasePath;
     this.#databaseIdentity =
-      options.databasePath === ":memory:" ? `:memory:${crypto.randomUUID()}` : resolve(options.databasePath);
+      options.databasePath === ":memory:"
+        ? `:memory:${crypto.randomUUID()}`
+        : resolve(options.databasePath);
     this.#clock = options.clock ?? systemClock;
   }
 
-  async open(): Promise<void> {
+  open(): Promise<void> {
     if (this.#lifecycle === "closed" || this.#lifecycle === "closing") {
-      throw this.#closedError();
+      return Promise.reject(this.#closedError());
     }
     if (this.#lifecycle === "open") {
-      return;
+      return Promise.resolve();
     }
+    if (this.#lifecycle === "opening") {
+      return this.#openPromise ?? Promise.reject(this.#closedError());
+    }
+    this.#lifecycle = "opening";
+    const opening = this.#openDatabase();
+    this.#openPromise = opening;
+    const clearOpening = () => {
+      if (this.#openPromise === opening) this.#openPromise = undefined;
+    };
+    void opening.then(clearOpening, clearOpening);
+    return opening;
+  }
+
+  async #openDatabase(): Promise<void> {
     if (this.#databasePath !== ":memory:") {
       await mkdir(dirname(this.#databasePath), { recursive: true });
     }
     const database = new DatabaseSync(this.#databasePath);
     try {
       applySqliteMigrations(database, this.#clock.now());
+      if (this.#lifecycle !== "opening") {
+        throw this.#closedError();
+      }
       this.#databaseConnection = database;
       this.#lifecycle = "open";
     } catch (error) {
       database.close();
+      if (this.#lifecycle === "opening") {
+        this.#lifecycle = "created";
+      }
       throw error;
     }
   }
@@ -623,15 +647,25 @@ export class SqliteStateStore implements StateStore {
     };
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     if (this.#lifecycle === "closed") {
-      return;
+      return Promise.resolve();
     }
-    if (this.#lifecycle === "created") {
-      this.#lifecycle = "closed";
-      return;
+    if (this.#closePromise !== undefined) {
+      return this.#closePromise;
     }
+    const closing = this.#closeStore();
+    this.#closePromise = closing;
+    const clearClosing = () => {
+      if (this.#closePromise === closing) this.#closePromise = undefined;
+    };
+    void closing.then(clearClosing, clearClosing);
+    return closing;
+  }
+
+  async #closeStore(): Promise<void> {
     this.#lifecycle = "closing";
+    await this.#openPromise?.catch(() => undefined);
     for (const watcher of [...this.#watchers]) {
       watcher.close();
     }
@@ -784,8 +818,7 @@ export class SqliteStateStore implements StateStore {
               )
               .run(mutation.key.namespace, mutation.key.collection, mutation.key.id);
           }
-          const valueJson =
-            mutation.kind === "put" ? canonicalJson(mutation.value) : null;
+          const valueJson = mutation.kind === "put" ? canonicalJson(mutation.value) : null;
           database
             .prepare(
               `
@@ -806,9 +839,7 @@ export class SqliteStateStore implements StateStore {
             revision,
             key: cloneKey(mutation.key),
             kind: mutation.kind,
-            ...(mutation.kind === "put"
-              ? { value: cloneJson(mutation.value, this.#clock) }
-              : {}),
+            ...(mutation.kind === "put" ? { value: cloneJson(mutation.value, this.#clock) } : {}),
           });
         }
 
@@ -915,9 +946,7 @@ export class SqliteStateStore implements StateStore {
       )
       .all(query.namespace, query.collection)
       .map((row) => this.#decodeRecord(row))
-      .filter(
-        (record) => query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix),
-      )
+      .filter((record) => query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix))
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
   }
 
@@ -996,9 +1025,7 @@ export class SqliteStateStore implements StateStore {
 
   #readIdempotency(key: string): IdempotencyRecord | undefined {
     const row = this.#database()
-      .prepare(
-        "SELECT fingerprint, result_json FROM idempotency WHERE idempotency_key = ?",
-      )
+      .prepare("SELECT fingerprint, result_json FROM idempotency WHERE idempotency_key = ?")
       .get(key);
     return row === undefined
       ? undefined

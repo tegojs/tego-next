@@ -102,7 +102,9 @@ export class FilesystemArtifactStore implements ArtifactStore {
   readonly #clock: Clock;
   readonly #platform: NodeJS.Platform;
   readonly #operations = new Set<Promise<unknown>>();
-  #lifecycle: "closed" | "closing" | "created" | "open" = "created";
+  #openPromise: Promise<void> | undefined;
+  #closePromise: Promise<void> | undefined;
+  #lifecycle: "closed" | "closing" | "created" | "open" | "opening" = "created";
 
   constructor(options: FilesystemArtifactStoreOptions) {
     this.#rootDirectory = options.rootDirectory;
@@ -111,12 +113,39 @@ export class FilesystemArtifactStore implements ArtifactStore {
     this.#platform = options.platform ?? process.platform;
   }
 
-  async open(): Promise<void> {
+  open(): Promise<void> {
     if (this.#lifecycle === "closed" || this.#lifecycle === "closing") {
-      throw this.#closedError();
+      return Promise.reject(this.#closedError());
     }
-    await mkdir(this.#artifactDirectory, { recursive: true });
-    this.#lifecycle = "open";
+    if (this.#lifecycle === "open") {
+      return Promise.resolve();
+    }
+    if (this.#lifecycle === "opening") {
+      return this.#openPromise ?? Promise.reject(this.#closedError());
+    }
+    this.#lifecycle = "opening";
+    const opening = this.#openArtifactDirectory();
+    this.#openPromise = opening;
+    const clearOpening = () => {
+      if (this.#openPromise === opening) this.#openPromise = undefined;
+    };
+    void opening.then(clearOpening, clearOpening);
+    return opening;
+  }
+
+  async #openArtifactDirectory(): Promise<void> {
+    try {
+      await mkdir(this.#artifactDirectory, { recursive: true });
+      if (this.#lifecycle !== "opening") {
+        throw this.#closedError();
+      }
+      this.#lifecycle = "open";
+    } catch (error) {
+      if (this.#lifecycle === "opening") {
+        this.#lifecycle = "created";
+      }
+      throw error;
+    }
   }
 
   pathFor(digest: ArtifactDigest): string {
@@ -158,15 +187,25 @@ export class FilesystemArtifactStore implements ArtifactStore {
     };
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     if (this.#lifecycle === "closed") {
-      return;
+      return Promise.resolve();
     }
-    if (this.#lifecycle === "created") {
-      this.#lifecycle = "closed";
-      return;
+    if (this.#closePromise !== undefined) {
+      return this.#closePromise;
     }
+    const closing = this.#closeStore();
+    this.#closePromise = closing;
+    const clearClosing = () => {
+      if (this.#closePromise === closing) this.#closePromise = undefined;
+    };
+    void closing.then(clearClosing, clearClosing);
+    return closing;
+  }
+
+  async #closeStore(): Promise<void> {
     this.#lifecycle = "closing";
+    await this.#openPromise?.catch(() => undefined);
     await Promise.allSettled([...this.#operations]);
     this.#lifecycle = "closed";
   }
@@ -175,10 +214,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
     const targetPath = this.pathFor(digest);
     const targetDirectory = join(this.#artifactDirectory, digestHex(digest).slice(0, 2));
     await mkdir(targetDirectory, { recursive: true });
-    const temporaryPath = join(
-      targetDirectory,
-      `.${digestHex(digest)}.${randomUUID()}.temporary`,
-    );
+    const temporaryPath = join(targetDirectory, `.${digestHex(digest)}.${randomUUID()}.temporary`);
     const hash = createHash("sha256");
     let handle: FileHandle | undefined;
     try {
@@ -294,10 +330,9 @@ export class FilesystemArtifactStore implements ArtifactStore {
   }
 
   #closedError(): DiagnosticError {
-    return this.#artifactError(
-      "ARTIFACT_CLOSED",
-      "Filesystem artifact store is closed",
-      { lifecycle: this.#lifecycle, rootDirectory: this.#rootDirectory },
-    );
+    return this.#artifactError("ARTIFACT_CLOSED", "Filesystem artifact store is closed", {
+      lifecycle: this.#lifecycle,
+      rootDirectory: this.#rootDirectory,
+    });
   }
 }
