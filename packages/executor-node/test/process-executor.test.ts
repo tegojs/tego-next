@@ -189,13 +189,35 @@ class RejectingKillProcessHost extends TestProcessHost {
 class DelayedSpawnProcessHost extends TestProcessHost {
   readonly started = Promise.withResolvers<void>();
   readonly gate = Promise.withResolvers<void>();
+  readonly returned = Promise.withResolvers<void>();
   spawnCount = 0;
 
   override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
     this.spawnCount += 1;
     this.started.resolve();
     await this.gate.promise;
-    return super.spawn(request);
+    const hosted = await super.spawn(request);
+    this.returned.resolve();
+    return hosted;
+  }
+}
+
+class StalledCloseDelayedSpawnProcessHost extends DelayedSpawnProcessHost {
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    const hosted = await super.spawn(request);
+    return {
+      pid: hosted.pid,
+      stdin: {
+        write: (bytes) => hosted.stdin.write(bytes),
+        close: () => new Promise<void>(() => {}),
+      },
+      stdout: hosted.stdout,
+      stderr: hosted.stderr,
+      signal: (signal) => hosted.signal(signal),
+      kill: () => hosted.kill(),
+      wait: () => hosted.wait(),
+      close: () => hosted.close(),
+    };
   }
 }
 
@@ -721,11 +743,35 @@ test("cancellation races delayed spawn and terminates the late child before boot
       },
     );
     processHost.gate.resolve();
+    await processHost.returned.promise;
     await eventually(() => assert.equal(processHost.activeProcessCount, 0), {
       attempts: 1_000,
       advance: () => new Promise((resolve) => setImmediate(resolve)),
     });
     assert.equal(processHost.spawnCount, 1);
+  } finally {
+    processHost.gate.resolve();
+    await processHost.close();
+  }
+});
+
+test("late-spawn cancellation cannot be blocked by stalled stdin closure", async () => {
+  const processHost = new StalledCloseDelayedSpawnProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost }));
+  const execution = request({ mode: "echo", value: "stalled-close" }, "cancel-stalled-close");
+  const handle = await executor.submit(execution);
+  await processHost.started.promise;
+  try {
+    await executor.cancel(execution.taskId, execution.attemptId);
+    clock.advanceBy(100);
+    assert.equal((await handle.result).status, "cancelled");
+    await executor.drain({});
+    processHost.gate.resolve();
+    await processHost.returned.promise;
+    await eventually(() => assert.equal(processHost.activeProcessCount, 0), {
+      attempts: 100,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
   } finally {
     processHost.gate.resolve();
     await processHost.close();
