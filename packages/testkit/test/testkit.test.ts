@@ -45,6 +45,7 @@ test("plugin fixtures produce fresh manifests and stable chunked artifact source
   assert.notEqual(first, second);
   assert.notEqual(first.components, second.components);
   assert.equal(first.pluginId, "org.example.echo");
+  assert.deepEqual(first.permissions, [{ kind: "executor", executors: ["process"] }]);
 
   const bytes = new TextEncoder().encode("deterministic artifact");
   const chunks: Uint8Array[] = [];
