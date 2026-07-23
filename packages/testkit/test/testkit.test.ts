@@ -49,6 +49,6 @@ test("plugin fixtures produce fresh manifests and stable chunked artifact source
   const bytes = new TextEncoder().encode("deterministic artifact");
   const chunks: Uint8Array[] = [];
   for await (const chunk of artifactBytesSource(bytes, 3)) chunks.push(chunk);
-  assert.deepEqual(Buffer.concat(chunks), bytes);
+  assert.deepEqual(Buffer.concat(chunks), Buffer.from(bytes));
   assert.match(artifactDigest(bytes), /^sha256:[0-9a-f]{64}$/u);
 });
