@@ -156,6 +156,11 @@ export default {
       setInterval(() => {}, 1000);
       return new Promise(() => {});
     }
+    if (input.mode === "linger-after-result") {
+      setInterval(() => {}, 1000);
+      await context.events.emit("run.finished", { mode: input.mode });
+      return input.value;
+    }
     if (input.mode === "crash") process.exit(42);
     if (input.mode === "stderr") {
       process.stderr.write("diagnostic " + "x".repeat(200000));
@@ -300,6 +305,16 @@ test("process framing rejects an oversized declared length before buffering its 
   } finally {
     JSON.parse = originalParse;
   }
+});
+
+test("process framing rejects excessive wire complexity", () => {
+  let nested: JsonValue = null;
+  for (let depth = 0; depth < 65; depth += 1) nested = [nested];
+  const frame = encodeProcessFrame(nested);
+  assert.throws(
+    () => new ProcessFrameDecoder().push(frame),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_PROCESS_FRAME_COMPLEXITY_EXCEEDED",
+  );
 });
 
 test("@spec:executor-runtime/executor-failure-containment/crash-replacement", async () => {
@@ -448,6 +463,39 @@ test("drain and close leave no active child process", async () => {
   await Promise.all([executor.close(), executor.close()]);
   assert.equal(processHost.activeProcessCount, 0);
   assert.equal((await executor.health()).active, 0);
+});
+
+test("a task that leaves handles behind cannot retain its child slot after returning", async () => {
+  const finished = Promise.withResolvers<void>();
+  const processHost = new TestProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      events: {
+        async emit(type) {
+          if (type === "run.finished") finished.resolve();
+        },
+      },
+    }),
+  );
+  const handle = await executor.submit(
+    request({ mode: "linger-after-result", value: "complete" }, "linger"),
+  );
+  try {
+    await finished.promise;
+    let settled = false;
+    void handle.result.then(() => {
+      settled = true;
+    });
+    for (let turn = 0; turn < 10 && !settled; turn += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(settled, true);
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    await processHost.close();
+    await executor.drain({});
+  }
 });
 
 test("stderr diagnostics are bounded and sensitive fields are redacted", async () => {
