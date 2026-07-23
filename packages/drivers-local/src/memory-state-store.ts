@@ -816,7 +816,7 @@ export class MemoryStateStore implements StateStore {
       }
     }
 
-    const newOutbox: OutboxMessage[] = [];
+    const newOutboxById = new Map<string, OutboxMessage>();
     for (const message of staged.outbox) {
       assertOutboxMessage(message, this.#clock);
       if (!validTimestamp(message.createdAt) || !validTimestamp(message.availableAt)) {
@@ -827,9 +827,21 @@ export class MemoryStateStore implements StateStore {
           this.#clock,
         );
       }
+      const stagedExisting = newOutboxById.get(message.messageId);
+      if (stagedExisting !== undefined) {
+        if (!sameOutboxMessage(stagedExisting, message)) {
+          throw stateError(
+            "STATE_IDEMPOTENCY_CONFLICT",
+            "Outbox message identity was reused with different content",
+            { messageId: message.messageId },
+            this.#clock,
+          );
+        }
+        continue;
+      }
       const existing = this.#outbox.get(message.messageId);
       if (existing === undefined || existing.acknowledgement?.outcome === "retry") {
-        newOutbox.push(message);
+        newOutboxById.set(message.messageId, message);
       } else if (!sameOutboxMessage(existing.message, message)) {
         throw stateError(
           "STATE_IDEMPOTENCY_CONFLICT",
@@ -839,6 +851,7 @@ export class MemoryStateStore implements StateStore {
         );
       }
     }
+    const newOutbox = [...newOutboxById.values()];
 
     let advancesFence = false;
     const fencing = options.fencing;

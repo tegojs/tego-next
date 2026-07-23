@@ -1173,7 +1173,7 @@ export class SqliteStateStore implements StateStore {
         }
       }
 
-      const newOutbox: OutboxMessage[] = [];
+      const newOutboxById = new Map<string, OutboxMessage>();
       for (const message of staged.outbox) {
         assertOutboxMessage(message, this.#clock);
         if (!validTimestamp(message.createdAt) || !validTimestamp(message.availableAt)) {
@@ -1183,6 +1183,18 @@ export class SqliteStateStore implements StateStore {
             { messageId: message.messageId },
             this.#clock,
           );
+        }
+        const stagedExisting = newOutboxById.get(message.messageId);
+        if (stagedExisting !== undefined) {
+          if (!sameOutboxMessage(stagedExisting, message)) {
+            throw stateError(
+              "STATE_IDEMPOTENCY_CONFLICT",
+              "Outbox message identity was reused with different content",
+              { messageId: message.messageId },
+              this.#clock,
+            );
+          }
+          continue;
         }
         const row = database
           .prepare(
@@ -1200,11 +1212,11 @@ export class SqliteStateStore implements StateStore {
           )
           .get(message.messageId);
         if (row === undefined) {
-          newOutbox.push(message);
+          newOutboxById.set(message.messageId, message);
           continue;
         }
         if (row.acknowledgement_outcome === "retry") {
-          newOutbox.push(message);
+          newOutboxById.set(message.messageId, message);
           continue;
         }
         const existing: OutboxMessage = {
@@ -1228,6 +1240,7 @@ export class SqliteStateStore implements StateStore {
           );
         }
       }
+      const newOutbox = [...newOutboxById.values()];
 
       let advancesFence = false;
       const fencing = options.fencing;
