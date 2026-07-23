@@ -583,6 +583,31 @@ test("process framing rejects excessive wire complexity", () => {
   );
 });
 
+test("process framing keeps copy work linear under one-byte fragmentation", () => {
+  const value = { payload: "x".repeat(4 * 1024) };
+  const frame = encodeProcessFrame(value);
+  const decoder = new ProcessFrameDecoder();
+  const originalConcat = Buffer.concat;
+  let copiedBytes = 0;
+  Buffer.concat = ((...arguments_: Parameters<typeof Buffer.concat>) => {
+    const result = originalConcat(...arguments_);
+    copiedBytes += result.byteLength;
+    return result;
+  }) as typeof Buffer.concat;
+  try {
+    const decoded: unknown[] = [];
+    for (const byte of frame) decoded.push(...decoder.push(Uint8Array.of(byte)));
+    decoder.finish();
+    assert.deepEqual(decoded, [value]);
+    assert.ok(
+      copiedBytes <= frame.byteLength * 2,
+      `fragmented frame copied ${copiedBytes} bytes for ${frame.byteLength} wire bytes`,
+    );
+  } finally {
+    Buffer.concat = originalConcat;
+  }
+});
+
 test("@spec:executor-runtime/executor-failure-containment/crash-replacement", async () => {
   const executor = new ProcessExecutor(await options({ maxConcurrency: 1 }));
   try {
