@@ -54,9 +54,7 @@ export interface ArtifactPublishSyncDirectoriesOptions {
 export function artifactPublishSyncDirectories(
   options: ArtifactPublishSyncDirectoriesOptions,
 ): readonly string[] {
-  return options.shardCreated
-    ? [options.shardDirectory, options.artifactDirectory]
-    : [options.shardDirectory];
+  return [options.shardDirectory, options.artifactDirectory];
 }
 
 function publishCollision(error: unknown, platform: NodeJS.Platform): boolean {
