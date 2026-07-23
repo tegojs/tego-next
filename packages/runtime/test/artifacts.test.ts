@@ -10,7 +10,17 @@ import {
   type ArtifactStore,
   type Clock,
   type DriverHealth,
+  type JsonValue,
   type PluginManifest,
+  type Revision,
+  type ScannedState,
+  type StateChange,
+  type StateKey,
+  type StateQuery,
+  type StateStore,
+  type StateTransaction,
+  type StateTransactionOptions,
+  type Versioned,
 } from "@tegojs/contracts";
 import { FakeClock } from "@tegojs/testkit";
 import { ArtifactService } from "../src/artifacts/artifact-service.js";
@@ -85,9 +95,10 @@ function sha256(bytes: Uint8Array): ArtifactDigest {
 function validEntries(
   manifestValue: unknown = manifest,
   extras: readonly TarInput[] = [],
+  componentBytes = encoder.encode("export default {};\n"),
 ): readonly TarInput[] {
   const payload = [
-    { name: "components/component.js", bytes: encoder.encode("export default {};\n") },
+    { name: "components/component.js", bytes: componentBytes },
     { name: "manifest.json", bytes: json(manifestValue) },
     { name: "metadata/sbom.json", bytes: json({ packages: [], schemaVersion: "1.0" }) },
     ...extras,
@@ -104,6 +115,60 @@ function validEntries(
       bytes: json({ files, schemaVersion: "1.0" }),
     },
   ].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+class InstallationStateStore implements StateStore {
+  readonly scope = "local" as const;
+  readonly records = new Map<string, Versioned<JsonValue>>();
+  writes = 0;
+
+  async open(): Promise<void> {}
+  async close(): Promise<void> {}
+  async health(): Promise<DriverHealth> {
+    return { status: "healthy", checkedAt: new Date(0).toISOString() };
+  }
+  async transact<T extends JsonValue>(
+    _options: StateTransactionOptions,
+    work: (transaction: StateTransaction) => Promise<T>,
+  ): Promise<T> {
+    const staged = new Map<string, JsonValue>();
+    const transaction = {
+      get: async <Value extends JsonValue>(
+        key: StateKey<Value>,
+      ): Promise<Versioned<Value> | undefined> => {
+        const record = this.records.get(JSON.stringify(key));
+        return record as Versioned<Value> | undefined;
+      },
+      scan: async function* <Value extends JsonValue>(
+        _query: StateQuery<Value>,
+      ): AsyncIterable<ScannedState<Value>> {},
+      put: async <Value extends JsonValue>(
+        key: StateKey<Value>,
+        value: Value,
+      ): Promise<void> => {
+        const serialized = JSON.stringify(key);
+        if (this.records.has(serialized)) {
+          throw new Error("expected absent");
+        }
+        staged.set(serialized, structuredClone(value));
+      },
+      delete: async () => {},
+      appendOperation: async () => {},
+      enqueueOutbox: async () => {},
+    } satisfies StateTransaction;
+    const result = await work(transaction);
+    for (const [key, value] of staged) {
+      this.writes += 1;
+      this.records.set(key, { revision: "1" as Revision, value });
+    }
+    return result;
+  }
+  async read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
+    return this.records.get(JSON.stringify(key)) as Versioned<T> | undefined;
+  }
+  async *scan<T extends JsonValue>(_query: StateQuery<T>): AsyncIterable<ScannedState<T>> {}
+  async *scanRecoverableOperations(): AsyncIterable<never> {}
+  async *watch(_cursor: Revision): AsyncIterable<StateChange> {}
 }
 
 class MemoryArtifactStore implements ArtifactStore {
@@ -356,4 +421,28 @@ test("verifies Ed25519 signature envelopes over raw digest bytes", async (contex
       "ARTIFACT_SIGNATURE_REQUIRED",
     );
   });
+});
+
+test("installs immutable plugin records transactionally and idempotently", async () => {
+  const state = new InstallationStateStore();
+  const firstArchive = tar(validEntries());
+  const first = await serviceFor(firstArchive, { state });
+
+  const installed = await first.service.install({ digest: first.digest });
+  const repeated = await first.service.install({ digest: first.digest });
+
+  assert.deepEqual(repeated, installed);
+  assert.equal(state.writes, 1);
+  assert.equal(installed.digest, first.digest);
+  assert.equal(installed.installedAt, "2026-01-02T03:04:05.000Z");
+
+  const conflictingArchive = tar(
+    validEntries(manifest, [], encoder.encode("export default { changed: true };\n")),
+  );
+  const conflicting = await serviceFor(conflictingArchive, { state });
+  await rejectsCode(
+    () => conflicting.service.install({ digest: conflicting.digest }),
+    "ARTIFACT_INSTALLATION_CONFLICT",
+  );
+  assert.equal(state.writes, 1);
 });
