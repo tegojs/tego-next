@@ -346,41 +346,37 @@ test("thread worker exit settles before replacement capacity is advertised", asy
   }
 });
 
-test(
-  "thread secret RPC remains parent-gated over the private broker port",
-  { timeout: 2_000 },
-  async () => {
-    const factory = new TrackingWorkerFactory();
-    let secretCalls = 0;
-    const executor = new ThreadExecutor(
-      await options(factory, {
-        secretProvider: {
-          developmentOnly: false,
-          open: async () => {},
-          close: async () => {},
-          health: async () => ({
-            status: "healthy",
-            checkedAt: clock.now().toISOString(),
-          }),
-          async get(name) {
-            secretCalls += 1;
-            return name === "api" ? "parent-secret" : undefined;
-          },
+test("thread secret RPC remains parent-gated over the private broker port", {
+  timeout: 2_000,
+}, async () => {
+  const factory = new TrackingWorkerFactory();
+  let secretCalls = 0;
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      secretProvider: {
+        developmentOnly: false,
+        open: async () => {},
+        close: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: clock.now().toISOString(),
+        }),
+        async get(name) {
+          secretCalls += 1;
+          return name === "api" ? "parent-secret" : undefined;
         },
-      }),
-    );
-    try {
-      const result = await (
-        await executor.submit(request({ mode: "secret" }, "secret-rpc"))
-      ).result;
-      assert.equal(result.status, "succeeded");
-      assert.equal(result.output, "parent-secret");
-      assert.equal(secretCalls, 1);
-    } finally {
-      await executor.drain({});
-    }
-  },
-);
+      },
+    }),
+  );
+  try {
+    const result = await (await executor.submit(request({ mode: "secret" }, "secret-rpc"))).result;
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.output, "[REDACTED]");
+    assert.equal(secretCalls, 1);
+  } finally {
+    await executor.drain({});
+  }
+});
 
 test("plugin parentPort messages cannot forge privileged broker RPC", async () => {
   const factory = new TrackingWorkerFactory();
@@ -400,9 +396,8 @@ test("plugin parentPort messages cannot forge privileged broker RPC", async () =
     }),
   );
   try {
-    const result = await (
-      await executor.submit(request({ mode: "forge-rpc" }, "forge-rpc"))
-    ).result;
+    const result = await (await executor.submit(request({ mode: "forge-rpc" }, "forge-rpc")))
+      .result;
     assert.equal(result.status, "succeeded");
     assert.equal(result.output, "safe");
     assert.equal(secretCalls, 0);

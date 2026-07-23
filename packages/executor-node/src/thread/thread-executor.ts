@@ -129,6 +129,7 @@ export interface ThreadExecutionRequest {
 }
 
 const threadExecutionRequests = new WeakSet<ThreadExecutionRequest>();
+const threadTransferFingerprints = new WeakMap<ThreadExecutionRequest, string>();
 
 export function threadExecutionRequest(
   execution: ExecutionRequest,
@@ -431,20 +432,24 @@ class ThreadChannel {
     }
     const id = `message-${++this.#nextId}`;
     const value = { ...message, id };
-    try {
-      validateThreadMessage(value, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
-    } catch (error) {
-      return Promise.reject(error);
-    }
     return new Promise<unknown>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
       try {
-        this.#port.postMessage(value, [...transferList]);
+        this.#send(value, transferList);
       } catch (error) {
         this.#pending.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
+  }
+
+  #send(value: Record<string, unknown>, transferList: readonly Transferable[] = []): void {
+    try {
+      validateThreadMessage(value, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    } catch (error) {
+      throw error;
+    }
+    this.#port.postMessage(value, [...transferList]);
   }
 
   async #dispatch(message: IncomingMessage): Promise<void> {
@@ -540,14 +545,14 @@ class ThreadChannel {
       } else {
         throw new Error("Thread RPC type is unsupported");
       }
-      await this.request({
+      this.#send({
         kind: "rpc-response",
         id: message.id,
         ok: true,
         ...(value === undefined ? {} : { value }),
       });
     } catch (error) {
-      await this.request({
+      this.#send({
         kind: "rpc-response",
         id: message.id,
         ok: false,
@@ -689,8 +694,7 @@ export class ThreadExecutor implements Executor {
     validateThreadMessage({ kind: "execution", request: parsed }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
     const request = deepFreeze(parseExecutionRequest(cloneComponentHostValue(parsed)));
     const key = attemptKey(request.taskId, request.attemptId);
-    const transferFingerprint =
-      wrapped === undefined ? "" : this.#transferFingerprint(wrapped.transfer);
+    const transferFingerprint = wrapped === undefined ? "" : this.#transferFingerprint(wrapped);
     const fingerprint = `${JSON.stringify(request)}:${transferFingerprint}`;
     const existing = this.#attempts.get(key);
     if (existing !== undefined) {
@@ -1358,7 +1362,10 @@ export class ThreadExecutor implements Executor {
       : undefined;
   }
 
-  #transferFingerprint(transfer: ThreadTransferOptions): string {
+  #transferFingerprint(request: ThreadExecutionRequest): string {
+    const cached = threadTransferFingerprints.get(request);
+    if (cached !== undefined) return cached;
+    const { transfer } = request;
     const seen = new Set<ArrayBuffer>();
     const hash = createHash("sha256");
     hash.update(transfer.ownership);
@@ -1380,7 +1387,10 @@ export class ThreadExecutor implements Executor {
       seen.add(buffer);
       hash.update(new Uint8Array(buffer));
     }
-    return hash.digest("hex");
+    validateThreadMessage({ buffers: transfer.buffers }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    const fingerprint = hash.digest("hex");
+    threadTransferFingerprints.set(request, fingerprint);
+    return fingerprint;
   }
 
   #claimTransfer(transfer: ThreadTransferOptions): readonly ArrayBuffer[] {
