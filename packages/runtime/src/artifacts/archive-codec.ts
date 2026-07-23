@@ -16,6 +16,16 @@ export interface DeterministicArchiveEntry {
   readonly bytes: Uint8Array;
 }
 
+export interface DeterministicArchiveLimits {
+  readonly maxArchiveBytes?: number;
+  readonly maxEntries?: number;
+  readonly maxEntryBytes?: number;
+}
+
+const DEFAULT_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_ENTRY_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_ENTRIES = 1_024;
+
 function artifactError(code: `ARTIFACT_${string}`, message: string, path?: string) {
   return new DiagnosticError(
     runtimeDiagnostic({
@@ -142,10 +152,46 @@ function createHeader(path: string, size: number): Uint8Array {
 
 export function createDeterministicArchive(
   input: readonly DeterministicArchiveEntry[],
+  limits: DeterministicArchiveLimits = {},
 ): Uint8Array {
   const entries = [...input].sort((left, right) =>
     left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
   );
+  const maxArchiveBytes = limits.maxArchiveBytes ?? DEFAULT_MAX_ARCHIVE_BYTES;
+  const maxEntryBytes = limits.maxEntryBytes ?? DEFAULT_MAX_ENTRY_BYTES;
+  const maxEntries = limits.maxEntries ?? DEFAULT_MAX_ENTRIES;
+  for (const [name, value] of Object.entries({
+    maxArchiveBytes,
+    maxEntries,
+    maxEntryBytes,
+  })) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new RangeError(`${name} must be a positive safe integer`);
+    }
+  }
+  if (entries.length > maxEntries) {
+    throw artifactError("ARTIFACT_ENTRY_COUNT_EXCEEDED", "Artifact contains too many entries");
+  }
+  let totalBytes = TAR_BLOCK_SIZE * 2;
+  for (const entry of entries) {
+    if (entry.bytes.byteLength > maxEntryBytes) {
+      throw artifactError(
+        "ARTIFACT_ENTRY_TOO_LARGE",
+        "Artifact entry exceeds the configured byte limit",
+        entry.path,
+      );
+    }
+    const paddedBytes =
+      entry.bytes.byteLength +
+      ((TAR_BLOCK_SIZE - (entry.bytes.byteLength % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE);
+    totalBytes += TAR_BLOCK_SIZE + paddedBytes;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > maxArchiveBytes) {
+      throw artifactError(
+        "ARTIFACT_ARCHIVE_TOO_LARGE",
+        "Artifact exceeds the configured byte limit",
+      );
+    }
+  }
   const chunks: Uint8Array[] = [];
   const paths = new Map<string, string>();
   for (const entry of entries) {
@@ -167,5 +213,5 @@ export function createDeterministicArchive(
     if (padding > 0) chunks.push(new Uint8Array(padding));
   }
   chunks.push(new Uint8Array(TAR_BLOCK_SIZE * 2));
-  return Buffer.concat(chunks);
+  return Buffer.concat(chunks, totalBytes);
 }

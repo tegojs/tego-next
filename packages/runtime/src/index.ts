@@ -13,6 +13,7 @@ export {
   assertPortableArtifactPath,
   canonicalJsonBytes,
   createDeterministicArchive,
+  type DeterministicArchiveLimits,
   portableArtifactCollisionKey,
   type DeterministicArchiveEntry,
 } from "./artifacts/archive-codec.js";
