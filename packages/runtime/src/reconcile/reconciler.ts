@@ -41,6 +41,7 @@ import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
 import {
   planReconcile,
+  reconcileEffectIdentities,
   type ArtifactDeploymentGate,
   type ComponentInstance,
   type ReconcileEffect,
@@ -755,41 +756,69 @@ export class Reconciler {
     try {
       effect = parseReconcileEffect(claim);
     } catch (error) {
-      const observedAt = this.#options.clock.now().toISOString();
-      const diagnostic = invalidMessageDiagnostic(claim, error, observedAt);
-      this.#diagnosticsByDeployment.set(`outbox/${claim.message.messageId}`, [diagnostic]);
-      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
-        await transaction.appendOperation({
-          operationId: claim.message.operationId,
-          kind: "component.lifecycle",
-          status: "failed",
-          state: { diagnostic },
-          updatedAt: observedAt,
-        });
-        return null;
-      });
-      await this.#acknowledge(claim, "completed");
+      await this.#rejectInvalidClaim(claim, error);
+      return;
+    }
+    const canonical = reconcileEffectIdentities(
+      {
+        applicationId: effect.applicationId,
+        generation: effect.deploymentGeneration,
+        pluginId: effect.pluginId,
+      },
+      effect.componentId,
+      effect.kind,
+    );
+    if (
+      effect.instanceId !== canonical.instanceId ||
+      effect.operationId !== canonical.operationId ||
+      effect.messageId !== canonical.messageId
+    ) {
+      await this.#rejectInvalidClaim(
+        claim,
+        new TypeError("Lifecycle effect identity is not canonical for its deployment tuple"),
+      );
       return;
     }
     const current = await this.#options.state.read(instanceKey(effect.instanceId));
+    if (current === undefined) {
+      this.#replanCount += 1;
+      await this.#acknowledge(claim, "completed");
+      return;
+    }
+    const instance = current.value;
     if (
-      current?.value.completedOperationId === effect.operationId ||
-      current?.value.completedOperationIds?.includes(effect.operationId)
+      instance.instanceId !== effect.instanceId ||
+      instance.applicationId !== effect.applicationId ||
+      instance.pluginId !== effect.pluginId ||
+      instance.componentId !== effect.componentId ||
+      instance.deploymentGeneration !== effect.deploymentGeneration ||
+      instance.artifactDigest !== effect.artifactDigest ||
+      instance.executor !== effect.executor ||
+      instance.workerId !== effect.workerId
+    ) {
+      await this.#rejectInvalidClaim(
+        claim,
+        new TypeError("Lifecycle effect tuple does not match its persisted component instance"),
+      );
+      return;
+    }
+    if (
+      instance.completedOperationId === effect.operationId ||
+      instance.completedOperationIds?.includes(effect.operationId)
     ) {
       await this.#acknowledge(claim, "completed");
       return;
     }
+    const deployments = await this.#loadDeployments();
+    const desired = deployments.find(
+      (candidate) =>
+        candidate.applicationId === effect.applicationId && candidate.pluginId === effect.pluginId,
+    );
     if (effect.kind === "prepare" || effect.kind === "start") {
-      const [deployments, installations, instances] = await Promise.all([
-        this.#loadDeployments(),
+      const [installations, instances] = await Promise.all([
         this.#loadInstallations(),
         this.#loadInstances(),
       ]);
-      const desired = deployments.find(
-        (candidate) =>
-          candidate.applicationId === effect.applicationId &&
-          candidate.pluginId === effect.pluginId,
-      );
       if (
         desired === undefined ||
         desired.state !== "active" ||
@@ -826,6 +855,15 @@ export class Reconciler {
         await this.#acknowledge(claim, "completed");
         return;
       }
+    } else if (
+      desired !== undefined &&
+      desired.state === "active" &&
+      desired.generation === effect.deploymentGeneration &&
+      desired.artifactDigest === effect.artifactDigest
+    ) {
+      this.#replanCount += 1;
+      await this.#acknowledge(claim, "completed");
+      return;
     }
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
       await transaction.appendOperation({
@@ -1079,5 +1117,22 @@ export class Reconciler {
       outcome,
       ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
     });
+  }
+
+  async #rejectInvalidClaim(claim: OutboxClaim, error: unknown): Promise<void> {
+    const observedAt = this.#options.clock.now().toISOString();
+    const diagnostic = invalidMessageDiagnostic(claim, error, observedAt);
+    this.#diagnosticsByDeployment.set(`outbox/${claim.message.messageId}`, [diagnostic]);
+    await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+      await transaction.appendOperation({
+        operationId: claim.message.operationId,
+        kind: "component.lifecycle",
+        status: "failed",
+        state: { diagnostic },
+        updatedAt: observedAt,
+      });
+      return null;
+    });
+    await this.#acknowledge(claim, "completed");
   }
 }

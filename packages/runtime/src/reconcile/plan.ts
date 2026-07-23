@@ -101,8 +101,8 @@ function portableStableId(parts: readonly string[]): string {
   return `${candidate.slice(0, 63)}.${digest}`;
 }
 
-function identities(
-  deployment: PluginDeployment,
+export function reconcileEffectIdentities(
+  deployment: Pick<PluginDeployment, "applicationId" | "generation" | "pluginId">,
   componentId: ComponentId,
   kind: ReconcileEffectKind,
 ): {
@@ -139,7 +139,7 @@ function step(
   expectedRevision: Revision | "absent",
   currentLifecycle: ComponentLifecycleState,
 ): ReconcilePlanStep {
-  const identity = identities(deployment, componentId, kind);
+  const identity = reconcileEffectIdentities(deployment, componentId, kind);
   const effect: ReconcileEffect = {
     kind,
     operationId: identity.operationId,
