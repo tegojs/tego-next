@@ -430,7 +430,7 @@ Commit: `git add packages/runtime && git commit -m "feat: boot and recover an em
 - Produces: `ArtifactService.validate`, `ArtifactService.install`, `packPlugin`, and `signArtifact`.
 - Produces: deterministic `.tego` archive and immutable `PluginInstallation`.
 
-- [ ] **Step 1: Write and commit failing artifact security tests**
+- [x] **Step 1: Write and commit failing artifact security tests**
 
 Test invalid-manifest side effects, traversal, absolute path, link/device entry,
 duplicate path, undeclared file, CommonJS, incompatible Node/Tego range, digest
@@ -442,19 +442,19 @@ Expected: FAIL because artifact services do not exist.
 
 Commit: `git add packages/runtime/test packages/cli/test examples/echo-plugin && git commit -m "test: define secure plugin artifacts"`
 
-- [ ] **Step 2: Implement data-only archive preflight**
+- [x] **Step 2: Implement data-only archive preflight**
 
 Read the tar header and only `manifest.json` plus `metadata/files.json` during
 preflight. Reject unsafe entries before extraction. Validate manifest before
 resolving any component entry.
 
-- [ ] **Step 3: Implement deterministic packing and Ed25519 signatures**
+- [x] **Step 3: Implement deterministic packing and Ed25519 signatures**
 
 Invoke `npm exec tsc -- -p <plugin-tsconfig>` as a child process. Sort entries,
 normalize tar metadata, hash final bytes, and sign the digest with
 `crypto.sign(null, digestBytes, privateKey)`.
 
-- [ ] **Step 4: Register installations and verify**
+- [x] **Step 4: Register installations and verify**
 
 Persist installation under `(pluginId, version, digest)`. A conflicting digest
 never overwrites an existing installation.

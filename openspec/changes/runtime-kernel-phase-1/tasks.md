@@ -33,12 +33,12 @@
 
 ## 5. Plugin Artifacts
 
-- [ ] 5.1 Write side-effect detection tests and implement data-only manifest reading and validation
-- [ ] 5.2 Write compatibility tests and implement Tego, Node.js, ESM, platform, and architecture checks
-- [ ] 5.3 Write digest and immutability tests and implement artifact registration plus installation records
-- [ ] 5.4 Write reproducibility tests and implement normalized deterministic `.tego` archive creation and inspection
-- [ ] 5.5 Write signing tests and implement Ed25519 signing and configured trust-key verification
-- [ ] 5.6 Add negative fixtures for path traversal, duplicate entries, digest mismatch, invalid schemas, and executable pre-validation side effects
+- [x] 5.1 Write side-effect detection tests and implement data-only manifest reading and validation
+- [x] 5.2 Write compatibility tests and implement Tego, Node.js, ESM, platform, and architecture checks
+- [x] 5.3 Write digest and immutability tests and implement artifact registration plus installation records
+- [x] 5.4 Write reproducibility tests and implement normalized deterministic `.tego` archive creation and inspection
+- [x] 5.5 Write signing tests and implement Ed25519 signing and configured trust-key verification
+- [x] 5.6 Add negative fixtures for path traversal, duplicate entries, digest mismatch, invalid schemas, and executable pre-validation side effects
 
 ## 6. Capability and Permission Resolution
 
