@@ -555,6 +555,35 @@ test("NodeProcessHost reports a failed SIGKILL delivery instead of waiting forev
   await host.close();
 });
 
+test("NodeProcessHost bounds SIGKILL settlement when the child never reports exit", async () => {
+  const directory = await temporaryDirectory("process-host-kill-settlement");
+  const entrypoint = join(directory, "wait.mjs");
+  await writeFile(entrypoint, "setInterval(() => {}, 1000);");
+  const clock = new FakeClock(new Date("2026-07-23T12:00:00.000Z"));
+  const host = new NodeProcessHost({ clock });
+  await host.open();
+  const child = await host.spawn({ entrypoint });
+  const originalKill = ChildProcess.prototype.kill;
+  let rejectionCode: string | undefined;
+  let killing: Promise<unknown> | undefined;
+  ChildProcess.prototype.kill = () => true;
+  try {
+    killing = child.kill().catch((error: unknown) => {
+      rejectionCode = diagnosticCode(error);
+    });
+    clock.advanceBy(5_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(rejectionCode, "EXECUTOR_PROCESS_KILL_TIMEOUT");
+  } finally {
+    ChildProcess.prototype.kill = originalKill;
+    await child.kill();
+    await killing;
+  }
+  assert.equal(host.activeProcessCount, 0);
+  await host.close();
+});
+
 test("close racing with open cannot resurrect filesystem artifact access", async () => {
   const rootDirectory = await temporaryDirectory("artifact-open-close-race");
   const store = new FilesystemArtifactStore({ rootDirectory });
