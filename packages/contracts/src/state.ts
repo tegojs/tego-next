@@ -1,5 +1,5 @@
 import type { FencingEpoch, MessageId, OperationId, Revision } from "./identity.js";
-import type { JsonValue } from "./json.js";
+import type { JsonObject, JsonValue } from "./json.js";
 
 export interface StateKey<_T extends JsonValue> {
   readonly namespace: string;
@@ -105,7 +105,7 @@ export interface OutboxMessage {
   readonly createdAt: string;
 }
 
-export interface DriverHealth {
+export interface DriverHealth extends JsonObject {
   readonly status: "degraded" | "healthy" | "unhealthy";
   readonly checkedAt: string;
   readonly message?: string;

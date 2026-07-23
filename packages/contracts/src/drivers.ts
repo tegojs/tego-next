@@ -55,6 +55,7 @@ export interface CoordinationChange {
 }
 
 export interface CoordinationProvider extends ManagedDriver {
+  readonly scope: "distributed" | "local";
   campaign(request: CampaignRequest): Promise<Leadership>;
   acquireLease(request: LeaseRequest): Promise<Lease>;
   nextEpoch(resource: string): Promise<FencingEpoch>;

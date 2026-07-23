@@ -111,6 +111,7 @@ class CoordinationWatchIterator
 }
 
 export class LocalCoordinationProvider implements CoordinationProvider {
+  readonly scope = "local" as const;
   readonly #clock: Clock;
   readonly #records = new Map<string, CoordinationRecord>();
   readonly #changes: CoordinationChange[] = [];

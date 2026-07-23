@@ -668,9 +668,7 @@ export class SqliteStateStore implements StateStore {
     }
   }
 
-  #decodeOperation(
-    row: Readonly<Record<string, SQLOutputValue>>,
-  ): PersistedOperationJournalEntry {
+  #decodeOperation(row: Readonly<Record<string, SQLOutputValue>>): PersistedOperationJournalEntry {
     const status = requiredText(row, "status", this.#clock);
     if (!["completed", "executing", "failed", "planned"].includes(status)) {
       throw stateError(
@@ -1134,10 +1132,7 @@ export class SqliteStateStore implements StateStore {
   }
 
   #assertOperationQuery(query: OperationJournalQuery): void {
-    if (
-      query.limit !== undefined &&
-      (!Number.isSafeInteger(query.limit) || query.limit <= 0)
-    ) {
+    if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0)) {
       throw stateError(
         "STATE_QUERY_INVALID",
         "Operation journal query limit must be a positive safe integer",

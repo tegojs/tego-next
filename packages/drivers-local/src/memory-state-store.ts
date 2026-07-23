@@ -463,8 +463,7 @@ export class MemoryStateStore implements StateStore {
       .filter(
         (entry) =>
           (entry.status === "executing" || entry.status === "planned") &&
-          (query.after === undefined ||
-            compareOperationJournalCursors(entry, query.after) > 0),
+          (query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0),
       )
       .sort(compareOperationJournalCursors);
     const limit = query.limit ?? matching.length;
@@ -678,10 +677,7 @@ export class MemoryStateStore implements StateStore {
   }
 
   #assertOperationQuery(query: OperationJournalQuery): void {
-    if (
-      query.limit !== undefined &&
-      (!Number.isSafeInteger(query.limit) || query.limit <= 0)
-    ) {
+    if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0)) {
       throw stateError(
         "STATE_QUERY_INVALID",
         "Operation journal query limit must be a positive safe integer",

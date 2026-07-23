@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   diagnosticCode,
+  compareOperationJournalCursors,
   parseApplicationId,
   parseFencingEpoch,
   parseNodeId,
@@ -29,11 +30,7 @@ import {
   type StateTransactionOptions,
   type Versioned,
 } from "@tegojs/contracts";
-import {
-  createRuntime,
-  isRuntimeReady,
-  transitionRuntimeState,
-} from "../src/index.js";
+import { createRuntime, isRuntimeReady, transitionRuntimeState } from "../src/index.js";
 
 const now = new Date("2026-07-23T00:00:00.000Z");
 const clock: Clock = {
@@ -98,7 +95,13 @@ class ControlledStateStore implements StateStore {
       async *[Symbol.asyncIterator]() {
         store.log.push(`state.recover:${query.limit ?? "all"}`);
         await store.recoveryGate;
-        for (const entry of store.recovered) yield entry;
+        const entries = store.recovered
+          .filter(
+            (entry) =>
+              query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+          )
+          .slice(0, query.limit);
+        for (const entry of entries) yield entry;
       },
     };
   }
@@ -145,7 +148,7 @@ class ControlledCoordination implements CoordinationProvider {
     return parseFencingEpoch("1");
   }
 
-  async compareAndSet<T extends JsonValue>(): Promise<{ readonly applied: false }> {
+  async compareAndSet<_T extends JsonValue>(): Promise<{ readonly applied: false }> {
     return { applied: false };
   }
 
@@ -190,9 +193,7 @@ class ControlledArtifacts implements ArtifactStore {
   }
 }
 
-function controlledDrivers(
-  recovered: readonly PersistedOperationJournalEntry[] = [],
-): {
+function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] = []): {
   readonly drivers: RuntimeDrivers;
   readonly state: ControlledStateStore;
   readonly coordination: ControlledCoordination;
@@ -222,8 +223,8 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
   const status = await runtime.status();
 
   assert.equal(status.lifecycle, "running");
-  assert.equal(status.live, true);
-  assert.equal(status.ready, true);
+  assert.equal(status.liveness, true);
+  assert.equal(status.readiness, true);
   assert.equal(status.acceptingOperations, true);
   assert.deepEqual(status.identity, {
     runtimeId: configuration.runtimeId,
@@ -238,27 +239,20 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     tasks: 0,
     workers: 0,
   });
-  assert.deepEqual(
-    log.slice(0, 8),
-    [
-      "state.open",
-      "coordination.open",
-      "artifacts.open",
-      "state.scan:installations",
-      "state.scan:deployments",
-      "state.scan:tasks",
-      "state.recover:100",
-      "coordination.campaign",
-    ],
-  );
+  assert.deepEqual(log.slice(0, 8), [
+    "state.open",
+    "coordination.open",
+    "artifacts.open",
+    "state.scan:installations",
+    "state.scan:deployments",
+    "state.scan:tasks",
+    "state.recover:100",
+    "coordination.campaign",
+  ]);
 
   await runtime.stop();
   assert.equal((await runtime.status()).lifecycle, "stopped");
-  assert.deepEqual(log.slice(-3), [
-    "artifacts.close",
-    "coordination.close",
-    "state.close",
-  ]);
+  assert.deepEqual(log.slice(-3), ["artifacts.close", "coordination.close", "state.close"]);
 });
 
 test("driver open failure closes previously opened drivers in reverse order", async () => {
@@ -348,7 +342,7 @@ test("stop racing with start prevents runtime resurrection", async () => {
   const status = await runtime.status();
   assert.equal(status.lifecycle, "stopped");
   assert.equal(status.acceptingOperations, false);
-  assert.equal(status.ready, false);
+  assert.equal(status.readiness, false);
 });
 
 test("runtime event iterators terminate on stop, including pending and late iterators", async () => {

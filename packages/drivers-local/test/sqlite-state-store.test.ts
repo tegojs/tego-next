@@ -143,10 +143,7 @@ test("a committed transaction survives abrupt process termination without close"
   await runChild(childScript, [databasePath, moduleUrl]);
 
   const reopened = await openStore(databasePath);
-  assert.equal(
-    (await recoverableOperations(reopened))[0]?.status,
-    "executing",
-  );
+  assert.equal((await recoverableOperations(reopened))[0]?.status, "executing");
   await reopened.close();
 });
 
