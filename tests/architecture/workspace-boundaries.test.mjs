@@ -370,6 +370,37 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
   );
 });
 
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-alias-subpath-import", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/testkit": {
+        name: "@tegojs/testkit",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+      "packages/drivers-local": {
+        name: "@tegojs/drivers-local",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+        devDependencies: {
+          "testkit-alias": "npm:@tegojs/testkit@0.0.0",
+        },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/drivers-local/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.js", outputDirectory),
+        'import "testkit-alias/state-store-suite";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/drivers-local -> @tegojs/testkit/state-store-suite",
+      ]);
+    },
+  );
+});
+
 for (const field of ["optionalDependencies", "peerDependencies"]) {
   test(`@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-${field}`, async () => {
     await withWorkspace(
