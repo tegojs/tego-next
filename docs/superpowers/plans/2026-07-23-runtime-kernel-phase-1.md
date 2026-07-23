@@ -237,7 +237,7 @@ Commit: `git add packages/contracts && git commit -m "feat: add validated runtim
 - Consumes: `StateStore`, `StateTransaction`, `Revision`, and `Clock` from contracts.
 - Produces: `stateStoreConformance(factory, options)` and `MemoryStateStore`.
 
-- [ ] **Step 1: Write and commit a failing public conformance suite**
+- [x] **Step 1: Write and commit a failing public conformance suite**
 
 The suite must verify:
 
@@ -256,19 +256,19 @@ Expected: FAIL because the contracts do not yet export `StateStore`.
 
 Commit: `git add packages/testkit && git commit -m "test: define state store conformance"`
 
-- [ ] **Step 2: Add the StateStore interfaces to contracts**
+- [x] **Step 2: Add the StateStore interfaces to contracts**
 
 Define the interfaces exactly as documented in the technical design. A
 transaction exposes `get`, `scan`, `put`, `delete`, `appendOperation`, and
 `enqueueOutbox`; all writes accept an expected revision.
 
-- [ ] **Step 3: Implement MemoryStateStore minimally**
+- [x] **Step 3: Implement MemoryStateStore minimally**
 
 Use immutable snapshots per transaction and one serialized commit queue.
 Watchers receive committed changes only. Abort replaces no state and consumes
 no revision.
 
-- [ ] **Step 4: Run conformance and commit**
+- [x] **Step 4: Run conformance and commit**
 
 Run:
 
@@ -980,7 +980,7 @@ After each implementation task passes, mark the corresponding items in
 | --- | --- |
 | 1 | 1.1, 1.2 |
 | 2 | 2.1–2.5 |
-| 3 | 1.3, 3.1, 3.2 |
+| 3 | 3.1, 3.2 |
 | 4 | 3.3, 3.5 |
 | 5 | 4.1–4.5 |
 | 6 | 5.1–5.6 |
@@ -993,7 +993,7 @@ After each implementation task passes, mark the corresponding items in
 | 13 | 9.4–9.7 |
 | 14 | 3.4, 3.6, 3.7 |
 | 15 | 11.1–11.5 |
-| 16 | 1.4, 10.3–10.5, 11.6, 11.7, 12.1–12.6 |
+| 16 | 1.3, 1.4, 10.3–10.5, 11.6, 11.7, 12.1–12.6 |
 
 Before leaving Build phase:
 

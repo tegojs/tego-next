@@ -15,8 +15,8 @@
 
 ## 3. State and Coordination Drivers
 
-- [ ] 3.1 Define the state-store conformance suite from restart, transaction, revision, journal, and namespace scenarios
-- [ ] 3.2 Implement the in-memory state store test double until it passes the conformance suite
+- [x] 3.1 Define the state-store conformance suite from restart, transaction, revision, journal, and namespace scenarios
+- [x] 3.2 Implement the in-memory state store test double until it passes the conformance suite
 - [ ] 3.3 Implement the SQLite state store and numbered migrations until it passes conformance and process-restart tests
 - [ ] 3.4 Define the coordination-provider conformance suite for leadership, leases, fencing, CAS, watch, namespaces, idempotency, and close
 - [ ] 3.5 Implement the local single-Main coordination provider until it passes all applicable conformance scenarios
