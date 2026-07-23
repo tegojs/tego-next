@@ -18,6 +18,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DiagnosticError } from "@tegojs/contracts";
 import { buildPlugin } from "../src/plugin/build-plugin.js";
+import { auditJavaScriptModules } from "../src/plugin/module-audit.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { signArtifact } from "../src/plugin/sign-plugin.js";
 
@@ -357,6 +358,88 @@ test("rejects actual CommonJS expressions without matching inert text", async (c
       });
     });
   }
+});
+
+test("does not hide imports or CommonJS behind postfix division", async (context) => {
+  for (const [label, source, code] of [
+    [
+      "dynamic import after increment",
+      'let counter = 1;\nconst value = counter++ / import("left-pad") / 2;\nexport default value;\n',
+      "ARTIFACT_IMPORT_UNSUPPORTED",
+    ],
+    [
+      "require after decrement",
+      'let counter = 1;\nconst value = counter-- / require("./local.js") / 2;\nexport default value;\n',
+      "ARTIFACT_MODULE_FORMAT_UNSUPPORTED",
+    ],
+  ] as const) {
+    await context.test(label, async () => {
+      await withBuiltSource(source, async (directory) => {
+        await assert.rejects(
+          () =>
+            packPlugin({
+              artifactPath: join(directory, "plugin.tego"),
+              build: false,
+              pluginDirectory: directory,
+            }),
+          (error: unknown) => {
+            assert.ok(error instanceof DiagnosticError);
+            assert.equal(error.diagnostic.code, code);
+            return true;
+          },
+        );
+      });
+    });
+  }
+});
+
+test("accepts control-body regex and contextual from import bindings", async (context) => {
+  for (const [label, source] of [
+    [
+      "control-body regex",
+      'const enabled = true;\nconst text = "value";\nif (enabled) /import("left-pad")/.test(text);\nexport default text;\n',
+    ],
+    [
+      "contextual from binding",
+      'import { from as value } from "./local.js"\nexport default value\n',
+    ],
+  ] as const) {
+    await context.test(label, async () => {
+      await withBuiltSource(source, async (directory) => {
+        await packPlugin({
+          artifactPath: join(directory, "plugin.tego"),
+          build: false,
+          pluginDirectory: directory,
+        });
+      });
+    });
+  }
+});
+
+test("module audit enforces a linear work budget for semicolonless declarations", () => {
+  const imports = Array.from(
+    { length: 500 },
+    (_, index) => `import { from as value${index} } from "./local.js"\n`,
+  );
+  const exports = Array.from(
+    { length: 500 },
+    (_, index) => `export { value${index} as item${index} }\n`,
+  );
+  const source = [...imports, ...exports].join("");
+  const auditWithBudget = auditJavaScriptModules as unknown as (
+    value: string,
+    options: { readonly maxWork: number },
+  ) => ReturnType<typeof auditJavaScriptModules>;
+
+  assert.doesNotThrow(() => auditWithBudget(source, { maxWork: source.length * 4 + 100 }));
+  assert.throws(
+    () => auditWithBudget("export default 1", { maxWork: 1 }),
+    (error: unknown) => {
+      assert.ok(error instanceof DiagnosticError);
+      assert.equal(error.diagnostic.code, "ARTIFACT_MODULE_AUDIT_LIMIT");
+      return true;
+    },
+  );
 });
 
 test("rejects case-folded component path collisions", async () => {
