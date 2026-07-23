@@ -136,8 +136,9 @@ test("migrations are idempotent and configure WAL mode", async () => {
   try {
     const migrations = database
       .prepare("SELECT version FROM schema_migrations ORDER BY version")
-      .all();
-    assert.deepEqual(migrations, [{ version: 1 }]);
+      .all()
+      .map((row) => row.version);
+    assert.deepEqual(migrations, [1]);
     assert.equal(database.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
     const tables = database
       .prepare(
@@ -255,6 +256,7 @@ test("decoded database values are validated before they escape", async () => {
   await store.close();
 
   const database = new DatabaseSync(databasePath);
+  database.prepare("INSERT INTO revisions DEFAULT VALUES").run();
   database
     .prepare(
       "INSERT INTO records(namespace, collection_name, record_id, value_json, revision) VALUES (?, ?, ?, ?, ?)",

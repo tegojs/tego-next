@@ -1,6 +1,7 @@
 export * from "./capability.js";
 export * from "./clock.js";
 export * from "./diagnostic.js";
+export * from "./drivers.js";
 export * from "./execution.js";
 export * from "./identity.js";
 export * from "./json.js";
