@@ -4,29 +4,36 @@ import test from "node:test";
 import {
   DiagnosticError,
   diagnosticCode,
-  parseApplicationId,
-  parseExecutionRequest,
-  parsePluginManifest,
-  parseRuntimeId,
-  parseSchema,
-  parseWorkerEnvelope,
-  serializeWireValue,
   type ExecutionRequest,
   type JsonSchema,
   type PluginManifest,
+  parseApplicationId,
+  parseAttemptId,
+  parseComponentId,
+  parseExecutionRequest,
+  parseMessageId,
+  parsePluginId,
+  parsePluginManifest,
+  parseRuntimeId,
+  parseSchema,
+  parseSequence,
+  parseSessionId,
+  parseTaskId,
+  parseWorkerEnvelope,
+  serializeWireValue,
   type WorkerEnvelope,
 } from "../src/index.js";
 
 const validManifest = {
   schemaVersion: "1.0",
-  pluginId: "org.example.echo",
+  pluginId: parsePluginId("org.example.echo"),
   version: "1.2.3",
   contractRange: "^1.0.0",
   nodeRange: ">=26.5.0 <27",
   moduleFormat: "esm",
   components: [
     {
-      componentId: "echo",
+      componentId: parseComponentId("echo"),
       kind: "task",
       entrypoint: "components/echo.js",
       executors: ["thread", "process", "remote"],
@@ -40,11 +47,11 @@ const validManifest = {
 } satisfies PluginManifest;
 
 const validExecutionRequest = {
-  taskId: "task-01",
-  attemptId: "attempt-01",
-  applicationId: "detector",
-  pluginId: "org.example.echo",
-  componentId: "echo",
+  taskId: parseTaskId("task-01"),
+  attemptId: parseAttemptId("attempt-01"),
+  applicationId: parseApplicationId("detector"),
+  pluginId: parsePluginId("org.example.echo"),
+  componentId: parseComponentId("echo"),
   input: { message: "hello" },
   deadline: "2026-07-23T12:00:00.000Z",
   orphanPolicy: "finish-and-buffer",
@@ -52,9 +59,9 @@ const validExecutionRequest = {
 
 const validWorkerEnvelope = {
   protocol: "1.0",
-  messageId: "message-01",
-  sessionId: "session-01",
-  sequence: "1",
+  messageId: parseMessageId("message-01"),
+  sessionId: parseSessionId("session-01"),
+  sequence: parseSequence("1"),
   type: "task.assign",
   sentAt: "2026-07-23T11:59:00.000Z",
   payload: validExecutionRequest,
@@ -109,7 +116,8 @@ test("plugin manifest validation reports deterministically sorted Ajv issues", (
           {
             instancePath: "/version",
             keyword: "pattern",
-            message: 'must match pattern "^(0|[1-9]\\\\d*)\\\\.(0|[1-9]\\\\d*)\\\\.(0|[1-9]\\\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\\\+[0-9A-Za-z.-]+)?$"',
+            message:
+              'must match pattern "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"',
             params: {
               pattern:
                 "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
