@@ -60,8 +60,10 @@ export function encodeProcessFrame(
 }
 
 export class ProcessFrameDecoder {
-  #buffer = Buffer.alloc(0);
-  #expectedLength: number | undefined;
+  readonly #header = Buffer.allocUnsafe(4);
+  #headerOffset = 0;
+  #payload: Buffer | undefined;
+  #payloadOffset = 0;
 
   push(chunk: Uint8Array): readonly unknown[] {
     if (!(chunk instanceof Uint8Array)) {
@@ -71,13 +73,14 @@ export class ProcessFrameDecoder {
     const input = Buffer.from(chunk);
     let offset = 0;
     while (offset < input.byteLength) {
-      if (this.#expectedLength === undefined) {
-        const headerBytes = Math.min(4 - this.#buffer.byteLength, input.byteLength - offset);
-        this.#buffer = Buffer.concat([this.#buffer, input.subarray(offset, offset + headerBytes)]);
+      if (this.#payload === undefined) {
+        const headerBytes = Math.min(4 - this.#headerOffset, input.byteLength - offset);
+        input.copy(this.#header, this.#headerOffset, offset, offset + headerBytes);
+        this.#headerOffset += headerBytes;
         offset += headerBytes;
-        if (this.#buffer.byteLength < 4) continue;
-        const length = this.#buffer.readUInt32BE(0);
-        this.#buffer = Buffer.alloc(0);
+        if (this.#headerOffset < 4) continue;
+        const length = this.#header.readUInt32BE(0);
+        this.#headerOffset = 0;
         // This check intentionally precedes buffering payload, decoding, and JSON.parse.
         if (length === 0 || length > PROCESS_EXECUTOR_MAX_FRAME_BYTES) {
           throw framingError(
@@ -85,19 +88,20 @@ export class ProcessFrameDecoder {
             "Process frame length exceeds the configured limit",
           );
         }
-        this.#expectedLength = length;
+        this.#payload = Buffer.allocUnsafe(length);
+        this.#payloadOffset = 0;
       }
-      const expectedLength = this.#expectedLength;
+      const payload = this.#payload;
       const payloadBytes = Math.min(
-        expectedLength - this.#buffer.byteLength,
+        payload.byteLength - this.#payloadOffset,
         input.byteLength - offset,
       );
-      this.#buffer = Buffer.concat([this.#buffer, input.subarray(offset, offset + payloadBytes)]);
+      input.copy(payload, this.#payloadOffset, offset, offset + payloadBytes);
+      this.#payloadOffset += payloadBytes;
       offset += payloadBytes;
-      if (this.#buffer.byteLength < expectedLength) continue;
-      const payload = this.#buffer;
-      this.#buffer = Buffer.alloc(0);
-      this.#expectedLength = undefined;
+      if (this.#payloadOffset < payload.byteLength) continue;
+      this.#payload = undefined;
+      this.#payloadOffset = 0;
       let text: string;
       try {
         text = new TextDecoder("utf-8", { fatal: true }).decode(payload);
@@ -117,7 +121,7 @@ export class ProcessFrameDecoder {
   }
 
   finish(): void {
-    if (this.#buffer.byteLength !== 0 || this.#expectedLength !== undefined) {
+    if (this.#headerOffset !== 0 || this.#payload !== undefined) {
       throw framingError(
         "PROTOCOL_PROCESS_FRAME_TRUNCATED",
         "Process frame ended before completion",
