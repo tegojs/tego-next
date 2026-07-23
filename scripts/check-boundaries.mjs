@@ -9,6 +9,7 @@ const DEPENDENCY_FIELDS = [
 
 const CONTRACTS_PACKAGE = "@tegojs/contracts";
 const CLI_PACKAGE = "@tegojs/cli";
+const TESTKIT_PACKAGE = "@tegojs/testkit";
 
 const FIRST_LAYER_FORBIDDEN_FRAGMENTS = [
   "tego/",
@@ -35,6 +36,7 @@ function localAliasTarget(version) {
 function dependencyEntries(manifest) {
   return DEPENDENCY_FIELDS.flatMap((field) =>
     Object.entries(manifest[field] ?? {}).map(([specifier, version]) => ({
+      field,
       specifier,
       targetSpecifier: npmAliasTarget(version) ?? localAliasTarget(version) ?? specifier,
     })),
@@ -351,19 +353,59 @@ function referencedWorkspace(specifier, workspaces, importingFile) {
   );
 }
 
-function addEdgeViolation(violations, source, specifier, workspaces, importingFile, edgeKind) {
-  const target = referencedWorkspace(specifier, workspaces, importingFile);
+function importTargets(specifier, dependencies, source, workspaces) {
+  const aliases = dependencies.filter(
+    (dependency) =>
+      dependency.specifier === specifier || specifier.startsWith(`${dependency.specifier}/`),
+  );
+  if (aliases.length === 0) {
+    return [specifier];
+  }
+
+  const manifestUrl = new URL("package.json", source.directory);
+  return [
+    ...new Set(
+      aliases.map((dependency) => {
+        const target = referencedWorkspace(dependency.targetSpecifier, workspaces, manifestUrl);
+        const subpath = specifier.slice(dependency.specifier.length);
+        return `${target?.manifest.name ?? dependency.targetSpecifier}${subpath}`;
+      }),
+    ),
+  ];
+}
+
+function isTestkitConformanceEdge(source, target, edge) {
+  if (
+    source.manifest.name === CONTRACTS_PACKAGE ||
+    target.manifest.name !== TESTKIT_PACKAGE ||
+    target === source
+  ) {
+    return false;
+  }
+
+  if (edge.kind === "manifest") {
+    return edge.dependencyField === "devDependencies";
+  }
+
+  const testOutputDirectory = new URL("dist/test/", source.directory);
+  return edge.importingFile.href.startsWith(testOutputDirectory.href);
+}
+
+function addEdgeViolation(violations, source, specifier, workspaces, edge) {
+  const target = referencedWorkspace(specifier, workspaces, edge.importingFile);
   if (!target) {
     return;
   }
 
-  if (edgeKind === "import" && target.manifest.name === source.manifest.name) {
+  if (edge.kind === "import" && target === source) {
     return;
   }
 
   if (
     source.kind === "first-layer" &&
-    (source.manifest.name === CONTRACTS_PACKAGE || target.manifest.name !== CONTRACTS_PACKAGE)
+    (source.manifest.name === CONTRACTS_PACKAGE ||
+      (target.manifest.name !== CONTRACTS_PACKAGE &&
+        !isTestkitConformanceEdge(source, target, edge)))
   ) {
     violations.add(`${source.manifest.name} -> ${specifier}`);
   }
@@ -400,14 +442,11 @@ export async function checkWorkspaceBoundaries(root) {
       ) {
         violations.add(`${workspace.manifest.name} -> ${dependency.targetSpecifier}`);
       }
-      addEdgeViolation(
-        violations,
-        workspace,
-        dependency.targetSpecifier,
-        workspaces,
-        new URL("package.json", workspace.directory),
-        "manifest",
-      );
+      addEdgeViolation(violations, workspace, dependency.targetSpecifier, workspaces, {
+        dependencyField: dependency.field,
+        importingFile: new URL("package.json", workspace.directory),
+        kind: "manifest",
+      });
     }
 
     const files = await emittedJavaScriptFiles(new URL("dist/", workspace.directory));
@@ -420,10 +459,23 @@ export async function checkWorkspaceBoundaries(root) {
       }
 
       for (const specifier of imports.specifiers) {
-        if (workspace.kind === "first-layer" && containsForbiddenFragment(specifier)) {
-          violations.add(`${workspace.manifest.name} -> ${specifier}`);
+        for (const targetSpecifier of importTargets(
+          specifier,
+          dependencies,
+          workspace,
+          workspaces,
+        )) {
+          if (
+            workspace.kind === "first-layer" &&
+            [specifier, targetSpecifier].some(containsForbiddenFragment)
+          ) {
+            violations.add(`${workspace.manifest.name} -> ${targetSpecifier}`);
+          }
+          addEdgeViolation(violations, workspace, targetSpecifier, workspaces, {
+            importingFile: file,
+            kind: "import",
+          });
         }
-        addEdgeViolation(violations, workspace, specifier, workspaces, file, "import");
       }
     }
   }
