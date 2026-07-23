@@ -969,9 +969,8 @@ test("fatal quarantine fails queued work without spawning replacement children",
   const running = request({ mode: "ignore-cancel" }, "quarantine-running");
   const runningHandle = await executor.submit(running);
   await started.promise;
-  const queuedHandle = await executor.submit(
-    request({ mode: "echo", value: "must-not-run" }, "quarantine-queued"),
-  );
+  const queued = request({ mode: "echo", value: "must-not-run" }, "quarantine-queued");
+  const queuedHandle = await executor.submit(queued);
   try {
     await executor.cancel(running.taskId, running.attemptId);
     clock.advanceBy(100);
@@ -983,6 +982,15 @@ test("fatal quarantine fails queued work without spawning replacement children",
     const queuedResult = await queuedHandle.result;
     assert.equal(queuedResult.status, "failed");
     assert.equal(queuedResult.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    assert.deepEqual(await executor.observe(queued.taskId, queued.attemptId), {
+      state: "terminal",
+      result: queuedResult,
+    });
+    const health = await executor.health();
+    assert.equal(health.active, 1);
+    assert.equal(health.queued, 0);
+    assert.equal(health.accepting, false);
+    await executor.drain({});
   } finally {
     await processHost.close();
   }

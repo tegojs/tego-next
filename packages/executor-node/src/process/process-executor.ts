@@ -725,6 +725,10 @@ export class ProcessExecutor implements Executor {
   }
 
   async #schedule(): Promise<void> {
+    if (this.#fatalDiagnostic !== undefined) {
+      this.#failQueued(this.#fatalDiagnostic);
+      return;
+    }
     try {
       await this.#ensureOpen();
     } catch (error) {
@@ -753,6 +757,10 @@ export class ProcessExecutor implements Executor {
       return;
     }
     while (this.#active < this.#maxConcurrency) {
+      if (this.#fatalDiagnostic !== undefined) {
+        this.#failQueued(this.#fatalDiagnostic);
+        return;
+      }
       const entry = this.#queue.shift();
       if (entry === undefined) return;
       if (entry.state === "terminal") continue;
@@ -1156,7 +1164,12 @@ export class ProcessExecutor implements Executor {
       this.#fatalDiagnostic ??= failure;
       this.#accepting = false;
       this.#quarantinedProcesses.add(process_);
-      this.#options.logger?.error(failure.message, failure);
+      this.#failQueued(this.#fatalDiagnostic);
+      try {
+        this.#options.logger?.error(failure.message, failure);
+      } catch {
+        // Quarantine containment must not depend on a diagnostic sink.
+      }
       void process_
         .wait()
         .then(() => {
@@ -1164,6 +1177,24 @@ export class ProcessExecutor implements Executor {
         })
         .catch(() => undefined);
       return { diagnostic: failure };
+    }
+  }
+
+  #failQueued(failure: RuntimeDiagnostic): void {
+    for (const entry of this.#queue.splice(0)) {
+      if (entry.state === "terminal") continue;
+      const now = this.#clock.now().toISOString();
+      this.#settle(entry, {
+        taskId: entry.request.taskId,
+        attemptId: entry.request.attemptId,
+        status: "failed",
+        diagnostic: failure,
+        executor: { kind: "process", metadata: { executorId: this.id } },
+        startedAt: now,
+        completedAt: now,
+      });
+      if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
+      entry.completed.resolve();
     }
   }
 
