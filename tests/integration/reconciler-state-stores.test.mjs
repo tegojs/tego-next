@@ -8,6 +8,7 @@ import {
   parseArtifactDigest,
   parseCapabilityName,
   parseComponentId,
+  parseFencingEpoch,
   parseGeneration,
   parsePluginId,
 } from "@tegojs/contracts";
@@ -672,6 +673,96 @@ test("current provider context mismatches cannot satisfy required capabilities",
           true,
         );
         assert.equal((await readObservation(state, providerId))?.value.status, "inconsistent");
+        await reconciler.stop();
+      });
+    });
+  }
+});
+
+test("failed start and stop retries persist a legal pre-state before external effects", async (t) => {
+  const authority = {
+    resource: "runtime:app",
+    epoch: parseFencingEpoch("7"),
+  };
+  for (const target of ["start", "stop"]) {
+    await t.test(target, async (targetTest) => {
+      await withRealStateStores(targetTest, async (state, clock) => {
+        const desired =
+          target === "start" ? deployment() : { ...deployment(), state: "disabled" };
+        if (target === "stop") {
+          const identity = planReconcile({
+            deployment: deployment(),
+            gate: gate(),
+            instances: [],
+            now: clock.now().toISOString(),
+            supportedExecutors: ["thread"],
+          }).steps[0]?.effect;
+          assert.ok(identity);
+          await state.transact({}, async (transaction) => {
+            await transaction.put(
+              {
+                namespace: "tego",
+                collection: "component-instances",
+                id: identity.instanceId,
+              },
+              {
+                applicationId,
+                artifactDigest: digest,
+                componentId,
+                deploymentGeneration: parseGeneration("1"),
+                executor: "thread",
+                instanceId: identity.instanceId,
+                lifecycle: "ready",
+                observedGeneration: parseGeneration("1"),
+                pluginId,
+              },
+              { expectedRevision: "absent" },
+            );
+            return null;
+          });
+        }
+        const effects = new RecordingEffects();
+        let targetAttempts = 0;
+        effects.perform = async (effect) => {
+          effects.calls.push(effect);
+          if (effect.kind === target) {
+            targetAttempts += 1;
+            if (targetAttempts === 1) throw new Error(`${target} failed once`);
+          }
+        };
+        const reconciler = new Reconciler({
+          artifactGate: { validate: async () => gate().artifact },
+          authority,
+          clock,
+          effects,
+          state,
+          loadDeployments: async () => [desired],
+          loadInstallations: async () => [installation()],
+        });
+
+        await reconciler.start();
+        await reconciler.wake();
+        const failedEffect = effects.calls.findLast((effect) => effect.kind === target);
+        assert.ok(failedEffect);
+        const failed = await readOnlyInstance(state, failedEffect.instanceId);
+        assert.equal(failed?.value.lifecycle, "failed");
+        assert.equal(failed?.value.retryEffect, target);
+
+        clock.advance(60_000);
+        await reconciler.wake();
+        const callCountAfterSuccess = effects.calls.length;
+        await reconciler.wake();
+
+        assert.equal(
+          effects.calls.filter((effect) => effect.kind === target).length,
+          2,
+        );
+        assert.equal(effects.calls.length, callCountAfterSuccess);
+        assert.equal(
+          (await readOnlyInstance(state, failedEffect.instanceId))?.value.lifecycle,
+          target === "start" ? "ready" : "stopped",
+        );
+        assert.equal(reconciler.lastCommitAuthority?.epoch, authority.epoch);
         await reconciler.stop();
       });
     });

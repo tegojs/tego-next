@@ -437,6 +437,7 @@ class TestStateStore implements StateStore {
   revision = 0n;
   failNextObservedCommit = false;
   failNextFailureCommit = false;
+  failNextExecutionPreStateCommit = false;
   failNextAcknowledgement = false;
   readonly #clock: Clock;
   #open = false;
@@ -512,6 +513,18 @@ class TestStateStore implements StateStore {
       operations.some((operation) => operation.status === "failed")
     ) {
       this.failNextFailureCommit = false;
+      const error = new Error("state revision conflict") as Error & {
+        diagnostic?: { code: string };
+      };
+      error.diagnostic = { code: "STATE_REVISION_CONFLICT" };
+      throw error;
+    }
+    if (
+      this.failNextExecutionPreStateCommit &&
+      puts.some((put) => put.key.collection === "component-instances") &&
+      operations.some((operation) => operation.status === "executing")
+    ) {
+      this.failNextExecutionPreStateCommit = false;
       const error = new Error("state revision conflict") as Error & {
         diagnostic?: { code: string };
       };
@@ -1608,6 +1621,87 @@ test("journaled execution persists before effect, commits with expected revision
   );
   assert.equal(reconciler.lastCommitAuthority?.epoch, authority.epoch);
   assert.equal(reconciler.replanCount >= 1, true);
+  await reconciler.stop();
+});
+
+test("retry pre-state revision conflicts replan before external execution", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const instance: ComponentInstance = {
+    applicationId,
+    artifactDigest: digestOne,
+    componentId,
+    deploymentGeneration: parseGeneration("1"),
+    executor: "process",
+    instanceId: "app.org_dexample_decho.echo-service.g1",
+    lifecycle: "failed",
+    observedGeneration: parseGeneration("1"),
+    pluginId,
+    retryAt: clock.now().toISOString(),
+    retryEffect: "start",
+    revision: parseRevision("1"),
+  };
+  const effect = planReconcile(snapshot(deployment(), [instance])).steps[0]?.effect;
+  assert.ok(effect);
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    const { revision: _revision, ...persisted } = instance;
+    void _revision;
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: instance.instanceId,
+      },
+      persisted,
+      { expectedRevision: "absent" },
+    );
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: effect.messageId,
+      operationId: effect.operationId,
+      payload: effect,
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  state.failNextExecutionPreStateCommit = true;
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    authority: {
+      resource: "runtime:app",
+      epoch: parseFencingEpoch("8"),
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.equal(effects.calls.length, 0);
+  assert.equal(reconciler.replanCount >= 1, true);
+  assert.equal(
+    [...state.operations.values()].some((operation) => operation.status === "executing"),
+    false,
+  );
+
+  await reconciler.wake();
+
+  assert.deepEqual(
+    effects.calls.map((candidate) => candidate.kind),
+    ["start"],
+  );
+  const ready = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: instance.instanceId,
+  });
+  assert.equal((ready?.value as { readonly lifecycle?: string } | undefined)?.lifecycle, "ready");
   await reconciler.stop();
 });
 
