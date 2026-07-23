@@ -737,7 +737,7 @@ export class ProcessExecutor implements Executor {
 
   async #schedule(): Promise<void> {
     if (this.#fatalDiagnostic !== undefined) {
-      this.#failQueued(this.#fatalDiagnostic);
+      this.#settlePreChannelAdmissions(this.#fatalDiagnostic);
       return;
     }
     try {
@@ -769,7 +769,7 @@ export class ProcessExecutor implements Executor {
     }
     while (this.#active < this.#maxConcurrency) {
       if (this.#fatalDiagnostic !== undefined) {
-        this.#failQueued(this.#fatalDiagnostic);
+        this.#settlePreChannelAdmissions(this.#fatalDiagnostic);
         return;
       }
       const entry = this.#queue.shift();
@@ -1208,23 +1208,34 @@ export class ProcessExecutor implements Executor {
               error instanceof Error ? error.message : "Forced process termination failed",
               this.#clock.now(),
             );
-      this.#fatalDiagnostic ??= failure;
-      this.#accepting = false;
-      this.#quarantinedProcesses.add(process_);
-      this.#failQueued(this.#fatalDiagnostic);
+      return { diagnostic: this.#enterFatalQuarantine(failure, process_) };
+    }
+  }
+
+  #enterFatalQuarantine(
+    failure: RuntimeDiagnostic,
+    process_: HostedProcess,
+  ): RuntimeDiagnostic {
+    const transitioning = this.#fatalDiagnostic === undefined;
+    this.#fatalDiagnostic ??= failure;
+    const fatal = this.#fatalDiagnostic;
+    this.#accepting = false;
+    this.#quarantinedProcesses.add(process_);
+    this.#settlePreChannelAdmissions(fatal);
+    if (transitioning) {
       try {
-        this.#options.logger?.error(failure.message, failure);
+        this.#options.logger?.error(fatal.message, fatal);
       } catch {
         // Quarantine containment must not depend on a diagnostic sink.
       }
-      void process_
-        .wait()
-        .then(() => {
-          this.#quarantinedProcesses.delete(process_);
-        })
-        .catch(() => undefined);
-      return { diagnostic: failure };
     }
+    void process_
+      .wait()
+      .then(() => {
+        this.#quarantinedProcesses.delete(process_);
+      })
+      .catch(() => undefined);
+    return fatal;
   }
 
   #raceAdmission<T>(
@@ -1271,12 +1282,14 @@ export class ProcessExecutor implements Executor {
     };
   }
 
-  #failQueued(failure: RuntimeDiagnostic): void {
-    for (const entry of this.#queue.splice(0)) {
-      if (entry.state === "terminal") continue;
+  #settlePreChannelAdmissions(failure: RuntimeDiagnostic): void {
+    this.#queue.splice(0);
+    for (const entry of this.#attempts.values()) {
+      if (entry.state === "terminal" || entry.channel !== undefined) continue;
+      const queued = entry.state === "accepted";
       this.#settleFatal(entry, failure);
       if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
-      entry.completed.resolve();
+      if (queued) entry.completed.resolve();
     }
   }
 
