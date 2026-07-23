@@ -18,6 +18,7 @@ export interface CapabilityResolutionDeployment extends JsonObject {
 
 export interface CapabilityResolutionInput {
   readonly deployments: readonly CapabilityResolutionDeployment[];
+  readonly previousBindings?: readonly PreviousCapabilityBinding[];
 }
 
 export type CapabilityResolutionDiagnosticCode =
@@ -26,6 +27,7 @@ export type CapabilityResolutionDiagnosticCode =
   | "CAPABILITY_BINDING_UNKNOWN"
   | "CAPABILITY_DUPLICATE_DEPLOYMENT"
   | "CAPABILITY_DUPLICATE_PROVIDER"
+  | "CAPABILITY_DUPLICATE_PREVIOUS_BINDING"
   | "CAPABILITY_DUPLICATE_REQUIREMENT"
   | "CAPABILITY_EXPLICIT_PROVIDER_INCOMPATIBLE"
   | "CAPABILITY_EXPLICIT_PROVIDER_MISSING"
@@ -34,7 +36,8 @@ export type CapabilityResolutionDiagnosticCode =
   | "CAPABILITY_PROTOCOL_RANGE_INVALID"
   | "CAPABILITY_PROTOCOL_VERSION_INVALID"
   | "CAPABILITY_REQUIRED_CYCLE"
-  | "CAPABILITY_REQUIRED_MISSING";
+  | "CAPABILITY_REQUIRED_MISSING"
+  | "CAPABILITY_REQUIRED_UNAVAILABLE";
 
 export interface CapabilityResolutionDiagnostic extends JsonObject {
   readonly code: CapabilityResolutionDiagnosticCode;
@@ -62,9 +65,23 @@ export interface ResolvedCapabilityBinding extends JsonObject {
   readonly provider: ResolvedCapabilityProvider | null;
 }
 
+export interface PreviousCapabilityBinding extends JsonObject {
+  readonly consumer: PluginDeploymentIdentity;
+  readonly capability: CapabilityName;
+  readonly provider: PluginDeploymentIdentity;
+}
+
+export interface ProviderLossDecision extends JsonObject {
+  readonly action: "degrade" | "fail" | "suspend";
+  readonly capability: CapabilityName;
+  readonly consumer: PluginDeploymentIdentity;
+  readonly provider: PluginDeploymentIdentity;
+}
+
 export interface ResolutionResult extends JsonObject {
   readonly ok: boolean;
   readonly diagnostics: readonly CapabilityResolutionDiagnostic[];
+  readonly providerLossActions: readonly ProviderLossDecision[];
   readonly bindings?: readonly ResolvedCapabilityBinding[];
   readonly order?: readonly PluginDeploymentIdentity[];
 }
@@ -222,6 +239,7 @@ function normalizeRequirement(
 
 function inputDiagnostics(
   deployments: readonly CapabilityResolutionDeployment[],
+  previousBindings: readonly PreviousCapabilityBinding[],
 ): CapabilityResolutionDiagnostic[] {
   const diagnostics: CapabilityResolutionDiagnostic[] = [];
   const seenDeployments = new Set<string>();
@@ -304,7 +322,71 @@ function inputDiagnostics(
       }
     }
   }
+  const seenPrevious = new Set<string>();
+  for (const binding of previousBindings) {
+    const key = `${identityKey(binding.consumer)}/${binding.capability}`;
+    if (seenPrevious.has(key)) {
+      diagnostics.push(
+        diagnostic(
+          "CAPABILITY_DUPLICATE_PREVIOUS_BINDING",
+          "Capability resolution input contains a duplicate previous binding",
+          binding.consumer,
+          binding.capability,
+          [binding.provider],
+        ),
+      );
+    }
+    seenPrevious.add(key);
+  }
   return diagnostics.sort(compareDiagnostic);
+}
+
+function compatibleProvisions(
+  deployment: CapabilityResolutionDeployment,
+  requirement: NormalizedCapabilityRequirement,
+): readonly PluginCapabilityProvision[] {
+  return deployment.provides
+    .filter(
+      (provided) =>
+        provided.name === requirement.name &&
+        satisfiesVersionRange(provided.protocolVersion, requirement.protocolRange),
+    )
+    .sort((left, right) => compareText(left.protocolVersion, right.protocolVersion));
+}
+
+function providerLossDecisions(
+  previousBindings: readonly PreviousCapabilityBinding[],
+  byIdentity: ReadonlyMap<string, CapabilityResolutionDeployment>,
+): readonly ProviderLossDecision[] {
+  const actions: ProviderLossDecision[] = [];
+  for (const previous of previousBindings) {
+    const consumer = byIdentity.get(identityKey(previous.consumer));
+    const requirementSource = consumer?.requires.find(
+      (candidate) => candidate.name === previous.capability,
+    );
+    if (consumer === undefined || requirementSource === undefined) continue;
+    const requirement = normalizeRequirement(requirementSource);
+    const provider = byIdentity.get(identityKey(previous.provider));
+    const available =
+      provider !== undefined &&
+      provider.ready &&
+      compatibleProvisions(provider, requirement).length > 0;
+    if (!available) {
+      actions.push({
+        action: requirement.lossPolicy,
+        capability: requirement.name,
+        consumer: consumer.identity,
+        provider: previous.provider,
+      });
+    }
+  }
+  return actions.sort(
+    (left, right) =>
+      compareIdentity(left.consumer, right.consumer) ||
+      compareText(left.capability, right.capability) ||
+      compareIdentity(left.provider, right.provider) ||
+      compareText(left.action, right.action),
+  );
 }
 
 export function resolveCapabilities(input: CapabilityResolutionInput): ResolutionResult {
@@ -325,13 +407,17 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
           invalid.message,
         ),
       ],
+      providerLossActions: [],
     };
   }
   const deployments = [...stableInput.deployments].sort((left, right) =>
     compareIdentity(left.identity, right.identity),
   );
-  const diagnostics = inputDiagnostics(deployments);
-  if (diagnostics.length > 0) return { ok: false, diagnostics };
+  const previousBindings = [...(stableInput.previousBindings ?? [])];
+  const diagnostics = inputDiagnostics(deployments, previousBindings);
+  if (diagnostics.length > 0) {
+    return { ok: false, diagnostics, providerLossActions: [] };
+  }
 
   const byIdentity = new Map(
     deployments.map((deployment) => [identityKey(deployment.identity), deployment]),
@@ -341,6 +427,7 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
     deployments.map((deployment) => [identityKey(deployment.identity), new Set<string>()]),
   );
   const optionalEdges: Array<readonly [string, string]> = [];
+  const providerLossActions = providerLossDecisions(previousBindings, byIdentity);
 
   for (const consumer of deployments) {
     for (const sourceRequirement of [...consumer.requires].sort((left, right) =>
@@ -348,10 +435,10 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
     )) {
       const requirement = normalizeRequirement(sourceRequirement);
       const explicit = ownBinding(consumer.bindings, requirement.name);
-      let candidates: CapabilityResolutionDeployment[] = [];
+      let provider: CapabilityResolutionDeployment | undefined;
 
       if (explicit !== undefined) {
-        const provider = byIdentity.get(identityKey(explicit));
+        provider = byIdentity.get(identityKey(explicit));
         if (
           provider === undefined ||
           provider.identity.applicationId !== consumer.identity.applicationId
@@ -380,11 +467,7 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
           );
           continue;
         }
-        if (
-          !matching.some((provided) =>
-            satisfiesVersionRange(provided.protocolVersion, requirement.protocolRange),
-          )
-        ) {
+        if (compatibleProvisions(provider, requirement).length === 0) {
           diagnostics.push(
             diagnostic(
               "CAPABILITY_EXPLICIT_PROVIDER_INCOMPATIBLE",
@@ -406,68 +489,88 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
               [provider.identity],
             ),
           );
-          continue;
         }
-        candidates = [provider];
       } else {
-        candidates = deployments.filter(
+        const compatible = deployments.filter(
           (provider) =>
             provider.identity.applicationId === consumer.identity.applicationId &&
-            provider.ready &&
-            provider.provides.some(
-              (provided) =>
-                provided.name === requirement.name &&
-                satisfiesVersionRange(provided.protocolVersion, requirement.protocolRange),
-            ),
+            compatibleProvisions(provider, requirement).length > 0,
         );
-      }
-
-      if (candidates.length === 0) {
-        if (requirement.optional) {
-          bindings.push({ consumer: consumer.identity, requirement, provider: null });
-        } else {
+        if (compatible.length === 0) {
+          if (requirement.optional) {
+            bindings.push({ consumer: consumer.identity, requirement, provider: null });
+          } else {
+            diagnostics.push(
+              diagnostic(
+                "CAPABILITY_REQUIRED_MISSING",
+                "No compatible provider satisfies the required capability",
+                consumer.identity,
+                requirement.name,
+              ),
+            );
+          }
+          continue;
+        }
+        const ready = compatible.filter((candidate) => candidate.ready);
+        if (ready.length > 1) {
           diagnostics.push(
             diagnostic(
-              "CAPABILITY_REQUIRED_MISSING",
-              "No ready compatible provider satisfies the required capability",
+              "CAPABILITY_AMBIGUOUS",
+              "Multiple ready compatible providers satisfy the capability",
               consumer.identity,
               requirement.name,
+              ready.map((candidate) => candidate.identity),
             ),
           );
+          continue;
         }
-        continue;
-      }
-      if (candidates.length > 1) {
-        diagnostics.push(
-          diagnostic(
-            "CAPABILITY_AMBIGUOUS",
-            "Multiple ready compatible providers satisfy the capability",
-            consumer.identity,
-            requirement.name,
-            candidates.map((candidate) => candidate.identity),
-          ),
-        );
-        continue;
+        if (ready.length === 1) {
+          provider = ready[0];
+        } else if (compatible.length === 1) {
+          provider = compatible[0];
+          if (!requirement.optional) {
+            diagnostics.push(
+              diagnostic(
+                "CAPABILITY_REQUIRED_UNAVAILABLE",
+                "Compatible providers exist but none are ready",
+                consumer.identity,
+                requirement.name,
+                compatible.map((candidate) => candidate.identity),
+              ),
+            );
+          }
+        } else {
+          if (!requirement.optional) {
+            diagnostics.push(
+              diagnostic(
+                "CAPABILITY_REQUIRED_UNAVAILABLE",
+                "Compatible providers exist but none are ready",
+                consumer.identity,
+                requirement.name,
+                compatible.map((candidate) => candidate.identity),
+              ),
+            );
+          }
+          bindings.push({ consumer: consumer.identity, requirement, provider: null });
+          continue;
+        }
       }
 
-      const provider = candidates[0];
       if (provider === undefined) continue;
-      const provision = provider.provides
-        .filter(
-          (provided) =>
-            provided.name === requirement.name &&
-            satisfiesVersionRange(provided.protocolVersion, requirement.protocolRange),
-        )
-        .sort((left, right) => compareText(left.protocolVersion, right.protocolVersion))[0];
+      const provision = compatibleProvisions(provider, requirement)[0];
       if (provision === undefined) continue;
-      bindings.push({
-        consumer: consumer.identity,
-        requirement,
-        provider: { deployment: provider.identity, capability: provision },
-      });
+      if (provider.ready) {
+        bindings.push({
+          consumer: consumer.identity,
+          requirement,
+          provider: { deployment: provider.identity, capability: provision },
+        });
+      } else if (requirement.optional) {
+        bindings.push({ consumer: consumer.identity, requirement, provider: null });
+      }
       if (!requirement.optional) {
         requiredOutgoing.get(identityKey(provider.identity))?.add(identityKey(consumer.identity));
-      } else {
+      } else if (provider.ready) {
         optionalEdges.push([identityKey(provider.identity), identityKey(consumer.identity)]);
       }
     }
@@ -495,7 +598,9 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
   }
 
   diagnostics.sort(compareDiagnostic);
-  if (diagnostics.length > 0) return { ok: false, diagnostics };
+  if (diagnostics.length > 0) {
+    return { ok: false, diagnostics, providerLossActions };
+  }
 
   const reachable = (start: string, target: string): boolean => {
     const pending = [start];
@@ -525,6 +630,7 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
       diagnostics: [
         diagnostic("CAPABILITY_REQUIRED_CYCLE", "Required capability dependencies form a cycle"),
       ],
+      providerLossActions,
     };
   }
   return {
@@ -534,11 +640,6 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
     order: order
       .map((key) => byIdentity.get(key)?.identity)
       .filter((identity): identity is PluginDeploymentIdentity => identity !== undefined),
+    providerLossActions,
   };
-}
-
-export function providerLossAction(
-  policy: PluginCapabilityRequirement["lossPolicy"],
-): "degrade" | "fail" | "suspend" {
-  return policy ?? "fail";
 }

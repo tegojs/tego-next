@@ -18,13 +18,14 @@ export {
   type DeterministicArchiveEntry,
 } from "./artifacts/archive-codec.js";
 export {
-  providerLossAction,
   resolveCapabilities,
   type CapabilityResolutionDeployment,
   type CapabilityResolutionDiagnostic,
   type CapabilityResolutionDiagnosticCode,
   type CapabilityResolutionInput,
   type NormalizedCapabilityRequirement,
+  type PreviousCapabilityBinding,
+  type ProviderLossDecision,
   type ResolutionResult,
   type ResolvedCapabilityBinding,
   type ResolvedCapabilityProvider,
