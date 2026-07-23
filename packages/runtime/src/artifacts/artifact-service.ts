@@ -67,6 +67,12 @@ export interface ValidatedPluginArtifact {
 
 export type InstallArtifactRequest = ValidateArtifactRequest;
 
+interface InstalledVersionIndex extends JsonObject {
+  readonly digest: ArtifactDigest;
+  readonly pluginId: PluginManifest["pluginId"];
+  readonly version: string;
+}
+
 function artifactError(code: `ARTIFACT_${string}`, message: string, details?: JsonObject) {
   return new DiagnosticError(
     runtimeDiagnostic({
@@ -172,7 +178,6 @@ export class ArtifactService {
 
   async install(request: InstallArtifactRequest): Promise<PluginInstallation> {
     const validated = await this.validate(request);
-    const key = this.#installationKey(validated.manifest);
     const candidate: PluginInstallation = {
       pluginId: validated.manifest.pluginId,
       version: validated.manifest.version,
@@ -181,47 +186,93 @@ export class ArtifactService {
       installedAt: this.#clock.now().toISOString(),
       ...(validated.signature === undefined ? {} : { signature: validated.signature }),
     };
+    const installationKey = this.#installationKey(candidate);
+    const versionKey = this.#versionKey(candidate);
 
     try {
       return await this.#state.transact({}, async (transaction) => {
-        const stored = await transaction.get(key);
-        if (stored !== undefined) {
-          return this.#resolveExistingInstallation(
-            parsePluginInstallation(stored.value),
-            candidate,
-          );
+        const indexed = await transaction.get(versionKey);
+        if (indexed !== undefined) {
+          const existingDigest = this.#parseVersionIndex(indexed.value, candidate);
+          if (existingDigest !== candidate.digest) {
+            throw this.#installationConflict(existingDigest, candidate);
+          }
+          const stored = await transaction.get(installationKey);
+          if (stored === undefined) {
+            throw artifactError(
+              "ARTIFACT_INSTALLATION_CORRUPT",
+              "Plugin version index refers to a missing installation record",
+              { digest: candidate.digest, pluginId: candidate.pluginId, version: candidate.version },
+            );
+          }
+          return parsePluginInstallation(stored.value);
         }
-        await transaction.put(key, candidate, { expectedRevision: "absent" });
+        const versionIndex: InstalledVersionIndex = {
+          digest: candidate.digest,
+          pluginId: candidate.pluginId,
+          version: candidate.version,
+        };
+        await transaction.put(versionKey, versionIndex, { expectedRevision: "absent" });
+        await transaction.put(installationKey, candidate, { expectedRevision: "absent" });
         return candidate;
       });
     } catch (error) {
       if (diagnosticCode(error) !== "STATE_REVISION_CONFLICT") throw error;
-      const stored = await this.#state.read(key);
+      const indexed = await this.#state.read(versionKey);
+      if (indexed === undefined) throw error;
+      const existingDigest = this.#parseVersionIndex(indexed.value, candidate);
+      if (existingDigest !== candidate.digest) {
+        throw this.#installationConflict(existingDigest, candidate);
+      }
+      const stored = await this.#state.read(installationKey);
       if (stored === undefined) throw error;
-      return this.#resolveExistingInstallation(parsePluginInstallation(stored.value), candidate);
+      return parsePluginInstallation(stored.value);
     }
   }
 
-  #installationKey(manifest: PluginManifest): StateKey<PluginInstallation> {
+  #installationKey(installation: PluginInstallation): StateKey<PluginInstallation> {
     return {
       namespace: "tego",
       collection: "installations",
-      id: `${manifest.pluginId}@${manifest.version}`,
+      id: `${installation.pluginId}@${installation.version}@${installation.digest}`,
     };
   }
 
-  #resolveExistingInstallation(
-    existing: PluginInstallation,
+  #versionKey(installation: PluginInstallation): StateKey<InstalledVersionIndex> {
+    return {
+      namespace: "tego",
+      collection: "installation-versions",
+      id: `${installation.pluginId}@${installation.version}`,
+    };
+  }
+
+  #parseVersionIndex(
+    value: JsonObject,
     candidate: PluginInstallation,
-  ): PluginInstallation {
-    if (existing.digest === candidate.digest) {
-      return existing;
+  ): ArtifactDigest {
+    if (
+      value.pluginId !== candidate.pluginId ||
+      value.version !== candidate.version ||
+      typeof value.digest !== "string"
+    ) {
+      throw artifactError(
+        "ARTIFACT_INSTALLATION_CORRUPT",
+        "Plugin version index is invalid",
+        { pluginId: candidate.pluginId, version: candidate.version },
+      );
     }
-    throw artifactError(
+    return value.digest as ArtifactDigest;
+  }
+
+  #installationConflict(
+    existingDigest: ArtifactDigest,
+    candidate: PluginInstallation,
+  ): DiagnosticError {
+    return artifactError(
       "ARTIFACT_INSTALLATION_CONFLICT",
       "A different artifact digest is already installed for this plugin version",
       {
-        existingDigest: existing.digest,
+        existingDigest,
         pluginId: candidate.pluginId,
         requestedDigest: candidate.digest,
         version: candidate.version,
@@ -260,8 +311,7 @@ export class ArtifactService {
       signature = Buffer.from(envelope.signature, "base64");
       if (
         signature.byteLength !== 64 ||
-        signature.toString("base64").replaceAll("=", "") !==
-          envelope.signature.replaceAll("=", "")
+        signature.toString("base64").replaceAll("=", "") !== envelope.signature.replaceAll("=", "")
       ) {
         throw new Error("non-canonical Ed25519 signature");
       }
@@ -279,11 +329,9 @@ export class ArtifactService {
       verified = false;
     }
     if (!verified) {
-      throw artifactError(
-        "ARTIFACT_SIGNATURE_INVALID",
-        "Artifact signature verification failed",
-        { keyId: envelope.keyId },
-      );
+      throw artifactError("ARTIFACT_SIGNATURE_INVALID", "Artifact signature verification failed", {
+        keyId: envelope.keyId,
+      });
     }
     return { algorithm: "Ed25519", keyId: envelope.keyId, verified: true };
   }
