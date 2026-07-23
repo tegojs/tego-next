@@ -586,5 +586,5 @@ test("successful component output remains non-terminal until worker cleanup sett
   assert.equal((await handle.result).status, "succeeded");
   assert.equal(resultSettled, true);
   assert.equal(drainSettled, true);
-  assert.equal((await executor.probe()).availableCapacity, 1);
+  assert.equal((await executor.health()).active, 0);
 });

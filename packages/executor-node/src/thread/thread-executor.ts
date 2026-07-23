@@ -444,11 +444,7 @@ class ThreadChannel {
   }
 
   #send(value: Record<string, unknown>, transferList: readonly Transferable[] = []): void {
-    try {
-      validateThreadMessage(value, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
-    } catch (error) {
-      throw error;
-    }
+    validateThreadMessage(value, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
     this.#port.postMessage(value, [...transferList]);
   }
 
@@ -960,7 +956,7 @@ export class ThreadExecutor implements Executor {
       if (!["cancelled", "failed", "rejected", "succeeded", "timed-out"].includes(String(status))) {
         throw new Error("Component run status is invalid");
       }
-      this.#settle(entry, {
+      const executionResult: ExecutionResult = {
         taskId: entry.request.taskId,
         attemptId: entry.request.attemptId,
         status: status as ExecutionResult["status"],
@@ -968,8 +964,9 @@ export class ThreadExecutor implements Executor {
         executor: this.#executorMetadata(lease),
         startedAt,
         completedAt: this.#clock.now().toISOString(),
-      });
+      };
       await this.#shutdownWorker(channel, lease, component.artifactDigest, controlDeadline);
+      this.#settle(entry, executionResult);
     } catch (error) {
       if (entry.state !== "terminal") {
         const code =
