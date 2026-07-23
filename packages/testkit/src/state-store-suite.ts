@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   diagnosticCode,
+  compareOperationJournalCursors,
   parseFencingEpoch,
+  parseOperationId,
   parseRevision,
   type JsonObject,
   type JsonValue,
+  type OperationJournalCursor,
+  type PersistedOperationJournalEntry,
   type StateKey,
   type StateStore,
   type StateTransactionOptions,
@@ -42,6 +46,17 @@ async function withStore<T>(
 
 function expectDiagnostic(code: string): (error: unknown) => boolean {
   return (error) => diagnosticCode(error) === code;
+}
+
+async function recoverableOperations(
+  store: StateStore,
+  query: Parameters<StateStore["scanRecoverableOperations"]>[0] = {},
+): Promise<readonly PersistedOperationJournalEntry[]> {
+  const entries = [];
+  for await (const entry of store.scanRecoverableOperations(query)) {
+    entries.push(entry);
+  }
+  return entries;
 }
 
 export function stateStoreConformance(
@@ -434,6 +449,76 @@ export function stateStoreConformance(
 
       assert.deepEqual(await pending, { done: true, value: undefined });
       await assert.rejects(store.read(key("closed", "record")), expectDiagnostic("STATE_CLOSED"));
+    });
+
+    test("@spec:runtime-bootstrap/durable-restart-recovery/deterministic-operation-journal-query", async () => {
+      await withStore(factory, async (store) => {
+        await store.transact({}, async (transaction) => {
+          for (const [operationId, status] of [
+            ["operation-z", "planned"],
+            ["operation-a", "executing"],
+            ["operation-completed", "completed"],
+          ] as const) {
+            await transaction.appendOperation({
+              operationId: parseOperationId(operationId),
+              kind: "deploy",
+              status,
+              state: { operationId },
+              updatedAt: "2026-07-23T00:00:00.000Z",
+            });
+          }
+          return null;
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.appendOperation({
+            operationId: parseOperationId("operation-b"),
+            kind: "install",
+            status: "planned",
+            state: null,
+            updatedAt: "2026-07-23T00:00:01.000Z",
+          });
+          await transaction.appendOperation({
+            operationId: parseOperationId("operation-failed"),
+            kind: "install",
+            status: "failed",
+            state: null,
+            updatedAt: "2026-07-23T00:00:01.000Z",
+          });
+          return null;
+        });
+
+        const firstPage = await recoverableOperations(store, { limit: 2 });
+        assert.deepEqual(
+          firstPage.map(({ operationId, revision }) => [operationId, revision]),
+          [
+            ["operation-a", parseRevision("1")],
+            ["operation-z", parseRevision("1")],
+          ],
+        );
+        const cursor = {
+          revision: firstPage[1]?.revision ?? parseRevision("0"),
+          operationId: firstPage[1]?.operationId ?? parseOperationId("missing"),
+        };
+        const secondPage = await recoverableOperations(store, { after: cursor, limit: 2 });
+        assert.deepEqual(
+          secondPage.map(({ operationId, revision }) => [operationId, revision]),
+          [["operation-b", parseRevision("2")]],
+        );
+      });
+    });
+
+    test("operation journal cursor ordering is exact above Number.MAX_SAFE_INTEGER", () => {
+      const left = {
+        revision: parseRevision("9007199254740992"),
+        operationId: parseOperationId("operation-z"),
+      } satisfies OperationJournalCursor;
+      const right = {
+        revision: parseRevision("9007199254740993"),
+        operationId: parseOperationId("operation-a"),
+      } satisfies OperationJournalCursor;
+
+      assert.equal(compareOperationJournalCursors(left, right), -1);
+      assert.equal(compareOperationJournalCursors(right, left), 1);
     });
   });
 }

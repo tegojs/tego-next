@@ -12,6 +12,7 @@ import {
   parseRevision,
   type JsonObject,
   type OperationJournalEntry,
+  type PersistedOperationJournalEntry,
   type StateKey,
 } from "@tegojs/contracts";
 import { stateStoreConformance } from "@tegojs/testkit";
@@ -46,6 +47,16 @@ async function openStore(databasePath: string): Promise<SqliteStateStore> {
   const store = new SqliteStateStore({ databasePath });
   await store.open();
   return store;
+}
+
+async function recoverableOperations(
+  store: SqliteStateStore,
+): Promise<readonly PersistedOperationJournalEntry[]> {
+  const entries = [];
+  for await (const entry of store.scanRecoverableOperations({})) {
+    entries.push(entry);
+  }
+  return entries;
 }
 
 function runChild(script: string, arguments_: readonly string[]): Promise<void> {
@@ -102,7 +113,9 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/restart-after-an-interrup
   await first.close();
 
   const second = await openStore(databasePath);
-  assert.deepEqual(await second.readOperation(operation.operationId), operation);
+  assert.deepEqual(await recoverableOperations(second), [
+    { ...operation, revision: parseRevision("1") },
+  ]);
   await second.close();
 });
 
@@ -131,7 +144,7 @@ test("a committed transaction survives abrupt process termination without close"
 
   const reopened = await openStore(databasePath);
   assert.equal(
-    (await reopened.readOperation(parseOperationId("operation-crash")))?.status,
+    (await recoverableOperations(reopened))[0]?.status,
     "executing",
   );
   await reopened.close();
