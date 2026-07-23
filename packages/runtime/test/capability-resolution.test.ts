@@ -275,6 +275,22 @@ test("self cycles are rejected but optional cycles are not required cycles", () 
   );
 });
 
+test("optional providers start first when doing so does not create a cycle", () => {
+  const result = resolveCapabilities({
+    deployments: [
+      deployment("consumer", {
+        requires: [{ name: echoName, protocolRange: "^1.0.0", optional: true }],
+      }),
+      deployment("provider", {
+        provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+      }),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.order, [identity("provider"), identity("consumer")]);
+});
+
 test("duplicate deployments, providers, and requirements are rejected deterministically", () => {
   const cases = [
     {
