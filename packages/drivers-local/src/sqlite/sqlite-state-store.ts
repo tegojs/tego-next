@@ -109,6 +109,10 @@ function cloneKey<T extends JsonValue>(key: StateKey<T>): StateKey<T> {
   };
 }
 
+function serializedKey(key: StateKey<JsonValue>): string {
+  return JSON.stringify([key.namespace, key.collection, key.id]);
+}
+
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -247,7 +251,7 @@ class SqliteTransaction implements StateTransaction {
 
   async get<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertActive();
-    const mutation = this.#mutations.get(JSON.stringify([key.namespace, key.collection, key.id]));
+    const mutation = this.#mutations.get(serializedKey(key));
     if (mutation?.kind === "delete") {
       return undefined;
     }
@@ -269,10 +273,7 @@ class SqliteTransaction implements StateTransaction {
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
     const records = new Map(
-      this.#scanRecords(query).map((record) => [
-        JSON.stringify([record.key.namespace, record.key.collection, record.key.id]),
-        record,
-      ]),
+      this.#scanRecords(query).map((record) => [serializedKey(record.key), record]),
     );
     for (const [identifier, mutation] of this.#mutations) {
       if (
@@ -312,7 +313,7 @@ class SqliteTransaction implements StateTransaction {
   ): Promise<void> {
     this.#assertActive();
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
-    this.#mutations.set(JSON.stringify([key.namespace, key.collection, key.id]), {
+    this.#mutations.set(serializedKey(key), {
       kind: "put",
       key: storedKey,
       value: cloneJson(value, this.#clock),
@@ -323,7 +324,7 @@ class SqliteTransaction implements StateTransaction {
   async delete<T extends JsonValue>(key: StateKey<T>, options: StateWriteOptions): Promise<void> {
     this.#assertActive();
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
-    this.#mutations.set(JSON.stringify([key.namespace, key.collection, key.id]), {
+    this.#mutations.set(serializedKey(key), {
       kind: "delete",
       key: storedKey,
       expectedRevision: options.expectedRevision,
@@ -513,11 +514,12 @@ export class SqliteStateStore implements StateStore {
   }
 
   async #openDatabase(): Promise<void> {
-    if (this.#databasePath !== ":memory:") {
-      await mkdir(dirname(this.#databasePath), { recursive: true });
-    }
-    const database = new DatabaseSync(this.#databasePath);
+    let database: DatabaseSync | undefined;
     try {
+      if (this.#databasePath !== ":memory:") {
+        await mkdir(dirname(this.#databasePath), { recursive: true });
+      }
+      database = new DatabaseSync(this.#databasePath);
       applySqliteMigrations(database, this.#clock.now());
       if (this.#lifecycle !== "opening") {
         throw this.#closedError();
@@ -525,7 +527,7 @@ export class SqliteStateStore implements StateStore {
       this.#databaseConnection = database;
       this.#lifecycle = "open";
     } catch (error) {
-      database.close();
+      database?.close();
       if (this.#lifecycle === "opening") {
         this.#lifecycle = "created";
       }
@@ -690,9 +692,18 @@ export class SqliteStateStore implements StateStore {
     identity: IdempotencyIdentity | undefined,
     work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
+    const snapshot = this.#snapshotRecords();
     const transaction = new SqliteTransaction(
-      (key) => this.#readRecord(key),
-      (query) => this.#scanRecords(query),
+      (key) => snapshot.get(serializedKey(key)),
+      (query) =>
+        [...snapshot.values()]
+          .filter(
+            (record) =>
+              record.key.namespace === query.namespace &&
+              record.key.collection === query.collection &&
+              (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
+          )
+          .sort((left, right) => compareCodeUnits(left.key.id, right.key.id)),
       this.#clock,
     );
     let result: T;
@@ -789,7 +800,9 @@ export class SqliteStateStore implements StateStore {
         staged.outbox.length > 0 ||
         advancesFence;
       if (mutates) {
-        const revisionInsert = database.prepare("INSERT INTO revisions DEFAULT VALUES").run();
+        const revisionInsert = database
+          .prepare("INSERT INTO revisions DEFAULT VALUES", { readBigInts: true })
+          .run();
         const revision = parseRevision(revisionInsert.lastInsertRowid.toString());
         const revisionInteger = BigInt(revision);
 
@@ -948,6 +961,16 @@ export class SqliteStateStore implements StateStore {
       .map((row) => this.#decodeRecord(row))
       .filter((record) => query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix))
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
+  }
+
+  #snapshotRecords(): ReadonlyMap<string, StoredRecord> {
+    const records = this.#database()
+      .prepare("SELECT namespace, collection_name, record_id, value_json, revision FROM records", {
+        readBigInts: true,
+      })
+      .all()
+      .map((row) => this.#decodeRecord(row));
+    return new Map(records.map((record) => [serializedKey(record.key), record]));
   }
 
   #decodeRecord(row: Readonly<Record<string, SQLOutputValue>>): StoredRecord {
