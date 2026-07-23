@@ -942,9 +942,10 @@ test("canonical lifecycle identities cannot be retargeted to another persisted i
     });
 
     await reconciler.start();
+    await reconciler.wake();
 
     assert.deepEqual(effects.calls, [], effect.kind);
-    assert.equal(reconciler.diagnostics()[0]?.code, "PROTOCOL_MESSAGE_INVALID");
+    assert.equal(reconciler.diagnostics()[0]?.code, "DEPLOYMENT_INSTANCE_INCONSISTENT");
     await reconciler.stop();
   }
 });
@@ -1445,12 +1446,30 @@ test("deployment observations distinguish unavailable, inconsistent, and degrade
     [
       "inconsistent",
       [
-        { instanceId: "duplicate-a", lifecycle: "ready" },
-        { instanceId: "duplicate-b", lifecycle: "ready" },
+        {
+          key: "duplicate-a",
+          instanceId: "app.org_dexample_decho.echo-service.g1",
+          lifecycle: "ready",
+        },
+        {
+          key: "duplicate-b",
+          instanceId: "app.org_dexample_decho.echo-service.g1",
+          lifecycle: "ready",
+        },
       ],
       [installation()],
     ],
-    ["degraded", [{ instanceId: "degraded", lifecycle: "degraded" }], [installation()]],
+    [
+      "degraded",
+      [
+        {
+          key: "app.org_dexample_decho.echo-service.g1",
+          instanceId: "app.org_dexample_decho.echo-service.g1",
+          lifecycle: "degraded",
+        },
+      ],
+      [installation()],
+    ],
   ] as const) {
     const clock = new ManualClock();
     const effects = new RecordingEffects();
@@ -1461,7 +1480,7 @@ test("deployment observations distinguish unavailable, inconsistent, and degrade
           {
             namespace: "tego",
             collection: "component-instances",
-            id: value.instanceId,
+            id: value.key,
           },
           {
             applicationId,

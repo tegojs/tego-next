@@ -49,6 +49,7 @@ import {
   type ReconcilePlanStep,
 } from "./plan.js";
 import type { PlacementWorker } from "./placement.js";
+import { planPlacement } from "./placement.js";
 import { deterministicRetryDelay } from "./retry.js";
 
 const namespace = "tego";
@@ -315,6 +316,44 @@ export class Reconciler {
           ? 1
           : 0,
     )) {
+      const deploymentInstances = instances.filter(
+        (instance) =>
+          instance.applicationId === deployment.applicationId &&
+          instance.pluginId === deployment.pluginId,
+      );
+      const invalidInstances = deploymentInstances.filter(
+        (instance) =>
+          reconcileEffectIdentities(
+            {
+              applicationId: instance.applicationId,
+              generation: instance.deploymentGeneration,
+              pluginId: instance.pluginId,
+            },
+            instance.componentId,
+            "prepare",
+          ).instanceId !== instance.instanceId,
+      );
+      if (invalidInstances.length > 0) {
+        await this.#recordBlocked(
+          deployment,
+          invalidInstances.map((instance) =>
+            runtimeDiagnostic({
+              code: "DEPLOYMENT_INSTANCE_INCONSISTENT",
+              message: "Persisted component instance identity is not canonical",
+              source: { kind: "deployment", id: deploymentKey(deployment) },
+              details: {
+                applicationId: instance.applicationId,
+                componentId: instance.componentId,
+                deploymentGeneration: instance.deploymentGeneration,
+                instanceId: instance.instanceId,
+                pluginId: instance.pluginId,
+              },
+              observedAt: this.#options.clock.now().toISOString(),
+            }),
+          ),
+        );
+        continue;
+      }
       const gate = await this.#gateDeployment(deployment, deployments, installations, instances);
       if (gate instanceof DiagnosticError) {
         await this.#recordBlocked(deployment, [gate.diagnostic]);
@@ -323,11 +362,7 @@ export class Reconciler {
       const plan = planReconcile({
         deployment,
         gate,
-        instances: instances.filter(
-          (instance) =>
-            instance.applicationId === deployment.applicationId &&
-            instance.pluginId === deployment.pluginId,
-        ),
+        instances: deploymentInstances,
         now: this.#options.clock.now().toISOString(),
         supportedExecutors: this.#options.effects.supportedExecutors,
         ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
@@ -814,11 +849,15 @@ export class Reconciler {
       (candidate) =>
         candidate.applicationId === effect.applicationId && candidate.pluginId === effect.pluginId,
     );
+    const [installations, instances] = await Promise.all([
+      this.#loadInstallations(),
+      this.#loadInstances(),
+    ]);
+    let currentGate: ArtifactDeploymentGate | DiagnosticError | undefined;
+    if (desired !== undefined) {
+      currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
+    }
     if (effect.kind === "prepare" || effect.kind === "start") {
-      const [installations, instances] = await Promise.all([
-        this.#loadInstallations(),
-        this.#loadInstances(),
-      ]);
       if (
         desired === undefined ||
         desired.state !== "active" ||
@@ -829,19 +868,23 @@ export class Reconciler {
         await this.#acknowledge(claim, "completed");
         return;
       }
-      const gate = await this.#gateDeployment(desired, deployments, installations, instances);
+      if (currentGate === undefined) {
+        this.#replanCount += 1;
+        await this.#acknowledge(claim, "completed");
+        return;
+      }
       if (
-        gate instanceof DiagnosticError ||
-        !gate.capabilityResolution.ok ||
-        !gate.permissionDecision.allowed
+        currentGate instanceof DiagnosticError ||
+        !currentGate.capabilityResolution.ok ||
+        !currentGate.permissionDecision.allowed
       ) {
         this.#replanCount += 1;
         const diagnostics =
-          gate instanceof DiagnosticError
-            ? [gate.diagnostic]
+          currentGate instanceof DiagnosticError
+            ? [currentGate.diagnostic]
             : [
-                ...gate.capabilityResolution.diagnostics,
-                ...gate.permissionDecision.diagnostics,
+                ...currentGate.capabilityResolution.diagnostics,
+                ...currentGate.permissionDecision.diagnostics,
               ].map((diagnostic) =>
                 runtimeDiagnostic({
                   code: diagnostic.code as `CAPABILITY_${string}` | `PERMISSION_${string}`,
@@ -861,6 +904,58 @@ export class Reconciler {
       desired.generation === effect.deploymentGeneration &&
       desired.artifactDigest === effect.artifactDigest
     ) {
+      this.#replanCount += 1;
+      await this.#acknowledge(claim, "completed");
+      return;
+    }
+    if (currentGate !== undefined && !(currentGate instanceof DiagnosticError)) {
+      const component = currentGate.artifact.manifest.components.find(
+        (candidate) => candidate.componentId === effect.componentId,
+      );
+      const installationAvailable =
+        desired !== undefined &&
+        installations.some(
+          (candidate) =>
+            candidate.pluginId === desired.pluginId &&
+            candidate.version === desired.version &&
+            candidate.digest === desired.artifactDigest,
+        );
+      if (
+        component === undefined &&
+        (effect.kind === "prepare" || effect.kind === "start" || installationAvailable)
+      ) {
+        this.#replanCount += 1;
+        await this.#acknowledge(claim, "completed");
+        return;
+      }
+      if (component !== undefined) {
+        const placement = planPlacement({
+          component,
+          grantedPermissions: currentGate.permissionDecision.granted ?? [],
+          supportedExecutors: this.#options.effects.supportedExecutors,
+          ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+        });
+        if (
+          !placement.ok ||
+          placement.placement === undefined ||
+          placement.placement.executor !== effect.executor ||
+          placement.placement.workerId !== effect.workerId
+        ) {
+          this.#replanCount += 1;
+          await this.#acknowledge(claim, "completed");
+          return;
+        }
+      }
+    }
+    const expectedLifecycle: PersistedComponentInstance["lifecycle"] =
+      effect.kind === "prepare"
+        ? "created"
+        : effect.kind === "start"
+          ? "starting"
+          : effect.kind === "drain"
+            ? "draining"
+            : "stopping";
+    if (instance.lifecycle !== expectedLifecycle) {
       this.#replanCount += 1;
       await this.#acknowledge(claim, "completed");
       return;
