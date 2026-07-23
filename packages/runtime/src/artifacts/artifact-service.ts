@@ -128,9 +128,10 @@ function parseRangeVersion(value: string): RangeVersion | undefined {
     numbers.push(number);
   }
   return {
-    precision: (wildcardIndex === undefined
-      ? parts.length
-      : Math.max(1, wildcardIndex)) as 1 | 2 | 3,
+    precision: (wildcardIndex === undefined ? parts.length : Math.max(1, wildcardIndex)) as
+      | 1
+      | 2
+      | 3,
     version: {
       major: numbers[0] ?? 0,
       minor: numbers[1] ?? 0,
@@ -198,16 +199,31 @@ function satisfiesComparator(version: Version, comparator: string): boolean {
   }
 }
 
+function isSupportedComparator(comparator: string): boolean {
+  if (comparator === "*") return true;
+  if (comparator.startsWith("^") || comparator.startsWith("~")) {
+    const target = parseRangeVersion(comparator.slice(1));
+    return target !== undefined && !target.wildcard;
+  }
+  const match = /^(>=|<=|>|<|=)?(.+)$/u.exec(comparator);
+  if (match === null) return false;
+  const target = parseRangeVersion(match[2] ?? "");
+  return target !== undefined && (match[1] === undefined || !target.wildcard);
+}
+
 function satisfiesRange(value: string, range: string): boolean {
   const version = parseVersion(value);
   if (version === undefined) return false;
   const alternatives = range.split("||").map((part) => part.trim());
   if (alternatives.some((alternative) => alternative.length === 0)) return false;
-  return alternatives.some((alternative) =>
-    alternative
-      .split(/\s+/u)
-      .filter((part) => part.length > 0)
-      .every((comparator) => satisfiesComparator(version, comparator)),
+  const comparatorSets = alternatives.map((alternative) => alternative.split(/\s+/u));
+  if (
+    comparatorSets.some((comparators) => comparators.some((value) => !isSupportedComparator(value)))
+  ) {
+    return false;
+  }
+  return comparatorSets.some((comparators) =>
+    comparators.every((comparator) => satisfiesComparator(version, comparator)),
   );
 }
 

@@ -1,4 +1,5 @@
 import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
+import { builtinModules } from "node:module";
 
 interface Token {
   readonly kind: "identifier" | "punctuation" | "string";
@@ -9,6 +10,12 @@ interface Token {
 export interface ModuleAudit {
   readonly runtimeImports: readonly string[];
 }
+
+const NODE_BUILTINS = new Set(
+  builtinModules.map((specifier) =>
+    specifier.startsWith("node:") ? specifier : `node:${specifier}`,
+  ),
+);
 
 function importError(message: string, specifier?: string): DiagnosticError {
   return new DiagnosticError(
@@ -115,7 +122,7 @@ function validateSpecifier(token: Token | undefined, runtimeImports: Set<string>
   }
   const specifier = token.value;
   if (specifier.startsWith("./") || specifier.startsWith("../")) return;
-  if (specifier.startsWith("node:")) {
+  if (NODE_BUILTINS.has(specifier)) {
     runtimeImports.add(specifier);
     return;
   }
