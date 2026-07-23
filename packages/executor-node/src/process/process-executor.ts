@@ -1212,10 +1212,7 @@ export class ProcessExecutor implements Executor {
     }
   }
 
-  #enterFatalQuarantine(
-    failure: RuntimeDiagnostic,
-    process_: HostedProcess,
-  ): RuntimeDiagnostic {
+  #enterFatalQuarantine(failure: RuntimeDiagnostic, process_: HostedProcess): RuntimeDiagnostic {
     const transitioning = this.#fatalDiagnostic === undefined;
     this.#fatalDiagnostic ??= failure;
     const fatal = this.#fatalDiagnostic;
