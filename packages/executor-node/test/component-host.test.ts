@@ -21,6 +21,7 @@ import {
   parseComponentHostCommand,
   type ComponentHostCommand,
   type ComponentHostOptions,
+  type ComponentHostResult,
   type PrepareComponentHostCommand,
 } from "../src/index.js";
 
@@ -177,6 +178,18 @@ function deferred(): {
     resolve = settle;
   });
   return { promise, resolve };
+}
+
+async function within<T>(promise: Promise<T>, milliseconds = 100): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("operation did not return promptly")), milliseconds);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 test("host command protocol is versioned, strict, JSON-safe, and bounded", () => {
@@ -509,7 +522,7 @@ test("component lifecycle order and command idempotency are enforced without dup
   );
 });
 
-test("concurrent lifecycle transitions serialize and invoke each hook once", async (t) => {
+test("concurrent identical transitions share one hook without exceeding hard command capacity", async (t) => {
   const fixture = await artifactFixture(
     t,
     `
@@ -546,15 +559,28 @@ test("concurrent lifecycle transitions serialize and invoke each hook once", asy
   await new Promise((resolve) => setImmediate(resolve));
 
   const pendingRetention = (
-    host as unknown as { retention(): { readonly commands: number; readonly runs: number } }
+    host as unknown as {
+      retention(): {
+        readonly commands: number;
+        readonly controlCommands: number;
+        readonly runs: number;
+      };
+    }
   ).retention();
-  assert.ok(pendingRetention.commands > 256);
+  assert.ok(pendingRetention.commands <= 256);
+  assert.ok(pendingRetention.controlCommands <= 32);
   const duplicate = host.handle(commands[0]);
   assert.equal(starts, 1);
 
   gate.resolve();
   const [results, duplicateResult] = await Promise.all([Promise.all(pending), duplicate]);
-  assert.ok(results.every((result) => result.ok));
+  assert.equal(results.filter((result) => result.ok).length, 256);
+  assert.equal(
+    results.filter(
+      (result) => result.diagnostics[0]?.code === "EXECUTOR_COMPONENT_HOST_CAPACITY_EXCEEDED",
+    ).length,
+    14,
+  );
   assert.deepEqual(duplicateResult, results[0]);
   assert.equal(starts, 1);
   assert.ok(
@@ -564,26 +590,25 @@ test("concurrent lifecycle transitions serialize and invoke each hook once", asy
   );
 });
 
-test("failed drain and stop transitions preserve state and remain retryable", async (t) => {
+test("failed drain preserves state and remains retryable", async (t) => {
   const fixture = await artifactFixture(
     t,
     `
       const { defineComponent } = await import("@tegojs/plugin-sdk");
       export default defineComponent({
         kind: "task",
-        drain: async (context) => context.events.emit("drain", null),
-        stop: async (context) => context.events.emit("stop", null)
+        drain: async (context) => context.events.emit("drain", null)
       });
     `,
   );
-  const calls = { drain: 0, stop: 0 };
+  let calls = 0;
   const host = new ComponentHost(
     allowedOptions(fixture, {
       events: {
         emit: async (type) => {
-          if (type !== "drain" && type !== "stop") return;
-          calls[type] += 1;
-          if (calls[type] === 1) throw new Error(`${type} failed`);
+          if (type !== "drain") return;
+          calls += 1;
+          if (calls === 1) throw new Error("drain failed");
         },
       },
     }),
@@ -606,15 +631,189 @@ test("failed drain and stop transitions preserve state and remain retryable", as
   );
   assert.equal(secondDrain.ok, true);
   assert.equal(secondDrain.state, "draining");
-  assert.equal(calls.drain, 2);
+  assert.equal(calls, 2);
+});
 
-  const firstStop = await host.handle(command("stop", "stop-failed", { artifactDigest: digest }));
-  assert.equal(firstStop.ok, false);
-  assert.equal(firstStop.state, "draining");
-  const secondStop = await host.handle(command("stop", "stop-retry", { artifactDigest: digest }));
-  assert.equal(secondStop.ok, true);
-  assert.equal(secondStop.state, "stopped");
-  assert.equal(calls.stop, 2);
+test("transition hook reentrancy returns promptly without waiting on the active hook", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        start: async (context) => context.events.emit("start", null),
+        drain: async (context) => context.events.emit("drain", null),
+        stop: async (context) => context.events.emit("stop", null)
+      });
+    `,
+  );
+  const reentrant: ComponentHostResult[] = [];
+  let host!: ComponentHost;
+  host = new ComponentHost(
+    allowedOptions(fixture, {
+      events: {
+        emit: async (type) => {
+          const reentrantType = type === "start" ? "drain" : type === "drain" ? "stop" : "start";
+          reentrant.push(
+            await within(
+              host.handle(
+                command(reentrantType, `reentrant-${type}`, { artifactDigest: digest }),
+              ),
+            ),
+          );
+        },
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "import-reentrant", { artifactDigest: digest }));
+
+  assert.equal(
+    (await within(host.handle(command("start", "start-reentrant", { artifactDigest: digest })))).ok,
+    true,
+  );
+  assert.equal(
+    (await within(host.handle(command("drain", "drain-reentrant", { artifactDigest: digest })))).ok,
+    true,
+  );
+  assert.equal(
+    (await within(host.handle(command("stop", "stop-reentrant", { artifactDigest: digest })))).ok,
+    true,
+  );
+  assert.equal(reentrant.length, 3);
+  assert.ok(reentrant.every((result) => !result.ok));
+  assert.ok(
+    reentrant.every(
+      (result) => result.diagnostics[0]?.code === "LIFECYCLE_TRANSITION_ILLEGAL_REENTRANCY",
+    ),
+  );
+});
+
+test("drain closes run intake synchronously before its hook settles", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => "ran",
+        drain: async (context) => context.events.emit("drain.blocked", null)
+      });
+    `,
+  );
+  const gate = deferred();
+  const host = new ComponentHost(
+    allowedOptions(fixture, {
+      events: { emit: async () => gate.promise },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "import-intake", { artifactDigest: digest }));
+  await host.handle(command("start", "start-intake", { artifactDigest: digest }));
+
+  const draining = host.handle(command("drain", "drain-intake", { artifactDigest: digest }));
+  const run = await host.handle(
+    command("run", "run-after-drain-submission", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("task-after-drain"),
+        attemptId: parseAttemptId("attempt-after-drain"),
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        input: null,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+  );
+  assert.equal(run.ok, false);
+  assert.equal(run.diagnostics[0]?.code, "LIFECYCLE_TRANSITION_IN_PROGRESS");
+  gate.resolve();
+  assert.equal((await draining).ok, true);
+});
+
+test("non-cooperative runs respect hard capacity while cancel and drain remain available", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => new Promise(() => {})
+      });
+    `,
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "import-hard-capacity", { artifactDigest: digest }));
+  await host.handle(command("start", "start-hard-capacity", { artifactDigest: digest }));
+
+  const settled: ComponentHostResult[] = [];
+  const pending = Array.from({ length: 270 }, (_, index) => {
+    const result = host.handle(
+      command("run", `run-hard-capacity-${index}`, {
+        artifactDigest: digest,
+        execution: {
+          taskId: parseTaskId(`task-hard-capacity-${index}`),
+          attemptId: parseAttemptId(`attempt-hard-capacity-${index}`),
+          applicationId: parseApplicationId("app-01"),
+          pluginId: parsePluginId("org.example.component"),
+          componentId: parseComponentId("component"),
+          input: index,
+          deadline: futureDeadline,
+          orphanPolicy: "cancel",
+        },
+      }),
+    );
+    void result.then((value) => settled.push(value));
+    return result;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const retention = (
+    host as unknown as {
+      retention(): {
+        readonly commands: number;
+        readonly controlCommands: number;
+        readonly runs: number;
+      };
+    }
+  ).retention();
+  assert.ok(retention.commands <= 256);
+  assert.ok(retention.controlCommands <= 32);
+  assert.ok(retention.runs <= 256);
+  assert.equal(
+    settled.filter(
+      (result) => result.diagnostics[0]?.code === "EXECUTOR_COMPONENT_HOST_CAPACITY_EXCEEDED",
+    ).length,
+    14,
+  );
+
+  const cancellation = host.handle(
+    command("cancel", "cancel-at-capacity", {
+      taskId: parseTaskId("task-hard-capacity-0"),
+      attemptId: parseAttemptId("attempt-hard-capacity-0"),
+      reason: "capacity-test",
+    }),
+  );
+  const duringControl = (
+    host as unknown as {
+      retention(): {
+        readonly commands: number;
+        readonly controlCommands: number;
+        readonly runs: number;
+      };
+    }
+  ).retention();
+  assert.ok(duringControl.commands <= 256);
+  assert.ok(duringControl.controlCommands <= 32);
+  assert.equal((await cancellation).ok, true);
+  assert.equal((await pending[0]!).ok, true);
+  assert.equal(
+    (await host.handle(command("drain", "drain-at-capacity", { artifactDigest: digest }))).ok,
+    true,
+  );
 });
 
 test("duplicate prepare compares the complete canonical deployment fingerprint", async (t) => {
