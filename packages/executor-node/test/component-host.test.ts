@@ -522,7 +522,7 @@ test("component lifecycle order and command idempotency are enforced without dup
   );
 });
 
-test("concurrent identical transitions share one hook without exceeding hard command capacity", async (t) => {
+test("only an identical command id shares an active transition", async (t) => {
   const fixture = await artifactFixture(
     t,
     `
@@ -552,42 +552,32 @@ test("concurrent identical transitions share one hook without exceeding hard com
     }),
   );
 
-  const commands = Array.from({ length: 270 }, (_, index) =>
-    command("start", `start-concurrent-${index}`, { artifactDigest: digest }),
-  );
-  const pending = commands.map((value) => host.handle(value));
+  const firstCommand = command("start", "start-concurrent-first", {
+    artifactDigest: digest,
+  });
+  const first = host.handle(firstCommand);
   await new Promise((resolve) => setImmediate(resolve));
 
-  const pendingRetention = (
-    host as unknown as {
-      retention(): {
-        readonly commands: number;
-        readonly controlCommands: number;
-        readonly runs: number;
-      };
-    }
-  ).retention();
-  assert.ok(pendingRetention.commands <= 256);
-  assert.ok(pendingRetention.controlCommands <= 32);
-  const duplicate = host.handle(commands[0]);
+  const duplicate = host.handle(firstCommand);
   assert.equal(starts, 1);
 
-  gate.resolve();
-  const [results, duplicateResult] = await Promise.all([Promise.all(pending), duplicate]);
-  assert.equal(results.filter((result) => result.ok).length, 256);
-  assert.equal(
-    results.filter(
-      (result) => result.diagnostics[0]?.code === "EXECUTOR_COMPONENT_HOST_CAPACITY_EXCEEDED",
-    ).length,
-    14,
-  );
-  assert.deepEqual(duplicateResult, results[0]);
+  let concurrent: ComponentHostResult;
+  try {
+    concurrent = await within(
+      host.handle(
+        command("start", "start-concurrent-second", {
+          artifactDigest: digest,
+        }),
+      ),
+    );
+  } finally {
+    gate.resolve();
+  }
+  const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
+  assert.equal(concurrent.ok, false);
+  assert.equal(concurrent.diagnostics[0]?.code, "LIFECYCLE_TRANSITION_IN_PROGRESS");
+  assert.deepEqual(duplicateResult, firstResult);
   assert.equal(starts, 1);
-  assert.ok(
-    (
-      host as unknown as { retention(): { readonly commands: number; readonly runs: number } }
-    ).retention().commands <= 256,
-  );
 });
 
 test("failed drain preserves state and remains retryable", async (t) => {
@@ -752,10 +742,87 @@ test("transition hook reentrancy returns promptly without waiting on the active 
   assert.equal(reentrant.length, 3);
   assert.ok(reentrant.every((result) => !result.ok));
   assert.ok(
-    reentrant.every(
-      (result) => result.diagnostics[0]?.code === "LIFECYCLE_TRANSITION_ILLEGAL_REENTRANCY",
+    reentrant.every((result) => result.diagnostics[0]?.code === "LIFECYCLE_TRANSITION_IN_PROGRESS"),
+  );
+});
+
+test("a plugin-created AsyncResource cannot self-await an active transition", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      let resource;
+      export default defineComponent({
+        kind: "task",
+        run: async () => {
+          const { AsyncResource } = await import("node:async_hooks");
+          resource = new AsyncResource("plugin-precreated");
+          return "prepared";
+        },
+        drain: async (context) => {
+          if (resource === undefined) throw new Error("run must create the resource");
+          try {
+            await resource.runInAsyncScope(() => context.events.emit("drain.reenter", null));
+          } finally {
+            resource.emitDestroy();
+          }
+        }
+      });
+    `,
+  );
+  let host!: ComponentHost;
+  let reentrant: ComponentHostResult | undefined;
+  host = new ComponentHost(
+    allowedOptions(fixture, {
+      events: {
+        emit: async (type) => {
+          if (type !== "drain.reenter") return;
+          reentrant = await within(
+            host.handle(
+              command("drain", "drain-async-resource-inner", {
+                artifactDigest: digest,
+              }),
+            ),
+          );
+        },
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(
+    command("import", "import-async-resource", {
+      artifactDigest: digest,
+    }),
+  );
+  await host.handle(command("start", "start-async-resource", { artifactDigest: digest }));
+  const run = await host.handle(
+    command("run", "run-create-async-resource", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("task-create-async-resource"),
+        attemptId: parseAttemptId("attempt-create-async-resource"),
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        input: null,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+  );
+  assert.equal(run.ok, true);
+
+  const outer = await within(
+    host.handle(
+      command("drain", "drain-async-resource-outer", {
+        artifactDigest: digest,
+      }),
     ),
   );
+  assert.equal(outer.ok, true);
+  assert.equal(outer.state, "draining");
+  assert.equal(reentrant?.ok, false);
+  assert.equal(reentrant?.diagnostics[0]?.code, "LIFECYCLE_TRANSITION_IN_PROGRESS");
 });
 
 test("drain closes run intake synchronously before its hook settles", async (t) => {
