@@ -248,3 +248,57 @@ Fresh re-review verification with Node.js `26.5.0`:
 - `git diff --check`: PASS;
 - SQLite restart smoke: PASS for pack, content-addressed persistence, install,
   close, reopen, and immutable installation recovery.
+
+## Final Review Correctness Remediation
+
+The final review identified four Important blockers, resolved in three bounded
+TDD cycles:
+
+| Final-review cycle | RED | GREEN |
+| --- | --- | --- |
+| Module lexical state, grammar position, and linear work | `c7854aa` | `9cf9d58` |
+| Empty artifact stream chunks | `955e4e2` | `f8db4a1` |
+| FileHandle close-error precedence | `58e8abc` | `69f60f1` |
+
+The module scanner now maintains explicit `expressionAllowed` state and a
+parenthesis-context stack. Postfix `++` and `--` therefore leave `/` in division
+mode, while the closing parenthesis of `if`, `for`, `while`, `switch`, `with`,
+and `catch` permits a regular-expression statement body. Dynamic imports and
+CommonJS calls can no longer hide between division slashes.
+
+Static import and export declarations are parsed once from their grammar
+position. Named-binding braces are matched before accepting `from`, so
+`import { from as value } from "./local.js"` is valid and a contextual binding
+cannot be mistaken for the module-specifier marker. The audit advances past
+each processed declaration and shares a deterministic work budget between
+lexing and token inspection. A proportional budget passes 500 semicolonless
+imports followed by 500 semicolonless exports; an intentionally insufficient
+budget fails with `ARTIFACT_MODULE_AUDIT_LIMIT`.
+
+`BoundedStreamReader` now rejects the first empty byte chunk with a structured
+`ARTIFACT_ARCHIVE_MALFORMED` diagnostic. It does not poll the source again and
+still invokes the iterator's `return()`, eliminating the zero-progress stream
+livelock.
+
+`FilesystemArtifactStore` accepts an injectable read-handle opener for
+deterministic failure testing. Verification and streaming paths both preserve
+their primary read error when handle closure also fails. A close error is still
+reported when reading and verification otherwise complete successfully. Active
+handle tracking and store-close best-effort cleanup remain unchanged.
+
+Fresh final-review verification with Node.js `26.5.0`:
+
+- scanner regression selection: 27/27 PASS;
+- empty-chunk and iterator-cleanup selection: 4/4 PASS;
+- injected handle-close and active-close selection: 6/6 PASS;
+- runtime focused suite: 76/76 PASS;
+- local-driver focused suites: 66/66 PASS;
+- CLI focused suite: 37/37 PASS;
+- combined contracts, testkit, runtime, local-driver, and CLI matrix: 197/197
+  PASS;
+- architecture suite: 18/18 PASS;
+- targeted typecheck for all implemented workspaces: PASS;
+- Biome format and lint: PASS;
+- `git diff --check`: PASS;
+- SQLite restart smoke: PASS for pack, content-addressed persistence, install,
+  close, reopen, and immutable installation recovery.
