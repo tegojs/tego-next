@@ -133,6 +133,10 @@ const SENSITIVE_KEY = /(?:credential|password|secret|token)/iu;
 const DIAGNOSTIC_CODE =
   /^(?:BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_[A-Z0-9_]+$/u;
 const MAX_TIMER_DELAY = 2_147_483_647;
+const ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
 export const COMPONENT_HOST_COMMAND_RETENTION_LIMIT = 256;
 export const COMPONENT_HOST_CONTROL_COMMAND_RETENTION_LIMIT = 32;
 export const COMPONENT_HOST_RUN_RETENTION_LIMIT = 256;
@@ -222,12 +226,8 @@ export class ComponentHost {
     }
     let attachments: RunAttachmentLease;
     try {
-      if (
-        !Array.isArray(attachmentInput) ||
-        attachmentInput.some((item) => !(item instanceof ArrayBuffer))
-      ) {
-        throw this.#protocolError("Component host attachments must be ArrayBuffers");
-      }
+      if (!Array.isArray(attachmentInput))
+        throw this.#protocolError("Component host attachments must be an array");
       if (command.type !== "run" && attachmentInput.length > 0) {
         throw this.#protocolError("Component host attachments are only valid for run commands");
       }
@@ -796,20 +796,45 @@ export class ComponentHost {
       );
     }
     let totalBytes = 0;
-    for (const buffer of input) {
-      if (buffer.byteLength > COMPONENT_HOST_WIRE_BYTE_LIMIT) {
+    const validated: { readonly buffer: ArrayBuffer; readonly byteLength: number }[] = [];
+    for (let index = 0; index < input.length; index += 1) {
+      let buffer: unknown;
+      try {
+        buffer = input[index];
+      } catch {
+        throw this.#protocolError("Component host attachment elements must be data");
+      }
+      if (!(buffer instanceof ArrayBuffer)) {
+        throw this.#protocolError("Component host attachments must be ArrayBuffers");
+      }
+      let byteLength: number;
+      try {
+        if (ARRAY_BUFFER_BYTE_LENGTH_GETTER === undefined) throw new TypeError();
+        byteLength = Reflect.apply(ARRAY_BUFFER_BYTE_LENGTH_GETTER, buffer, []);
+      } catch {
+        throw this.#protocolError("Component host attachment byte length is invalid");
+      }
+      if (byteLength > COMPONENT_HOST_WIRE_BYTE_LIMIT) {
         throw this.#protocolError(
           `Component host attachment exceeds the byte limit of ${COMPONENT_HOST_WIRE_BYTE_LIMIT}`,
         );
       }
-      totalBytes += buffer.byteLength;
+      totalBytes += byteLength;
       if (totalBytes > COMPONENT_HOST_WIRE_BYTE_LIMIT) {
         throw this.#protocolError(
           `Component host attachments exceed the aggregate byte limit of ${COMPONENT_HOST_WIRE_BYTE_LIMIT}`,
         );
       }
+      validated.push({ buffer, byteLength });
     }
-    const values = input.map((buffer) => new Uint8Array(buffer).slice());
+    let values: Uint8Array[];
+    try {
+      values = validated.map(({ buffer, byteLength }) =>
+        new Uint8Array(buffer, 0, byteLength).slice(),
+      );
+    } catch {
+      throw this.#protocolError("Component host attachment bytes are invalid");
+    }
     const hash = createHash("sha256");
     const count = Buffer.allocUnsafe(4);
     count.writeUInt32BE(values.length);
