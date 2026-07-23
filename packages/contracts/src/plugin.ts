@@ -6,6 +6,7 @@ import type {
   PluginId,
 } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
+import type { Permission } from "./permission.js";
 
 export type PluginModuleFormat = "esm";
 export type ComponentKind = "service" | "task";
@@ -44,7 +45,7 @@ export interface PluginManifest extends JsonObject {
   readonly moduleFormat: PluginModuleFormat;
   readonly architectures?: readonly string[];
   readonly components: readonly PluginComponent[];
-  readonly permissions: readonly string[];
+  readonly permissions: readonly Permission[];
   readonly capabilities: PluginCapabilitySet;
   readonly metadata?: JsonObject;
 }
@@ -66,6 +67,11 @@ export interface PluginInstallation extends JsonObject {
 
 export type PluginDeploymentState = "active" | "disabled";
 
+export interface PluginDeploymentIdentity extends JsonObject {
+  readonly applicationId: ApplicationId;
+  readonly pluginId: PluginId;
+}
+
 export interface PluginDeployment extends JsonObject {
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
@@ -75,6 +81,6 @@ export interface PluginDeployment extends JsonObject {
   readonly state: PluginDeploymentState;
   readonly essential: boolean;
   readonly configuration: JsonValue;
-  readonly permissionGrants: readonly string[];
-  readonly capabilityBindings: Readonly<Record<string, PluginId>>;
+  readonly permissionGrants: readonly Permission[];
+  readonly capabilityBindings: Readonly<Record<string, PluginDeploymentIdentity>>;
 }

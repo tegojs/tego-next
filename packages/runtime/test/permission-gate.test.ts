@@ -18,7 +18,7 @@ const requested = [
     kind: "network",
     hosts: ["EXAMPLE.com.", "xn--bcher-kva.example"],
     ports: [443, 80, 443],
-    methods: ["post", "GET", "GET"],
+    methods: ["POST", "GET", "GET"],
   },
   {
     kind: "filesystem",
@@ -42,7 +42,7 @@ const granted = [
     capabilities: [{ name: "org.example.echo", methods: ["read"] }],
   },
   { kind: "executor", executors: ["process"] },
-  { kind: "network", hosts: ["example.com"], ports: [443], methods: ["get"] },
+  { kind: "network", hosts: ["example.com"], ports: [443], methods: ["GET"] },
   {
     kind: "filesystem",
     roots: [{ path: "/data/reports/daily", access: ["read"] }],

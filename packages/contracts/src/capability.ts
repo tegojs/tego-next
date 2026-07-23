@@ -1,5 +1,6 @@
-import type { CapabilityName, PluginId } from "./identity.js";
+import type { CapabilityName } from "./identity.js";
 import type { JsonObject } from "./json.js";
+import type { PluginDeploymentIdentity } from "./plugin.js";
 import type { JsonSchema } from "./schema.js";
 
 export interface CapabilityIdentity extends JsonObject {
@@ -15,5 +16,5 @@ export interface CapabilityDefinition extends JsonObject {
 
 export interface CapabilityBinding extends JsonObject {
   readonly capability: CapabilityIdentity;
-  readonly providerPluginId: PluginId;
+  readonly providerDeployment: PluginDeploymentIdentity;
 }

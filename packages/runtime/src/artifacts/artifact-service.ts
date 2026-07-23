@@ -19,6 +19,7 @@ import {
   type ArtifactFilesMetadata,
   type ArtifactReadLimits,
 } from "./manifest-reader.js";
+import { satisfiesVersionRange } from "../capabilities/version.js";
 
 export interface ArtifactSignatureEnvelope extends JsonObject {
   readonly algorithm: "Ed25519";
@@ -81,149 +82,6 @@ function artifactError(code: `ARTIFACT_${string}`, message: string, details?: Js
       source: { kind: "artifact", id: "validation" },
       ...(details === undefined ? {} : { details }),
     }),
-  );
-}
-
-interface Version {
-  readonly major: number;
-  readonly minor: number;
-  readonly patch: number;
-}
-
-interface RangeVersion {
-  readonly precision: 1 | 2 | 3;
-  readonly version: Version;
-  readonly wildcard: boolean;
-}
-
-function parseVersion(value: string): Version | undefined {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+].*)?$/u.exec(value);
-  if (match === null) return undefined;
-  return {
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
-  };
-}
-
-function parseRangeVersion(value: string): RangeVersion | undefined {
-  const parts = value.split(".");
-  if (parts.length < 1 || parts.length > 3) return undefined;
-  const numbers: number[] = [];
-  let wildcard = false;
-  let wildcardIndex: number | undefined;
-  for (const [index, part] of parts.entries()) {
-    if (part === "*" || part.toLowerCase() === "x") {
-      wildcard = true;
-      wildcardIndex ??= index;
-      numbers.push(0);
-      if (parts.slice(index + 1).some((nested) => nested !== "*" && nested.toLowerCase() !== "x")) {
-        return undefined;
-      }
-      continue;
-    }
-    if (wildcard || !/^(?:0|[1-9]\d*)$/u.test(part)) return undefined;
-    const number = Number(part);
-    if (!Number.isSafeInteger(number)) return undefined;
-    numbers.push(number);
-  }
-  return {
-    precision: (wildcardIndex === undefined ? parts.length : Math.max(1, wildcardIndex)) as
-      | 1
-      | 2
-      | 3,
-    version: {
-      major: numbers[0] ?? 0,
-      minor: numbers[1] ?? 0,
-      patch: numbers[2] ?? 0,
-    },
-    wildcard,
-  };
-}
-
-function compareVersion(left: Version, right: Version): number {
-  return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
-}
-
-function upperBound(target: RangeVersion): Version {
-  if (target.precision === 1) {
-    return { major: target.version.major + 1, minor: 0, patch: 0 };
-  }
-  return {
-    major: target.version.major,
-    minor: target.version.minor + 1,
-    patch: 0,
-  };
-}
-
-function satisfiesComparator(version: Version, comparator: string): boolean {
-  if (comparator === "*" || comparator === "") return true;
-  if (comparator.startsWith("^")) {
-    const target = parseRangeVersion(comparator.slice(1));
-    if (target === undefined || target.wildcard) return false;
-    const minimum = target.version;
-    const maximum =
-      minimum.major > 0
-        ? { major: minimum.major + 1, minor: 0, patch: 0 }
-        : minimum.minor > 0
-          ? { major: 0, minor: minimum.minor + 1, patch: 0 }
-          : { major: 0, minor: 0, patch: minimum.patch + 1 };
-    return compareVersion(version, minimum) >= 0 && compareVersion(version, maximum) < 0;
-  }
-  if (comparator.startsWith("~")) {
-    const target = parseRangeVersion(comparator.slice(1));
-    return (
-      target !== undefined &&
-      !target.wildcard &&
-      compareVersion(version, target.version) >= 0 &&
-      compareVersion(version, upperBound(target)) < 0
-    );
-  }
-  const match = /^(>=|<=|>|<|=)?(.+)$/u.exec(comparator);
-  const target = match === null ? undefined : parseRangeVersion(match[2] ?? "");
-  if (match === null || target === undefined) return false;
-  const order = compareVersion(version, target.version);
-  switch (match[1] ?? "=") {
-    case ">":
-      return order > 0;
-    case ">=":
-      return order >= 0;
-    case "<":
-      return order < 0;
-    case "<=":
-      return order <= 0;
-    default:
-      return target.precision === 3 && !target.wildcard
-        ? order === 0
-        : order >= 0 && compareVersion(version, upperBound(target)) < 0;
-  }
-}
-
-function isSupportedComparator(comparator: string): boolean {
-  if (comparator === "*") return true;
-  if (comparator.startsWith("^") || comparator.startsWith("~")) {
-    const target = parseRangeVersion(comparator.slice(1));
-    return target !== undefined && !target.wildcard;
-  }
-  const match = /^(>=|<=|>|<|=)?(.+)$/u.exec(comparator);
-  if (match === null) return false;
-  const target = parseRangeVersion(match[2] ?? "");
-  return target !== undefined && (match[1] === undefined || !target.wildcard);
-}
-
-function satisfiesRange(value: string, range: string): boolean {
-  const version = parseVersion(value);
-  if (version === undefined) return false;
-  const alternatives = range.split("||").map((part) => part.trim());
-  if (alternatives.some((alternative) => alternative.length === 0)) return false;
-  const comparatorSets = alternatives.map((alternative) => alternative.split(/\s+/u));
-  if (
-    comparatorSets.some((comparators) => comparators.some((value) => !isSupportedComparator(value)))
-  ) {
-    return false;
-  }
-  return comparatorSets.some((comparators) =>
-    comparators.every((comparator) => satisfiesComparator(version, comparator)),
   );
 }
 
@@ -427,14 +285,14 @@ export class ArtifactService {
   }
 
   #validateCompatibility(manifest: PluginManifest): void {
-    if (!satisfiesRange(this.#compatibility.nodeVersion, manifest.nodeRange)) {
+    if (!satisfiesVersionRange(this.#compatibility.nodeVersion, manifest.nodeRange)) {
       throw artifactError(
         "ARTIFACT_NODE_INCOMPATIBLE",
         "Plugin does not support the configured Node.js version",
         { actual: this.#compatibility.nodeVersion, required: manifest.nodeRange },
       );
     }
-    if (!satisfiesRange(this.#compatibility.tegoContractVersion, manifest.contractRange)) {
+    if (!satisfiesVersionRange(this.#compatibility.tegoContractVersion, manifest.contractRange)) {
       throw artifactError(
         "ARTIFACT_CONTRACT_INCOMPATIBLE",
         "Plugin does not support the configured Tego contract version",

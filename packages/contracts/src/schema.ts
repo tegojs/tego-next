@@ -12,6 +12,7 @@ import type { ExecutionRequest, ExecutionResult } from "./execution.js";
 import type { Leadership } from "./drivers.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
 import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
+import type { Permission } from "./permission.js";
 import type { RuntimeConfiguration, RuntimeEvent, RuntimeStatus } from "./runtime.js";
 import type { DriverHealth } from "./state.js";
 import type { WorkerEnvelope } from "./worker.js";
@@ -36,6 +37,11 @@ const JSON_VALUE_SCHEMA_ID = "https://tegojs.dev/schemas/json-value.json";
 const DIAGNOSTIC_SCHEMA_ID = "https://tegojs.dev/schemas/runtime-diagnostic-1.0.json";
 const PLUGIN_MANIFEST_SCHEMA_ID = "https://tegojs.dev/schemas/plugin-manifest-1.0.json";
 const CAPABILITY_IDENTITY_SCHEMA_ID = "https://tegojs.dev/schemas/capability-identity-1.0.json";
+const PERMISSION_SET_SCHEMA_ID = "https://tegojs.dev/schemas/permission-set-1.0.json";
+const PORTABLE_NAME_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
+const ENVIRONMENT_NAME_PATTERN = "^[A-Za-z_][A-Za-z0-9_]{0,127}$";
+const LOGICAL_ROOT_PATTERN =
+  "^/(?!.*(?:^|/)\\.\\.(?:/|$))(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)?$";
 
 function isJsonValue(input: unknown, ancestors = new Set<object>()): boolean {
   if (
@@ -107,6 +113,142 @@ const jsonObjectSchema = {
   additionalProperties: { $ref: JSON_VALUE_SCHEMA_ID },
 } as const;
 
+const permissionSchema = {
+  oneOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "capabilities"],
+      properties: {
+        kind: { const: "capability" },
+        capabilities: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["name", "methods"],
+            properties: {
+              name: { type: "string", pattern: IDENTITY_PATTERN },
+              methods: {
+                type: "array",
+                items: { type: "string", pattern: PORTABLE_NAME_PATTERN },
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "executors"],
+      properties: {
+        kind: { const: "executor" },
+        executors: {
+          type: "array",
+          items: { enum: ["process", "remote", "thread"] },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "hosts", "ports", "methods"],
+      properties: {
+        kind: { const: "network" },
+        hosts: { type: "array", items: { type: "string", minLength: 1 } },
+        ports: {
+          type: "array",
+          items: { type: "integer", minimum: 1, maximum: 65_535 },
+        },
+        methods: {
+          type: "array",
+          items: {
+            enum: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+          },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "roots"],
+      properties: {
+        kind: { const: "filesystem" },
+        roots: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["path", "access"],
+            properties: {
+              path: { type: "string", pattern: LOGICAL_ROOT_PATTERN },
+              access: {
+                type: "array",
+                items: { enum: ["read", "write"] },
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "names"],
+      properties: {
+        kind: { const: "secret" },
+        names: {
+          type: "array",
+          items: { type: "string", pattern: PORTABLE_NAME_PATTERN },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "names"],
+      properties: {
+        kind: { const: "environment" },
+        names: {
+          type: "array",
+          items: { type: "string", pattern: ENVIRONMENT_NAME_PATTERN },
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "labels", "resources"],
+      properties: {
+        kind: { const: "worker" },
+        labels: {
+          type: "object",
+          propertyNames: { pattern: PORTABLE_NAME_PATTERN },
+          additionalProperties: { type: "string", pattern: PORTABLE_NAME_PATTERN },
+        },
+        resources: {
+          type: "object",
+          additionalProperties: false,
+          required: ["cpuMillis", "memoryBytes", "storageBytes"],
+          properties: {
+            cpuMillis: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            memoryBytes: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            storageBytes: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+          },
+        },
+      },
+    },
+  ],
+} as const;
+
+const permissionSetSchema = {
+  $id: PERMISSION_SET_SCHEMA_ID,
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "array",
+  items: permissionSchema,
+} as const;
+
 const pluginManifestSchema = {
   $id: PLUGIN_MANIFEST_SCHEMA_ID,
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -160,8 +302,7 @@ const pluginManifestSchema = {
     },
     permissions: {
       type: "array",
-      uniqueItems: true,
-      items: { type: "string", minLength: 1 },
+      items: permissionSchema,
     },
     capabilities: {
       type: "object",
@@ -176,7 +317,7 @@ const pluginManifestSchema = {
             required: ["name", "protocolVersion"],
             properties: {
               name: { $ref: "#/$defs/identity" },
-              protocolVersion: { type: "string", minLength: 1 },
+              protocolVersion: { type: "string", pattern: SEMVER_PATTERN },
             },
           },
         },
@@ -433,13 +574,20 @@ const pluginDeploymentSchema = {
     configuration: { $ref: JSON_VALUE_SCHEMA_ID },
     permissionGrants: {
       type: "array",
-      uniqueItems: true,
-      items: { type: "string", minLength: 1 },
+      items: permissionSchema,
     },
     capabilityBindings: {
       type: "object",
       tegoJsonValue: true,
-      additionalProperties: { type: "string", pattern: IDENTITY_PATTERN },
+      additionalProperties: {
+        type: "object",
+        additionalProperties: false,
+        required: ["applicationId", "pluginId"],
+        properties: {
+          applicationId: { type: "string", pattern: IDENTITY_PATTERN },
+          pluginId: { type: "string", pattern: IDENTITY_PATTERN },
+        },
+      },
     },
   },
 } as const;
@@ -452,7 +600,7 @@ const capabilityIdentitySchema = {
   required: ["name", "protocolVersion"],
   properties: {
     name: { type: "string", pattern: IDENTITY_PATTERN },
-    protocolVersion: { type: "string", minLength: 1 },
+    protocolVersion: { type: "string", pattern: SEMVER_PATTERN },
   },
 } as const;
 
@@ -478,10 +626,18 @@ const capabilityBindingSchema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
   type: "object",
   additionalProperties: false,
-  required: ["capability", "providerPluginId"],
+  required: ["capability", "providerDeployment"],
   properties: {
     capability: { $ref: CAPABILITY_IDENTITY_SCHEMA_ID },
-    providerPluginId: { type: "string", pattern: IDENTITY_PATTERN },
+    providerDeployment: {
+      type: "object",
+      additionalProperties: false,
+      required: ["applicationId", "pluginId"],
+      properties: {
+        applicationId: { type: "string", pattern: IDENTITY_PATTERN },
+        pluginId: { type: "string", pattern: IDENTITY_PATTERN },
+      },
+    },
   },
 } as const;
 
@@ -598,6 +754,7 @@ const validateLeadership = ajv.compile(leadershipSchema);
 const validateRuntimeStatus = ajv.compile(runtimeStatusSchema);
 const validateRuntimeEvent = ajv.compile(runtimeEventSchema);
 const validateRuntimeDiagnostic = ajv.compile(runtimeDiagnosticSchema);
+const validatePermissionSet = ajv.compile(permissionSetSchema);
 const validatePluginManifest = ajv.compile(pluginManifestSchema);
 const validatePluginInstallation = ajv.compile(pluginInstallationSchema);
 const validatePluginDeployment = ajv.compile(pluginDeploymentSchema);
@@ -766,6 +923,16 @@ export function parsePluginManifest(input: unknown): PluginManifest {
     "ARTIFACT_MANIFEST_INVALID",
     "Plugin manifest is invalid",
     { kind: "artifact", id: "manifest.json" },
+  );
+}
+
+export function parsePermissionSet(input: unknown): readonly Permission[] {
+  return parseWithValidator(
+    validatePermissionSet,
+    input,
+    "PERMISSION_ENVELOPE_INVALID",
+    "Permission envelope is invalid",
+    { kind: "deployment", id: "permissions" },
   );
 }
 
