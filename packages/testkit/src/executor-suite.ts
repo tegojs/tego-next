@@ -1,11 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type {
-  ExecutionRequest,
-  ExecutionResult,
-  Executor,
-  JsonValue,
-} from "@tegojs/contracts";
+import type { ExecutionRequest, ExecutionResult, Executor, JsonValue } from "@tegojs/contracts";
 
 export type ExecutorFactory = () => Executor | Promise<Executor>;
 
@@ -75,7 +70,8 @@ export function executorConformance(
         await assert.rejects(
           executor.submit({ ...original, input: fixture.echoInput }),
           (error: unknown) =>
-            error instanceof Error && /identity|fingerprint|idempotency|conflict/iu.test(error.message),
+            error instanceof Error &&
+            /identity|fingerprint|idempotency|conflict/iu.test(error.message),
         );
         await executor.cancel(original.taskId, original.attemptId);
         await fixture.advanceClock(1_000);

@@ -18,6 +18,7 @@ import {
   FilesystemArtifactStore,
   hashArtifactHandle,
   LocalCoordinationProvider,
+  NodeProcessHost,
   publishTempFileAtomically,
 } from "../src/index.js";
 
@@ -451,10 +452,12 @@ test("createLocalDrivers composes durable state, local authority, and filesystem
   assert.ok(drivers.state instanceof Object);
   assert.ok(drivers.coordination instanceof LocalCoordinationProvider);
   assert.ok(drivers.artifacts instanceof FilesystemArtifactStore);
+  assert.ok(drivers.processHost instanceof NodeProcessHost);
 
   await drivers.state.open();
   await drivers.coordination.open();
   await drivers.artifacts.open();
+  await drivers.processHost.open();
   assert.deepEqual(await drivers.state.health(), {
     status: "healthy",
     checkedAt: "2026-07-23T12:00:00.000Z",
@@ -467,10 +470,64 @@ test("createLocalDrivers composes durable state, local authority, and filesystem
     status: "healthy",
     checkedAt: "2026-07-23T12:00:00.000Z",
   });
+  assert.deepEqual(await drivers.processHost.health(), {
+    status: "healthy",
+    checkedAt: "2026-07-23T12:00:00.000Z",
+    message: "0 active hosted processes",
+  });
 
+  await drivers.processHost.close();
   await drivers.artifacts.close();
   await drivers.coordination.close();
   await drivers.state.close();
+});
+
+test("NodeProcessHost exposes raw backpressured pipes and reclaims process handles", async () => {
+  const directory = await temporaryDirectory("process-host");
+  const entrypoint = join(directory, "echo.mjs");
+  await writeFile(
+    entrypoint,
+    `
+for await (const chunk of process.stdin) {
+  await new Promise((resolve, reject) => {
+    process.stdout.write(chunk, (error) => error ? reject(error) : resolve());
+  });
+}
+`,
+  );
+  const host = new NodeProcessHost({
+    clock: new FakeClock(new Date("2026-07-23T12:00:00.000Z")),
+  });
+  await Promise.all([host.open(), host.open()]);
+  const child = await host.spawn({ entrypoint });
+  const output = (async () => {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of child.stdout) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  })();
+  const bytes = Buffer.alloc(256 * 1024, 0x61);
+  await child.stdin.write(bytes);
+  await child.stdin.close();
+  assert.deepEqual(await output, bytes);
+  assert.deepEqual(await child.wait(), { code: 0 });
+  assert.equal(host.activeProcessCount, 0);
+  await Promise.all([host.close(), host.close()]);
+});
+
+test("NodeProcessHost rejects secret-like bootstrap environment names before spawn", async () => {
+  const host = new NodeProcessHost({
+    clock: new FakeClock(new Date("2026-07-23T12:00:00.000Z")),
+  });
+  await host.open();
+  await assert.rejects(
+    host.spawn({
+      entrypoint: join(process.cwd(), "entry.mjs"),
+      environment: { API_SECRET: "must-not-cross-bootstrap" },
+    }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_PROCESS_ENVIRONMENT_INVALID",
+  );
+  assert.equal(host.activeProcessCount, 0);
+  await host.close();
 });
 
 test("close racing with open cannot resurrect filesystem artifact access", async () => {

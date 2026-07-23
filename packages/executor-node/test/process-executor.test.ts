@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,15 +13,15 @@ import {
   parsePluginId,
   parsePluginManifest,
   parseTaskId,
+  type DriverHealth,
   type ExecutionRequest,
+  type HostedProcess,
+  type HostedProcessExit,
   type JsonValue,
+  type ProcessHost,
+  type ProcessSpawnRequest,
 } from "@tegojs/contracts";
-import { NodeProcessHost } from "@tegojs/drivers-local";
-import {
-  executorConformance,
-  FakeClock,
-  type ExecutorConformanceFixture,
-} from "@tegojs/testkit";
+import { executorConformance, FakeClock, type ExecutorConformanceFixture } from "@tegojs/testkit";
 import {
   PROCESS_EXECUTOR_MAX_FRAME_BYTES,
   ProcessFrameDecoder,
@@ -34,8 +35,104 @@ const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
 const clock = new FakeClock(new Date(0));
 const directories: string[] = [];
 
+class TestHostedProcess implements HostedProcess {
+  readonly pid: number | undefined;
+  readonly stdin: HostedProcess["stdin"];
+  readonly stdout: AsyncIterable<Uint8Array>;
+  readonly stderr: AsyncIterable<Uint8Array>;
+  readonly #child: ChildProcessWithoutNullStreams;
+  readonly #exit: Promise<HostedProcessExit>;
+
+  constructor(child: ChildProcessWithoutNullStreams, exited: () => void) {
+    this.#child = child;
+    this.pid = child.pid;
+    this.stdout = child.stdout as AsyncIterable<Uint8Array>;
+    this.stderr = child.stderr as AsyncIterable<Uint8Array>;
+    this.#exit = new Promise((resolve) => {
+      child.once("exit", (code, signal) => {
+        exited();
+        resolve({
+          ...(code === null ? {} : { code }),
+          ...(signal === null ? {} : { signal }),
+        });
+      });
+    });
+    this.stdin = {
+      write: (bytes) =>
+        new Promise<void>((resolve, reject) => {
+          child.stdin.write(Buffer.from(bytes), (error) =>
+            error === null || error === undefined ? resolve() : reject(error),
+          );
+        }),
+      close: () =>
+        new Promise<void>((resolve) => {
+          if (child.stdin.destroyed || child.stdin.writableEnded) resolve();
+          else child.stdin.end(resolve);
+        }),
+    };
+  }
+
+  async signal(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+    this.#child.kill(signal);
+  }
+
+  async kill(): Promise<void> {
+    this.#child.kill("SIGKILL");
+  }
+
+  wait(): Promise<HostedProcessExit> {
+    return this.#exit;
+  }
+
+  async close(): Promise<void> {
+    await this.stdin.close().catch(() => undefined);
+    await this.wait();
+  }
+}
+
+class TestProcessHost implements ProcessHost {
+  readonly #processes = new Set<TestHostedProcess>();
+  #open = false;
+
+  get activeProcessCount(): number {
+    return this.#processes.size;
+  }
+
+  async open(): Promise<void> {
+    this.#open = true;
+  }
+
+  async health(): Promise<DriverHealth> {
+    return {
+      status: this.#open ? "healthy" : "unhealthy",
+      checkedAt: clock.now().toISOString(),
+    };
+  }
+
+  async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    if (!this.#open) throw new Error("Test process host is closed");
+    const child = spawn(process.execPath, [request.entrypoint, ...(request.arguments ?? [])], {
+      env: { ...(request.environment ?? {}) },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let hosted!: TestHostedProcess;
+    hosted = new TestHostedProcess(child, () => this.#processes.delete(hosted));
+    this.#processes.add(hosted);
+    return hosted;
+  }
+
+  async close(): Promise<void> {
+    const processes = [...this.#processes];
+    await Promise.all(processes.map((hosted) => hosted.kill()));
+    await Promise.all(processes.map((hosted) => hosted.wait()));
+    this.#open = false;
+  }
+}
+
 after(async () => {
-  await Promise.all(directories.splice(0).map((path) => rm(path, { force: true, recursive: true })));
+  await Promise.all(
+    directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
+  );
 });
 
 const componentSource = `
@@ -63,6 +160,11 @@ export default {
     if (input.mode === "stderr") {
       process.stderr.write("diagnostic " + "x".repeat(200000));
       return input.value;
+    }
+    if (input.mode === "secret-stderr") {
+      const secret = await context.secrets.get("api");
+      process.stderr.write("secret=" + secret);
+      return { secretToken: secret };
     }
     if (input.mode === "large-output") return "x".repeat(${1024 * 1024 + 64});
     return input.value;
@@ -92,7 +194,10 @@ async function artifact() {
         executors: ["process", "thread"],
       },
     ],
-    permissions: [{ kind: "executor", executors: ["process", "thread"] }],
+    permissions: [
+      { kind: "executor", executors: ["process", "thread"] },
+      { kind: "secret", names: ["api"] },
+    ],
     capabilities: { provides: [], requires: [] },
   });
   return { artifactRoot, manifest };
@@ -118,7 +223,7 @@ async function options(
   return {
     id: "process-local",
     clock,
-    processHost: new NodeProcessHost({ clock }),
+    processHost: new TestProcessHost(),
     maxConcurrency: 2,
     cancellationGraceMs: 100,
     resolveComponent: async () => ({
@@ -189,8 +294,7 @@ test("process framing rejects an oversized declared length before buffering its 
   try {
     assert.throws(
       () => new ProcessFrameDecoder().push(malicious),
-      (error: unknown) =>
-        diagnosticCode(error) === "PROTOCOL_PROCESS_FRAME_LENGTH_INVALID",
+      (error: unknown) => diagnosticCode(error) === "PROTOCOL_PROCESS_FRAME_LENGTH_INVALID",
     );
     assert.equal(parseCalls, 0);
   } finally {
@@ -217,7 +321,7 @@ test("@spec:executor-runtime/executor-failure-containment/crash-replacement", as
 
 test("active cancellation is cooperative before fake-clock grace forces process termination", async () => {
   const started = Promise.withResolvers<void>();
-  const processHost = new NodeProcessHost({ clock });
+  const processHost = new TestProcessHost();
   const executor = new ProcessExecutor(
     await options({
       processHost,
@@ -242,7 +346,7 @@ test("active cancellation is cooperative before fake-clock grace forces process 
 
 test("an active deadline uses the shared clock and cannot be overwritten by a late exit", async () => {
   const started = Promise.withResolvers<void>();
-  const processHost = new NodeProcessHost({ clock });
+  const processHost = new TestProcessHost();
   const executor = new ProcessExecutor(
     await options({
       processHost,
@@ -262,6 +366,8 @@ test("an active deadline uses the shared clock and cannot be overwritten by a la
   await started.promise;
   clock.advanceBy(50);
   await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
   clock.advanceBy(100);
   const first = await handle.result;
   assert.equal(first.status, "timed-out");
@@ -279,9 +385,7 @@ test("an active deadline uses the shared clock and cannot be overwritten by a la
 });
 
 test("active and queued attempts are hard bounded before asynchronous spawn begins", async () => {
-  const executor = new ProcessExecutor(
-    await options({ maxConcurrency: 1, maxQueue: 0 }),
-  );
+  const executor = new ProcessExecutor(await options({ maxConcurrency: 1, maxQueue: 0 }));
   const firstRequest = request({ mode: "wait" }, "bounded-first");
   const first = await executor.submit(firstRequest);
   await assert.rejects(
@@ -301,9 +405,8 @@ test("input and output wire sizes are bounded", async () => {
       executor.submit(request({ value: "x".repeat(PROCESS_EXECUTOR_MAX_FRAME_BYTES) }, "large-in")),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_INPUT_LIMIT_EXCEEDED",
     );
-    const result = await (
-      await executor.submit(request({ mode: "large-output" }, "large-out"))
-    ).result;
+    const result = await (await executor.submit(request({ mode: "large-output" }, "large-out")))
+      .result;
     assert.equal(result.status, "failed");
     assert.equal(result.diagnostic?.code, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED");
   } finally {
@@ -312,7 +415,7 @@ test("input and output wire sizes are bounded", async () => {
 });
 
 test("spawn failure leaks neither capacity nor hosted process handles", async () => {
-  const processHost = new NodeProcessHost({ clock });
+  const processHost = new TestProcessHost();
   const executor = new ProcessExecutor(
     await options({
       processHost,
@@ -329,7 +432,7 @@ test("spawn failure leaks neither capacity nor hosted process handles", async ()
 });
 
 test("process host open, health, and shutdown are idempotent", async () => {
-  const host = new NodeProcessHost({ clock });
+  const host = new TestProcessHost();
   await Promise.all([host.open(), host.open()]);
   assert.equal((await host.health()).status, "healthy");
   await Promise.all([host.close(), host.close()]);
@@ -337,7 +440,7 @@ test("process host open, health, and shutdown are idempotent", async () => {
 });
 
 test("drain and close leave no active child process", async () => {
-  const processHost = new NodeProcessHost({ clock });
+  const processHost = new TestProcessHost();
   const executor = new ProcessExecutor(await options({ processHost }));
   const handled = await executor.submit(request({ mode: "echo", value: "done" }, "close"));
   assert.equal((await handled.result).status, "succeeded");
@@ -359,6 +462,34 @@ test("stderr diagnostics are bounded and sensitive fields are redacted", async (
     const metadata = result.executor.metadata;
     assert.ok(JSON.stringify(metadata).length < 70_000);
     assert.doesNotMatch(JSON.stringify(metadata), /do-not-return/u);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("secret RPC stays parent-gated and redacts direct child stderr", async () => {
+  const executor = new ProcessExecutor(
+    await options({
+      secretProvider: {
+        developmentOnly: false,
+        open: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: clock.now().toISOString(),
+        }),
+        close: async () => {},
+        get: async (name) => (name === "api" ? "parent-only-secret" : undefined),
+      },
+    }),
+  );
+  try {
+    const result = await (
+      await executor.submit(request({ mode: "secret-stderr" }, "secret-stderr"))
+    ).result;
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.output, { secretToken: "[REDACTED]" });
+    assert.doesNotMatch(JSON.stringify(result.executor.metadata), /parent-only-secret/u);
+    assert.match(JSON.stringify(result.executor.metadata), /\[REDACTED\]/u);
   } finally {
     await executor.drain({});
   }

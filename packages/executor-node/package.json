@@ -19,5 +19,8 @@
   },
   "dependencies": {
     "@tegojs/contracts": "0.0.0"
+  },
+  "devDependencies": {
+    "@tegojs/testkit": "0.0.0"
   }
 }

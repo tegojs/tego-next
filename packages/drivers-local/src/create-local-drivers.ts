@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Clock, RuntimeDrivers } from "@tegojs/contracts";
 import { FilesystemArtifactStore } from "./filesystem-artifact-store.js";
 import { LocalCoordinationProvider } from "./local-coordination.js";
+import { NodeProcessHost } from "./node-process-host.js";
 import { SqliteStateStore } from "./sqlite/sqlite-state-store.js";
 import { DevelopmentSecretProvider } from "./development-secret-provider.js";
 
@@ -38,6 +39,7 @@ export async function createLocalDrivers(
       rootDirectory: options.dataDirectory,
       clock,
     }),
+    processHost: new NodeProcessHost({ clock }),
     secrets: new DevelopmentSecretProvider({
       values: options.developmentSecrets ?? {},
       clock,

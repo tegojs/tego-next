@@ -8,6 +8,7 @@ import type {
   WorkerId,
 } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
+import type { DriverHealth } from "./state.js";
 
 export type OrphanPolicy = "cancel" | "finish-and-buffer" | "finish-and-persist";
 
@@ -44,4 +45,60 @@ export interface ExecutionResult extends JsonObject {
   readonly executor: ExecutionExecutor;
   readonly startedAt: string;
   readonly completedAt: string;
+}
+
+export interface ExecutorCapabilities extends JsonObject {
+  readonly id: string;
+  readonly type: ExecutionExecutor["kind"];
+  readonly available: boolean;
+  readonly maxConcurrency: number;
+  readonly availableCapacity: number;
+  readonly securityIsolation: boolean;
+}
+
+export interface ExecutionHandle {
+  readonly taskId: TaskId;
+  readonly attemptId: AttemptId;
+  readonly result: Promise<ExecutionResult>;
+}
+
+export type AttemptState = "accepted" | "running" | "terminal";
+
+export type AttemptStatus =
+  | {
+      readonly state: "accepted" | "running";
+    }
+  | {
+      readonly state: "terminal";
+      readonly result: ExecutionResult;
+    };
+
+export interface ExecutorHealth extends DriverHealth {
+  readonly id: string;
+  readonly type: ExecutionExecutor["kind"];
+  readonly accepting: boolean;
+  readonly active: number;
+  readonly queued: number;
+  readonly retainedAttempts: number;
+}
+
+export interface DrainOptions {
+  readonly deadline?: string;
+}
+
+/**
+ * Executor implementations own execution deduplication and lifecycle. Artifact
+ * resolution is an injected bootstrap concern and is intentionally absent from
+ * this public command surface.
+ */
+export interface Executor {
+  readonly id: string;
+  readonly type: ExecutionExecutor["kind"];
+  probe(): Promise<ExecutorCapabilities>;
+  submit(request: ExecutionRequest): Promise<ExecutionHandle>;
+  observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined>;
+  cancel(taskId: TaskId, attemptId: AttemptId): Promise<void>;
+  drain(options: DrainOptions): Promise<void>;
+  health(): Promise<ExecutorHealth>;
+  close(): Promise<void>;
 }

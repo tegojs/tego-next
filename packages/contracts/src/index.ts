@@ -8,6 +8,7 @@ export * from "./identity.js";
 export * from "./json.js";
 export * from "./permission.js";
 export * from "./plugin.js";
+export * from "./process-host.js";
 export * from "./runtime.js";
 export * from "./schema.js";
 export * from "./secrets.js";

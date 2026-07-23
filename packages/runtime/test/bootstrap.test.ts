@@ -23,6 +23,9 @@ import {
   type Leadership,
   type OperationJournalQuery,
   type PersistedOperationJournalEntry,
+  type HostedProcess,
+  type ProcessHost,
+  type ProcessSpawnRequest,
   type RuntimeConfiguration,
   type RuntimeDrivers,
   type SecretProvider,
@@ -267,11 +270,38 @@ class ControlledSecrets implements SecretProvider {
   }
 }
 
+class ControlledProcessHost implements ProcessHost {
+  readonly #log: string[];
+  readonly activeProcessCount = 0;
+
+  constructor(log: string[]) {
+    this.#log = log;
+  }
+
+  async open(): Promise<void> {
+    this.#log.push("processHost.open");
+  }
+
+  async spawn(_request: ProcessSpawnRequest): Promise<HostedProcess> {
+    throw new Error("Controlled process host does not spawn");
+  }
+
+  async health(): Promise<DriverHealth> {
+    this.#log.push("processHost.health");
+    return healthy();
+  }
+
+  async close(): Promise<void> {
+    this.#log.push("processHost.close");
+  }
+}
+
 function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] = []): {
   readonly drivers: RuntimeDrivers;
   readonly state: ControlledStateStore;
   readonly coordination: ControlledCoordination;
   readonly artifacts: ControlledArtifacts;
+  readonly processHost: ControlledProcessHost;
   readonly secrets: ControlledSecrets;
   readonly log: string[];
 } {
@@ -279,18 +309,21 @@ function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] 
   const state = new ControlledStateStore(log, recovered);
   const coordination = new ControlledCoordination(log);
   const artifacts = new ControlledArtifacts(log);
+  const processHost = new ControlledProcessHost(log);
   const secrets = new ControlledSecrets(log);
   return {
     drivers: {
       state,
       coordination,
       artifacts,
+      processHost,
       secrets,
       clock,
     },
     state,
     coordination,
     artifacts,
+    processHost,
     secrets,
     log,
   };
@@ -320,10 +353,11 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     tasks: 0,
     workers: 0,
   });
-  assert.deepEqual(log.slice(0, 9), [
+  assert.deepEqual(log.slice(0, 10), [
     "state.open",
     "coordination.open",
     "artifacts.open",
+    "processHost.open",
     "secrets.open",
     "state.scan:installations",
     "state.scan:deployments",
@@ -334,8 +368,9 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
 
   await runtime.stop();
   assert.equal((await runtime.status()).lifecycle, "stopped");
-  assert.deepEqual(log.slice(-4), [
+  assert.deepEqual(log.slice(-5), [
     "secrets.close",
+    "processHost.close",
     "artifacts.close",
     "coordination.close",
     "state.close",
@@ -439,14 +474,14 @@ test("concurrent and repeated start and stop calls are idempotent", async () => 
   assert.equal(firstStart, secondStart);
   await Promise.all([firstStart, secondStart]);
   await runtime.start();
-  assert.equal(log.filter((entry) => entry.endsWith(".open")).length, 4);
+  assert.equal(log.filter((entry) => entry.endsWith(".open")).length, 5);
 
   const firstStop = runtime.stop();
   const secondStop = runtime.stop();
   assert.equal(firstStop, secondStop);
   await Promise.all([firstStop, secondStop]);
   await runtime.stop();
-  assert.equal(log.filter((entry) => entry.endsWith(".close")).length, 4);
+  assert.equal(log.filter((entry) => entry.endsWith(".close")).length, 5);
 });
 
 test("stop racing with start prevents runtime resurrection", async () => {
@@ -535,8 +570,9 @@ test("runtime rejects leadership for a different campaign resource before runnin
   assert.equal(status.lifecycle, "failed");
   assert.equal(status.acceptingOperations, false);
   assert.equal(log.includes("state.health"), false);
-  assert.deepEqual(log.slice(-4), [
+  assert.deepEqual(log.slice(-5), [
     "secrets.close",
+    "processHost.close",
     "artifacts.close",
     "coordination.close",
     "state.close",
