@@ -115,6 +115,7 @@ interface AttemptEntry {
   readonly deadlineController: AbortController;
   readonly admissionController: AbortController;
   state: "accepted" | "running" | "terminal";
+  decision?: ExecutionResult;
   terminal?: ExecutionResult;
   process?: HostedProcess;
   channel?: ProcessChannel;
@@ -780,6 +781,7 @@ export class ProcessExecutor implements Executor {
       this.#active += 1;
       entry.state = "running";
       void this.#run(entry).finally(() => {
+        this.#publish(entry);
         this.#active -= 1;
         if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
         entry.completed.resolve();
@@ -802,7 +804,7 @@ export class ProcessExecutor implements Executor {
     try {
       const resolution = await this.#raceAdmission(entry, this.#resolve(entry.request)).outcome;
       if (resolution.cancelled) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
+        this.#decide(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
         return;
       }
       const component = resolution.value;
@@ -811,7 +813,7 @@ export class ProcessExecutor implements Executor {
         return;
       }
       if (entry.cancellation !== undefined) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
+        this.#decide(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
       const spawnAdmission = this.#raceAdmission(
@@ -828,7 +830,7 @@ export class ProcessExecutor implements Executor {
       admissionSettlement = spawnAdmission.settled;
       const spawning = await spawnAdmission.outcome;
       if (spawning.cancelled) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
+        this.#decide(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
         return;
       }
       process_ = spawning.value;
@@ -840,7 +842,7 @@ export class ProcessExecutor implements Executor {
       }
       if (entry.cancellation !== undefined) {
         await terminateBeforeChannel(process_);
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
+        this.#decide(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
       channel = new ProcessChannel(process_, this.#options, component);
@@ -894,7 +896,7 @@ export class ProcessExecutor implements Executor {
       );
       if (entry.state === "terminal") return;
       if (entry.cancellation !== undefined) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
+        this.#decide(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
       const run = await this.#hostCommand(channel, {
@@ -919,7 +921,7 @@ export class ProcessExecutor implements Executor {
       if (!["cancelled", "failed", "rejected", "succeeded", "timed-out"].includes(String(status))) {
         throw new Error("Component run status is invalid");
       }
-      this.#settle(entry, {
+      this.#decide(entry, {
         taskId: entry.request.taskId,
         attemptId: entry.request.attemptId,
         status: status as ExecutionResult["status"],
@@ -930,7 +932,7 @@ export class ProcessExecutor implements Executor {
       });
       await this.#shutdownChild(channel, process_, component.artifactDigest, controlDeadline);
     } catch (error) {
-      if (entry.state !== "terminal") {
+      if (entry.decision === undefined) {
         const termination =
           process_ === undefined
             ? undefined
@@ -948,7 +950,7 @@ export class ProcessExecutor implements Executor {
         const message =
           termination?.diagnostic?.message ??
           (error instanceof Error ? error.message : "Process executor attempt failed unexpectedly");
-        this.#settle(entry, {
+        this.#decide(entry, {
           taskId: entry.request.taskId,
           attemptId: entry.request.attemptId,
           status:
@@ -972,7 +974,6 @@ export class ProcessExecutor implements Executor {
         });
       }
     } finally {
-      entry.deadlineController.abort("terminal");
       await admissionSettlement;
       if (process_ !== undefined) {
         await this.#terminate(process_);
@@ -980,6 +981,22 @@ export class ProcessExecutor implements Executor {
       }
       delete entry.process;
       delete entry.channel;
+      if (entry.decision === undefined) {
+        const now = this.#clock.now().toISOString();
+        this.#decide(entry, {
+          taskId: entry.request.taskId,
+          attemptId: entry.request.attemptId,
+          status: "failed",
+          diagnostic: diagnostic(
+            "EXECUTOR_PROCESS_EXIT",
+            "Process executor attempt ended without a result",
+            this.#clock.now(),
+          ),
+          executor: this.#executorMetadata(process_, channel),
+          startedAt,
+          completedAt: now,
+        });
+      }
     }
   }
 
@@ -1141,7 +1158,7 @@ export class ProcessExecutor implements Executor {
     entry: AttemptEntry,
     cancellation: "cancelled" | "timed-out",
   ): Promise<void> {
-    if (entry.state === "terminal") return;
+    if (entry.state === "terminal" || entry.decision !== undefined) return;
     entry.cancellation ??= cancellation;
     entry.admissionController.abort(entry.cancellation);
     if (entry.state === "accepted") {
@@ -1196,13 +1213,27 @@ export class ProcessExecutor implements Executor {
     };
   }
 
-  #settle(entry: AttemptEntry, result: ExecutionResult): boolean {
-    if (entry.state === "terminal") return false;
-    entry.state = "terminal";
+  #decide(entry: AttemptEntry, result: ExecutionResult): boolean {
+    if (entry.decision !== undefined) return false;
     entry.deadlineController.abort("terminal");
     entry.admissionController.abort("terminal");
-    entry.terminal = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
+    entry.decision = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
     return true;
+  }
+
+  #publish(entry: AttemptEntry): boolean {
+    if (entry.state === "terminal") return false;
+    if (entry.decision === undefined) {
+      throw new Error("Process attempt decision is missing");
+    }
+    entry.state = "terminal";
+    entry.terminal = entry.decision;
+    return true;
+  }
+
+  #settle(entry: AttemptEntry, result: ExecutionResult): boolean {
+    if (!this.#decide(entry, result)) return false;
+    return this.#publish(entry);
   }
 
   async #terminate(process_: HostedProcess): Promise<TerminationOutcome> {
@@ -1309,6 +1340,7 @@ export class ProcessExecutor implements Executor {
       const queued = entry.state === "accepted";
       this.#settleFatal(entry, failure);
       if (queued) {
+        this.#publish(entry);
         if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
         entry.completed.resolve();
       }
@@ -1317,7 +1349,7 @@ export class ProcessExecutor implements Executor {
 
   #settleFatal(entry: AttemptEntry, failure: RuntimeDiagnostic): void {
     const now = this.#clock.now().toISOString();
-    this.#settle(entry, {
+    this.#decide(entry, {
       taskId: entry.request.taskId,
       attemptId: entry.request.attemptId,
       status: "failed",

@@ -1057,8 +1057,8 @@ test("terminate rejection transfers custody to quarantine without double-countin
       advance: () => new Promise((resolve) => setImmediate(resolve)),
     });
     if (result === undefined) throw new Error("Termination rejection result is missing");
-    assert.equal(result.status, "failed");
-    assert.equal(result.diagnostic?.code, "EXECUTOR_THREAD_TERMINATION_FAILED");
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.output, "termination-reject");
     assert.equal((await executor.health()).active, 1);
     assert.equal((await executor.health()).status, "unhealthy");
     assert.equal((await executor.probe()).availableCapacity, 0);
@@ -1096,8 +1096,8 @@ test("terminate and exit timeout enters bounded quarantine until authoritative e
       advance: () => new Promise((resolve) => setImmediate(resolve)),
     });
     if (result === undefined) throw new Error("Termination timeout result is missing");
-    assert.equal(result.status, "failed");
-    assert.equal(result.diagnostic?.code, "EXECUTOR_THREAD_TERMINATION_FAILED");
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.output, "termination-timeout");
     assert.equal((await executor.health()).active, 1);
     assert.equal((await executor.health()).status, "unhealthy");
     assert.equal((await executor.probe()).availableCapacity, 0);
@@ -1158,10 +1158,7 @@ test("fatal quarantine publishes stalled resolver attempts without awaiting late
     delayedResult = value;
   });
   try {
-    assert.equal(
-      (await primaryHandle.result).diagnostic?.code,
-      "EXECUTOR_THREAD_TERMINATION_FAILED",
-    );
+    assert.equal((await primaryHandle.result).status, "succeeded");
     await eventually(
       () => {
         assert.notEqual(neverResult, undefined);
@@ -1198,7 +1195,7 @@ test("fatal quarantine publishes stalled resolver attempts without awaiting late
   }
 });
 
-test("cancellation during worker cleanup wins the single terminal decision", async () => {
+test("cancellation during worker cleanup cannot rewrite the completed execution decision", async () => {
   const factory = new GatedTerminationFactory();
   const componentFinished = Promise.withResolvers<void>();
   const executor = new ThreadExecutor(
@@ -1218,13 +1215,13 @@ test("cancellation during worker cleanup wins the single terminal decision", asy
   await executor.cancel(execution.taskId, execution.attemptId);
   factory.gate.resolve();
   try {
-    assert.equal((await handle.result).status, "cancelled");
+    assert.equal((await handle.result).status, "succeeded");
   } finally {
     await executor.drain({});
   }
 });
 
-test("deadline during worker cleanup wins the single terminal decision", async () => {
+test("deadline during worker cleanup cannot rewrite the completed execution decision", async () => {
   const factory = new GatedTerminationFactory();
   const componentFinished = Promise.withResolvers<void>();
   const executor = new ThreadExecutor(
@@ -1249,7 +1246,7 @@ test("deadline during worker cleanup wins the single terminal decision", async (
   await Promise.resolve();
   factory.gate.resolve();
   try {
-    assert.equal((await handle.result).status, "timed-out");
+    assert.equal((await handle.result).status, "succeeded");
   } finally {
     await executor.drain({});
   }

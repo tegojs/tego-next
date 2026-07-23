@@ -164,6 +164,7 @@ interface AttemptEntry {
   readonly deadlineController: AbortController;
   readonly admissionController: AbortController;
   state: "accepted" | "running" | "terminal";
+  decision?: ExecutionResult;
   terminal?: ExecutionResult;
   forced?: ExecutionResult;
   lease?: WorkerLease;
@@ -942,6 +943,7 @@ export class ThreadExecutor implements Executor {
       this.#active += 1;
       entry.state = "running";
       void this.#run(entry).finally(() => {
+        this.#publish(entry);
         this.#active -= 1;
         if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
         entry.completed.resolve();
@@ -1081,9 +1083,10 @@ export class ThreadExecutor implements Executor {
         startedAt,
         completedAt: this.#clock.now().toISOString(),
       };
+      this.#decide(entry, candidate);
       await this.#shutdownWorker(channel, lease, component.artifactDigest, controlDeadline);
     } catch (error) {
-      if (entry.state !== "terminal") {
+      if (entry.decision === undefined) {
         const code =
           error instanceof DiagnosticError
             ? error.diagnostic.code
@@ -1115,8 +1118,8 @@ export class ThreadExecutor implements Executor {
       delete entry.channel;
       delete entry.transfer;
       delete entry.forced;
-      if (entry.state !== "terminal") {
-        this.#settle(
+      if (entry.decision === undefined) {
+        this.#decide(
           entry,
           termination?.diagnostic !== undefined
             ? this.#terminationFailureResult(entry, termination.diagnostic, lease, startedAt)
@@ -1314,7 +1317,7 @@ export class ThreadExecutor implements Executor {
     entry: AttemptEntry,
     cancellation: "cancelled" | "timed-out",
   ): Promise<void> {
-    if (entry.state === "terminal") return;
+    if (entry.state === "terminal" || entry.decision !== undefined) return;
     entry.cancellation ??= cancellation;
     entry.admissionController.abort(entry.cancellation);
     if (entry.state === "accepted") {
@@ -1373,13 +1376,27 @@ export class ThreadExecutor implements Executor {
     };
   }
 
-  #settle(entry: AttemptEntry, result: ExecutionResult): boolean {
-    if (entry.state === "terminal") return false;
-    entry.state = "terminal";
+  #decide(entry: AttemptEntry, result: ExecutionResult): boolean {
+    if (entry.decision !== undefined) return false;
     entry.deadlineController.abort("terminal");
     entry.admissionController.abort("terminal");
-    entry.terminal = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
+    entry.decision = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
     return true;
+  }
+
+  #publish(entry: AttemptEntry): boolean {
+    if (entry.state === "terminal") return false;
+    if (entry.decision === undefined) {
+      throw new Error("Thread attempt decision is missing");
+    }
+    entry.state = "terminal";
+    entry.terminal = entry.decision;
+    return true;
+  }
+
+  #settle(entry: AttemptEntry, result: ExecutionResult): boolean {
+    if (!this.#decide(entry, result)) return false;
+    return this.#publish(entry);
   }
 
   #lease(worker: ThreadWorker): WorkerLease {
@@ -1549,7 +1566,7 @@ export class ThreadExecutor implements Executor {
         this.#settle(entry, fatal);
       } else {
         entry.forced ??= fatal;
-        entry.admissionController.abort("fatal");
+        this.#decide(entry, entry.forced);
       }
       if (queued) {
         if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
