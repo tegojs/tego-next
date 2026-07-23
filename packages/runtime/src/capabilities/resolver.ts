@@ -180,9 +180,8 @@ function ownBinding(
   name: string,
 ): PluginDeploymentIdentity | undefined {
   const descriptor = Object.getOwnPropertyDescriptor(bindings, name);
-  return descriptor !== undefined && descriptor.enumerable && "value" in descriptor
-    ? descriptor.value
-    : undefined;
+  if (descriptor?.enumerable !== true || !("value" in descriptor)) return undefined;
+  return descriptor.value;
 }
 
 function identityKey(identity: PluginDeploymentIdentity): string {
@@ -368,8 +367,7 @@ function providerLossDecisions(
     const requirement = normalizeRequirement(requirementSource);
     const provider = byIdentity.get(identityKey(previous.provider));
     const available =
-      provider !== undefined &&
-      provider.ready &&
+      provider?.ready === true &&
       compatibleProvisions(provider, requirement).length > 0;
     if (!available) {
       actions.push({
