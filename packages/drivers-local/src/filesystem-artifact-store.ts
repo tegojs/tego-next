@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
 import {
   access,
   mkdir,
@@ -108,6 +107,39 @@ async function writeChunk(handle: FileHandle, chunk: Uint8Array): Promise<void> 
   }
 }
 
+export interface ArtifactRandomAccessReader {
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{ readonly bytesRead: number }>;
+}
+
+const ARTIFACT_READ_CHUNK_BYTES = 64 * 1024;
+
+export async function hashArtifactHandle(
+  reader: ArtifactRandomAccessReader,
+  chunkBytes = ARTIFACT_READ_CHUNK_BYTES,
+): Promise<ArtifactDigest> {
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes <= 0) {
+    throw new RangeError("chunkBytes must be a positive safe integer");
+  }
+  const buffer = Buffer.allocUnsafe(chunkBytes);
+  const hash = createHash("sha256");
+  let position = 0;
+  while (true) {
+    const { bytesRead } = await reader.read(buffer, 0, buffer.byteLength, position);
+    if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 || bytesRead > buffer.byteLength) {
+      throw new Error("Artifact file read returned an invalid byte count");
+    }
+    if (bytesRead === 0) break;
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return parseArtifactDigest(`sha256:${hash.digest("hex")}`);
+}
+
 export class FilesystemArtifactStore implements ArtifactStore {
   readonly scope = "local" as const;
   readonly #rootDirectory: string;
@@ -179,18 +211,28 @@ export class FilesystemArtifactStore implements ArtifactStore {
   async *read(digest: ArtifactDigest): AsyncIterable<Uint8Array> {
     this.#assertOpen();
     const parsed = parseArtifactDigest(digest);
-    const operation = this.#readVerified(parsed);
+    const operation = this.#openVerified(parsed);
     this.#operations.add(operation);
+    let handle: FileHandle | undefined;
     try {
-      const chunks = await operation;
-      for (const chunk of chunks) {
+      handle = await operation;
+    } finally {
+      this.#operations.delete(operation);
+    }
+    try {
+      const buffer = Buffer.allocUnsafe(ARTIFACT_READ_CHUNK_BYTES);
+      let position = 0;
+      while (true) {
         if (this.#lifecycle === "closed") {
           throw this.#closedError();
         }
-        yield chunk;
+        const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        yield Buffer.from(buffer.subarray(0, bytesRead));
       }
     } finally {
-      this.#operations.delete(operation);
+      await handle?.close();
     }
   }
 
@@ -278,19 +320,18 @@ export class FilesystemArtifactStore implements ArtifactStore {
     }
   }
 
-  async #readVerified(digest: ArtifactDigest): Promise<readonly Buffer[]> {
-    const chunks: Buffer[] = [];
-    const hash = createHash("sha256");
-    for await (const chunk of createReadStream(this.pathFor(digest))) {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      hash.update(bytes);
-      chunks.push(bytes);
+  async #openVerified(digest: ArtifactDigest): Promise<FileHandle> {
+    const handle = await open(this.pathFor(digest), "r");
+    try {
+      const actual = await hashArtifactHandle(handle);
+      if (actual !== digest) {
+        throw this.#digestMismatch(digest, actual);
+      }
+      return handle;
+    } catch (error) {
+      await handle.close();
+      throw error;
     }
-    const actual = parseArtifactDigest(`sha256:${hash.digest("hex")}`);
-    if (actual !== digest) {
-      throw this.#digestMismatch(digest, actual);
-    }
-    return chunks;
   }
 
   async #fileMatches(path: string, digest: ArtifactDigest): Promise<boolean> {
