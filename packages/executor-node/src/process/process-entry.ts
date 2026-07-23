@@ -13,6 +13,10 @@ import {
 import { ComponentHost, type ComponentHostClock } from "../host/component-host.js";
 import { authenticateProcessMessage, signProcessMessage } from "./authentication.js";
 import { ProcessFrameDecoder, encodeProcessFrame } from "./framing.js";
+import {
+  ProcessOutboundWriter,
+  type ProcessOutboundPriority,
+} from "./outbound-writer.js";
 
 interface BootstrapMessage {
   readonly kind: "bootstrap";
@@ -48,7 +52,6 @@ let nextRpcId = 0;
 let outboundSequence = 0;
 let inboundSequence = 0;
 let channelKey: Uint8Array | undefined;
-let writeChain = Promise.resolve();
 const pendingRpc = new Map<
   string,
   {
@@ -66,24 +69,24 @@ function writeRaw(bytes: Uint8Array): Promise<void> {
   });
 }
 
-function send(value: unknown): Promise<void> {
+const outboundWriter = new ProcessOutboundWriter({
+  encode(value) {
+    const message =
+      channelKey === undefined
+        ? value
+        : signProcessMessage(channelKey, "child-to-parent", outboundSequence, value);
+    const frame = encodeProcessFrame(message, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED");
+    if (channelKey !== undefined) outboundSequence += 1;
+    return frame;
+  },
+  write: writeRaw,
+});
+
+function send(value: unknown, priority: ProcessOutboundPriority = "required"): Promise<void> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return Promise.reject(new Error("Process response must be an object"));
   }
-  const message =
-    channelKey === undefined
-      ? value
-      : signProcessMessage(
-          channelKey,
-          "child-to-parent",
-          outboundSequence++,
-          value as Record<string, unknown>,
-        );
-  const queued = writeChain.then(() =>
-    writeRaw(encodeProcessFrame(message, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED")),
-  );
-  writeChain = queued.catch(() => undefined);
-  return queued;
+  return outboundWriter.send(value as Record<string, unknown>, priority);
 }
 
 async function respond(id: string, result: unknown): Promise<void> {
@@ -337,13 +340,21 @@ async function bootstrap(message: BootstrapMessage): Promise<void> {
     clock,
     logger: {
       debug: (...values) =>
-        void send({ kind: "diagnostic", level: "debug", values }).catch(() => undefined),
+        void send({ kind: "diagnostic", level: "debug", values }, "diagnostic").catch(
+          () => undefined,
+        ),
       error: (...values) =>
-        void send({ kind: "diagnostic", level: "error", values }).catch(() => undefined),
+        void send({ kind: "diagnostic", level: "error", values }, "diagnostic").catch(
+          () => undefined,
+        ),
       info: (...values) =>
-        void send({ kind: "diagnostic", level: "info", values }).catch(() => undefined),
+        void send({ kind: "diagnostic", level: "info", values }, "diagnostic").catch(
+          () => undefined,
+        ),
       warn: (...values) =>
-        void send({ kind: "diagnostic", level: "warn", values }).catch(() => undefined),
+        void send({ kind: "diagnostic", level: "warn", values }, "diagnostic").catch(
+          () => undefined,
+        ),
     },
     events: {
       emit: async (type, payload) => {
@@ -413,7 +424,7 @@ async function main(): Promise<void> {
   } finally {
     for (const pending of pendingRpc.values()) pending.reject(new Error("Parent channel closed"));
     pendingRpc.clear();
-    await writeChain;
+    await outboundWriter.flush();
   }
 }
 
