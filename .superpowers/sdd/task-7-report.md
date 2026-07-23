@@ -110,3 +110,21 @@ The formal review requested changes were handled in additional RED/GREEN slices:
     runtime canonicalizer does.
 
 `3f0ebae` is the final lint-only simplification after these changes.
+
+## Final Re-review Remediation
+
+- RED `9830919` reproduced the remaining findings:
+  - multi-segment top-level wildcards such as `x.x`, `x.x.x`, and `*.*` were accepted as valid
+    ranges but did not behave universally;
+  - duplicate deployment validation depended on which identical deployment appeared first;
+  - a consumer already marked unready still received a provider-loss action.
+- GREEN `0b02c34` closes them with narrow changes:
+  - only single-token `x`, `X`, and `*` are universal; multi-segment top-level wildcards are
+    consistently invalid and never match, including through ArtifactService;
+  - duplicate identities are diagnosed while every grouped deployment is still validated, making
+    diagnostics independent of duplicate input order;
+  - provider-loss propagation requires the consumer itself to be ready.
+
+Focused RED was observed with three failing resolver assertions; the artifact cases already
+rejected the malformed ranges and therefore confirmed the inconsistency was specifically in
+`isValidVersionRange`. Focused GREEN passed 94/94 artifact and capability tests.
