@@ -41,7 +41,7 @@ const PERMISSION_SET_SCHEMA_ID = "https://tegojs.dev/schemas/permission-set-1.0.
 const PORTABLE_NAME_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 const ENVIRONMENT_NAME_PATTERN = "^[A-Za-z_][A-Za-z0-9_]{0,127}$";
 const LOGICAL_ROOT_PATTERN =
-  "^/(?!.*(?:^|/)\\.\\.(?:/|$))(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)?$";
+  "^/(?!(?:\\.{1,2})(?:/|$))(?!.*\\/(?:\\.{1,2})(?:/|$))(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)?$";
 
 function isJsonValue(input: unknown, ancestors = new Set<object>()): boolean {
   if (
