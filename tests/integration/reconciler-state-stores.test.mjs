@@ -19,6 +19,9 @@ const componentId = parseComponentId("echo-service");
 const digest = parseArtifactDigest(
   "sha256:1111111111111111111111111111111111111111111111111111111111111111",
 );
+const digestTwo = parseArtifactDigest(
+  "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+);
 
 class ManualClock {
   #now = Date.parse("2026-07-23T00:00:00.000Z");
@@ -221,4 +224,114 @@ test("stale pending placement is quarantined before its stable identity is repla
     assert.equal((await readOnlyInstance(state, pending.instanceId))?.value.lifecycle, "ready");
     await reconciler.stop();
   });
+});
+
+test("upgrade and rollback tear down old components removed from the current manifest", async (t) => {
+  for (const scenario of [
+    {
+      name: "upgrade",
+      currentDigest: digestTwo,
+      currentGeneration: parseGeneration("2"),
+      currentVersion: "2.0.0",
+      oldDigest: digest,
+      oldGeneration: parseGeneration("1"),
+    },
+    {
+      name: "rollback",
+      currentDigest: digest,
+      currentGeneration: parseGeneration("3"),
+      currentVersion: "1.0.0",
+      oldDigest: digestTwo,
+      oldGeneration: parseGeneration("2"),
+    },
+  ]) {
+    await t.test(scenario.name, async (scenarioTest) => {
+      await withRealStateStores(scenarioTest, async (state, clock) => {
+        const currentManifest = {
+          ...manifest(),
+          version: scenario.currentVersion,
+          components: [],
+          permissions: [],
+        };
+        const desired = {
+          ...deployment(),
+          version: scenario.currentVersion,
+          artifactDigest: scenario.currentDigest,
+          generation: scenario.currentGeneration,
+          permissionGrants: [],
+        };
+        const currentInstallation = {
+          ...installation(),
+          version: scenario.currentVersion,
+          digest: scenario.currentDigest,
+          manifest: currentManifest,
+        };
+        const oldIdentity = planReconcile({
+          deployment: {
+            ...desired,
+            artifactDigest: scenario.oldDigest,
+            generation: scenario.oldGeneration,
+          },
+          gate: gate(),
+          instances: [],
+          now: clock.now().toISOString(),
+          supportedExecutors: ["process"],
+        }).steps[0]?.effect;
+        assert.ok(oldIdentity);
+        await state.transact({}, async (transaction) => {
+          await transaction.put(
+            {
+              namespace: "tego",
+              collection: "component-instances",
+              id: oldIdentity.instanceId,
+            },
+            {
+              applicationId,
+              artifactDigest: scenario.oldDigest,
+              componentId,
+              deploymentGeneration: scenario.oldGeneration,
+              executor: "process",
+              instanceId: oldIdentity.instanceId,
+              lifecycle: "ready",
+              observedGeneration: scenario.oldGeneration,
+              pluginId,
+            },
+            { expectedRevision: "absent" },
+          );
+          return null;
+        });
+        const effects = new RecordingEffects();
+        const reconciler = new Reconciler({
+          artifactGate: {
+            validate: async () => ({
+              ...gate().artifact,
+              digest: scenario.currentDigest,
+              manifest: currentManifest,
+            }),
+          },
+          clock,
+          effects,
+          state,
+          loadDeployments: async () => [desired],
+          loadInstallations: async () => [currentInstallation],
+        });
+
+        await reconciler.start();
+        await reconciler.wake();
+
+        assert.deepEqual(
+          effects.calls.map((effect) => [effect.kind, effect.artifactDigest, effect.executor]),
+          [
+            ["drain", scenario.oldDigest, "process"],
+            ["stop", scenario.oldDigest, "process"],
+          ],
+        );
+        assert.equal(
+          (await readOnlyInstance(state, oldIdentity.instanceId))?.value.lifecycle,
+          "stopped",
+        );
+        await reconciler.stop();
+      });
+    });
+  }
 });
