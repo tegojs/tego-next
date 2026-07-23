@@ -10,7 +10,7 @@ import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { signArtifact } from "../src/plugin/sign-plugin.js";
 
 const fixtureDirectory = fileURLToPath(
-  new URL("../../../examples/echo-plugin/", import.meta.url),
+  new URL("../../../../examples/echo-plugin/", import.meta.url),
 );
 
 async function temporaryFixture(): Promise<string> {
@@ -20,6 +20,23 @@ async function temporaryFixture(): Promise<string> {
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(join(fixtureDirectory, path), destination);
   }
+  await writeFile(
+    join(directory, "tsconfig.json"),
+    JSON.stringify({
+      compilerOptions: {
+        declaration: false,
+        erasableSyntaxOnly: true,
+        module: "NodeNext",
+        moduleResolution: "NodeNext",
+        outDir: "build/components",
+        rootDir: "src",
+        sourceMap: false,
+        strict: true,
+        target: "ES2024",
+      },
+      include: ["src/component.ts"],
+    }),
+  );
   return directory;
 }
 

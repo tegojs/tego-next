@@ -257,6 +257,11 @@ test("rejects malformed, truncated, checksum-mismatched, and oversized archives"
   await context.test("malformed octal", async () => {
     const archive = tar(validEntries());
     archive[124] = "z".charCodeAt(0);
+    archive.fill(0x20, 148, 156);
+    const checksum = archive
+      .subarray(0, 512)
+      .reduce((sum, byte) => sum + byte, 0);
+    writeOctal(archive, 148, 7, checksum);
     const { digest, service } = await serviceFor(archive);
     await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ARCHIVE_MALFORMED");
   });

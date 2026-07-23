@@ -6,8 +6,7 @@
     "declarationMap": false,
     "outDir": "build/components",
     "rootDir": "src",
-    "sourceMap": false,
-    "tsBuildInfoFile": null
+    "sourceMap": false
   },
   "include": ["src/component.ts"]
 }

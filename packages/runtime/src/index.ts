@@ -1,3 +1,18 @@
+export {
+  ArtifactService,
+  type ArtifactCompatibility,
+  type ArtifactServiceOptions,
+  type ArtifactSignatureEnvelope,
+  type ArtifactTrustConfiguration,
+  type ArtifactTrustKey,
+  type ValidateArtifactRequest,
+  type ValidatedPluginArtifact,
+} from "./artifacts/artifact-service.js";
+export {
+  canonicalJsonBytes,
+  createDeterministicArchive,
+  type DeterministicArchiveEntry,
+} from "./artifacts/archive-codec.js";
 export { createRuntime } from "./create-runtime.js";
 export {
   isRuntimeReady,
