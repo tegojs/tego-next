@@ -781,6 +781,10 @@ export class ProcessExecutor implements Executor {
     const startedAt = this.#clock.now().toISOString();
     try {
       const component = await this.#resolve(entry.request);
+      if (this.#fatalDiagnostic !== undefined) {
+        this.#settleFatal(entry, this.#fatalDiagnostic);
+        return;
+      }
       if (entry.cancellation !== undefined) {
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
@@ -790,6 +794,11 @@ export class ProcessExecutor implements Executor {
         environment: {},
       });
       entry.process = process_;
+      if (this.#fatalDiagnostic !== undefined) {
+        await this.#terminate(process_);
+        this.#settleFatal(entry, this.#fatalDiagnostic);
+        return;
+      }
       channel = new ProcessChannel(process_, this.#options, component);
       entry.channel = channel;
       const bootstrap = await channel.request({
@@ -1183,19 +1192,23 @@ export class ProcessExecutor implements Executor {
   #failQueued(failure: RuntimeDiagnostic): void {
     for (const entry of this.#queue.splice(0)) {
       if (entry.state === "terminal") continue;
-      const now = this.#clock.now().toISOString();
-      this.#settle(entry, {
-        taskId: entry.request.taskId,
-        attemptId: entry.request.attemptId,
-        status: "failed",
-        diagnostic: failure,
-        executor: { kind: "process", metadata: { executorId: this.id } },
-        startedAt: now,
-        completedAt: now,
-      });
+      this.#settleFatal(entry, failure);
       if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
       entry.completed.resolve();
     }
+  }
+
+  #settleFatal(entry: AttemptEntry, failure: RuntimeDiagnostic): void {
+    const now = this.#clock.now().toISOString();
+    this.#settle(entry, {
+      taskId: entry.request.taskId,
+      attemptId: entry.request.attemptId,
+      status: "failed",
+      diagnostic: failure,
+      executor: { kind: "process", metadata: { executorId: this.id } },
+      startedAt: now,
+      completedAt: now,
+    });
   }
 
   #executorMetadata(
