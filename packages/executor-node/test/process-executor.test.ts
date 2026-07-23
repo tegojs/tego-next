@@ -19,6 +19,7 @@ import {
   type HostedProcess,
   type HostedProcessExit,
   type JsonValue,
+  type Permission,
   type ProcessHost,
   type ProcessSpawnRequest,
 } from "@tegojs/contracts";
@@ -432,6 +433,82 @@ test("terminal results are deeply immutable cached snapshots", async () => {
     if (observed?.state === "terminal") {
       assert.deepEqual(observed.result.output, { nested: { value: "original" } });
     }
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("child permission validation accepts canonical narrowed grants for every permission category", async () => {
+  const requested = [
+    {
+      kind: "capability",
+      capabilities: [{ name: "org.example.echo", methods: ["read", "write"] }],
+    },
+    { kind: "executor", executors: ["process", "thread"] },
+    { kind: "secret", names: ["api", "signing"] },
+    {
+      kind: "network",
+      hosts: ["EXAMPLE.com.", "api.example.com"],
+      ports: [80, 443],
+      methods: ["GET", "POST"],
+    },
+    {
+      kind: "filesystem",
+      roots: [{ path: "/data", access: ["read", "write"] }],
+    },
+    {
+      kind: "worker",
+      labels: { zone: "edge-a" },
+      resources: { cpuMillis: 2_000, memoryBytes: 2_000, storageBytes: 2_000 },
+    },
+  ] satisfies readonly Permission[];
+  const granted = [
+    {
+      kind: "capability",
+      capabilities: [{ name: "org.example.echo", methods: ["read"] }],
+    },
+    { kind: "executor", executors: ["process"] },
+    { kind: "secret", names: ["api"] },
+    {
+      kind: "network",
+      hosts: ["example.com"],
+      ports: [443],
+      methods: ["GET"],
+    },
+    {
+      kind: "filesystem",
+      roots: [{ path: "/data/reports", access: ["read"] }],
+    },
+    {
+      kind: "worker",
+      labels: { zone: "edge-a", accelerator: "gpu" },
+      resources: { cpuMillis: 1_000, memoryBytes: 1_000, storageBytes: 1_000 },
+    },
+  ] satisfies readonly Permission[];
+  const fixture = await artifact();
+  const manifest = parsePluginManifest({ ...fixture.manifest, permissions: requested });
+  const executor = new ProcessExecutor(
+    await options({
+      resolveComponent: async () => ({
+        artifactDigest: digest,
+        artifactRoot: fixture.artifactRoot,
+        manifest,
+        runtimeId: "runtime",
+        instanceId: "instance",
+        configuration: {},
+        permissionGrants: granted,
+        capabilityDefinitions: [],
+      }),
+    }),
+  );
+  try {
+    const result = await (
+      await executor.submit(
+        request({ mode: "echo", value: "narrowed" }, "narrowed-permissions"),
+      )
+    ).result;
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.output, "narrowed");
   } finally {
     await executor.drain({});
   }
