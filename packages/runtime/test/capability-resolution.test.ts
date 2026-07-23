@@ -8,6 +8,7 @@ import {
 } from "@tegojs/contracts";
 import {
   isValidVersion,
+  isValidVersionRange,
   resolveCapabilities,
   satisfiesVersionRange,
   type CapabilityResolutionDeployment,
@@ -402,6 +403,39 @@ test("strict versions reject invalid prerelease identifiers and compare prerelea
   assert.equal(isValidVersion("1.0.0-alpha.1"), true);
   assert.equal(satisfiesVersionRange("1.0.0-alpha.1", ">=1.0.0"), false);
   assert.equal(satisfiesVersionRange("1.0.0+build.1", "=1.0.0"), true);
+});
+
+test("supported version ranges have strict partial, wildcard, caret, and prerelease semantics", () => {
+  for (const [version, range, expected] of [
+    ["99.0.0", "*", true],
+    ["99.0.0", "x", true],
+    ["99.0.0", "X", true],
+    ["1.9.9", "1.x", true],
+    ["2.0.0", "1.x", false],
+    ["26.9.9", ">26", false],
+    ["27.0.0", ">26", true],
+    ["26.9.9", "<=26", true],
+    ["27.0.0", "<=26", false],
+    ["0.9.9", "^0", true],
+    ["1.0.0", "^0", false],
+    ["0.0.9", "^0.0", true],
+    ["0.1.0", "^0.0", false],
+    ["0.0.3", "^0.0.3", true],
+    ["0.0.4", "^0.0.3", false],
+    ["1.0.0-alpha", "=1.0.0-alpha", true],
+    ["1.0.0-alpha", ">=1.0.0", false],
+    ["1.0.0-alpha", ">=0.0.0", false],
+    ["1.0.0-beta", ">=1.0.0-alpha <2.0.0", true],
+    ["1.0.0-999999999999999999999999", ">=1.0.0-1000000000000000000000000", false],
+    ["1.0.0-1000000000000000000000000", ">1.0.0-999999999999999999999999", true],
+  ] as const) {
+    assert.equal(satisfiesVersionRange(version, range), expected, `${version} ${range}`);
+  }
+
+  for (const range of ["1.0.0 - 2.0.0", "latest", ">=1.0.0 ||", "|| >=1.0.0"]) {
+    assert.equal(isValidVersionRange(range), false, range);
+    assert.equal(satisfiesVersionRange("1.5.0", range), false, range);
+  }
 });
 
 test("static required cycles are diagnosed even when every provider is unready", () => {

@@ -532,6 +532,10 @@ test("compatibility ranges never match empty or incomplete alternatives", async 
   for (const [range, compatible] of [
     [">=26 <27", true],
     ["26.x", true],
+    ["*", true],
+    ["x", true],
+    [">26", false],
+    ["<=26", true],
     ["~26.5.0", true],
     [">=27 || >=26 <27", true],
     ["||", false],
@@ -540,6 +544,7 @@ test("compatibility ranges never match empty or incomplete alternatives", async 
     [">=26 nonsense", false],
     ["nonsense || >=26", false],
     [">", false],
+    ["26.0.0 - 27.0.0", false],
   ] as const) {
     await context.test(range, async () => {
       const archive = tar(validEntries({ ...manifest, nodeRange: range }));
