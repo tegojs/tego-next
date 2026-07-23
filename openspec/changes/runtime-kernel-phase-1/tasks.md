@@ -17,9 +17,9 @@
 
 - [x] 3.1 Define the state-store conformance suite from restart, transaction, revision, journal, and namespace scenarios
 - [x] 3.2 Implement the in-memory state store test double until it passes the conformance suite
-- [ ] 3.3 Implement the SQLite state store and numbered migrations until it passes conformance and process-restart tests
+- [x] 3.3 Implement the SQLite state store and numbered migrations until it passes conformance and process-restart tests
 - [ ] 3.4 Define the coordination-provider conformance suite for leadership, leases, fencing, CAS, watch, namespaces, idempotency, and close
-- [ ] 3.5 Implement the local single-Main coordination provider until it passes all applicable conformance scenarios
+- [x] 3.5 Implement the local single-Main coordination provider until it passes all applicable conformance scenarios
 - [ ] 3.6 Implement PostgreSQL schema migrations, leadership, lease, fencing, CAS, watch catch-up, and cleanup test-first
 - [ ] 3.7 Run PostgreSQL takeover and stale-leader fault tests against a pinned Docker image
 

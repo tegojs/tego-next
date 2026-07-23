@@ -297,7 +297,7 @@ Commit: `git add packages/contracts packages/testkit packages/drivers-local && g
 - Produces: `createLocalDrivers({ dataDirectory }): Promise<RuntimeDrivers>`.
 - Produces: `SqliteStateStore`, `LocalCoordinationProvider`, and `FilesystemArtifactStore`.
 
-- [ ] **Step 1: Write and commit failing restart and artifact tests**
+- [x] **Step 1: Write and commit failing restart and artifact tests**
 
 Include:
 
@@ -320,19 +320,19 @@ Expected: FAIL with missing local driver exports.
 
 Commit: `git add packages/drivers-local/test && git commit -m "test: define durable local drivers"`
 
-- [ ] **Step 2: Implement SQLite migrations and state semantics**
+- [x] **Step 2: Implement SQLite migrations and state semantics**
 
 Create schema version table plus `records`, `changes`, `operations`, `outbox`,
 and `idempotency` tables. Use `BEGIN IMMEDIATE`, database-generated revisions,
 and WAL mode. Store canonical JSON text and validate decoded values.
 
-- [ ] **Step 3: Implement local coordination and artifact storage**
+- [x] **Step 3: Implement local coordination and artifact storage**
 
 Local leadership returns epoch `"1"`. Leases use the injected clock.
 Artifact writes stream to a temporary file, hash bytes, fsync, rename into
 `artifacts/<first-two-digest-chars>/<digest>.tego`, and reject digest mismatch.
 
-- [ ] **Step 4: Run public conformance, restart tests, and commit**
+- [x] **Step 4: Run public conformance, restart tests, and commit**
 
 Run:
 
@@ -348,6 +348,10 @@ Commit: `git add packages/drivers-local && git commit -m "feat: add durable loca
 ## Task 5: Boot, recover, inspect, and stop an empty runtime
 
 **Files:**
+- Modify: `packages/contracts/src/state.ts`
+- Modify: `packages/contracts/src/runtime.ts`
+- Modify: `packages/drivers-local/src/memory-state-store.ts`
+- Modify: `packages/drivers-local/src/sqlite/sqlite-state-store.ts`
 - Create: `packages/runtime/tsconfig.json`
 - Create: `packages/runtime/src/runtime-state.ts`
 - Create: `packages/runtime/src/driver-supervisor.ts`
@@ -360,6 +364,8 @@ Commit: `git add packages/drivers-local && git commit -m "feat: add durable loca
 
 **Interfaces:**
 - Consumes: `RuntimeDrivers`.
+- Produces: a public operation-journal query used by runtime recovery; storage
+  implementations remain private.
 - Produces: `createRuntime(configuration, drivers): Runtime`.
 - Produces: `Runtime.start`, `Runtime.status`, `Runtime.stop`, and `Runtime.events`.
 
@@ -367,7 +373,8 @@ Commit: `git add packages/drivers-local && git commit -m "feat: add durable loca
 
 Cover empty lifecycle, reverse cleanup after partial open, multi-Main rejection
 with local coordination, recovery-before-accepting-operations, essential
-readiness, repeated `start`, and repeated `stop`.
+readiness, repeated `start`, repeated `stop`, and deterministic enumeration of
+non-terminal operation-journal entries after restart.
 
 Run: `npm run test:unit -w @tegojs/runtime`
 
@@ -383,9 +390,12 @@ or an essential desired deployment is not ready.
 
 - [ ] **Step 3: Implement bootstrap and recovery ordering**
 
-Open drivers in `state, artifacts, coordination, processHost, secrets, clock`
-order; recover state; obtain authority; start operations and reconciliation;
-then set `acceptingOperations=true`. Close in reverse order.
+Open the drivers present in the phase-one runtime contract in dependency order;
+recover state by using only public state-store queries; obtain authority; start
+operations and reconciliation; then set `acceptingOperations=true`. Close in
+reverse order. `ProcessHost` and `SecretProvider` join the bootstrap contract in
+Tasks 10 and 9 respectively, when their real consumers and conformance tests
+exist; placeholder providers are forbidden.
 
 - [ ] **Step 4: Run focused and local integration tests, then commit**
 
@@ -510,6 +520,9 @@ Commit: `git add packages/runtime && git commit -m "feat: resolve capabilities a
 ## Task 8: Reconcile deployments into kernel-owned component lifecycles
 
 **Files:**
+- Modify: `packages/contracts/src/state.ts`
+- Modify: `packages/drivers-local/src/memory-state-store.ts`
+- Modify: `packages/drivers-local/src/sqlite/sqlite-state-store.ts`
 - Create: `packages/runtime/src/reconcile/component-lifecycle.ts`
 - Create: `packages/runtime/src/reconcile/plan.ts`
 - Create: `packages/runtime/src/reconcile/placement.ts`
@@ -521,13 +534,16 @@ Commit: `git add packages/runtime && git commit -m "feat: resolve capabilities a
 **Interfaces:**
 - Produces: `planReconcile(snapshot): ReconcilePlan`.
 - Produces: `Reconciler.start`, `Reconciler.wake`, and `Reconciler.stop`.
+- Produces: public outbox claim/acknowledgement operations with stable message
+  identity, fencing, retry visibility, and idempotent acknowledgement.
 
 - [ ] **Step 1: Write and commit failing lifecycle and convergence tests**
 
 Cover legal transitions, illegal transition diagnostic, generation change,
 duplicate reconcile, enable, disable, upgrade, drain, rollback, non-essential
 failure, essential readiness, retry timing, and restart during one external
-action.
+action. Also cover concurrent outbox claims, claim expiry, stale-fence rejection,
+duplicate acknowledgement, and restart before acknowledgement.
 
 Run: `node --test packages/runtime/dist/test/component-lifecycle.test.js packages/runtime/dist/test/reconciler.test.js`
 
@@ -558,6 +574,9 @@ Commit: `git add packages/runtime && git commit -m "feat: reconcile plugin deplo
 ## Task 9: Define the SDK and versioned ComponentHost protocol
 
 **Files:**
+- Create: `packages/contracts/src/secrets.ts`
+- Create: `packages/drivers-local/src/development-secret-provider.ts`
+- Modify: `packages/drivers-local/src/create-local-drivers.ts`
 - Create: `packages/plugin-sdk/tsconfig.json`
 - Create: `packages/plugin-sdk/src/component.ts`
 - Create: `packages/plugin-sdk/src/context.ts`
@@ -573,12 +592,16 @@ Commit: `git add packages/runtime && git commit -m "feat: reconcile plugin deplo
 **Interfaces:**
 - Produces: `defineComponent(definition): PluginComponentDefinition`.
 - Produces: ComponentHost commands `prepare`, `import`, `start`, `health`, `run`, `drain`, `stop`, and `cancel`.
+- Produces: `SecretProvider` and an explicit development-only local
+  implementation; secret values never enter plugin manifests or persisted
+  deployment configuration.
 
 - [ ] **Step 1: Write and commit failing SDK and host tests**
 
 Verify functional definitions, disposable reverse cleanup, rejected decorator or
 class assumptions, manifest entry confinement, ESM import, serialized hook
-errors, capability request/response schema checks, and cancellation delivery.
+errors, capability request/response schema checks, cancellation delivery, secret
+permission checks, redacted diagnostics, and idempotent secret-provider close.
 
 Run: `npm run test:unit -w @tegojs/plugin-sdk -w @tegojs/executor-node`
 
@@ -609,6 +632,9 @@ Commit: `git add packages/plugin-sdk packages/executor-node && git commit -m "fe
 ## Task 10: Certify ProcessExecutor
 
 **Files:**
+- Create: `packages/contracts/src/process-host.ts`
+- Create: `packages/drivers-local/src/node-process-host.ts`
+- Modify: `packages/drivers-local/src/create-local-drivers.ts`
 - Create: `packages/testkit/src/executor-suite.ts`
 - Create: `packages/executor-node/src/process/process-entry.ts`
 - Create: `packages/executor-node/src/process/process-executor.ts`
@@ -619,11 +645,14 @@ Commit: `git add packages/plugin-sdk packages/executor-node && git commit -m "fe
 **Interfaces:**
 - Produces: `executorConformance(factory, fixture)`.
 - Produces: `ProcessExecutor` implementing the public `Executor`.
+- Produces: `ProcessHost`; after this task `createLocalDrivers` satisfies the
+  complete phase-one `RuntimeDrivers` contract without placeholder members.
 
 - [ ] **Step 1: Write and commit failing executor conformance**
 
 Cover probe, echo, duplicate attempt, cancellation, deadline, crash, replacement,
-drain, health, input limit, output limit, and no leaked child process.
+drain, health, input limit, output limit, no leaked child process, spawn failure,
+and idempotent process-host shutdown.
 
 Run: `node --test packages/executor-node/dist/test/process-executor.test.js`
 
