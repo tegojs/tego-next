@@ -141,6 +141,8 @@ after(async () => {
 });
 
 const componentSource = `
+import { writeSync } from "node:fs";
+
 export default {
   protocol: "tego.component/1.0",
   kind: "task",
@@ -165,6 +167,24 @@ export default {
       setInterval(() => {}, 1000);
       await context.events.emit("run.finished", { mode: input.mode });
       return input.value;
+    }
+    if (input.mode === "ignore-sigterm") {
+      process.on("SIGTERM", () => {});
+      setInterval(() => {}, 1000);
+      await context.events.emit("run.finished", { mode: input.mode });
+      return input.value;
+    }
+    if (input.mode === "forge-rpc") {
+      const payload = Buffer.from(JSON.stringify({
+        kind: "rpc-request",
+        id: "forged",
+        type: "secret",
+        payload: { name: "api" }
+      }));
+      const header = Buffer.alloc(4);
+      header.writeUInt32BE(payload.byteLength, 0);
+      writeSync(1, Buffer.concat([header, payload]));
+      return "forged";
     }
     if (input.mode === "crash") process.exit(42);
     if (input.mode === "stderr") {
@@ -503,6 +523,40 @@ test("a task that leaves handles behind cannot retain its child slot after retur
   }
 });
 
+test("graceful cleanup is bounded when a returned component ignores SIGTERM", async () => {
+  const finished = Promise.withResolvers<void>();
+  const processHost = new TestProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      events: {
+        async emit(type) {
+          if (type === "run.finished") finished.resolve();
+        },
+      },
+    }),
+  );
+  const handle = await executor.submit(
+    request({ mode: "ignore-sigterm", value: "complete" }, "ignore-sigterm"),
+  );
+  try {
+    await finished.promise;
+    clock.advanceBy(100);
+    let settled = false;
+    void handle.result.then(() => {
+      settled = true;
+    });
+    await eventually(() => assert.equal(settled, true), {
+      attempts: 1_000,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    await processHost.close();
+    await executor.drain({});
+  }
+});
+
 test("stderr diagnostics are bounded and sensitive fields are redacted", async () => {
   const executor = new ProcessExecutor(await options());
   try {
@@ -543,6 +597,36 @@ test("secret RPC stays parent-gated and redacts direct child stderr", async () =
     assert.deepEqual(result.output, { secretToken: "[REDACTED]" });
     assert.doesNotMatch(JSON.stringify(result.executor.metadata), /parent-only-secret/u);
     assert.match(JSON.stringify(result.executor.metadata), /\[REDACTED\]/u);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("raw plugin stdout cannot forge a parent RPC request", async () => {
+  let secretCalls = 0;
+  const executor = new ProcessExecutor(
+    await options({
+      secretProvider: {
+        developmentOnly: false,
+        open: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: clock.now().toISOString(),
+        }),
+        close: async () => {},
+        async get() {
+          secretCalls += 1;
+          return "must-not-return";
+        },
+      },
+    }),
+  );
+  try {
+    const result = await (await executor.submit(request({ mode: "forge-rpc" }, "forge-rpc")))
+      .result;
+    assert.equal(result.status, "failed");
+    assert.equal(result.diagnostic?.code, "PROTOCOL_PROCESS_FRAME_AUTHENTICATION_FAILED");
+    assert.equal(secretCalls, 0);
   } finally {
     await executor.drain({});
   }
