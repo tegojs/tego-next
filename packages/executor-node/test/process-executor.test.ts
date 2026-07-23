@@ -1039,6 +1039,47 @@ test("throwing quarantine logger cannot prevent terminal failure containment", a
   }
 });
 
+test("fatal quarantine stops an already-dequeued delayed resolution before spawn", async () => {
+  const started = Promise.withResolvers<void>();
+  const resolverGate = Promise.withResolvers<void>();
+  const processHost = new RejectingKillProcessHost();
+  const base = await options({ processHost });
+  const executor = new ProcessExecutor({
+    ...base,
+    maxConcurrency: 2,
+    async resolveComponent(execution) {
+      if (execution.attemptId === "attempt-quarantine-delayed") {
+        await resolverGate.promise;
+      }
+      return base.resolveComponent(execution);
+    },
+    events: {
+      async emit(type) {
+        if (type === "run.started") started.resolve();
+      },
+    },
+  });
+  const running = request({ mode: "ignore-cancel" }, "quarantine-race-running");
+  const delayed = request({ mode: "echo", value: "must-not-spawn" }, "quarantine-delayed");
+  const runningHandle = await executor.submit(running);
+  await started.promise;
+  const delayedHandle = await executor.submit(delayed);
+  try {
+    await executor.cancel(running.taskId, running.attemptId);
+    clock.advanceBy(100);
+    assert.equal((await runningHandle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    resolverGate.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(processHost.spawnCount, 1);
+    const delayedResult = await delayedHandle.result;
+    assert.equal(delayedResult.status, "failed");
+    assert.equal(delayedResult.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+  } finally {
+    resolverGate.resolve();
+    await processHost.close();
+  }
+});
+
 test("stderr diagnostics are bounded and sensitive fields are redacted", async () => {
   const executor = new ProcessExecutor(await options());
   try {
