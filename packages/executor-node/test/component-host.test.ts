@@ -192,6 +192,73 @@ async function within<T>(promise: Promise<T>, milliseconds = 100): Promise<T> {
   }
 }
 
+async function attachmentLimitResult(
+  t: TestContext,
+  attachments: readonly ArrayBuffer[],
+): Promise<{ readonly result: ComponentHostResult; readonly runCalls: number }> {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async (context) => {
+          await context.events.emit("run.called", null);
+          return "ran";
+        }
+      });
+    `,
+  );
+  let runCalls = 0;
+  const host = new ComponentHost(
+    allowedOptions(fixture, {
+      events: {
+        emit: async (type) => {
+          if (type === "run.called") runCalls += 1;
+        },
+      },
+    }),
+  );
+  assert.equal((await host.handle(prepareCommand(fixture))).ok, true);
+  assert.equal(
+    (
+      await host.handle(
+        command("import", "import-attachment-limit", {
+          artifactDigest: digest,
+        }),
+      )
+    ).ok,
+    true,
+  );
+  assert.equal(
+    (
+      await host.handle(
+        command("start", "start-attachment-limit", {
+          artifactDigest: digest,
+        }),
+      )
+    ).ok,
+    true,
+  );
+  const result = await host.handle(
+    command("run", "run-attachment-limit", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("task-attachment-limit"),
+        attemptId: parseAttemptId("attempt-attachment-limit"),
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        input: null,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+    attachments,
+  );
+  return { result, runCalls };
+}
+
 test("host command protocol is versioned, strict, JSON-safe, and bounded", () => {
   const valid = {
     protocol: "1.0",
@@ -227,6 +294,36 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
   });
   assert.throws(() => parseComponentHostCommand(accessor), /data propert/u);
   assert.equal(calls, 0);
+});
+
+test("component host rejects excessive attachment count before plugin execution", async (t) => {
+  const { result, runCalls } = await attachmentLimitResult(
+    t,
+    Array.from({ length: 65 }, () => new ArrayBuffer(0)),
+  );
+
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
+test("component host rejects an oversized attachment before plugin execution", async (t) => {
+  const { result, runCalls } = await attachmentLimitResult(t, [new ArrayBuffer(1024 * 1024 + 1)]);
+
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
+test("component host rejects oversized aggregate attachments before plugin execution", async (t) => {
+  const { result, runCalls } = await attachmentLimitResult(t, [
+    new ArrayBuffer(512 * 1024 + 1),
+    new ArrayBuffer(512 * 1024 + 1),
+  ]);
+
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
 });
 
 test("prepare and import commands cannot nominate replaceable artifact locations", () => {
