@@ -258,6 +258,31 @@ class FatalThenDelayedSpawnProcessHost extends TestProcessHost {
   }
 }
 
+class RejectingLateSpawnProcessHost extends DelayedSpawnProcessHost {
+  readonly killCalled = Promise.withResolvers<void>();
+  readonly waitGate = Promise.withResolvers<void>();
+
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    const hosted = await super.spawn(request);
+    return {
+      pid: hosted.pid,
+      stdin: hosted.stdin,
+      stdout: hosted.stdout,
+      stderr: hosted.stderr,
+      signal: (signal) => hosted.signal(signal),
+      kill: () => {
+        this.killCalled.resolve();
+        return Promise.reject(new Error("late SIGKILL delivery failed"));
+      },
+      wait: async () => {
+        await this.waitGate.promise;
+        return hosted.kill();
+      },
+      close: () => hosted.close(),
+    };
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -845,6 +870,41 @@ test("late-spawn cleanup retains its reservation before replacement and drain co
     assert.equal(processHost.activeProcessCount, 0);
   } finally {
     processHost.gate.resolve();
+    await processHost.close();
+  }
+});
+
+test("late-spawn cleanup retains its reservation through quarantine settlement", async () => {
+  const processHost = new RejectingLateSpawnProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost, maxConcurrency: 1 }));
+  const execution = request({ mode: "echo", value: "late-rejected-kill" }, "late-rejected-kill");
+  const handle = await executor.submit(execution);
+  await processHost.started.promise;
+  try {
+    await executor.cancel(execution.taskId, execution.attemptId);
+    clock.advanceBy(100);
+    let result: Awaited<typeof handle.result> | undefined;
+    let drained = false;
+    void handle.result.then((value) => {
+      result = value;
+    });
+    const draining = executor.drain({}).then(() => {
+      drained = true;
+    });
+    processHost.gate.resolve();
+    await processHost.killCalled.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(result, undefined);
+    assert.equal(drained, false);
+    assert.equal(processHost.activeProcessCount, 1);
+
+    processHost.waitGate.resolve();
+    await draining;
+    assert.equal((await handle.result).status, "cancelled");
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    processHost.gate.resolve();
+    processHost.waitGate.resolve();
     await processHost.close();
   }
 });
