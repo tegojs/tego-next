@@ -149,6 +149,22 @@ class TestProcessHost implements ProcessHost {
   }
 }
 
+class NonSettlingWaitProcessHost extends TestProcessHost {
+  override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    const hosted = await super.spawn(request);
+    return {
+      pid: hosted.pid,
+      stdin: hosted.stdin,
+      stdout: hosted.stdout,
+      stderr: hosted.stderr,
+      signal: (signal) => hosted.signal(signal),
+      kill: () => hosted.kill(),
+      wait: () => new Promise<HostedProcessExit>(() => {}),
+      close: () => new Promise<void>(() => {}),
+    };
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -802,6 +818,57 @@ test("drain deadline cancels accepted work and bounds shutdown", async () => {
     });
     assert.equal((await handle.result).status, "cancelled");
     await draining;
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("an invalid drain deadline leaves admission and later shutdown usable", async () => {
+  const processHost = new TestProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost }));
+  await assert.rejects(executor.drain({ deadline: "not-a-deadline" }), TypeError);
+  const handled = await executor.submit(
+    request({ mode: "echo", value: "still-accepted" }, "invalid-drain"),
+  );
+  assert.equal((await handled.result).output, "still-accepted");
+  await executor.drain({});
+  await executor.close();
+  assert.equal((await executor.health()).accepting, false);
+  await processHost.close();
+});
+
+test("forced cleanup releases capacity when host wait never settles after kill", async () => {
+  const finished = Promise.withResolvers<void>();
+  const processHost = new NonSettlingWaitProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      events: {
+        async emit(type) {
+          if (type === "run.finished") finished.resolve();
+        },
+      },
+    }),
+  );
+  const handle = await executor.submit(
+    request({ mode: "ignore-sigterm", value: "complete" }, "non-settling-wait"),
+  );
+  try {
+    await finished.promise;
+    await eventually(() => assert.equal(processHost.signalCount, 1), {
+      attempts: 1_000,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    clock.advanceBy(100);
+    let settled = false;
+    void handle.result.then(() => {
+      settled = true;
+    });
+    await eventually(() => assert.equal(settled, true), {
+      attempts: 100,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    assert.equal((await executor.health()).active, 0);
   } finally {
     await processHost.close();
   }
