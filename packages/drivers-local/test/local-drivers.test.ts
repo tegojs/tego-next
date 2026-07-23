@@ -140,6 +140,38 @@ test("artifact reads verify all bytes before yielding any content", async () => 
   await store.close();
 });
 
+test("closing the store reclaims suspended verified reads", async () => {
+  const rootDirectory = await temporaryDirectory("active-read-close");
+  const store = new FilesystemArtifactStore({ rootDirectory });
+  await store.open();
+  const content = Buffer.alloc(128 * 1024, 0x61);
+  const expected = digest(content);
+  await store.put(expected, bytesSource(content));
+
+  const iterator = store.read(expected)[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  assert.equal(first.done, false);
+
+  await store.close();
+  assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+});
+
+test("closing during verification terminates the read before its first yield", async () => {
+  const rootDirectory = await temporaryDirectory("verify-yield-close");
+  const store = new FilesystemArtifactStore({ rootDirectory });
+  await store.open();
+  const content = Buffer.alloc(128 * 1024, 0x61);
+  const expected = digest(content);
+  await store.put(expected, bytesSource(content));
+
+  const iterator = store.read(expected)[Symbol.asyncIterator]();
+  const reading = iterator.next();
+  const closing = store.close();
+
+  const [first] = await Promise.all([reading, closing]);
+  assert.equal(first.done, true);
+});
+
 test("artifact verification uses a bounded reusable buffer and streams bounded chunks", async () => {
   const size = 8 * 1024 * 1024;
   const content = Buffer.alloc(size, 0x61);

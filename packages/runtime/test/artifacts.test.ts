@@ -23,6 +23,7 @@ import {
 } from "@tegojs/contracts";
 import { FakeClock } from "@tegojs/testkit";
 import { ArtifactService } from "../src/artifacts/artifact-service.js";
+import { readPluginArtifact } from "../src/artifacts/manifest-reader.js";
 
 interface TarInput {
   readonly name: string;
@@ -263,6 +264,56 @@ test("invalid manifest is rejected without evaluating component code", async () 
 
   await rejectsCode(() => service.validate({ digest }), "ARTIFACT_SCHEMA_VERSION_UNSUPPORTED");
   assert.equal((globalThis as Record<string, unknown>)[marker], undefined);
+});
+
+test("artifact parsing closes its source iterator without masking parse failures", async (context) => {
+  await context.test("successful parse", async () => {
+    const archive = tar(validEntries());
+    let returned = 0;
+    let yielded = false;
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            if (yielded) return { done: true, value: undefined };
+            yielded = true;
+            return { done: false, value: archive };
+          },
+          async return() {
+            returned += 1;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+
+    await readPluginArtifact(source);
+    assert.equal(returned, 1);
+  });
+
+  await context.test("early parse failure", async () => {
+    const archive = tar(validEntries(), { corruptChecksum: true });
+    let returned = 0;
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            return { done: false, value: archive };
+          },
+          async return() {
+            returned += 1;
+            throw new Error("iterator cleanup failed");
+          },
+        };
+      },
+    };
+
+    await rejectsCode(
+      () => readPluginArtifact(source),
+      "ARTIFACT_HEADER_CHECKSUM_INVALID",
+    );
+    assert.equal(returned, 1);
+  });
 });
 
 for (const [name, unsafePath] of [
