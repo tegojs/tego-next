@@ -167,7 +167,10 @@ class NonSettlingWaitProcessHost extends TestProcessHost {
 }
 
 class RejectingKillProcessHost extends TestProcessHost {
+  spawnCount = 0;
+
   override async spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    this.spawnCount += 1;
     const hosted = await super.spawn(request);
     return {
       pid: hosted.pid,
@@ -944,6 +947,85 @@ test("failed final kill quarantines the executor and reports unhealthy capacity"
       executor.submit(request({ mode: "echo", value: "blocked" }, "after-rejected-kill")),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_DRAINING",
     );
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("fatal quarantine fails queued work without spawning replacement children", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new RejectingKillProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const running = request({ mode: "ignore-cancel" }, "quarantine-running");
+  const runningHandle = await executor.submit(running);
+  await started.promise;
+  const queuedHandle = await executor.submit(
+    request({ mode: "echo", value: "must-not-run" }, "quarantine-queued"),
+  );
+  try {
+    await executor.cancel(running.taskId, running.attemptId);
+    clock.advanceBy(100);
+    const runningResult = await runningHandle.result;
+    assert.equal(runningResult.status, "failed");
+    assert.equal(runningResult.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(processHost.spawnCount, 1);
+    const queuedResult = await queuedHandle.result;
+    assert.equal(queuedResult.status, "failed");
+    assert.equal(queuedResult.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("throwing quarantine logger cannot prevent terminal failure containment", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new RejectingKillProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      logger: {
+        debug() {},
+        error() {
+          throw new Error("logger failed");
+        },
+        info() {},
+        warn() {},
+      },
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "throwing-quarantine-logger");
+  const handle = await executor.submit(execution);
+  try {
+    await started.promise;
+    await executor.cancel(execution.taskId, execution.attemptId);
+    clock.advanceBy(100);
+    let result: Awaited<typeof handle.result> | undefined;
+    void handle.result.then((value) => {
+      result = value;
+    });
+    await eventually(() => assert.notEqual(result, undefined), {
+      attempts: 100,
+      advance: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    if (result === undefined) throw new Error("Execution result is missing");
+    assert.equal(result.status, "failed");
+    assert.equal(result.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
   } finally {
     await processHost.close();
   }
