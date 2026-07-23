@@ -16,6 +16,7 @@ import {
   type SecretProvider,
 } from "@tegojs/contracts";
 import {
+  cloneComponentHostValue,
   ComponentHost,
   parseComponentHostCommand,
   type ComponentHostCommand,
@@ -189,6 +190,10 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
         payload: { value: "x".repeat(1024 * 1024 + 1) },
       }),
     /bounded|large|limit/u,
+  );
+  assert.throws(
+    () => cloneComponentHostValue(Array.from({ length: 99_999 }, () => Number.MAX_VALUE)),
+    /wire size|bounded|limit/u,
   );
 
   let calls = 0;

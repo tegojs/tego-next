@@ -233,3 +233,148 @@ test("component context rejects accessor and exotic configuration without invoki
     /plain object/u,
   );
 });
+
+test("component context captures the complete input envelope and adapter methods without getters", () => {
+  let envelopeGetterCalls = 0;
+  const base = {
+    identity: {
+      applicationId: "app-01",
+      pluginId: "org.example.echo",
+      componentId: "echo",
+      instanceId: "instance-01",
+    },
+    configuration: null,
+    events: { emit: async () => {} },
+    capabilities: { call: async () => null },
+    lifecycle: { state: "created" },
+    runtime: {
+      executor: "process" as const,
+      mode: "single-main" as const,
+      runtimeId: "runtime-01",
+    },
+    cancellation: new AbortController().signal,
+    disposables: createDisposableStack(),
+    secrets: { get: async () => undefined },
+  };
+  const accessorEnvelope = Object.defineProperty({ ...base }, "logger", {
+    enumerable: true,
+    get() {
+      envelopeGetterCalls += 1;
+      return {
+        debug() {},
+        error() {},
+        info() {},
+        warn() {},
+      };
+    },
+  });
+
+  assert.throws(() => createComponentContext(accessorEnvelope as never), /data propert/u);
+  assert.equal(envelopeGetterCalls, 0);
+
+  let methodGetterCalls = 0;
+  const accessorLogger = Object.defineProperty(
+    {
+      debug() {},
+      error() {},
+      warn() {},
+    },
+    "info",
+    {
+      enumerable: true,
+      get() {
+        methodGetterCalls += 1;
+        return () => {};
+      },
+    },
+  );
+  assert.throws(
+    () => createComponentContext({ ...base, logger: accessorLogger } as never),
+    /data propert/u,
+  );
+  assert.equal(methodGetterCalls, 0);
+
+  const calls: string[] = [];
+  const input = {
+    ...base,
+    logger: {
+      debug() {},
+      error() {},
+      info() {
+        calls.push("captured");
+      },
+      warn() {},
+    },
+  };
+  const context = createComponentContext(input);
+  (input as { logger: typeof input.logger }).logger = {
+    debug() {},
+    error() {},
+    info() {
+      calls.push("replacement");
+    },
+    warn() {},
+  };
+  context.logger.info("message");
+  assert.deepEqual(calls, ["captured"]);
+});
+
+test("capability calls snapshot and freeze both request and response boundaries", async () => {
+  let providerRequest: JsonValue | undefined;
+  const sharedResponse = { nested: { value: "original" } };
+  const context = createComponentContext({
+    identity: {
+      applicationId: "app-01",
+      pluginId: "org.example.echo",
+      componentId: "echo",
+      instanceId: "instance-01",
+    },
+    configuration: null,
+    logger: {
+      debug() {},
+      error() {},
+      info() {},
+      warn() {},
+    },
+    events: { emit: async () => {} },
+    capabilities: {
+      call: async (request) => {
+        providerRequest = request;
+        assert.throws(() => {
+          (request.input as { value: string }).value = "provider-mutated";
+        }, TypeError);
+        return sharedResponse;
+      },
+    },
+    lifecycle: { state: "started" },
+    runtime: {
+      executor: "process",
+      mode: "single-main",
+      runtimeId: "runtime-01",
+    },
+    cancellation: new AbortController().signal,
+    disposables: createDisposableStack(),
+    secrets: { get: async () => undefined },
+  });
+  const request = {
+    name: "org.example.echo",
+    protocolVersion: "1.0.0",
+    method: "echo",
+    input: { value: "original" },
+  };
+
+  const response = await context.capabilities.call(request);
+  request.input.value = "plugin-mutated";
+  sharedResponse.nested.value = "provider-mutated";
+
+  assert.notEqual(providerRequest, request);
+  assert.ok(Object.isFrozen(providerRequest));
+  assert.ok(
+    Object.isFrozen(
+      (providerRequest as { readonly input?: { readonly value?: string } } | undefined)?.input,
+    ),
+  );
+  assert.deepEqual(response, { nested: { value: "original" } });
+  assert.ok(Object.isFrozen(response));
+  assert.ok(Object.isFrozen((response as { readonly nested: object }).nested));
+});
