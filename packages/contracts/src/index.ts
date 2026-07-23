@@ -1,4 +1,5 @@
 export * from "./capability.js";
+export * from "./clock.js";
 export * from "./diagnostic.js";
 export * from "./execution.js";
 export * from "./identity.js";
@@ -6,4 +7,5 @@ export * from "./json.js";
 export * from "./plugin.js";
 export * from "./runtime.js";
 export * from "./schema.js";
+export * from "./state.js";
 export * from "./worker.js";
