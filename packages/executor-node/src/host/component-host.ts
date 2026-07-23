@@ -790,14 +790,15 @@ export class ComponentHost {
   }
 
   #attachments(input: readonly ArrayBuffer[]): RunAttachmentLease {
-    if (input.length > COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT) {
+    const count = input.length;
+    if (count > COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT) {
       throw this.#protocolError(
         `Component host attachments exceed the count limit of ${COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT}`,
       );
     }
     let totalBytes = 0;
     const validated: { readonly buffer: ArrayBuffer; readonly byteLength: number }[] = [];
-    for (let index = 0; index < input.length; index += 1) {
+    for (let index = 0; index < count; index += 1) {
       let buffer: unknown;
       try {
         buffer = input[index];
@@ -836,9 +837,9 @@ export class ComponentHost {
       throw this.#protocolError("Component host attachment bytes are invalid");
     }
     const hash = createHash("sha256");
-    const count = Buffer.allocUnsafe(4);
-    count.writeUInt32BE(values.length);
-    hash.update(count);
+    const countFrame = Buffer.allocUnsafe(4);
+    countFrame.writeUInt32BE(values.length);
+    hash.update(countFrame);
     for (const value of values) {
       const length = Buffer.allocUnsafe(4);
       length.writeUInt32BE(value.byteLength);
