@@ -313,6 +313,30 @@ test("artifact parsing closes its source iterator without masking parse failures
   });
 });
 
+test("artifact parsing rejects an empty source chunk without requesting another", async () => {
+  let nextCalls = 0;
+  let returned = 0;
+  const source: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          nextCalls += 1;
+          if (nextCalls > 1) throw new Error("empty source was polled again");
+          return { done: false, value: new Uint8Array() };
+        },
+        async return() {
+          returned += 1;
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
+
+  await rejectsCode(() => readPluginArtifact(source), "ARTIFACT_ARCHIVE_MALFORMED");
+  assert.equal(nextCalls, 1);
+  assert.equal(returned, 1);
+});
+
 for (const [name, unsafePath] of [
   ["parent traversal", "../escape.js"],
   ["backslash traversal", String.raw`components\..\escape.js`],
