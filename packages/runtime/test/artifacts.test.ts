@@ -274,6 +274,7 @@ for (const [name, unsafePath] of [
   ["non-normal path", "components//component.js"],
   ["non-NFC path", "components/e\u0301.js"],
   ["Windows device path", "components/CON.js"],
+  ["Windows superscript device path", "components/COM¹.js"],
   ["Windows alternate stream path", "components/component.js:stream"],
 ] as const) {
   test(`rejects ${name}`, async () => {
@@ -305,6 +306,32 @@ test("rejects duplicate normalized names", async () => {
   const entries = [...validEntries(), { name: "manifest.json", bytes: json(manifest) }];
   const { digest, service } = await serviceFor(tar(entries));
   await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ENTRY_DUPLICATE");
+});
+
+test("rejects case-folded archive and metadata declaration collisions", async (context) => {
+  await context.test("archive entries", async () => {
+    const entries = [
+      ...validEntries(),
+      { name: "MANIFEST.JSON", bytes: json(manifest) },
+    ];
+    const { digest, service } = await serviceFor(tar(entries));
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ENTRY_COLLISION");
+  });
+
+  await context.test("metadata declarations", async () => {
+    const entries = validEntries().map((entry) => {
+      if (entry.name !== "metadata/files.json") return entry;
+      const metadata = JSON.parse(new TextDecoder().decode(entry.bytes));
+      metadata.files.push({
+        path: "MANIFEST.JSON",
+        sha256: sha256(json(manifest)),
+        size: json(manifest).byteLength,
+      });
+      return { ...entry, bytes: json(metadata) };
+    });
+    const { digest, service } = await serviceFor(tar(entries));
+    await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ENTRY_COLLISION");
+  });
 });
 
 test("rejects undeclared and missing declared files", async (context) => {
@@ -432,6 +459,30 @@ test("accepts common partial semver comparators without evaluating plugin code",
   assert.equal(validated.manifest.nodeRange, ">=26 <27");
 });
 
+test("compatibility ranges never match empty or incomplete alternatives", async (context) => {
+  for (const [range, compatible] of [
+    [">=26 <27", true],
+    ["26.x", true],
+    ["~26.5.0", true],
+    [">=27 || >=26 <27", true],
+    ["||", false],
+    [">=27 ||", false],
+    ["|| >=26", false],
+    [">=26 nonsense", false],
+    [">", false],
+  ] as const) {
+    await context.test(range, async () => {
+      const archive = tar(validEntries({ ...manifest, nodeRange: range }));
+      const { digest, service } = await serviceFor(archive);
+      if (compatible) {
+        await service.validate({ digest });
+      } else {
+        await rejectsCode(() => service.validate({ digest }), "ARTIFACT_NODE_INCOMPATIBLE");
+      }
+    });
+  }
+});
+
 test("verifies Ed25519 signature envelopes over raw digest bytes", async (context) => {
   const archive = tar(validEntries());
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -477,6 +528,69 @@ test("verifies Ed25519 signature envelopes over raw digest bytes", async (contex
   await context.test("required but absent", async () => {
     await rejectsCode(() => configured.service.validate({ digest }), "ARTIFACT_SIGNATURE_REQUIRED");
   });
+  for (const malformed of [`${signature}=`, `${signature.slice(0, 20)}=${signature.slice(21)}`]) {
+    await context.test(`non-canonical ${malformed.length}`, async () => {
+      await rejectsCode(
+        () =>
+          configured.service.validate({
+            digest,
+            signature: {
+              algorithm: "Ed25519",
+              digest,
+              keyId: "release",
+              signature: malformed,
+            },
+          }),
+        "ARTIFACT_SIGNATURE_INVALID",
+      );
+    });
+  }
+});
+
+test("hashes the exact ArtifactStore byte stream before accepting a signed digest", async () => {
+  const archiveA = tar(validEntries());
+  const archiveB = tar(
+    validEntries(manifest, [], encoder.encode("export default { artifact: 'B' };\n")),
+  );
+  const digestA = sha256(archiveA);
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const signature = sign(null, Buffer.from(digestA.slice(7), "hex"), privateKey).toString("base64");
+  const dishonestStore: ArtifactStore = {
+    scope: "local",
+    async open() {},
+    async close() {},
+    async health() {
+      return { status: "healthy", checkedAt: new Date(0).toISOString() };
+    },
+    async put() {},
+    async *read() {
+      yield archiveB;
+    },
+  };
+  const service = new ArtifactService({
+    artifacts: dishonestStore,
+    clock: new FakeClock(),
+    compatibility: {
+      architecture: "x64",
+      nodeVersion: "26.5.0",
+      platform: "linux",
+      tegoContractVersion: "2.0.0",
+    },
+    state: {} as never,
+    trust: {
+      mode: "required",
+      keys: [{ keyId: "release", publicKey: publicKey.export({ format: "pem", type: "spki" }) }],
+    },
+  });
+
+  await rejectsCode(
+    () =>
+      service.validate({
+        digest: digestA,
+        signature: { algorithm: "Ed25519", digest: digestA, keyId: "release", signature },
+      }),
+    "ARTIFACT_DIGEST_MISMATCH",
+  );
 });
 
 test("installs immutable plugin records transactionally and idempotently", async () => {
