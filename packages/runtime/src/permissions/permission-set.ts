@@ -78,6 +78,9 @@ export function clonePermissionBoundaryValue(
   ancestors.add(value);
   try {
     if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new PermissionInputError(path, "array must have the standard array prototype");
+      }
       const result: unknown[] = [];
       for (let index = 0; index < value.length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));

@@ -263,6 +263,9 @@ function clonePayload(value: unknown, path = "$", ancestors = new Set<object>())
   ancestors.add(value);
   try {
     if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new Error(`Value at ${path} must have the standard array prototype`);
+      }
       const result: JsonValue[] = [];
       for (let index = 0; index < value.length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
