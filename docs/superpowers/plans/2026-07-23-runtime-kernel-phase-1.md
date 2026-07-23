@@ -537,7 +537,7 @@ Commit: `git add packages/runtime && git commit -m "feat: resolve capabilities a
 - Produces: public outbox claim/acknowledgement operations with stable message
   identity, fencing, retry visibility, and idempotent acknowledgement.
 
-- [ ] **Step 1: Write and commit failing lifecycle and convergence tests**
+- [x] **Step 1: Write and commit failing lifecycle and convergence tests**
 
 Cover legal transitions, illegal transition diagnostic, generation change,
 duplicate reconcile, enable, disable, upgrade, drain, rollback, non-essential
@@ -551,19 +551,19 @@ Expected: FAIL with missing reconcile exports.
 
 Commit: `git add packages/runtime/test && git commit -m "test: define deployment reconciliation"`
 
-- [ ] **Step 2: Implement pure lifecycle, placement, and plan functions**
+- [x] **Step 2: Implement pure lifecycle, placement, and plan functions**
 
 Plans contain one bounded external effect per step and stable operation,
 instance, and generation identities. Retry delay is capped exponential backoff
 with deterministic jitter derived from operation ID.
 
-- [ ] **Step 3: Implement journaled reconciler execution**
+- [x] **Step 3: Implement journaled reconciler execution**
 
 Persist the step before performing the effect. Conditionally commit observed
 state using expected revision and fencing epoch. Re-read after conflicts rather
 than mutating stale snapshots.
 
-- [ ] **Step 4: Verify restart convergence and commit**
+- [x] **Step 4: Verify restart convergence and commit**
 
 Run: `npm run build -w @tegojs/runtime && node --test packages/runtime/dist/test/component-lifecycle.test.js packages/runtime/dist/test/reconciler.test.js`
 
