@@ -1081,16 +1081,46 @@ export class Reconciler {
       await this.#acknowledge(claim, "completed");
       return;
     }
-    await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
-      await transaction.appendOperation({
-        operationId: effect.operationId,
-        kind: "component.lifecycle",
-        status: "executing",
-        state: effect,
-        updatedAt: this.#options.clock.now().toISOString(),
+    const retryPreState =
+      retryableFailure && (effect.kind === "start" || effect.kind === "stop")
+        ? expectedLifecycle
+        : undefined;
+    try {
+      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+        if (retryPreState !== undefined) {
+          await transaction.put(
+            instanceKey(effect.instanceId),
+            {
+              ...instance,
+              lifecycle: retryPreState,
+            },
+            { expectedRevision: current.revision },
+          );
+        }
+        await transaction.appendOperation({
+          operationId: effect.operationId,
+          kind: "component.lifecycle",
+          status: "executing",
+          state: effect,
+          updatedAt: this.#options.clock.now().toISOString(),
+        });
+        return null;
       });
-      return null;
-    });
+      if (retryPreState !== undefined) this.#lastCommitAuthority = this.#options.authority;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+      const latest = await this.#options.state.read(instanceKey(effect.instanceId));
+      if (
+        latest?.value.completedOperationId === effect.operationId ||
+        latest?.value.completedOperationIds?.includes(effect.operationId)
+      ) {
+        await this.#acknowledge(claim, "completed");
+      } else {
+        await this.#retryClaim(claim);
+      }
+      return;
+    }
     try {
       await this.#options.effects.perform(effect);
     } catch (error) {
