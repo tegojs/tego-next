@@ -419,9 +419,7 @@ test("current instance context mismatches cannot satisfy essential readiness", a
               instanceId: identity.instanceId,
               lifecycle: "ready",
               observedGeneration:
-                mismatch === "observedGeneration"
-                  ? parseGeneration("2")
-                  : parseGeneration("1"),
+                mismatch === "observedGeneration" ? parseGeneration("2") : parseGeneration("1"),
               pluginId,
             },
             { expectedRevision: "absent" },
@@ -553,9 +551,7 @@ test("current provider context mismatches cannot satisfy required capabilities",
               instanceId: identity.instanceId,
               lifecycle: "ready",
               observedGeneration:
-                mismatch === "observedGeneration"
-                  ? parseGeneration("2")
-                  : parseGeneration("1"),
+                mismatch === "observedGeneration" ? parseGeneration("2") : parseGeneration("1"),
               pluginId: providerId,
             },
             { expectedRevision: "absent" },

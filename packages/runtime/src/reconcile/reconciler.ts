@@ -431,7 +431,8 @@ export class Reconciler {
           invalidInstances.map((instance) =>
             runtimeDiagnostic({
               code: "DEPLOYMENT_INSTANCE_INCONSISTENT",
-              message: "Persisted component instance identity or deployment context is inconsistent",
+              message:
+                "Persisted component instance identity or deployment context is inconsistent",
               source: { kind: "deployment", id: deploymentKey(deployment) },
               details: {
                 applicationId: instance.applicationId,
