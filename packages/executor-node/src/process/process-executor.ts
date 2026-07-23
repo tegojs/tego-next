@@ -138,6 +138,7 @@ interface IncomingMessage {
 interface TerminationOutcome {
   readonly exit?: Awaited<ReturnType<HostedProcess["kill"]>>;
   readonly diagnostic?: RuntimeDiagnostic;
+  readonly settled: Promise<void>;
 }
 
 type AdmissionRace<T> =
@@ -530,6 +531,7 @@ export class ProcessExecutor implements Executor {
   readonly #attempts = new Map<string, AttemptEntry>();
   readonly #queue: AttemptEntry[] = [];
   readonly #quarantinedProcesses = new Set<HostedProcess>();
+  readonly #quarantineSettlements = new Map<HostedProcess, Promise<void>>();
   #active = 0;
   #accepting = true;
   #opened = false;
@@ -813,7 +815,8 @@ export class ProcessExecutor implements Executor {
           environment: {},
         }),
         async (lateProcess) => {
-          await this.#terminate(lateProcess);
+          const termination = await this.#terminate(lateProcess);
+          await termination.settled;
         },
       );
       admissionSettlement = spawnAdmission.settled;
@@ -1193,12 +1196,15 @@ export class ProcessExecutor implements Executor {
 
   async #terminate(process_: HostedProcess): Promise<TerminationOutcome> {
     if (this.#quarantinedProcesses.has(process_)) {
+      const settled = this.#quarantineSettlements.get(process_);
+      if (settled === undefined) throw new Error("Quarantined process settlement is missing");
       return {
         ...(this.#fatalDiagnostic === undefined ? {} : { diagnostic: this.#fatalDiagnostic }),
+        settled,
       };
     }
     try {
-      return { exit: await process_.kill() };
+      return { exit: await process_.kill(), settled: Promise.resolve() };
     } catch (error) {
       const failure =
         error instanceof DiagnosticError && error.diagnostic.code === "EXECUTOR_PROCESS_KILL_FAILED"
@@ -1208,16 +1214,18 @@ export class ProcessExecutor implements Executor {
               error instanceof Error ? error.message : "Forced process termination failed",
               this.#clock.now(),
             );
-      return { diagnostic: this.#enterFatalQuarantine(failure, process_) };
+      return this.#enterFatalQuarantine(failure, process_);
     }
   }
 
-  #enterFatalQuarantine(failure: RuntimeDiagnostic, process_: HostedProcess): RuntimeDiagnostic {
+  #enterFatalQuarantine(failure: RuntimeDiagnostic, process_: HostedProcess): TerminationOutcome {
     const transitioning = this.#fatalDiagnostic === undefined;
     this.#fatalDiagnostic ??= failure;
     const fatal = this.#fatalDiagnostic;
     this.#accepting = false;
     this.#quarantinedProcesses.add(process_);
+    const completion = Promise.withResolvers<void>();
+    this.#quarantineSettlements.set(process_, completion.promise);
     this.#settlePreChannelAdmissions(fatal);
     if (transitioning) {
       try {
@@ -1230,9 +1238,13 @@ export class ProcessExecutor implements Executor {
       .wait()
       .then(() => {
         this.#quarantinedProcesses.delete(process_);
+        this.#quarantineSettlements.delete(process_);
+        completion.resolve();
       })
-      .catch(() => undefined);
-    return fatal;
+      .catch(() => {
+        // A rejected wait cannot prove that the quarantined process exited.
+      });
+    return { diagnostic: fatal, settled: completion.promise };
   }
 
   #raceAdmission<T>(
