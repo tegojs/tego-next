@@ -291,6 +291,7 @@ class PostOutcomeCancellationProcessHost extends TestProcessHost {
   override spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
     const spawning = super.spawn(request);
     return {
+      // biome-ignore lint/suspicious/noThenProperty: intentional thenable controls the await continuation boundary
       then: (resolve: (value: HostedProcess) => unknown, reject: (error: unknown) => unknown) =>
         spawning.then((hosted) => {
           const result = resolve({
@@ -328,6 +329,7 @@ class PostOutcomeFatalProcessHost extends TestProcessHost {
     const index = this.spawnCount;
     const spawning = super.spawn(request);
     return {
+      // biome-ignore lint/suspicious/noThenProperty: intentional thenable controls the await continuation boundary
       then: (resolve: (value: HostedProcess) => unknown, reject: (error: unknown) => unknown) =>
         spawning.then((hosted) => {
           const wrapped: HostedProcess =
