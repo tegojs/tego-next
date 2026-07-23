@@ -7,10 +7,12 @@ import {
   type CapabilityIdentity,
   DiagnosticError,
   diagnosticCode,
+  type DriverHealth,
   type ExecutionRequest,
   type ExecutionResult,
   type JsonSchema,
   type JsonValue,
+  type Leadership,
   type PluginDeployment,
   type PluginInstallation,
   type PluginManifest,
@@ -25,6 +27,9 @@ import {
   parseExecutionRequest,
   parseExecutionResult,
   parseGeneration,
+  parseDriverHealth,
+  parseFencingEpoch,
+  parseLeadership,
   parseMessageId,
   parseNodeId,
   parsePluginDeployment,
@@ -33,7 +38,9 @@ import {
   parsePluginManifest,
   parseRuntimeConfiguration,
   parseRuntimeDiagnostic,
+  parseRuntimeEvent,
   parseRuntimeId,
+  parseRuntimeStatus,
   parseSchema,
   parseSequence,
   parseSessionId,
@@ -41,6 +48,8 @@ import {
   parseWorkerEnvelope,
   type RuntimeConfiguration,
   type RuntimeDiagnostic,
+  type RuntimeEvent,
+  type RuntimeStatus,
   serializeWireValue,
   type WorkerEnvelope,
 } from "../src/index.js";
@@ -94,6 +103,49 @@ const validRuntimeConfiguration = {
   applicationId: parseApplicationId("detector"),
   nodeId: parseNodeId("main-01"),
 } satisfies RuntimeConfiguration;
+
+const validDriverHealth = {
+  status: "healthy",
+  checkedAt: "2026-07-23T12:00:00.000Z",
+} satisfies DriverHealth;
+
+const validLeadership = {
+  resource: "runtime:medical-device-01",
+  epoch: parseFencingEpoch("3"),
+} satisfies Leadership;
+
+const validRuntimeStatus = {
+  identity: {
+    runtimeId: validRuntimeConfiguration.runtimeId,
+    applicationId: validRuntimeConfiguration.applicationId,
+    nodeId: validRuntimeConfiguration.nodeId,
+  },
+  mode: validRuntimeConfiguration.mode,
+  lifecycle: "running",
+  liveness: true,
+  readiness: true,
+  acceptingOperations: true,
+  drivers: [
+    { name: "state", health: validDriverHealth },
+    { name: "coordination", health: validDriverHealth },
+    { name: "artifacts", health: validDriverHealth },
+  ],
+  counts: {
+    deployments: 0,
+    installations: 0,
+    recoverableOperations: 0,
+    tasks: 0,
+    workers: 0,
+  },
+  authority: validLeadership,
+} satisfies RuntimeStatus;
+
+const validRuntimeEvent = {
+  type: "runtime.lifecycle",
+  previous: "electing",
+  current: "running",
+  occurredAt: "2026-07-23T12:00:00.000Z",
+} satisfies RuntimeEvent;
 
 const validInstallation = {
   pluginId: validManifest.pluginId,
@@ -334,6 +386,10 @@ test("every exported public wire contract survives serialization and validating 
     roundTrip(validRuntimeConfiguration, parseRuntimeConfiguration),
     validRuntimeConfiguration,
   );
+  assert.deepEqual(roundTrip(validDriverHealth, parseDriverHealth), validDriverHealth);
+  assert.deepEqual(roundTrip(validLeadership, parseLeadership), validLeadership);
+  assert.deepEqual(roundTrip(validRuntimeStatus, parseRuntimeStatus), validRuntimeStatus);
+  assert.deepEqual(roundTrip(validRuntimeEvent, parseRuntimeEvent), validRuntimeEvent);
   assert.deepEqual(roundTrip(validManifest, parsePluginManifest), validManifest);
   assert.deepEqual(roundTrip(validInstallation, parsePluginInstallation), validInstallation);
   assert.deepEqual(roundTrip(validDeployment, parsePluginDeployment), validDeployment);
@@ -353,6 +409,36 @@ test("every exported public wire contract survives serialization and validating 
   assert.deepEqual(roundTrip(validExecutionResult, parseExecutionResult), validExecutionResult);
   assert.deepEqual(roundTrip(validWorkerEnvelope, parseWorkerEnvelope), validWorkerEnvelope);
   assert.deepEqual(roundTrip(validDiagnostic, parseRuntimeDiagnostic), validDiagnostic);
+});
+
+test("runtime boundary validators reject malformed health, authority, status, and events", () => {
+  for (const [value, parse, code] of [
+    [
+      { status: "unknown", checkedAt: 1n },
+      parseDriverHealth,
+      "PROTOCOL_DRIVER_HEALTH_INVALID",
+    ],
+    [
+      { resource: "", epoch: "not-decimal" },
+      parseLeadership,
+      "COORDINATION_LEADERSHIP_INVALID",
+    ],
+    [
+      { ...validRuntimeStatus, readiness: 1n },
+      parseRuntimeStatus,
+      "PROTOCOL_RUNTIME_STATUS_INVALID",
+    ],
+    [
+      { ...validRuntimeEvent, occurredAt: 1n },
+      parseRuntimeEvent,
+      "PROTOCOL_RUNTIME_EVENT_INVALID",
+    ],
+  ] as const) {
+    assert.throws(
+      () => parse(value),
+      (error: unknown) => diagnosticCode(error) === code,
+    );
+  }
 });
 
 test("JSON-bearing contract fields reject non-JSON values recursively", () => {
