@@ -94,6 +94,33 @@ class TrackingWorkerFactory implements ThreadWorkerFactory {
   }
 }
 
+class GatedTerminationFactory extends TrackingWorkerFactory {
+  readonly gate = Promise.withResolvers<void>();
+  terminationStarted = Promise.withResolvers<void>();
+
+  override create(entrypoint: string): ThreadWorker {
+    const worker = super.create(entrypoint);
+    const owner = this;
+    return {
+      ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
+      postMessage: (value, transferList) => worker.postMessage(value, transferList),
+      on(event, listener) {
+        worker.on(event, listener);
+        return this;
+      },
+      once(event, listener) {
+        worker.once(event, listener);
+        return this;
+      },
+      terminate: async () => {
+        owner.terminationStarted.resolve();
+        await owner.gate.promise;
+        return worker.terminate();
+      },
+    };
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -130,6 +157,10 @@ export default {
         payload: { name: "api" }
       });
       return "safe";
+    }
+    if (input.mode === "finish-gate") {
+      await context.events.emit("run.finished", { mode: input.mode });
+      return input.value;
     }
     if (input.mode === "crash") process.exit(42);
     if (input.mode === "large-output") return "x".repeat(${1024 * 1024 + 64});
@@ -515,4 +546,45 @@ test("resolver cancellation does not release result, drain, or capacity before a
   assert.equal(resultSettled, true);
   assert.equal(drainSettled, true);
   assert.equal(factory.created, 0);
+});
+
+test("successful component output remains non-terminal until worker cleanup settles", async () => {
+  const factory = new GatedTerminationFactory();
+  const componentFinished = Promise.withResolvers<void>();
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.finished") componentFinished.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "finish-gate", value: "complete" }, "cleanup-gate");
+  const handle = await executor.submit(execution);
+  await componentFinished.promise;
+  await factory.terminationStarted.promise;
+  let resultSettled = false;
+  let drainSettled = false;
+  void handle.result.then(() => {
+    resultSettled = true;
+  });
+  const draining = executor.drain({}).then(() => {
+    drainSettled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(await executor.observe(execution.taskId, execution.attemptId), {
+    state: "running",
+  });
+  assert.equal(resultSettled, false);
+  assert.equal(drainSettled, false);
+  assert.equal((await executor.probe()).availableCapacity, 0);
+
+  factory.gate.resolve();
+  await draining;
+  assert.equal((await handle.result).status, "succeeded");
+  assert.equal(resultSettled, true);
+  assert.equal(drainSettled, true);
+  assert.equal((await executor.probe()).availableCapacity, 1);
 });
