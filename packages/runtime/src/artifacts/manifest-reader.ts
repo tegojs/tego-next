@@ -68,6 +68,7 @@ class BoundedStreamReader {
   #offset = 0;
   #ended = false;
   #consumed = 0;
+  #closed = false;
 
   constructor(source: AsyncIterable<Uint8Array>, maxBytes: number) {
     this.#iterator = source[Symbol.asyncIterator]();
@@ -118,6 +119,12 @@ class BoundedStreamReader {
 
   digest(): ArtifactDigest {
     return parseArtifactDigest(`sha256:${this.#hash.digest("hex")}`);
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    await this.#iterator.return?.();
   }
 
   async assertZeroRemainder(): Promise<void> {
@@ -352,120 +359,132 @@ export async function readPluginArtifact(
   let manifestBytes: Uint8Array | undefined;
   let filesBytes: Uint8Array | undefined;
   let zeroBlocks = 0;
+  let failed = false;
 
-  while (zeroBlocks < 2) {
-    const header = await reader.readExact(TAR_BLOCK_SIZE, true);
-    if (header === undefined) {
-      throw artifactError(
-        "ARTIFACT_ARCHIVE_TRUNCATED",
-        "Plugin archive has no complete end marker",
-      );
-    }
-    if (isZeroBlock(header)) {
-      zeroBlocks += 1;
-      continue;
-    }
-    if (zeroBlocks !== 0) {
-      throw artifactError(
-        "ARTIFACT_ARCHIVE_MALFORMED",
-        "Tar end marker contains only one zero block",
-      );
-    }
+  try {
+    while (zeroBlocks < 2) {
+      const header = await reader.readExact(TAR_BLOCK_SIZE, true);
+      if (header === undefined) {
+        throw artifactError(
+          "ARTIFACT_ARCHIVE_TRUNCATED",
+          "Plugin archive has no complete end marker",
+        );
+      }
+      if (isZeroBlock(header)) {
+        zeroBlocks += 1;
+        continue;
+      }
+      if (zeroBlocks !== 0) {
+        throw artifactError(
+          "ARTIFACT_ARCHIVE_MALFORMED",
+          "Tar end marker contains only one zero block",
+        );
+      }
 
-    const parsed = parseHeader(header);
-    const collisionKey = portableArtifactCollisionKey(parsed.path);
-    const previous = collisionKeys.get(collisionKey);
-    if (previous !== undefined) {
-      throw artifactError(
-        previous === parsed.path ? "ARTIFACT_ENTRY_DUPLICATE" : "ARTIFACT_ENTRY_COLLISION",
-        previous === parsed.path
-          ? "Artifact contains a duplicate entry"
-          : "Artifact entries collide on a portable filesystem",
-        { path: parsed.path, previous },
-      );
-    }
-    if (entries.size >= maxEntries) {
-      throw artifactError("ARTIFACT_ENTRY_COUNT_EXCEEDED", "Artifact contains too many entries", {
-        maxEntries,
-      });
-    }
-    if (parsed.size > maxEntryBytes) {
-      throw artifactError(
-        "ARTIFACT_ENTRY_TOO_LARGE",
-        "Artifact entry exceeds the configured byte limit",
-        { maxEntryBytes, path: parsed.path, size: parsed.size },
-      );
-    }
+      const parsed = parseHeader(header);
+      const collisionKey = portableArtifactCollisionKey(parsed.path);
+      const previous = collisionKeys.get(collisionKey);
+      if (previous !== undefined) {
+        throw artifactError(
+          previous === parsed.path ? "ARTIFACT_ENTRY_DUPLICATE" : "ARTIFACT_ENTRY_COLLISION",
+          previous === parsed.path
+            ? "Artifact contains a duplicate entry"
+            : "Artifact entries collide on a portable filesystem",
+          { path: parsed.path, previous },
+        );
+      }
+      if (entries.size >= maxEntries) {
+        throw artifactError("ARTIFACT_ENTRY_COUNT_EXCEEDED", "Artifact contains too many entries", {
+          maxEntries,
+        });
+      }
+      if (parsed.size > maxEntryBytes) {
+        throw artifactError(
+          "ARTIFACT_ENTRY_TOO_LARGE",
+          "Artifact entry exceeds the configured byte limit",
+          { maxEntryBytes, path: parsed.path, size: parsed.size },
+        );
+      }
 
-    const captureLimit =
-      parsed.path === "manifest.json"
-        ? MAX_MANIFEST_BYTES
-        : parsed.path === "metadata/files.json"
-          ? MAX_METADATA_BYTES
-          : undefined;
-    if (captureLimit !== undefined && parsed.size > captureLimit) {
-      throw artifactError(
-        "ARTIFACT_ENTRY_TOO_LARGE",
-        "Artifact metadata entry exceeds its byte limit",
-        { maxEntryBytes: captureLimit, path: parsed.path, size: parsed.size },
-      );
+      const captureLimit =
+        parsed.path === "manifest.json"
+          ? MAX_MANIFEST_BYTES
+          : parsed.path === "metadata/files.json"
+            ? MAX_METADATA_BYTES
+            : undefined;
+      if (captureLimit !== undefined && parsed.size > captureLimit) {
+        throw artifactError(
+          "ARTIFACT_ENTRY_TOO_LARGE",
+          "Artifact metadata entry exceeds its byte limit",
+          { maxEntryBytes: captureLimit, path: parsed.path, size: parsed.size },
+        );
+      }
+      const contents = await readEntry(reader, parsed.size, captureLimit);
+      entries.set(parsed.path, { digest: contents.digest, size: parsed.size });
+      collisionKeys.set(collisionKey, parsed.path);
+      if (parsed.path === "manifest.json") manifestBytes = contents.bytes;
+      if (parsed.path === "metadata/files.json") filesBytes = contents.bytes;
     }
-    const contents = await readEntry(reader, parsed.size, captureLimit);
-    entries.set(parsed.path, { digest: contents.digest, size: parsed.size });
-    collisionKeys.set(collisionKey, parsed.path);
-    if (parsed.path === "manifest.json") manifestBytes = contents.bytes;
-    if (parsed.path === "metadata/files.json") filesBytes = contents.bytes;
-  }
-  await reader.assertZeroRemainder();
+    await reader.assertZeroRemainder();
 
-  if (manifestBytes === undefined || filesBytes === undefined) {
-    throw artifactError(
-      "ARTIFACT_REQUIRED_FILE_MISSING",
-      "Artifact must contain one manifest.json and one metadata/files.json",
-    );
-  }
-  const manifest = parsePluginManifest(parseJson(manifestBytes, "manifest.json"));
-  const files = parseFilesMetadata(parseJson(filesBytes, "metadata/files.json"));
-  const declared = new Map(files.files.map((file) => [file.path, file]));
+    if (manifestBytes === undefined || filesBytes === undefined) {
+      throw artifactError(
+        "ARTIFACT_REQUIRED_FILE_MISSING",
+        "Artifact must contain one manifest.json and one metadata/files.json",
+      );
+    }
+    const manifest = parsePluginManifest(parseJson(manifestBytes, "manifest.json"));
+    const files = parseFilesMetadata(parseJson(filesBytes, "metadata/files.json"));
+    const declared = new Map(files.files.map((file) => [file.path, file]));
 
-  for (const [path, actual] of entries) {
-    if (path === "metadata/files.json") continue;
-    const declaration = declared.get(path);
-    if (declaration === undefined) {
-      throw artifactError("ARTIFACT_FILE_UNDECLARED", "Artifact contains an undeclared file", {
-        path,
-      });
+    for (const [path, actual] of entries) {
+      if (path === "metadata/files.json") continue;
+      const declaration = declared.get(path);
+      if (declaration === undefined) {
+        throw artifactError("ARTIFACT_FILE_UNDECLARED", "Artifact contains an undeclared file", {
+          path,
+        });
+      }
+      if (declaration.size !== actual.size || declaration.sha256 !== actual.digest) {
+        throw artifactError(
+          "ARTIFACT_FILE_DIGEST_MISMATCH",
+          "Artifact file does not match metadata/files.json",
+          { path },
+        );
+      }
     }
-    if (declaration.size !== actual.size || declaration.sha256 !== actual.digest) {
+    for (const path of declared.keys()) {
+      if (!entries.has(path)) {
+        throw artifactError("ARTIFACT_FILE_MISSING", "A declared artifact file is missing", {
+          path,
+        });
+      }
+    }
+    if (!entries.has("metadata/sbom.json")) {
       throw artifactError(
-        "ARTIFACT_FILE_DIGEST_MISMATCH",
-        "Artifact file does not match metadata/files.json",
-        { path },
+        "ARTIFACT_REQUIRED_FILE_MISSING",
+        "Artifact must contain metadata/sbom.json",
       );
     }
-  }
-  for (const path of declared.keys()) {
-    if (!entries.has(path)) {
-      throw artifactError("ARTIFACT_FILE_MISSING", "A declared artifact file is missing", {
-        path,
-      });
+    for (const component of manifest.components) {
+      assertPortableArtifactPath(component.entrypoint);
+      if (!entries.has(component.entrypoint)) {
+        throw artifactError(
+          "ARTIFACT_ENTRYPOINT_MISSING",
+          "A component entrypoint is missing from the artifact",
+          { componentId: component.componentId, entrypoint: component.entrypoint },
+        );
+      }
+    }
+    return { archiveDigest: reader.digest(), files, manifest };
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    try {
+      await reader.close();
+    } catch (error) {
+      if (!failed) throw error;
     }
   }
-  if (!entries.has("metadata/sbom.json")) {
-    throw artifactError(
-      "ARTIFACT_REQUIRED_FILE_MISSING",
-      "Artifact must contain metadata/sbom.json",
-    );
-  }
-  for (const component of manifest.components) {
-    assertPortableArtifactPath(component.entrypoint);
-    if (!entries.has(component.entrypoint)) {
-      throw artifactError(
-        "ARTIFACT_ENTRYPOINT_MISSING",
-        "A component entrypoint is missing from the artifact",
-        { componentId: component.componentId, entrypoint: component.entrypoint },
-      );
-    }
-  }
-  return { archiveDigest: reader.digest(), files, manifest };
 }

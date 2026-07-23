@@ -147,6 +147,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
   readonly #clock: Clock;
   readonly #platform: NodeJS.Platform;
   readonly #operations = new Set<Promise<unknown>>();
+  readonly #readHandles = new Set<FileHandle>();
   #openPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #lifecycle: "closed" | "closing" | "created" | "open" | "opening" = "created";
@@ -223,15 +224,21 @@ export class FilesystemArtifactStore implements ArtifactStore {
       const buffer = Buffer.allocUnsafe(ARTIFACT_READ_CHUNK_BYTES);
       let position = 0;
       while (true) {
-        if (this.#lifecycle === "closed") {
-          throw this.#closedError();
+        if (this.#lifecycle !== "open") return;
+        let bytesRead: number;
+        try {
+          ({ bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position));
+        } catch (error) {
+          if (this.#lifecycle !== "open") return;
+          throw error;
         }
-        const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
         if (bytesRead === 0) break;
+        if (this.#lifecycle !== "open") return;
         position += bytesRead;
         yield Buffer.from(buffer.subarray(0, bytesRead));
       }
     } finally {
+      if (handle !== undefined) this.#readHandles.delete(handle);
       await handle?.close();
     }
   }
@@ -265,6 +272,8 @@ export class FilesystemArtifactStore implements ArtifactStore {
     this.#lifecycle = "closing";
     await this.#openPromise?.catch(() => undefined);
     await Promise.allSettled([...this.#operations]);
+    await Promise.allSettled([...this.#readHandles].map((handle) => handle.close()));
+    this.#readHandles.clear();
     this.#lifecycle = "closed";
   }
 
@@ -327,6 +336,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
       if (actual !== digest) {
         throw this.#digestMismatch(digest, actual);
       }
+      this.#readHandles.add(handle);
       return handle;
     } catch (error) {
       await handle.close();
