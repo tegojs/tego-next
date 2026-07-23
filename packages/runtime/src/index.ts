@@ -36,11 +36,14 @@ export {
 } from "./capabilities/version.js";
 export { createRuntime } from "./create-runtime.js";
 export {
+  CapabilitySchemaGate,
+  CapabilitySchemaRegistry,
   gateCapabilityRequest,
   gateCapabilityResponse,
   gatePermission,
   type CapabilityPayloadDecision,
   type CapabilityPayloadDiagnostic,
+  type CapabilitySchemaRegistration,
   type PermissionCallAttempt,
   type PermissionGateDecision,
 } from "./permissions/gate.js";

@@ -1,12 +1,13 @@
 import {
+  compileSchemaValidator,
   DiagnosticError,
   parseCapabilityDefinition,
-  parseSchema,
   type CapabilityDefinition,
   type FilesystemAccess,
   type JsonObject,
   type JsonValue,
   type Permission,
+  type SchemaValidator,
   type WorkerResourceCeilings,
 } from "@tegojs/contracts";
 import {
@@ -61,6 +62,7 @@ export interface CapabilityPayloadDiagnostic extends JsonObject {
     | "CAPABILITY_PAYLOAD_INVALID"
     | "CAPABILITY_REQUEST_INVALID"
     | "CAPABILITY_RESPONSE_INVALID"
+    | "CAPABILITY_SCHEMA_ID_CONFLICT"
     | "CAPABILITY_SCHEMA_INVALID";
   readonly message: string;
   readonly details?: JsonValue;
@@ -70,6 +72,156 @@ export interface CapabilityPayloadDecision extends JsonObject {
   readonly allowed: boolean;
   readonly diagnostics: readonly CapabilityPayloadDiagnostic[];
   readonly value?: JsonValue;
+}
+
+export interface CapabilitySchemaRegistration {
+  readonly ok: boolean;
+  readonly diagnostics: readonly CapabilityPayloadDiagnostic[];
+  readonly gate?: CapabilitySchemaGate;
+}
+
+interface RegisteredSchema {
+  readonly canonical: string;
+  readonly validator: SchemaValidator<JsonValue>;
+}
+
+function deepFreezeJson<T extends JsonValue>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const key of Object.keys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor !== undefined && "value" in descriptor) {
+      deepFreezeJson(descriptor.value as JsonValue);
+    }
+  }
+  return Object.freeze(value);
+}
+
+function canonicalJson(value: JsonValue): string {
+  return JSON.stringify(value);
+}
+
+function schemaId(schema: CapabilityDefinition["requestSchema"]): string | undefined {
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(schema, "$id");
+  return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : undefined;
+}
+
+export class CapabilitySchemaGate {
+  readonly definition: CapabilityDefinition;
+  readonly #request: SchemaValidator<JsonValue>;
+  readonly #response: SchemaValidator<JsonValue>;
+
+  constructor(
+    definition: CapabilityDefinition,
+    request: SchemaValidator<JsonValue>,
+    response: SchemaValidator<JsonValue>,
+  ) {
+    this.definition = definition;
+    this.#request = request;
+    this.#response = response;
+  }
+
+  validate(direction: "request" | "response", input: JsonValue): JsonValue {
+    return direction === "request" ? this.#request.parse(input) : this.#response.parse(input);
+  }
+}
+
+/**
+ * Registration is explicitly scoped to a runtime/component-host lifecycle. `clear()` releases
+ * registry references; callers must also release any gates they retained.
+ */
+export class CapabilitySchemaRegistry {
+  readonly #gates = new Map<string, CapabilitySchemaGate>();
+  readonly #schemas = new Map<string, RegisteredSchema>();
+
+  register(definitionInput: CapabilityDefinition): CapabilitySchemaRegistration {
+    let definition: CapabilityDefinition;
+    try {
+      definition = deepFreezeJson(
+        parseCapabilityDefinition(clonePayload(definitionInput)),
+      ) as CapabilityDefinition;
+    } catch (error) {
+      return registrationFailure("CAPABILITY_SCHEMA_INVALID", error);
+    }
+
+    const definitionKey = canonicalJson(definition);
+    const existingGate = this.#gates.get(definitionKey);
+    if (existingGate !== undefined) {
+      return { ok: true, diagnostics: [], gate: existingGate };
+    }
+
+    const pending = new Map<string, RegisteredSchema>();
+    const request = this.#prepare(definition.requestSchema, pending);
+    if ("diagnostic" in request) return { ok: false, diagnostics: [request.diagnostic] };
+    const response = this.#prepare(definition.responseSchema, pending);
+    if ("diagnostic" in response) return { ok: false, diagnostics: [response.diagnostic] };
+
+    for (const [key, registered] of pending) this.#schemas.set(key, registered);
+    const gate = new CapabilitySchemaGate(definition, request.validator, response.validator);
+    this.#gates.set(definitionKey, gate);
+    return { ok: true, diagnostics: [], gate };
+  }
+
+  clear(): void {
+    this.#gates.clear();
+    this.#schemas.clear();
+  }
+
+  #prepare(
+    schema: CapabilityDefinition["requestSchema"],
+    pending: Map<string, RegisteredSchema>,
+  ):
+    | { readonly validator: SchemaValidator<JsonValue> }
+    | { readonly diagnostic: CapabilityPayloadDiagnostic } {
+    const canonical = canonicalJson(schema);
+    const id = schemaId(schema);
+    const key = id === undefined ? `anonymous:${canonical}` : `id:${id}`;
+    const existing = pending.get(key) ?? this.#schemas.get(key);
+    if (existing !== undefined) {
+      if (existing.canonical !== canonical) {
+        return {
+          diagnostic: {
+            code: "CAPABILITY_SCHEMA_ID_CONFLICT",
+            message: `Capability schema identifier ${id ?? key} is already registered differently`,
+          },
+        };
+      }
+      return { validator: existing.validator };
+    }
+    try {
+      const registered = {
+        canonical,
+        validator: compileSchemaValidator<JsonValue>(schema),
+      };
+      pending.set(key, registered);
+      return { validator: registered.validator };
+    } catch (error) {
+      return {
+        diagnostic: registrationDiagnostic("CAPABILITY_SCHEMA_INVALID", error),
+      };
+    }
+  }
+}
+
+function registrationDiagnostic(
+  code: "CAPABILITY_SCHEMA_ID_CONFLICT" | "CAPABILITY_SCHEMA_INVALID",
+  error: unknown,
+): CapabilityPayloadDiagnostic {
+  const details = error instanceof DiagnosticError ? error.diagnostic.details : undefined;
+  return {
+    code,
+    message: error instanceof Error ? error.message : "Capability schema is invalid",
+    ...(details === undefined ? {} : { details }),
+  };
+}
+
+function registrationFailure(
+  code: "CAPABILITY_SCHEMA_ID_CONFLICT" | "CAPABILITY_SCHEMA_INVALID",
+  error: unknown,
+): CapabilitySchemaRegistration {
+  return { ok: false, diagnostics: [registrationDiagnostic(code, error)] };
 }
 
 function denied(message: string, path = "$/attempt"): PermissionGateDecision {
@@ -318,17 +470,13 @@ function clonePayload(value: unknown, path = "$", ancestors = new Set<object>())
 }
 
 function payloadGate(
-  definitionInput: CapabilityDefinition,
+  gate: CapabilitySchemaGate,
   input: unknown,
   direction: "request" | "response",
 ): CapabilityPayloadDecision {
   try {
-    const definition = parseCapabilityDefinition(clonePayload(definitionInput));
     const value = clonePayload(input);
-    parseSchema(
-      direction === "request" ? definition.requestSchema : definition.responseSchema,
-      value,
-    );
+    gate.validate(direction, value);
     return { allowed: true, diagnostics: [], value };
   } catch (error) {
     const schemaInvalid =
@@ -358,15 +506,15 @@ function payloadGate(
 }
 
 export function gateCapabilityRequest(
-  definition: CapabilityDefinition,
+  gate: CapabilitySchemaGate,
   input: unknown,
 ): CapabilityPayloadDecision {
-  return payloadGate(definition, input, "request");
+  return payloadGate(gate, input, "request");
 }
 
 export function gateCapabilityResponse(
-  definition: CapabilityDefinition,
+  gate: CapabilitySchemaGate,
   input: unknown,
 ): CapabilityPayloadDecision {
-  return payloadGate(definition, input, "response");
+  return payloadGate(gate, input, "response");
 }

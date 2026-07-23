@@ -734,18 +734,23 @@ const workerEnvelopeSchema = {
   },
 } as const;
 
-const ajv = new Ajv2020Module.default({
-  allErrors: true,
-  strict: true,
-  validateFormats: true,
-});
-addFormatsModule.default(ajv);
-ajv.addKeyword({
-  keyword: "tegoJsonValue",
-  schemaType: "boolean",
-  errors: false,
-  validate: (enabled: boolean, data: unknown) => !enabled || isJsonValue(data),
-});
+function createAjv(): InstanceType<typeof Ajv2020Module.default> {
+  const instance = new Ajv2020Module.default({
+    allErrors: true,
+    strict: true,
+    validateFormats: true,
+  });
+  addFormatsModule.default(instance);
+  instance.addKeyword({
+    keyword: "tegoJsonValue",
+    schemaType: "boolean",
+    errors: false,
+    validate: (enabled: boolean, data: unknown) => !enabled || isJsonValue(data),
+  });
+  return instance;
+}
+
+const ajv = createAjv();
 
 const validateJsonValue = ajv.compile(jsonValueSchema);
 const validateRuntimeConfiguration = ajv.compile(runtimeConfigurationSchema);
@@ -1028,7 +1033,7 @@ export function parseWorkerEnvelope<T extends JsonValue = JsonValue>(
   );
 }
 
-function compileSchema(schema: JsonSchema): ValidateFunction {
+function compileCachedSchema(schema: JsonSchema): ValidateFunction {
   if (typeof schema === "boolean") {
     return ajv.compile(schema);
   }
@@ -1056,7 +1061,7 @@ function compileSchema(schema: JsonSchema): ValidateFunction {
 }
 
 export function parseSchema<T>(schema: JsonSchema, input: unknown): T {
-  const validate = compileSchema(schema);
+  const validate = compileCachedSchema(schema);
   if (!validate(input)) {
     throw validationError(
       "PROTOCOL_SCHEMA_VALIDATION_FAILED",
@@ -1066,4 +1071,56 @@ export function parseSchema<T>(schema: JsonSchema, input: unknown): T {
     );
   }
   return input as T;
+}
+
+export interface SchemaValidator<T = JsonValue> {
+  parse(input: unknown): T;
+}
+
+export function compileSchemaValidator<T = JsonValue>(schema: JsonSchema): SchemaValidator<T> {
+  if (!validateJsonValue(schema)) {
+    throw validationError(
+      "PROTOCOL_SCHEMA_INVALID",
+      "JSON Schema is not safe JSON data",
+      { kind: "schema" },
+      validateJsonValue.errors,
+    );
+  }
+  let validate: ValidateFunction;
+  try {
+    validate = createAjv().compile(schema);
+  } catch (error) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "PROTOCOL_SCHEMA_INVALID",
+        message: "JSON Schema could not be compiled",
+        source: { kind: "schema" },
+        cause:
+          error instanceof Error
+            ? { name: error.name, message: error.message }
+            : { name: "UnknownCause", message: String(error) },
+      }),
+    );
+  }
+  return {
+    parse(input: unknown): T {
+      if (!validateJsonValue(input)) {
+        throw validationError(
+          "PROTOCOL_SCHEMA_VALIDATION_FAILED",
+          "Value does not satisfy the JSON Schema",
+          { kind: "schema" },
+          validateJsonValue.errors,
+        );
+      }
+      if (!validate(input)) {
+        throw validationError(
+          "PROTOCOL_SCHEMA_VALIDATION_FAILED",
+          "Value does not satisfy the JSON Schema",
+          { kind: "schema" },
+          validate.errors,
+        );
+      }
+      return input as T;
+    },
+  };
 }
