@@ -19,9 +19,7 @@
   },
   "dependencies": {
     "@tegojs/contracts": "0.0.0",
-    "@tegojs/runtime": "0.0.0"
-  },
-  "devDependencies": {
-    "@tegojs/testkit": "0.0.0"
+    "@tegojs/runtime": "0.0.0",
+    "typescript": "7.0.2"
   }
 }
