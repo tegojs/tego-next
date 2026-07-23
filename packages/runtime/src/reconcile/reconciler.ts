@@ -861,7 +861,8 @@ export class Reconciler {
         return null;
       });
     } catch (error) {
-      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      const code = conflictCode(error);
+      if (code !== "STATE_REVISION_CONFLICT" && code !== "STATE_IDEMPOTENCY_CONFLICT") throw error;
       this.#replanCount += 1;
     }
     void deployment;
