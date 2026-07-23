@@ -16,6 +16,7 @@ import {
   artifactPublishSyncDirectories,
   createLocalDrivers,
   FilesystemArtifactStore,
+  hashArtifactHandle,
   LocalCoordinationProvider,
   publishTempFileAtomically,
 } from "../src/index.js";
@@ -136,6 +137,40 @@ test("artifact reads verify all bytes before yielding any content", async () => 
     (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
   );
   assert.deepEqual(yielded, []);
+  await store.close();
+});
+
+test("artifact verification uses a bounded reusable buffer and streams bounded chunks", async () => {
+  const size = 8 * 1024 * 1024;
+  const content = Buffer.alloc(size, 0x61);
+  let largestRead = 0;
+  const reader = {
+    async read(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ): Promise<{ bytesRead: number; buffer: Uint8Array }> {
+      largestRead = Math.max(largestRead, buffer.byteLength, length);
+      const bytesRead = Math.min(length, size - position);
+      if (bytesRead > 0) buffer.fill(0x61, offset, offset + bytesRead);
+      return { buffer, bytesRead };
+    },
+  };
+  assert.equal(await hashArtifactHandle(reader), digest(content));
+  assert.ok(largestRead <= 64 * 1024);
+
+  const rootDirectory = await temporaryDirectory("bounded-read");
+  const store = new FilesystemArtifactStore({ rootDirectory });
+  await store.open();
+  const expected = digest(content);
+  await store.put(expected, bytesSource(content));
+  let total = 0;
+  for await (const chunk of store.read(expected)) {
+    assert.ok(chunk.byteLength <= 64 * 1024);
+    total += chunk.byteLength;
+  }
+  assert.equal(total, size);
   await store.close();
 });
 
