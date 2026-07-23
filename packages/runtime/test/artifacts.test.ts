@@ -310,10 +310,7 @@ test("rejects duplicate normalized names", async () => {
 
 test("rejects case-folded archive and metadata declaration collisions", async (context) => {
   await context.test("archive entries", async () => {
-    const entries = [
-      ...validEntries(),
-      { name: "MANIFEST.JSON", bytes: json(manifest) },
-    ];
+    const entries = [...validEntries(), { name: "MANIFEST.JSON", bytes: json(manifest) }];
     const { digest, service } = await serviceFor(tar(entries));
     await rejectsCode(() => service.validate({ digest }), "ARTIFACT_ENTRY_COLLISION");
   });

@@ -8,10 +8,7 @@ import {
   type JsonObject,
   type PluginManifest,
 } from "@tegojs/contracts";
-import {
-  assertPortableArtifactPath,
-  portableArtifactCollisionKey,
-} from "./archive-codec.js";
+import { assertPortableArtifactPath, portableArtifactCollisionKey } from "./archive-codec.js";
 
 const TAR_BLOCK_SIZE = 512;
 const DEFAULT_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;

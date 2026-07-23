@@ -193,7 +193,10 @@ test("build rejects a tsconfig reached through a symlinked internal ancestor", a
     const pluginRoot = await realpath(directory);
     const configurationDirectory = join(pluginRoot, "configuration");
     await mkdir(configurationDirectory);
-    await copyFile(join(pluginRoot, "tsconfig.json"), join(configurationDirectory, "tsconfig.json"));
+    await copyFile(
+      join(pluginRoot, "tsconfig.json"),
+      join(configurationDirectory, "tsconfig.json"),
+    );
     await symlink(configurationDirectory, join(pluginRoot, "configuration-link"), "dir");
     await assert.rejects(
       () =>
