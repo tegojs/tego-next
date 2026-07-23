@@ -96,6 +96,11 @@ interface PersistedComponentInstance extends JsonObject {
   readonly completedOperationIds?: readonly OperationId[];
 }
 
+interface LoadedComponentInstance {
+  readonly storageId: string;
+  readonly value: ComponentInstance;
+}
+
 interface DeploymentObservation extends JsonObject {
   readonly applicationId: PluginDeployment["applicationId"];
   readonly pluginId: PluginDeployment["pluginId"];
@@ -122,6 +127,22 @@ function instanceKey(instanceId: string): StateKey<PersistedComponentInstance> {
     collection: "component-instances",
     id: instanceId,
   };
+}
+
+function isCanonicalInstance(record: LoadedComponentInstance): boolean {
+  const instance = record.value;
+  return (
+    record.storageId === instance.instanceId &&
+    reconcileEffectIdentities(
+      {
+        applicationId: instance.applicationId,
+        generation: instance.deploymentGeneration,
+        pluginId: instance.pluginId,
+      },
+      instance.componentId,
+      "prepare",
+    ).instanceId === instance.instanceId
+  );
 }
 
 function observationKey(deployment: PluginDeployment): StateKey<DeploymentObservation> {
@@ -300,7 +321,7 @@ export class Reconciler {
 
   async #reconcilePass(): Promise<void> {
     if (!this.#running) return;
-    const [deployments, installations, instances] = await Promise.all([
+    const [deployments, installations, loadedInstances] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstallations(),
       this.#loadInstances(),
@@ -316,30 +337,21 @@ export class Reconciler {
           ? 1
           : 0,
     );
-    const canonicalInstances = instances.filter(
-      (instance) =>
-        reconcileEffectIdentities(
-          {
-            applicationId: instance.applicationId,
-            generation: instance.deploymentGeneration,
-            pluginId: instance.pluginId,
-          },
-          instance.componentId,
-          "prepare",
-        ).instanceId === instance.instanceId,
-    );
+    const canonicalInstances = loadedInstances
+      .filter(isCanonicalInstance)
+      .map((record) => record.value);
     const invalidByDeployment = new Map<string, readonly ComponentInstance[]>();
     const gates = new Map<string, ArtifactDeploymentGate | DiagnosticError>();
     const orderRanks = new Map<string, number>();
     for (const deployment of lexicalDeployments) {
-      const deploymentInstances = instances.filter(
-        (instance) =>
-          instance.applicationId === deployment.applicationId &&
-          instance.pluginId === deployment.pluginId,
-      );
-      const invalidInstances = deploymentInstances.filter(
-        (instance) => !canonicalInstances.includes(instance),
-      );
+      const invalidInstances = loadedInstances
+        .filter(
+          (record) =>
+            record.value.applicationId === deployment.applicationId &&
+            record.value.pluginId === deployment.pluginId &&
+            !isCanonicalInstance(record),
+        )
+        .map((record) => record.value);
       if (invalidInstances.length > 0) {
         invalidByDeployment.set(deploymentKey(deployment), invalidInstances);
         continue;
@@ -482,13 +494,16 @@ export class Reconciler {
     return installations;
   }
 
-  async #loadInstances(): Promise<readonly ComponentInstance[]> {
-    const instances: ComponentInstance[] = [];
+  async #loadInstances(): Promise<readonly LoadedComponentInstance[]> {
+    const instances: LoadedComponentInstance[] = [];
     for await (const record of this.#options.state.scan<PersistedComponentInstance>({
       namespace,
       collection: "component-instances",
     })) {
-      instances.push({ ...record.value, revision: record.revision });
+      instances.push({
+        storageId: record.key.id,
+        value: { ...record.value, revision: record.revision },
+      });
     }
     return instances;
   }
@@ -900,10 +915,11 @@ export class Reconciler {
       (candidate) =>
         candidate.applicationId === effect.applicationId && candidate.pluginId === effect.pluginId,
     );
-    const [installations, instances] = await Promise.all([
+    const [installations, loadedInstances] = await Promise.all([
       this.#loadInstallations(),
       this.#loadInstances(),
     ]);
+    const instances = loadedInstances.filter(isCanonicalInstance).map((record) => record.value);
     let currentGate: ArtifactDeploymentGate | DiagnosticError | undefined;
     if (desired !== undefined) {
       currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
@@ -1194,7 +1210,9 @@ export class Reconciler {
   }
 
   async #refreshReadiness(): Promise<void> {
-    const instances = await this.#loadInstances();
+    const instances = (await this.#loadInstances())
+      .filter(isCanonicalInstance)
+      .map((record) => record.value);
     for (const deployment of this.#deployments) {
       if (deployment.state !== "active") continue;
       const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
