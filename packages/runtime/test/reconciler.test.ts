@@ -878,10 +878,12 @@ test("non-canonical provider instances cannot satisfy execution-time capabilitie
     [providerDigest, { ...gate().artifact, digest: providerDigest, manifest: providerManifest }],
     [consumerDigest, { ...gate().artifact, digest: consumerDigest, manifest: consumerManifest }],
   ]);
+  const consumerArtifact = artifacts.get(consumerDigest);
+  assert.ok(consumerArtifact);
   const effect = planReconcile({
     deployment: consumerDeployment,
     gate: {
-      artifact: artifacts.get(consumerDigest)!,
+      artifact: consumerArtifact,
       capabilityResolution: {
         ok: true,
         diagnostics: [],
@@ -981,9 +983,9 @@ test("non-canonical provider instances cannot satisfy execution-time capabilitie
     false,
   );
   assert.equal(
-    reconciler.diagnostics().some(
-      (diagnostic) => diagnostic.code === "CAPABILITY_REQUIRED_UNAVAILABLE",
-    ),
+    reconciler
+      .diagnostics()
+      .some((diagnostic) => diagnostic.code === "CAPABILITY_REQUIRED_UNAVAILABLE"),
     true,
   );
   await reconciler.stop();
