@@ -155,7 +155,10 @@ export function executorConformance(
     test("spawn failure releases executor capacity and process resources", async () => {
       const executor = await fixture.spawnFailureFactory();
       try {
-        const failure = await terminal(executor, fixture.request(fixture.echoInput, "spawn-failure"));
+        const failure = await terminal(
+          executor,
+          fixture.request(fixture.echoInput, "spawn-failure"),
+        );
         assert.equal(failure.status, "failed");
         assert.equal((await executor.health()).active, 0);
         assert.equal(fixture.activeResourceCount(), 0);

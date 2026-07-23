@@ -50,11 +50,7 @@ class TestHostedProcess implements HostedProcess {
   readonly #exit: Promise<HostedProcessExit>;
   readonly #signalled: () => void;
 
-  constructor(
-    child: ChildProcessWithoutNullStreams,
-    exited: () => void,
-    signalled: () => void,
-  ) {
+  constructor(child: ChildProcessWithoutNullStreams, exited: () => void, signalled: () => void) {
     this.#child = child;
     this.#signalled = signalled;
     this.pid = child.pid;

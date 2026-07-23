@@ -1,9 +1,13 @@
+import { randomBytes } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  compileSchemaValidator,
   DiagnosticError,
   parseArtifactDigest,
+  parseCapabilityName,
   parseExecutionRequest,
+  parseExecutionResult,
   parsePluginManifest,
   runtimeDiagnostic,
   type ArtifactDigest,
@@ -31,11 +35,13 @@ import {
 } from "@tegojs/contracts";
 import {
   COMPONENT_HOST_PROTOCOL,
+  cloneComponentHostValue,
   parseComponentHostResult,
   type ComponentHostCommand,
   type ComponentHostResult,
   type PrepareComponentHostCommand,
 } from "../host/protocol.js";
+import { authenticateProcessMessage, signProcessMessage } from "./authentication.js";
 import { ProcessFrameDecoder, encodeProcessFrame } from "./framing.js";
 
 export const PROCESS_EXECUTOR_MAX_RETAINED_ATTEMPTS = 256;
@@ -88,6 +94,7 @@ export interface ProcessExecutorOptions {
   readonly maxConcurrency?: number;
   readonly maxQueue?: number;
   readonly cancellationGraceMs?: number;
+  readonly cleanupGraceMs?: number;
   readonly processEntrypoint?: string;
   readonly permissionBoundary?: ComponentPermissionBoundary;
   readonly capabilityBoundary?: ComponentCapabilityBoundary;
@@ -112,6 +119,7 @@ interface AttemptEntry {
   channel?: ProcessChannel;
   cancellation?: "cancelled" | "timed-out";
   cancellationSent?: boolean;
+  cancellationEscalation?: Promise<void>;
 }
 
 interface IncomingMessage {
@@ -190,9 +198,24 @@ function boundedStderr(value: string, secrets: ReadonlySet<string>): string {
     : `${Buffer.from(redacted).subarray(0, PROCESS_EXECUTOR_MAX_STDERR_BYTES).toString("utf8")}[TRUNCATED]`;
 }
 
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const nested of Object.values(value)) deepFreeze(nested);
+  return Object.freeze(value);
+}
+
 class ProcessChannel {
   readonly #process: HostedProcess;
   readonly #options: ProcessExecutorOptions;
+  readonly #component: ResolvedProcessComponent;
+  readonly #channelKey = randomBytes(32);
+  readonly #capabilityValidators = new Map<
+    string,
+    {
+      readonly request: { parse(input: unknown): JsonValue };
+      readonly response: { parse(input: unknown): JsonValue };
+    }
+  >();
   readonly #pending = new Map<
     string,
     {
@@ -204,11 +227,25 @@ class ProcessChannel {
   #writeChain = Promise.resolve();
   #closedError: Error | undefined;
   #stderr = "";
+  #authenticationActive = false;
+  #outboundSequence = 0;
+  #inboundSequence = 0;
   readonly #secretValues = new Set<string>();
 
-  constructor(process_: HostedProcess, options: ProcessExecutorOptions) {
+  constructor(
+    process_: HostedProcess,
+    options: ProcessExecutorOptions,
+    component: ResolvedProcessComponent,
+  ) {
     this.#process = process_;
     this.#options = options;
+    this.#component = component;
+    for (const definition of component.capabilityDefinitions) {
+      this.#capabilityValidators.set(this.#capabilityKey(definition.identity), {
+        request: compileSchemaValidator<JsonValue>(definition.requestSchema),
+        response: compileSchemaValidator<JsonValue>(definition.responseSchema),
+      });
+    }
     void this.#readStdout();
     void this.#readStderr();
     void process_.wait().then((exit) => {
@@ -234,9 +271,17 @@ class ProcessChannel {
     const id = `message-${++this.#nextId}`;
     return new Promise<unknown>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      const frame = encodeProcessFrame({ ...message, id }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
-      const written = this.#writeChain.then(() => this.#process.stdin.write(frame));
-      this.#writeChain = written.catch(() => undefined);
+      const bootstrap = message.kind === "bootstrap";
+      if (bootstrap && this.#authenticationActive) {
+        this.#pending.delete(id);
+        reject(new Error("Process channel is already bootstrapped"));
+        return;
+      }
+      const value = bootstrap
+        ? { ...message, id, channelKey: this.#channelKey.toString("hex") }
+        : { ...message, id };
+      if (bootstrap) this.#authenticationActive = true;
+      const written = this.#write(value, bootstrap);
       void written.catch((error: unknown) => {
         const pending = this.#pending.get(id);
         if (pending === undefined) return;
@@ -250,7 +295,15 @@ class ProcessChannel {
     const decoder = new ProcessFrameDecoder();
     try {
       for await (const chunk of this.#process.stdout) {
-        for (const value of decoder.push(chunk)) await this.#dispatch(incoming(value));
+        for (const value of decoder.push(chunk)) {
+          const authenticated = authenticateProcessMessage(
+            this.#channelKey,
+            "child-to-parent",
+            this.#inboundSequence++,
+            value,
+          );
+          await this.#dispatch(incoming(authenticated));
+        }
       }
       decoder.finish();
     } catch (error) {
@@ -322,41 +375,119 @@ class ProcessChannel {
     try {
       let value: unknown;
       if (message.type === "secret") {
-        const payload = message.payload as Record<string, JsonValue>;
-        if (typeof payload.name !== "string") throw new Error("Secret RPC name is invalid");
+        const payload = this.#exactPayload(message.payload, ["name"]);
+        if (
+          typeof payload.name !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(payload.name)
+        ) {
+          throw new Error("Secret RPC name is invalid");
+        }
+        this.#authorize("secret", payload.name);
         if (this.#options.secretProvider === undefined) {
           throw new Error("Secret provider is unavailable");
         }
         value = await this.#options.secretProvider.get(payload.name);
         if (typeof value === "string" && value.length > 0) this.#secretValues.add(value);
       } else if (message.type === "capability") {
+        const payload = this.#exactPayload(message.payload, ["identity", "method", "input"]);
+        const identity = this.#exactPayload(payload.identity, ["name", "protocolVersion"]);
+        const name = parseCapabilityName(identity.name);
+        if (typeof identity.protocolVersion !== "string" || identity.protocolVersion.length === 0) {
+          throw new Error("Capability protocol version is invalid");
+        }
+        if (typeof payload.method !== "string" || payload.method.length === 0) {
+          throw new Error("Capability RPC method is invalid");
+        }
+        const capabilityIdentity = { name, protocolVersion: identity.protocolVersion };
+        this.#authorize("capability", name, payload.method);
+        const validators = this.#capabilityValidators.get(this.#capabilityKey(capabilityIdentity));
+        if (validators === undefined) throw new Error("Capability RPC is not registered");
+        const input = validators.request.parse(payload.input);
         if (this.#options.capabilityBoundary === undefined) {
           throw new Error("Capability boundary is unavailable");
         }
-        value = await this.#options.capabilityBoundary.invoke(message.payload as never);
+        value = validators.response.parse(
+          await this.#options.capabilityBoundary.invoke({
+            identity: capabilityIdentity,
+            method: payload.method,
+            input,
+          }),
+        );
       } else {
         throw new Error("Child RPC type is unsupported");
       }
-      const frame = encodeProcessFrame({
+      await this.#write({
         kind: "rpc-response",
         id: message.id,
         ok: true,
         ...(value === undefined ? {} : { value }),
       });
-      const written = this.#writeChain.then(() => this.#process.stdin.write(frame));
-      this.#writeChain = written.catch(() => undefined);
-      await written;
     } catch (error) {
-      const frame = encodeProcessFrame({
+      await this.#write({
         kind: "rpc-response",
         id: message.id,
         ok: false,
         message: error instanceof Error ? error.message : "Parent RPC failed",
       });
-      const written = this.#writeChain.then(() => this.#process.stdin.write(frame));
-      this.#writeChain = written.catch(() => undefined);
-      await written;
     }
+  }
+
+  #write(message: Record<string, unknown>, unsigned = false): Promise<void> {
+    const value = unsigned
+      ? message
+      : signProcessMessage(this.#channelKey, "parent-to-child", this.#outboundSequence++, message);
+    const frame = encodeProcessFrame(value, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    const written = this.#writeChain.then(() => this.#process.stdin.write(frame));
+    this.#writeChain = written.catch(() => undefined);
+    return written;
+  }
+
+  #exactPayload(input: unknown, fields: readonly string[]): Record<string, JsonValue> {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      throw new Error("Child RPC payload must be an object");
+    }
+    const payload = input as Record<string, JsonValue>;
+    const keys = Object.keys(payload);
+    if (
+      keys.length !== fields.length ||
+      fields.some((field) => !Object.hasOwn(payload, field)) ||
+      keys.some((field) => !fields.includes(field))
+    ) {
+      throw new Error("Child RPC payload fields are invalid");
+    }
+    return payload;
+  }
+
+  #authorize(kind: "capability" | "secret", name: string, method?: string): void {
+    const requested = this.#component.manifest.permissions;
+    const granted = this.#component.permissionGrants;
+    const permits = (permissions: readonly Permission[]) =>
+      permissions.some((permission) => {
+        if (kind === "secret") {
+          return permission.kind === "secret" && permission.names.includes(name);
+        }
+        return (
+          permission.kind === "capability" &&
+          permission.capabilities.some(
+            (capability) =>
+              capability.name === name &&
+              method !== undefined &&
+              capability.methods.includes(method),
+          )
+        );
+      });
+    const decision = this.#options.permissionBoundary?.authorize(granted, {
+      kind,
+      name,
+      ...(method === undefined ? {} : { method }),
+    });
+    if (!permits(requested) || !permits(granted) || decision?.allowed === false) {
+      throw new Error(`Component ${kind} operation is not granted`);
+    }
+  }
+
+  #capabilityKey(identity: { readonly name: string; readonly protocolVersion: string }): string {
+    return `${identity.name.length}:${identity.name}${identity.protocolVersion}`;
   }
 
   #fail(error: Error): void {
@@ -375,6 +506,7 @@ export class ProcessExecutor implements Executor {
   readonly #maxConcurrency: number;
   readonly #maxQueue: number;
   readonly #cancellationGraceMs: number;
+  readonly #cleanupGraceMs: number;
   readonly #processEntrypoint: string;
   readonly #attempts = new Map<string, AttemptEntry>();
   readonly #queue: AttemptEntry[] = [];
@@ -392,6 +524,7 @@ export class ProcessExecutor implements Executor {
     const maxConcurrency = options.maxConcurrency ?? 1;
     const maxQueue = options.maxQueue ?? PROCESS_EXECUTOR_MAX_QUEUE;
     const cancellationGraceMs = options.cancellationGraceMs ?? 1_000;
+    const cleanupGraceMs = options.cleanupGraceMs ?? cancellationGraceMs;
     if (
       !Number.isInteger(maxConcurrency) ||
       maxConcurrency < 1 ||
@@ -405,12 +538,16 @@ export class ProcessExecutor implements Executor {
     if (!Number.isFinite(cancellationGraceMs) || cancellationGraceMs < 0) {
       throw new RangeError("cancellationGraceMs must be finite and non-negative");
     }
+    if (!Number.isFinite(cleanupGraceMs) || cleanupGraceMs < 0) {
+      throw new RangeError("cleanupGraceMs must be finite and non-negative");
+    }
     this.id = options.id;
     this.#options = options;
     this.#clock = options.clock ?? systemClock;
     this.#maxConcurrency = maxConcurrency;
     this.#maxQueue = maxQueue;
     this.#cancellationGraceMs = cancellationGraceMs;
+    this.#cleanupGraceMs = cleanupGraceMs;
     this.#processEntrypoint =
       options.processEntrypoint ?? fileURLToPath(new URL("./process-entry.js", import.meta.url));
   }
@@ -436,9 +573,10 @@ export class ProcessExecutor implements Executor {
         this.#clock.now(),
       );
     }
-    const request = parseExecutionRequest(input);
+    const parsed = parseExecutionRequest(input);
     // Validate the public command against the wire limit before resolver or plugin work.
-    encodeProcessFrame({ kind: "execution", request }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    encodeProcessFrame({ kind: "execution", request: parsed }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    const request = deepFreeze(parseExecutionRequest(cloneComponentHostValue(parsed)));
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = JSON.stringify(request);
     const existing = this.#attempts.get(key);
@@ -507,11 +645,29 @@ export class ProcessExecutor implements Executor {
     await this.#requestCancellation(entry, "cancelled");
   }
 
-  drain(_options: DrainOptions): Promise<void> {
+  drain(options: DrainOptions): Promise<void> {
     this.#accepting = false;
     this.#drainPromise ??= (async () => {
-      await Promise.all([...this.#attempts.values()].map((entry) => entry.completed.promise));
-      await this.#options.processHost.close();
+      const deadlineController = new AbortController();
+      if (options.deadline !== undefined) {
+        if (!Number.isFinite(Date.parse(options.deadline))) {
+          throw new TypeError("Drain deadline must be an ISO timestamp");
+        }
+        void this.#waitUntilDeadline(options.deadline, deadlineController.signal)
+          .then(async () => {
+            await Promise.all(
+              [...this.#attempts.values()].map((entry) =>
+                this.#requestCancellation(entry, "cancelled"),
+              ),
+            );
+          })
+          .catch(() => undefined);
+      }
+      try {
+        await Promise.all([...this.#attempts.values()].map((entry) => entry.completed.promise));
+      } finally {
+        deadlineController.abort("drained");
+      }
     })();
     return this.#drainPromise;
   }
@@ -602,7 +758,7 @@ export class ProcessExecutor implements Executor {
         environment: {},
       });
       entry.process = process_;
-      channel = new ProcessChannel(process_, this.#options);
+      channel = new ProcessChannel(process_, this.#options, component);
       entry.channel = channel;
       const bootstrap = await channel.request({
         kind: "bootstrap",
@@ -722,9 +878,9 @@ export class ProcessExecutor implements Executor {
       entry.deadlineController.abort("terminal");
       if (process_ !== undefined) {
         await process_.stdin.close().catch(() => undefined);
-        await process_.close().catch(async () => {
-          await process_?.kill().catch(() => undefined);
-        });
+        await process_.kill().catch(() => undefined);
+        await process_.wait().catch(() => undefined);
+        await process_.close().catch(() => undefined);
       }
       delete entry.process;
       delete entry.channel;
@@ -834,16 +990,42 @@ export class ProcessExecutor implements Executor {
     artifactDigest: ArtifactDigest,
     deadline: string,
   ): Promise<void> {
-    await this.#hostCommand(
-      channel,
-      this.#artifactCommand("drain", "drain", deadline, artifactDigest),
-    ).catch(() => undefined);
-    await this.#hostCommand(
-      channel,
-      this.#artifactCommand("stop", "stop", deadline, artifactDigest),
-    ).catch(() => undefined);
+    const lifecycle = (async () => {
+      await this.#hostCommand(
+        channel,
+        this.#artifactCommand("drain", "drain", deadline, artifactDigest),
+      ).catch(() => undefined);
+      await this.#hostCommand(
+        channel,
+        this.#artifactCommand("stop", "stop", deadline, artifactDigest),
+      ).catch(() => undefined);
+    })();
+    if (!(await this.#withinCleanupGrace(lifecycle))) {
+      await process_.kill().catch(() => undefined);
+      await process_.wait().catch(() => undefined);
+      return;
+    }
     await process_.stdin.close().catch(() => undefined);
     await process_.signal("SIGTERM").catch(() => undefined);
+    if (!(await this.#withinCleanupGrace(process_.wait()))) {
+      await process_.kill().catch(() => undefined);
+    }
+    await process_.wait().catch(() => undefined);
+  }
+
+  async #withinCleanupGrace(operation: Promise<unknown>): Promise<boolean> {
+    const controller = new AbortController();
+    try {
+      return await Promise.race([
+        operation.then(
+          () => true,
+          () => true,
+        ),
+        this.#clock.sleep(this.#cleanupGraceMs, controller.signal).then(() => false),
+      ]);
+    } finally {
+      controller.abort("cleanup-complete");
+    }
   }
 
   #armDeadline(entry: AttemptEntry): void {
@@ -895,8 +1077,8 @@ export class ProcessExecutor implements Executor {
         })
         .catch(() => undefined);
     }
-    void this.#clock
-      .sleep(this.#cancellationGraceMs)
+    entry.cancellationEscalation ??= this.#clock
+      .sleep(this.#cancellationGraceMs, entry.deadlineController.signal)
       .then(async () => {
         if (entry.state !== "terminal") await entry.process?.kill().catch(() => undefined);
       })
@@ -918,7 +1100,8 @@ export class ProcessExecutor implements Executor {
   #settle(entry: AttemptEntry, result: ExecutionResult): boolean {
     if (entry.state === "terminal") return false;
     entry.state = "terminal";
-    entry.terminal = Object.freeze(result);
+    entry.deadlineController.abort("terminal");
+    entry.terminal = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
     return true;
   }
 

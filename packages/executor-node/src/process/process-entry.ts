@@ -10,12 +10,14 @@ import {
   type SecretProvider,
 } from "@tegojs/contracts";
 import { ComponentHost, type ComponentHostClock } from "../host/component-host.js";
+import { authenticateProcessMessage, signProcessMessage } from "./authentication.js";
 import { ProcessFrameDecoder, encodeProcessFrame } from "./framing.js";
 
 interface BootstrapMessage {
   readonly kind: "bootstrap";
   readonly id: string;
   readonly now: string;
+  readonly channelKey: string;
   readonly artifact: {
     readonly artifactDigest: string;
     readonly artifactRoot: string;
@@ -42,6 +44,9 @@ type ParentMessage = BootstrapMessage | CommandMessage | RpcResponseMessage;
 const MAX_RPC_INFLIGHT = 64;
 let host: ComponentHost | undefined;
 let nextRpcId = 0;
+let outboundSequence = 0;
+let inboundSequence = 0;
+let channelKey: Uint8Array | undefined;
 let writeChain = Promise.resolve();
 const pendingRpc = new Map<
   string,
@@ -61,8 +66,20 @@ function writeRaw(bytes: Uint8Array): Promise<void> {
 }
 
 function send(value: unknown): Promise<void> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return Promise.reject(new Error("Process response must be an object"));
+  }
+  const message =
+    channelKey === undefined
+      ? value
+      : signProcessMessage(
+          channelKey,
+          "child-to-parent",
+          outboundSequence++,
+          value as Record<string, unknown>,
+        );
   const queued = writeChain.then(() =>
-    writeRaw(encodeProcessFrame(value, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED")),
+    writeRaw(encodeProcessFrame(message, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED")),
   );
   writeChain = queued.catch(() => undefined);
   return queued;
@@ -94,7 +111,13 @@ function parentMessage(input: unknown): ParentMessage {
     throw new Error("Process message identity is invalid");
   }
   if (value.kind === "bootstrap") {
-    if (typeof value.now !== "string") throw new Error("Bootstrap clock is invalid");
+    if (
+      typeof value.now !== "string" ||
+      typeof value.channelKey !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(value.channelKey)
+    ) {
+      throw new Error("Bootstrap channel authentication is invalid");
+    }
     const artifact = exactObject(value.artifact);
     if (typeof artifact.artifactDigest !== "string" || typeof artifact.artifactRoot !== "string") {
       throw new Error("Bootstrap artifact is invalid");
@@ -103,6 +126,7 @@ function parentMessage(input: unknown): ParentMessage {
       kind: "bootstrap",
       id: value.id,
       now: value.now,
+      channelKey: value.channelKey,
       artifact: {
         artifactDigest: artifact.artifactDigest,
         artifactRoot: artifact.artifactRoot,
@@ -288,6 +312,7 @@ function capabilityBoundary(): ComponentCapabilityBoundary {
 
 async function bootstrap(message: BootstrapMessage): Promise<void> {
   if (host !== undefined) throw new Error("Process component host is already bootstrapped");
+  channelKey = Buffer.from(message.channelKey, "hex");
   const artifactDigest = parseArtifactDigest(message.artifact.artifactDigest);
   const manifest = parsePluginManifest(message.artifact.manifest);
   const logicalNow = new Date(message.now);
@@ -383,7 +408,14 @@ async function main(): Promise<void> {
   try {
     for await (const chunk of process.stdin) {
       for (const value of decoder.push(chunk)) {
-        const message = parentMessage(value);
+        const authenticated =
+          channelKey === undefined
+            ? value
+            : authenticateProcessMessage(channelKey, "parent-to-child", inboundSequence++, value);
+        const message = parentMessage(authenticated);
+        if (channelKey === undefined && message.kind !== "bootstrap") {
+          throw new Error("First process message must bootstrap the authenticated channel");
+        }
         void handle(message).catch(async (error: unknown) => {
           await respond(message.id, {
             ok: false,
