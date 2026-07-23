@@ -283,6 +283,99 @@ class RejectingLateSpawnProcessHost extends DelayedSpawnProcessHost {
   }
 }
 
+class PostOutcomeCancellationProcessHost extends TestProcessHost {
+  readonly killCalled = Promise.withResolvers<void>();
+  readonly waitGate = Promise.withResolvers<void>();
+  afterOutcome = () => {};
+
+  override spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    const spawning = super.spawn(request);
+    return {
+      then: (
+        resolve: (value: HostedProcess) => unknown,
+        reject: (error: unknown) => unknown,
+      ) =>
+        spawning.then((hosted) => {
+          const result = resolve({
+            pid: hosted.pid,
+            stdin: hosted.stdin,
+            stdout: hosted.stdout,
+            stderr: hosted.stderr,
+            signal: (signal) => hosted.signal(signal),
+            kill: () => {
+              this.killCalled.resolve();
+              return Promise.reject(new Error("post-outcome SIGKILL delivery failed"));
+            },
+            wait: async () => {
+              await this.waitGate.promise;
+              return hosted.kill();
+            },
+            close: () => hosted.close(),
+          });
+          this.afterOutcome();
+          return result;
+        }, reject),
+    } as unknown as Promise<HostedProcess>;
+  }
+}
+
+class PostOutcomeFatalProcessHost extends TestProcessHost {
+  readonly primaryKillCalled = Promise.withResolvers<void>();
+  readonly primaryKill = Promise.withResolvers<HostedProcessExit>();
+  readonly victimKillCalled = Promise.withResolvers<void>();
+  readonly victimWaitGate = Promise.withResolvers<void>();
+  spawnCount = 0;
+
+  override spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
+    this.spawnCount += 1;
+    const index = this.spawnCount;
+    const spawning = super.spawn(request);
+    return {
+      then: (
+        resolve: (value: HostedProcess) => unknown,
+        reject: (error: unknown) => unknown,
+      ) =>
+        spawning.then((hosted) => {
+          const wrapped: HostedProcess =
+            index === 1
+              ? {
+                  pid: hosted.pid,
+                  stdin: hosted.stdin,
+                  stdout: hosted.stdout,
+                  stderr: hosted.stderr,
+                  signal: (signal) => hosted.signal(signal),
+                  kill: () => {
+                    this.primaryKillCalled.resolve();
+                    return this.primaryKill.promise;
+                  },
+                  wait: () => new Promise<HostedProcessExit>(() => {}),
+                  close: () => hosted.close(),
+                }
+              : {
+                  pid: hosted.pid,
+                  stdin: hosted.stdin,
+                  stdout: hosted.stdout,
+                  stderr: hosted.stderr,
+                  signal: (signal) => hosted.signal(signal),
+                  kill: () => {
+                    this.victimKillCalled.resolve();
+                    return Promise.reject(new Error("victim SIGKILL delivery failed"));
+                  },
+                  wait: async () => {
+                    await this.victimWaitGate.promise;
+                    return hosted.kill();
+                  },
+                  close: () => hosted.close(),
+                };
+          if (index === 2) {
+            this.primaryKill.reject(new Error("primary SIGKILL delivery failed"));
+          }
+          return resolve(wrapped);
+        }, reject),
+    } as unknown as Promise<HostedProcess>;
+  }
+}
+
 after(async () => {
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
@@ -904,6 +997,42 @@ test("late-spawn cleanup retains its reservation through quarantine settlement",
     assert.equal(processHost.activeProcessCount, 0);
   } finally {
     processHost.gate.resolve();
+    processHost.waitGate.resolve();
+    await processHost.close();
+  }
+});
+
+test("post-outcome cancellation retains direct termination settlement", async () => {
+  const processHost = new PostOutcomeCancellationProcessHost();
+  const executor = new ProcessExecutor(await options({ processHost, maxConcurrency: 1 }));
+  const execution = request({ mode: "echo", value: "post-outcome-cancel" }, "post-outcome-cancel");
+  processHost.afterOutcome = () => {
+    void executor.cancel(execution.taskId, execution.attemptId);
+  };
+  const handle = await executor.submit(execution);
+  let result: Awaited<typeof handle.result> | undefined;
+  let drained = false;
+  void handle.result.then((value) => {
+    result = value;
+  });
+  const draining = executor.drain({}).then(() => {
+    drained = true;
+  });
+  try {
+    await processHost.killCalled.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(result, undefined);
+    assert.equal(drained, false);
+    assert.equal(processHost.activeProcessCount, 1);
+
+    processHost.waitGate.resolve();
+    await draining;
+    assert.equal(
+      (await handle.result).diagnostic?.code,
+      "EXECUTOR_PROCESS_KILL_FAILED",
+    );
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
     processHost.waitGate.resolve();
     await processHost.close();
   }
@@ -1553,6 +1682,57 @@ test("fatal quarantine settles delayed spawn while drain tracks its late child c
     assert.equal((await executor.health()).active, 1);
   } finally {
     processHost.delayedGate.resolve();
+    await processHost.close();
+  }
+});
+
+test("post-outcome fatal quarantine retains direct termination settlement", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new PostOutcomeFatalProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      maxConcurrency: 2,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const primary = request({ mode: "ignore-cancel" }, "post-outcome-fatal-primary");
+  const victim = request({ mode: "echo", value: "must-not-bootstrap" }, "post-outcome-fatal-victim");
+  const primaryHandle = await executor.submit(primary);
+  await started.promise;
+  await executor.cancel(primary.taskId, primary.attemptId);
+  clock.advanceBy(100);
+  await processHost.primaryKillCalled.promise;
+  const victimHandle = await executor.submit(victim);
+  let victimResult: Awaited<typeof victimHandle.result> | undefined;
+  let drained = false;
+  void victimHandle.result.then((value) => {
+    victimResult = value;
+  });
+  const draining = executor.drain({}).then(() => {
+    drained = true;
+  });
+  try {
+    await processHost.victimKillCalled.promise;
+    assert.equal((await primaryHandle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(victimResult, undefined);
+    assert.equal(drained, false);
+    assert.equal(processHost.activeProcessCount, 2);
+
+    processHost.victimWaitGate.resolve();
+    await draining;
+    assert.equal(
+      (await victimHandle.result).diagnostic?.code,
+      "EXECUTOR_PROCESS_KILL_FAILED",
+    );
+    assert.equal(processHost.activeProcessCount, 1);
+  } finally {
+    processHost.victimWaitGate.resolve();
     await processHost.close();
   }
 });
