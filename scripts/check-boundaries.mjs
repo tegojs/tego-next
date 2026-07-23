@@ -33,18 +33,12 @@ function localAliasTarget(version) {
 }
 
 function dependencyEntries(manifest) {
-  const dependencies = new Map();
-
-  for (const field of DEPENDENCY_FIELDS) {
-    for (const [specifier, version] of Object.entries(manifest[field] ?? {})) {
-      dependencies.set(specifier, version);
-    }
-  }
-
-  return [...dependencies].map(([specifier, version]) => ({
-    specifier,
-    targetSpecifier: npmAliasTarget(version) ?? localAliasTarget(version) ?? specifier,
-  }));
+  return DEPENDENCY_FIELDS.flatMap((field) =>
+    Object.entries(manifest[field] ?? {}).map(([specifier, version]) => ({
+      specifier,
+      targetSpecifier: npmAliasTarget(version) ?? localAliasTarget(version) ?? specifier,
+    })),
+  );
 }
 
 function containsForbiddenFragment(value) {
@@ -214,6 +208,12 @@ function javascriptTokens(source) {
       continue;
     }
 
+    if (["++", "--"].includes(source.slice(index, index + 2))) {
+      tokens.push({ type: "punctuator", value: source.slice(index, index + 2) });
+      index += 2;
+      continue;
+    }
+
     if (character === "/" && canStartRegularExpression(tokens)) {
       let inCharacterClass = false;
       index += 1;
@@ -344,7 +344,10 @@ function addEdgeViolation(violations, source, specifier, workspaces, importingFi
     return;
   }
 
-  if (source.kind === "first-layer" && target.manifest.name !== CONTRACTS_PACKAGE) {
+  if (
+    source.kind === "first-layer" &&
+    (source.manifest.name === CONTRACTS_PACKAGE || target.manifest.name !== CONTRACTS_PACKAGE)
+  ) {
     violations.add(`${source.manifest.name} -> ${specifier}`);
   }
 
