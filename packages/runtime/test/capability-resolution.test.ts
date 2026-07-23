@@ -8,7 +8,6 @@ import {
 } from "@tegojs/contracts";
 import {
   isValidVersion,
-  providerLossAction,
   resolveCapabilities,
   satisfiesVersionRange,
   type CapabilityResolutionDeployment,
@@ -405,9 +404,114 @@ test("strict versions reject invalid prerelease identifiers and compare prerelea
   assert.equal(satisfiesVersionRange("1.0.0+build.1", "=1.0.0"), true);
 });
 
+test("static required cycles are diagnosed even when every provider is unready", () => {
+  const result = resolveCapabilities({
+    deployments: [
+      deployment("a", {
+        ready: false,
+        provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+        requires: [{ name: auditName, protocolRange: "^1.0.0" }],
+      }),
+      deployment("b", {
+        ready: false,
+        provides: [{ name: auditName, protocolVersion: "1.0.0" }],
+        requires: [{ name: echoName, protocolRange: "^1.0.0" }],
+      }),
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    result.diagnostics.map((item) => item.code),
+    [
+      "CAPABILITY_REQUIRED_CYCLE",
+      "CAPABILITY_REQUIRED_UNAVAILABLE",
+      "CAPABILITY_REQUIRED_UNAVAILABLE",
+    ],
+  );
+  assert.deepEqual(result.providerLossActions, []);
+});
+
 test("@spec:capability-resolution/provider-loss-propagation/suspend-on-provider-loss", () => {
-  assert.equal(providerLossAction("degrade"), "degrade");
-  assert.equal(providerLossAction("suspend"), "suspend");
-  assert.equal(providerLossAction("fail"), "fail");
-  assert.equal(providerLossAction(undefined), "fail");
+  const provider = identity("provider");
+  const consumers = [
+    ["consumer-degrade", "degrade", false],
+    ["consumer-fail", "fail", false],
+    ["consumer-suspend", "suspend", true],
+  ] as const;
+  const result = resolveCapabilities({
+    deployments: [
+      ...consumers.map(([pluginId, lossPolicy, optional]) =>
+        deployment(pluginId, {
+          requires: [
+            {
+              name: echoName,
+              protocolRange: "^1.0.0",
+              lossPolicy,
+              optional,
+            },
+          ],
+          bindings: pluginId === "consumer-suspend" ? { [echoName]: provider } : {},
+        }),
+      ),
+      deployment("provider", {
+        ready: false,
+        provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+      }),
+    ],
+    previousBindings: consumers.map(([pluginId]) => ({
+      consumer: identity(pluginId),
+      capability: echoName,
+      provider,
+    })),
+  });
+
+  assert.deepEqual(result.providerLossActions, [
+    {
+      action: "degrade",
+      capability: echoName,
+      consumer: identity("consumer-degrade"),
+      provider,
+    },
+    {
+      action: "fail",
+      capability: echoName,
+      consumer: identity("consumer-fail"),
+      provider,
+    },
+    {
+      action: "suspend",
+      capability: echoName,
+      consumer: identity("consumer-suspend"),
+      provider,
+    },
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+});
+
+test("initial unready providers do not look like provider loss and recovery clears actions", () => {
+  const unavailable = deployment("provider", {
+    ready: false,
+    provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+  });
+  const consumer = deployment("consumer", {
+    requires: [{ name: echoName, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+  });
+
+  const initial = resolveCapabilities({ deployments: [consumer, unavailable] });
+  assert.equal(initial.ok, false);
+  assert.equal(initial.diagnostics[0]?.code, "CAPABILITY_REQUIRED_UNAVAILABLE");
+  assert.deepEqual(initial.providerLossActions, []);
+
+  const recovered = resolveCapabilities({
+    deployments: [consumer, { ...unavailable, ready: true }],
+    previousBindings: [
+      {
+        consumer: identity("consumer"),
+        capability: echoName,
+        provider: identity("provider"),
+      },
+    ],
+  });
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(recovered.providerLossActions, []);
 });
