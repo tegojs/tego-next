@@ -42,12 +42,12 @@
 
 ## 6. Capability and Permission Resolution
 
-- [ ] 6.1 Write resolver tests and implement capability token identity and protocol-version compatibility
-- [ ] 6.2 Write binding tests and implement explicit, unique automatic, ambiguous, required, and optional resolution
-- [ ] 6.3 Write graph tests and implement provider-first ordering plus required-cycle diagnostics
-- [ ] 6.4 Write provider-loss tests and implement degrade, suspend, and fail propagation policies
-- [ ] 6.5 Write permission-envelope tests and implement pre-import checks for capability, executor, network, filesystem, secret, environment, and Worker-selector grants
-- [ ] 6.6 Write payload validation tests and implement runtime request and response schema enforcement at capability boundaries
+- [x] 6.1 Write resolver tests and implement capability token identity and protocol-version compatibility
+- [x] 6.2 Write binding tests and implement explicit, unique automatic, ambiguous, required, and optional resolution
+- [x] 6.3 Write graph tests and implement provider-first ordering plus required-cycle diagnostics
+- [x] 6.4 Write provider-loss tests and implement degrade, suspend, and fail propagation policies
+- [x] 6.5 Write permission-envelope tests and implement pre-import checks for capability, executor, network, filesystem, secret, environment, and Worker-selector grants
+- [x] 6.6 Write payload validation tests and implement runtime request and response schema enforcement at capability boundaries
 
 ## 7. Plugin Deployment and Reconciliation
 

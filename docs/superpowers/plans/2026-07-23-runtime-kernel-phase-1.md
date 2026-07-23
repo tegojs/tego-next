@@ -485,7 +485,7 @@ Commit: `git add packages/runtime packages/cli packages/testkit examples/echo-pl
 - Produces: `resolveCapabilities(input): ResolutionResult`.
 - Produces: `validatePermissionGrant(requested, granted): PermissionDecision`.
 
-- [ ] **Step 1: Write and commit failing table-driven resolver tests**
+- [x] **Step 1: Write and commit failing table-driven resolver tests**
 
 Cover explicit binding, exactly one provider, no required provider, absent
 optional provider, ambiguous providers, incompatible versions, provider-first
@@ -497,19 +497,19 @@ Expected: FAIL with missing resolver module.
 
 Commit: `git add packages/runtime/test && git commit -m "test: define capability and permission resolution"`
 
-- [ ] **Step 2: Implement pure graph resolution**
+- [x] **Step 2: Implement pure graph resolution**
 
 Sort every candidate by provider deployment identity before producing
 diagnostics. Use Tarjan strongly connected components for required cycles.
 Return a binding graph only when all required nodes resolve.
 
-- [ ] **Step 3: Implement permission subset and call gates**
+- [x] **Step 3: Implement permission subset and call gates**
 
 Canonicalize hosts, paths, environment names, methods, and selectors before
 comparison. Reject any grant outside the manifest request and any call outside
 the grant before module import or RPC dispatch.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `npm run build -w @tegojs/runtime && node --test packages/runtime/dist/test/capability-resolution.test.js packages/runtime/dist/test/permission-gate.test.js`
 
