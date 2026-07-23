@@ -1180,6 +1180,7 @@ export class ThreadExecutor implements Executor {
     if (entry.state === "accepted") {
       const index = this.#queue.indexOf(entry);
       if (index >= 0) this.#queue.splice(index, 1);
+      delete entry.transfer;
       this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
       if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
       entry.completed.resolve();
@@ -1321,6 +1322,7 @@ export class ThreadExecutor implements Executor {
     for (const entry of this.#attempts.values()) {
       if (entry.state === "terminal" || entry.channel !== undefined) continue;
       const queued = entry.state === "accepted";
+      delete entry.transfer;
       const now = this.#clock.now().toISOString();
       this.#settle(entry, {
         taskId: entry.request.taskId,
@@ -1363,9 +1365,15 @@ export class ThreadExecutor implements Executor {
     const cached = threadTransferFingerprints.get(request);
     if (cached !== undefined) return cached;
     const { transfer } = request;
+    if (transfer.ownership !== "clone" && transfer.ownership !== "transfer") {
+      throw executorError(
+        "EXECUTOR_THREAD_TRANSFER_INVALID",
+        "Thread transfer ownership must be clone or transfer",
+        this.#clock.now(),
+      );
+    }
     const seen = new Set<ArrayBuffer>();
-    const hash = createHash("sha256");
-    hash.update(transfer.ownership);
+    let bytes = 0;
     for (const buffer of transfer.buffers) {
       if (!(buffer instanceof ArrayBuffer) || buffer.byteLength === 0) {
         throw executorError(
@@ -1382,9 +1390,18 @@ export class ThreadExecutor implements Executor {
         );
       }
       seen.add(buffer);
-      hash.update(new Uint8Array(buffer));
+      bytes += buffer.byteLength;
+      if (bytes > THREAD_EXECUTOR_MAX_MESSAGE_BYTES) {
+        throw executorError(
+          "EXECUTOR_INPUT_LIMIT_EXCEEDED",
+          "Thread transfer buffers exceed the configured wire limit",
+          this.#clock.now(),
+        );
+      }
     }
-    validateThreadMessage({ buffers: transfer.buffers }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    const hash = createHash("sha256");
+    hash.update(transfer.ownership);
+    for (const buffer of transfer.buffers) hash.update(new Uint8Array(buffer));
     const fingerprint = hash.digest("hex");
     threadTransferFingerprints.set(request, fingerprint);
     return fingerprint;
