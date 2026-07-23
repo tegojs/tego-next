@@ -254,9 +254,9 @@ function inputDiagnostics(
           deployment.identity,
         ),
       );
-      continue;
+    } else {
+      seenDeployments.add(key);
     }
-    seenDeployments.add(key);
 
     const providers = new Set<string>();
     for (const provider of deployment.provides) {
@@ -363,7 +363,7 @@ function providerLossDecisions(
     const requirementSource = consumer?.requires.find(
       (candidate) => candidate.name === previous.capability,
     );
-    if (consumer === undefined || requirementSource === undefined) continue;
+    if (consumer?.ready !== true || requirementSource === undefined) continue;
     const requirement = normalizeRequirement(requirementSource);
     const provider = byIdentity.get(identityKey(previous.provider));
     const available =

@@ -63,6 +63,7 @@ function parseRangeVersion(value: string): RangeVersion | undefined {
   let wildcardIndex: number | undefined;
   for (const [index, part] of parts.entries()) {
     if (part === "*" || part.toLowerCase() === "x") {
+      if (index === 0) return undefined;
       wildcardIndex ??= index;
       numbers.push(0);
       if (parts.slice(index + 1).some((nested) => nested !== "*" && nested.toLowerCase() !== "x")) {
