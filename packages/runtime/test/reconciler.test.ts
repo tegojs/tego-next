@@ -734,8 +734,8 @@ test("Reconciler gates artifact, capabilities, permissions, placement, and execu
     (
       [...state.records.values()].find(
         (entry) => entry.key.collection === "deployment-observations",
-      )?.value as { readonly status?: string }
-    ).status,
+      )?.value as { readonly status?: string } | undefined
+    )?.status,
     "blocked",
   );
   await reconciler.stop();
@@ -1201,7 +1201,10 @@ test("deployment observations distinguish unavailable, inconsistent, and degrade
     const observation = [...state.records.values()].find(
       (entry) => entry.key.collection === "deployment-observations",
     );
-    assert.equal((observation?.value as { readonly status?: string }).status, expected);
+    assert.equal(
+      (observation?.value as { readonly status?: string } | undefined)?.status,
+      expected,
+    );
     await reconciler.stop();
   }
 });

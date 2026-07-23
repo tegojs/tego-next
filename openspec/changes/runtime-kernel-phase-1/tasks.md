@@ -51,12 +51,12 @@
 
 ## 7. Plugin Deployment and Reconciliation
 
-- [ ] 7.1 Write desired/observed state tests and implement deployment generations and instance observed generations
-- [ ] 7.2 Write lifecycle transition tests and implement the kernel-owned component lifecycle state machine
-- [ ] 7.3 Write reconciliation idempotency tests and implement stable instance identity, placement, retry scheduling, and convergence
-- [ ] 7.4 Write enable, disable, upgrade, drain, and rollback plan tests and implement their reconciliation steps
-- [ ] 7.5 Write failure-isolation tests and implement structured blocked, failed, degraded, unavailable, and inconsistent states
-- [ ] 7.6 Write restart-during-reconcile tests and implement operation-journal recovery without duplicate component instances
+- [x] 7.1 Write desired/observed state tests and implement deployment generations and instance observed generations
+- [x] 7.2 Write lifecycle transition tests and implement the kernel-owned component lifecycle state machine
+- [x] 7.3 Write reconciliation idempotency tests and implement stable instance identity, placement, retry scheduling, and convergence
+- [x] 7.4 Write enable, disable, upgrade, drain, and rollback plan tests and implement their reconciliation steps
+- [x] 7.5 Write failure-isolation tests and implement structured blocked, failed, degraded, unavailable, and inconsistent states
+- [x] 7.6 Write restart-during-reconcile tests and implement operation-journal recovery without duplicate component instances
 
 ## 8. Local Executors
 
