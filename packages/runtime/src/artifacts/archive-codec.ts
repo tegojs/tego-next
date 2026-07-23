@@ -8,7 +8,8 @@ import {
 const TAR_BLOCK_SIZE = 512;
 const encoder = new TextEncoder();
 const PORTABLE_DRIVE_PATH = /^[A-Za-z]:/u;
-const WINDOWS_DEVICE_SEGMENT = /^(?:aux|com[1-9]|con|lpt[1-9]|nul|prn)(?:\.|$)/iu;
+const WINDOWS_DEVICE_SEGMENT =
+  /^(?:aux|com(?:[1-9]|[¹²³])|con|lpt(?:[1-9]|[¹²³])|nul|prn)(?:\.|$)/iu;
 
 export interface DeterministicArchiveEntry {
   readonly path: string;
@@ -52,6 +53,11 @@ export function assertPortableArtifactPath(path: string): void {
   ) {
     throw artifactError("ARTIFACT_PATH_UNSAFE", "Artifact entry path is not portable", path);
   }
+}
+
+export function portableArtifactCollisionKey(path: string): string {
+  assertPortableArtifactPath(path);
+  return path.normalize("NFC").toLowerCase();
 }
 
 function canonicalize(value: JsonValue): JsonValue {
@@ -141,17 +147,20 @@ export function createDeterministicArchive(
     left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
   );
   const chunks: Uint8Array[] = [];
-  let previous: string | undefined;
+  const paths = new Map<string, string>();
   for (const entry of entries) {
-    assertPortableArtifactPath(entry.path);
-    if (entry.path === previous) {
+    const collisionKey = portableArtifactCollisionKey(entry.path);
+    const previous = paths.get(collisionKey);
+    if (previous !== undefined) {
       throw artifactError(
-        "ARTIFACT_ENTRY_DUPLICATE",
-        "Artifact contains a duplicate entry",
+        previous === entry.path ? "ARTIFACT_ENTRY_DUPLICATE" : "ARTIFACT_ENTRY_COLLISION",
+        previous === entry.path
+          ? "Artifact contains a duplicate entry"
+          : "Artifact entries collide on a portable filesystem",
         entry.path,
       );
     }
-    previous = entry.path;
+    paths.set(collisionKey, entry.path);
     const stableBytes = Buffer.from(entry.bytes);
     chunks.push(createHeader(entry.path, stableBytes.byteLength), stableBytes);
     const padding = (TAR_BLOCK_SIZE - (stableBytes.byteLength % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;

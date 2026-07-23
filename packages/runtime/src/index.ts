@@ -13,6 +13,7 @@ export {
   assertPortableArtifactPath,
   canonicalJsonBytes,
   createDeterministicArchive,
+  portableArtifactCollisionKey,
   type DeterministicArchiveEntry,
 } from "./artifacts/archive-codec.js";
 export { createRuntime } from "./create-runtime.js";

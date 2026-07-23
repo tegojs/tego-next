@@ -111,9 +111,11 @@ function parseRangeVersion(value: string): RangeVersion | undefined {
   if (parts.length < 1 || parts.length > 3) return undefined;
   const numbers: number[] = [];
   let wildcard = false;
+  let wildcardIndex: number | undefined;
   for (const [index, part] of parts.entries()) {
     if (part === "*" || part.toLowerCase() === "x") {
       wildcard = true;
+      wildcardIndex ??= index;
       numbers.push(0);
       if (parts.slice(index + 1).some((nested) => nested !== "*" && nested.toLowerCase() !== "x")) {
         return undefined;
@@ -126,7 +128,9 @@ function parseRangeVersion(value: string): RangeVersion | undefined {
     numbers.push(number);
   }
   return {
-    precision: parts.length as 1 | 2 | 3,
+    precision: (wildcardIndex === undefined
+      ? parts.length
+      : Math.max(1, wildcardIndex)) as 1 | 2 | 3,
     version: {
       major: numbers[0] ?? 0,
       minor: numbers[1] ?? 0,
@@ -198,6 +202,7 @@ function satisfiesRange(value: string, range: string): boolean {
   const version = parseVersion(value);
   if (version === undefined) return false;
   const alternatives = range.split("||").map((part) => part.trim());
+  if (alternatives.some((alternative) => alternative.length === 0)) return false;
   return alternatives.some((alternative) =>
     alternative
       .split(/\s+/u)
@@ -225,10 +230,17 @@ export class ArtifactService {
 
   async validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact> {
     const signature = this.#verifySignature(request);
-    const { files, manifest } = await readPluginArtifact(
+    const { archiveDigest, files, manifest } = await readPluginArtifact(
       this.#artifacts.read(request.digest),
       this.#limits,
     );
+    if (archiveDigest !== request.digest) {
+      throw artifactError(
+        "ARTIFACT_DIGEST_MISMATCH",
+        "ArtifactStore bytes do not match the requested digest",
+        { actual: archiveDigest, expected: request.digest },
+      );
+    }
     this.#validateCompatibility(manifest);
     return {
       digest: request.digest,
@@ -370,11 +382,11 @@ export class ArtifactService {
 
     let signature: Buffer;
     try {
+      if (!/^[A-Za-z0-9+/]{86}==$/u.test(envelope.signature)) {
+        throw new Error("non-canonical Ed25519 signature");
+      }
       signature = Buffer.from(envelope.signature, "base64");
-      if (
-        signature.byteLength !== 64 ||
-        signature.toString("base64").replaceAll("=", "") !== envelope.signature.replaceAll("=", "")
-      ) {
+      if (signature.byteLength !== 64 || signature.toString("base64") !== envelope.signature) {
         throw new Error("non-canonical Ed25519 signature");
       }
     } catch {

@@ -8,7 +8,10 @@ import {
   type JsonObject,
   type PluginManifest,
 } from "@tegojs/contracts";
-import { assertPortableArtifactPath } from "./archive-codec.js";
+import {
+  assertPortableArtifactPath,
+  portableArtifactCollisionKey,
+} from "./archive-codec.js";
 
 const TAR_BLOCK_SIZE = 512;
 const DEFAULT_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
@@ -36,6 +39,7 @@ export interface ArtifactFilesMetadata extends JsonObject {
 }
 
 export interface ReadPluginArtifact {
+  readonly archiveDigest: ArtifactDigest;
   readonly manifest: PluginManifest;
   readonly files: ArtifactFilesMetadata;
 }
@@ -62,6 +66,7 @@ function boundedPositiveInteger(value: number | undefined, fallback: number, nam
 class BoundedStreamReader {
   readonly #iterator: AsyncIterator<Uint8Array>;
   readonly #maxBytes: number;
+  readonly #hash = createHash("sha256");
   #chunk: Uint8Array<ArrayBufferLike> = new Uint8Array();
   #offset = 0;
   #ended = false;
@@ -99,6 +104,7 @@ class BoundedStreamReader {
 
       const count = Math.min(length - written, this.#chunk.byteLength - this.#offset);
       output.set(this.#chunk.subarray(this.#offset, this.#offset + count), written);
+      this.#hash.update(this.#chunk.subarray(this.#offset, this.#offset + count));
       this.#offset += count;
       written += count;
       this.#consumed += count;
@@ -111,6 +117,10 @@ class BoundedStreamReader {
       }
     }
     return output;
+  }
+
+  digest(): ArtifactDigest {
+    return parseArtifactDigest(`sha256:${this.#hash.digest("hex")}`);
   }
 
   async assertZeroRemainder(): Promise<void> {
@@ -279,7 +289,7 @@ function parseFilesMetadata(input: unknown): ArtifactFilesMetadata {
     throw artifactError("ARTIFACT_METADATA_INVALID", "metadata/files.json has an invalid shape");
   }
   const records: ArtifactFileRecord[] = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, string>();
   for (const value of (input as { files: unknown[] }).files) {
     if (
       typeof value !== "object" ||
@@ -296,15 +306,25 @@ function parseFilesMetadata(input: unknown): ArtifactFilesMetadata {
       );
     }
     const path = (value as { path: string }).path;
-    assertPortableArtifactPath(path);
-    if (path === "metadata/files.json" || seen.has(path)) {
+    const collisionKey = portableArtifactCollisionKey(path);
+    const previous = seen.get(collisionKey);
+    if (path === "metadata/files.json") {
       throw artifactError(
         "ARTIFACT_METADATA_INVALID",
-        "metadata/files.json contains a duplicate or self declaration",
+        "metadata/files.json contains a self declaration",
         { path },
       );
     }
-    seen.add(path);
+    if (previous !== undefined) {
+      throw artifactError(
+        previous === path ? "ARTIFACT_METADATA_INVALID" : "ARTIFACT_ENTRY_COLLISION",
+        previous === path
+          ? "metadata/files.json contains a duplicate declaration"
+          : "Artifact declarations collide on a portable filesystem",
+        { path, previous },
+      );
+    }
+    seen.set(collisionKey, path);
     records.push({
       path,
       sha256: parseArtifactDigest((value as { sha256: string }).sha256),
@@ -331,6 +351,7 @@ export async function readPluginArtifact(
   const maxEntries = boundedPositiveInteger(limits.maxEntries, DEFAULT_MAX_ENTRIES, "maxEntries");
   const reader = new BoundedStreamReader(source, maxArchiveBytes);
   const entries = new Map<string, { readonly digest: ArtifactDigest; readonly size: number }>();
+  const collisionKeys = new Map<string, string>();
   let manifestBytes: Uint8Array | undefined;
   let filesBytes: Uint8Array | undefined;
   let zeroBlocks = 0;
@@ -355,10 +376,16 @@ export async function readPluginArtifact(
     }
 
     const parsed = parseHeader(header);
-    if (entries.has(parsed.path)) {
-      throw artifactError("ARTIFACT_ENTRY_DUPLICATE", "Artifact contains a duplicate entry", {
-        path: parsed.path,
-      });
+    const collisionKey = portableArtifactCollisionKey(parsed.path);
+    const previous = collisionKeys.get(collisionKey);
+    if (previous !== undefined) {
+      throw artifactError(
+        previous === parsed.path ? "ARTIFACT_ENTRY_DUPLICATE" : "ARTIFACT_ENTRY_COLLISION",
+        previous === parsed.path
+          ? "Artifact contains a duplicate entry"
+          : "Artifact entries collide on a portable filesystem",
+        { path: parsed.path, previous },
+      );
     }
     if (entries.size >= maxEntries) {
       throw artifactError("ARTIFACT_ENTRY_COUNT_EXCEEDED", "Artifact contains too many entries", {
@@ -388,6 +415,7 @@ export async function readPluginArtifact(
     }
     const contents = await readEntry(reader, parsed.size, captureLimit);
     entries.set(parsed.path, { digest: contents.digest, size: parsed.size });
+    collisionKeys.set(collisionKey, parsed.path);
     if (parsed.path === "manifest.json") manifestBytes = contents.bytes;
     if (parsed.path === "metadata/files.json") filesBytes = contents.bytes;
   }
@@ -442,5 +470,5 @@ export async function readPluginArtifact(
       );
     }
   }
-  return { files, manifest };
+  return { archiveDigest: reader.digest(), files, manifest };
 }
