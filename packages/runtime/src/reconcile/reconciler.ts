@@ -1045,7 +1045,12 @@ export class Reconciler {
           : effect.kind === "drain"
             ? "draining"
             : "stopping";
-    if (instance.lifecycle !== expectedLifecycle) {
+    const retryableFailure =
+      instance.lifecycle === "failed" &&
+      instance.retryEffect === effect.kind &&
+      (instance.retryAt === undefined ||
+        instance.retryAt <= this.#options.clock.now().toISOString());
+    if (instance.lifecycle !== expectedLifecycle && !retryableFailure) {
       this.#replanCount += 1;
       await this.#acknowledge(claim, "completed");
       return;
