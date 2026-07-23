@@ -95,7 +95,12 @@ class BoundedStreamReader {
             "Plugin archive yielded a non-byte chunk",
           );
         }
-        if (next.value.byteLength === 0) continue;
+        if (next.value.byteLength === 0) {
+          throw artifactError(
+            "ARTIFACT_ARCHIVE_MALFORMED",
+            "Plugin archive yielded an empty byte chunk",
+          );
+        }
         this.#chunk = next.value;
         this.#offset = 0;
       }
