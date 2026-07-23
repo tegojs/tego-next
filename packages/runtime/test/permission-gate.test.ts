@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseCapabilityName, type CapabilityDefinition, type Permission } from "@tegojs/contracts";
 import {
+  CapabilitySchemaRegistry,
   gateCapabilityRequest,
   gateCapabilityResponse,
   gatePermission,
@@ -273,14 +274,20 @@ test("capability request and response payload gates return structured diagnostic
     },
   } satisfies CapabilityDefinition;
 
-  assert.deepEqual(gateCapabilityRequest(definition, { message: "hello" }), {
+  const registry = new CapabilitySchemaRegistry();
+  const registration = registry.register(definition);
+  assert.equal(registration.ok, true);
+  assert.ok(registration.gate);
+  const gate = registration.gate;
+
+  assert.deepEqual(gateCapabilityRequest(gate, { message: "hello" }), {
     allowed: true,
     diagnostics: [],
     value: { message: "hello" },
   });
-  assert.equal(gateCapabilityRequest(definition, { message: 7 }).allowed, false);
-  assert.equal(gateCapabilityResponse(definition, { echo: "hello" }).allowed, true);
-  const invalid = gateCapabilityResponse(definition, { echo: 7 });
+  assert.equal(gateCapabilityRequest(gate, { message: 7 }).allowed, false);
+  assert.equal(gateCapabilityResponse(gate, { echo: "hello" }).allowed, true);
+  const invalid = gateCapabilityResponse(gate, { echo: 7 });
   assert.equal(invalid.allowed, false);
   assert.equal(invalid.diagnostics[0]?.code, "CAPABILITY_RESPONSE_INVALID");
 
@@ -288,10 +295,9 @@ test("capability request and response payload gates return structured diagnostic
     ...definition,
     requestSchema: { type: "unknown-json-schema-type" },
   } as unknown as CapabilityDefinition;
-  assert.equal(
-    gateCapabilityRequest(badSchema, { message: "hello" }).diagnostics[0]?.code,
-    "CAPABILITY_SCHEMA_INVALID",
-  );
+  const rejected = registry.register(badSchema);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.diagnostics[0]?.code, "CAPABILITY_SCHEMA_INVALID");
 });
 
 test("payload gates reject accessors and exotic prototypes without invoking user code", () => {
@@ -303,6 +309,10 @@ test("payload gates reject accessors and exotic prototypes without invoking user
     requestSchema: true,
     responseSchema: true,
   } satisfies CapabilityDefinition;
+  const registration = new CapabilitySchemaRegistry().register(definition);
+  assert.equal(registration.ok, true);
+  assert.ok(registration.gate);
+  const gate = registration.gate;
 
   let invoked = false;
   const accessor = {};
@@ -314,18 +324,62 @@ test("payload gates reject accessors and exotic prototypes without invoking user
     },
   });
 
-  assert.equal(gateCapabilityRequest(definition, accessor).allowed, false);
+  assert.equal(gateCapabilityRequest(gate, accessor).allowed, false);
   assert.equal(invoked, false);
-  assert.equal(gateCapabilityRequest(definition, new (class Payload {})()).allowed, false);
+  assert.equal(gateCapabilityRequest(gate, new (class Payload {})()).allowed, false);
   const exoticArray: unknown[] = [];
   Object.setPrototypeOf(exoticArray, { inherited: true });
-  assert.equal(gateCapabilityRequest(definition, exoticArray).allowed, false);
+  assert.equal(gateCapabilityRequest(gate, exoticArray).allowed, false);
 
   const polluted = JSON.parse('{"__proto__":{"polluted":true},"safe":"value"}');
-  const result = gateCapabilityRequest(definition, polluted);
+  const result = gateCapabilityRequest(gate, polluted);
   assert.equal(result.allowed, true);
   assert.equal(({} as { polluted?: boolean }).polluted, undefined);
   assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+});
+
+test("capability schema registration reuses canonical $id schemas and rejects conflicts", () => {
+  const registry = new CapabilitySchemaRegistry();
+  const definition = {
+    identity: {
+      name: parseCapabilityName("org.example.registered"),
+      protocolVersion: "1.0.0",
+    },
+    requestSchema: {
+      $id: "urn:tego:test:registered-request",
+      type: "object",
+      additionalProperties: false,
+      required: ["value"],
+      properties: { value: { type: "string" } },
+    },
+    responseSchema: { type: "boolean" },
+  } satisfies CapabilityDefinition;
+
+  const first = registry.register(definition);
+  const repeated = registry.register(definition);
+  const structural = registry.register(structuredClone(definition));
+  assert.equal(first.ok, true);
+  assert.equal(repeated.ok, true);
+  assert.equal(structural.ok, true);
+  assert.equal(first.gate, repeated.gate);
+  assert.equal(first.gate, structural.gate);
+  assert.ok(first.gate);
+  assert.equal(gateCapabilityRequest(first.gate, { value: "one" }).allowed, true);
+  assert.equal(gateCapabilityRequest(first.gate, { value: "two" }).allowed, true);
+
+  const conflict = registry.register({
+    ...definition,
+    identity: {
+      name: parseCapabilityName("org.example.conflict"),
+      protocolVersion: "1.0.0",
+    },
+    requestSchema: {
+      $id: "urn:tego:test:registered-request",
+      type: "number",
+    },
+  });
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.diagnostics[0]?.code, "CAPABILITY_SCHEMA_ID_CONFLICT");
 });
 
 test("permission call gates reject accessors without invoking user code", () => {
