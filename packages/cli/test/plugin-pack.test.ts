@@ -52,6 +52,20 @@ async function temporaryFixture(): Promise<string> {
   return directory;
 }
 
+async function withBuiltSource<T>(
+  source: string,
+  action: (directory: string) => Promise<T>,
+): Promise<T> {
+  const directory = await temporaryFixture();
+  try {
+    await mkdir(join(directory, "build/components"), { recursive: true });
+    await writeFile(join(directory, "build/components/component.js"), source);
+    return await action(directory);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+}
+
 test("packs unchanged ESM plugin inputs into identical deterministic archives", async () => {
   const directory = await temporaryFixture();
   try {
@@ -220,6 +234,10 @@ test("rejects host-resolved bare module specifiers without false positives", asy
     ["static import", 'import value from "left-pad";\nexport default value;\n'],
     ["export from", 'export { value as default } from "left-pad";\n'],
     ["dynamic import", 'export default () => import("left-pad");\n'],
+    [
+      "dynamic import in template expression",
+      'const load = () => `value: ${import("left-pad")}`;\nexport default load;\n',
+    ],
     ["fake node builtin", 'import value from "node:left-pad";\nexport default value;\n'],
   ] as const) {
     await context.test(label, async () => {
@@ -267,6 +285,84 @@ test("rejects host-resolved bare module specifiers without false positives", asy
       await rm(directory, { force: true, recursive: true });
     }
   });
+});
+
+test("accepts legal ESM lexical forms and the plugin SDK API path", async (context) => {
+  for (const [label, source] of [
+    [
+      "template interpolation",
+      "const value = 42;\nconst text = `value: ${value}`;\nexport default text;\n",
+    ],
+    [
+      "regex contents",
+      String.raw`const pattern = /import\(\"left-pad\"\)|require\(|module\.exports/u;` +
+        "\nexport default pattern;\n",
+    ],
+    [
+      "strings comments and template text",
+      [
+        '// require("left-pad"); module.exports = {};',
+        'const one = "require(\\"left-pad\\")";',
+        "const two = 'module.exports = {}; exports.value = 1';",
+        "const three = `require(\"left-pad\") and module.exports`;",
+        "export default [one, two, three];",
+      ].join("\n"),
+    ],
+    [
+      "division and regex",
+      String.raw`const ratio = 10 / 2 / 5; const pattern = /import\(\"left-pad\"\)/u;` +
+        "\nexport default { pattern, ratio };\n",
+    ],
+    [
+      "static plugin SDK import",
+      'import sdk from "@tegojs/plugin-sdk";\nexport default sdk;\n',
+    ],
+    ["plugin SDK export", 'export { default } from "@tegojs/plugin-sdk";\n'],
+    [
+      "dynamic plugin SDK import",
+      'export default () => import("@tegojs/plugin-sdk");\n',
+    ],
+    [
+      "plugin SDK import in template expression",
+      'const load = () => `sdk: ${import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
+    ],
+  ] as const) {
+    await context.test(label, async () => {
+      await withBuiltSource(source, async (directory) => {
+        await packPlugin({
+          artifactPath: join(directory, "plugin.tego"),
+          build: false,
+          pluginDirectory: directory,
+        });
+      });
+    });
+  }
+});
+
+test("rejects actual CommonJS expressions without matching inert text", async (context) => {
+  for (const [label, source] of [
+    ["require call", 'const value = require("./local.js");\nexport default value;\n'],
+    ["module exports", "module.exports = {};\n"],
+    ["exports member", "exports.value = 1;\n"],
+  ] as const) {
+    await context.test(label, async () => {
+      await withBuiltSource(source, async (directory) => {
+        await assert.rejects(
+          () =>
+            packPlugin({
+              artifactPath: join(directory, "plugin.tego"),
+              build: false,
+              pluginDirectory: directory,
+            }),
+          (error: unknown) => {
+            assert.ok(error instanceof DiagnosticError);
+            assert.equal(error.diagnostic.code, "ARTIFACT_MODULE_FORMAT_UNSUPPORTED");
+            return true;
+          },
+        );
+      });
+    });
+  }
 });
 
 test("rejects case-folded component path collisions", async () => {
