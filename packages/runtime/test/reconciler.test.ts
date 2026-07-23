@@ -824,6 +824,171 @@ test("an unready capability consumer does not block its provider from bootstrapp
   await reconciler.stop();
 });
 
+test("non-canonical provider instances cannot satisfy execution-time capabilities", async () => {
+  const providerId = parsePluginId("z-provider");
+  const consumerId = parsePluginId("a-consumer");
+  const capability = parseCapabilityName("org.example.echo");
+  const providerDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const providerComponentId = parseComponentId("provider");
+  const consumerComponentId = parseComponentId("consumer");
+  const component = (id: string) => ({
+    componentId: parseComponentId(id),
+    kind: "service" as const,
+    entrypoint: `components/${id}.js`,
+    executors: ["process" as const],
+  });
+  const providerManifest: PluginManifest = {
+    ...manifest("1.0.0", providerDigest),
+    pluginId: providerId,
+    components: [component("provider")],
+    capabilities: {
+      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      requires: [],
+    },
+  };
+  const consumerManifest: PluginManifest = {
+    ...manifest("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    components: [component("consumer")],
+    capabilities: {
+      provides: [],
+      requires: [{ name: capability, protocolRange: "^1.0.0" }],
+    },
+  };
+  const providerDeployment = deployment("1", {
+    pluginId: providerId,
+    artifactDigest: providerDigest,
+  });
+  const consumerDeployment = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+  });
+  const providerInstallation: PluginInstallation = {
+    ...installation("1.0.0", providerDigest),
+    pluginId: providerId,
+    manifest: providerManifest,
+  };
+  const consumerInstallation: PluginInstallation = {
+    ...installation("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    manifest: consumerManifest,
+  };
+  const artifacts = new Map([
+    [providerDigest, { ...gate().artifact, digest: providerDigest, manifest: providerManifest }],
+    [consumerDigest, { ...gate().artifact, digest: consumerDigest, manifest: consumerManifest }],
+  ]);
+  const effect = planReconcile({
+    deployment: consumerDeployment,
+    gate: {
+      artifact: artifacts.get(consumerDigest)!,
+      capabilityResolution: {
+        ok: true,
+        diagnostics: [],
+        providerLossActions: [],
+        bindings: [],
+        order: [
+          { applicationId, pluginId: providerId },
+          { applicationId, pluginId: consumerId },
+        ],
+      },
+      permissionDecision: {
+        allowed: true,
+        diagnostics: [],
+        granted: consumerManifest.permissions,
+        requested: consumerManifest.permissions,
+      },
+    },
+    instances: [],
+    now: "2026-07-23T00:00:00.000Z",
+    supportedExecutors: ["process"],
+  }).steps[0]?.effect;
+  assert.ok(effect);
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: "non-canonical-provider",
+      },
+      {
+        applicationId,
+        artifactDigest: providerDigest,
+        componentId: providerComponentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: "process",
+        instanceId: "non-canonical-provider",
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId: providerId,
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: effect.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: consumerDigest,
+        componentId: consumerComponentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: effect.executor,
+        instanceId: effect.instanceId,
+        lifecycle: "created",
+        observedGeneration: parseGeneration("1"),
+        pluginId: consumerId,
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: effect.messageId,
+      operationId: effect.operationId,
+      payload: effect,
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate(request) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [providerDeployment, consumerDeployment],
+    loadInstallations: async () => [providerInstallation, consumerInstallation],
+  });
+
+  await reconciler.start();
+
+  assert.equal(
+    effects.calls.some(
+      (candidate) => candidate.pluginId === consumerId && candidate.kind === "prepare",
+    ),
+    false,
+  );
+  assert.equal(
+    reconciler.diagnostics().some(
+      (diagnostic) => diagnostic.code === "CAPABILITY_REQUIRED_UNAVAILABLE",
+    ),
+    true,
+  );
+  await reconciler.stop();
+});
+
 test("optional capability edges still enqueue providers before lexical-first consumers", async () => {
   const providerId = parsePluginId("z-optional-provider");
   const consumerId = parsePluginId("a-optional-consumer");
@@ -1353,6 +1518,52 @@ test("non-canonical persisted instance identities remain durably inconsistent ac
     (observation?.value as { readonly status?: string } | undefined)?.status,
     "inconsistent",
   );
+  assert.deepEqual(effects.calls, []);
+  await reconciler.stop();
+});
+
+test("canonical instance values stored under non-canonical keys remain inconsistent", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const effect = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(effect);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: "non-canonical-storage-key",
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: effect.executor,
+        instanceId: effect.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.equal(reconciler.applicationReady(), false);
+  assert.equal(reconciler.diagnostics()[0]?.code, "DEPLOYMENT_INSTANCE_INCONSISTENT");
   assert.deepEqual(effects.calls, []);
   await reconciler.stop();
 });
