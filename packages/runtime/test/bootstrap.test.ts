@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DiagnosticError,
   diagnosticCode,
   compareOperationJournalCursors,
   parseApplicationId,
@@ -465,6 +466,35 @@ test("runtime validates health, status, events, and acquired authority before ex
     (error: unknown) => diagnosticCode(error) === "COORDINATION_LEADERSHIP_INVALID",
   );
   assert.equal((await invalidRuntime.status()).lifecycle, "failed");
+});
+
+test("runtime rejects leadership for a different campaign resource before running", async () => {
+  const { coordination, drivers, log } = controlledDrivers();
+  coordination.campaignResult = {
+    resource: "runtime:someone-else",
+    epoch: parseFencingEpoch("1"),
+  };
+  const runtime = createRuntime(configuration, drivers);
+
+  await assert.rejects(runtime.start(), (error: unknown) => {
+    assert.ok(error instanceof DiagnosticError);
+    assert.equal(error.diagnostic.code, "COORDINATION_LEADERSHIP_RESOURCE_MISMATCH");
+    assert.deepEqual(error.diagnostic.details, {
+      expectedResource: `runtime:${configuration.runtimeId}`,
+      actualResource: "runtime:someone-else",
+    });
+    JSON.stringify(error.diagnostic.details);
+    return true;
+  });
+  const status = await runtime.status();
+  assert.equal(status.lifecycle, "failed");
+  assert.equal(status.acceptingOperations, false);
+  assert.equal(log.includes("state.health"), false);
+  assert.deepEqual(log.slice(-3), [
+    "artifacts.close",
+    "coordination.close",
+    "state.close",
+  ]);
 });
 
 test("runtime lifecycle transitions are pure and reject illegal edges", () => {
