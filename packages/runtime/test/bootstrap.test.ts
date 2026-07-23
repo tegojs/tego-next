@@ -490,11 +490,7 @@ test("runtime rejects leadership for a different campaign resource before runnin
   assert.equal(status.lifecycle, "failed");
   assert.equal(status.acceptingOperations, false);
   assert.equal(log.includes("state.health"), false);
-  assert.deepEqual(log.slice(-3), [
-    "artifacts.close",
-    "coordination.close",
-    "state.close",
-  ]);
+  assert.deepEqual(log.slice(-3), ["artifacts.close", "coordination.close", "state.close"]);
 });
 
 test("runtime lifecycle transitions are pure and reject illegal edges", () => {
