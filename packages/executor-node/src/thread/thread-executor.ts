@@ -190,6 +190,11 @@ interface WorkerLease {
   readonly exited: Promise<{ readonly code?: number; readonly error?: Error }>;
 }
 
+interface ThreadInboundBudget {
+  bytes: number;
+  count: number;
+}
+
 type AdmissionRace<T> =
   | { readonly cancelled: true }
   | { readonly cancelled: false; readonly value: T };
@@ -366,6 +371,7 @@ class ThreadChannel {
   readonly #port: MessagePort;
   readonly #options: ThreadExecutorOptions;
   readonly #component: ResolvedThreadComponent;
+  readonly #inboundBudget: ThreadInboundBudget;
   readonly #capabilityValidators = new Map<
     string,
     {
@@ -383,8 +389,6 @@ class ThreadChannel {
   >();
   #nextId = 0;
   #pendingBytes = 0;
-  #inbound = 0;
-  #inboundBytes = 0;
   #closedError: Error | undefined;
   readonly #onMessage = (value: unknown): void => {
     try {
@@ -393,16 +397,16 @@ class ThreadChannel {
       const tracked = ["diagnostic", "event", "rpc-request"].includes(message.kind);
       if (
         tracked &&
-        (this.#inbound >= THREAD_CHANNEL_MAX_INBOUND ||
-          this.#inboundBytes + metrics.bytes > THREAD_CHANNEL_MAX_INBOUND_BYTES)
+        (this.#inboundBudget.count >= THREAD_CHANNEL_MAX_INBOUND ||
+          this.#inboundBudget.bytes + metrics.bytes > THREAD_CHANNEL_MAX_INBOUND_BYTES)
       ) {
         this.#fail(new Error("Thread channel inbound capacity is exhausted"));
         this.#port.close();
         return;
       }
       if (tracked) {
-        this.#inbound += 1;
-        this.#inboundBytes += metrics.bytes;
+        this.#inboundBudget.count += 1;
+        this.#inboundBudget.bytes += metrics.bytes;
       }
       void this.#dispatch(message)
         .catch((error: unknown) => {
@@ -410,8 +414,8 @@ class ThreadChannel {
         })
         .finally(() => {
           if (!tracked) return;
-          this.#inbound -= 1;
-          this.#inboundBytes -= metrics.bytes;
+          this.#inboundBudget.count -= 1;
+          this.#inboundBudget.bytes -= metrics.bytes;
         });
     } catch (error) {
       this.#fail(error instanceof Error ? error : new Error(String(error)));
@@ -428,9 +432,11 @@ class ThreadChannel {
     lease: WorkerLease,
     options: ThreadExecutorOptions,
     component: ResolvedThreadComponent,
+    inboundBudget: ThreadInboundBudget,
   ) {
     this.#options = options;
     this.#component = component;
+    this.#inboundBudget = inboundBudget;
     for (const definition of component.capabilityDefinitions) {
       this.#capabilityValidators.set(this.#capabilityKey(definition.identity), {
         request: compileSchemaValidator<JsonValue>(definition.requestSchema),
@@ -706,6 +712,7 @@ export class ThreadExecutor implements Executor {
   readonly #workerEntrypoint: string;
   readonly #attempts = new Map<string, AttemptEntry>();
   readonly #queue: AttemptEntry[] = [];
+  readonly #inboundBudget: ThreadInboundBudget = { bytes: 0, count: 0 };
   readonly #termination = new WeakMap<ThreadWorker, Promise<void>>();
   readonly #quarantined = new Set<WorkerLease>();
   #active = 0;
@@ -933,6 +940,7 @@ export class ThreadExecutor implements Executor {
   async #run(entry: AttemptEntry): Promise<void> {
     let lease: WorkerLease | undefined;
     let channel: ThreadChannel | undefined;
+    let candidate: ExecutionResult | undefined;
     const admissionSettlements: Promise<void>[] = [];
     const startedAt = this.#clock.now().toISOString();
     try {
@@ -940,23 +948,22 @@ export class ThreadExecutor implements Executor {
       admissionSettlements.push(resolutionAdmission.settled);
       const resolution = await resolutionAdmission.outcome;
       if (resolution.cancelled) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
+        candidate = this.#cancelledResult(entry, entry.cancellation ?? "cancelled");
         return;
       }
       const component = resolution.value;
       if (entry.cancellation !== undefined) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
+        candidate = this.#cancelledResult(entry, entry.cancellation);
         return;
       }
       const worker = this.#workerFactory.create(this.#workerEntrypoint);
       lease = this.#lease(worker);
       entry.lease = lease;
       if (entry.cancellation !== undefined) {
-        await this.#terminate(lease);
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
+        candidate = this.#cancelledResult(entry, entry.cancellation);
         return;
       }
-      channel = new ThreadChannel(lease, this.#options, component);
+      channel = new ThreadChannel(lease, this.#options, component, this.#inboundBudget);
       entry.channel = channel;
       const bootstrap = await channel.request({
         kind: "bootstrap",
@@ -1007,7 +1014,7 @@ export class ThreadExecutor implements Executor {
       );
       if (entry.state === "terminal") return;
       if (entry.cancellation !== undefined) {
-        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
+        candidate = this.#cancelledResult(entry, entry.cancellation);
         return;
       }
       const attachments = entry.transfer?.buffers ?? [];
@@ -1038,7 +1045,7 @@ export class ThreadExecutor implements Executor {
       if (!["cancelled", "failed", "rejected", "succeeded", "timed-out"].includes(String(status))) {
         throw new Error("Component run status is invalid");
       }
-      const executionResult: ExecutionResult = {
+      candidate = {
         taskId: entry.request.taskId,
         attemptId: entry.request.attemptId,
         status: status as ExecutionResult["status"],
@@ -1048,12 +1055,6 @@ export class ThreadExecutor implements Executor {
         completedAt: this.#clock.now().toISOString(),
       };
       await this.#shutdownWorker(channel, lease, component.artifactDigest, controlDeadline);
-      this.#settle(
-        entry,
-        entry.cancellation === undefined
-          ? executionResult
-          : this.#cancelledResult(entry, entry.cancellation),
-      );
     } catch (error) {
       if (entry.state !== "terminal") {
         const code =
@@ -1062,7 +1063,7 @@ export class ThreadExecutor implements Executor {
             : lease === undefined
               ? "EXECUTOR_THREAD_SPAWN_FAILED"
               : "EXECUTOR_THREAD_EXIT";
-        this.#settle(entry, {
+        candidate = {
           taskId: entry.request.taskId,
           attemptId: entry.request.attemptId,
           status: entry.cancellation ?? "failed",
@@ -1077,16 +1078,35 @@ export class ThreadExecutor implements Executor {
           executor: this.#executorMetadata(lease),
           startedAt,
           completedAt: this.#clock.now().toISOString(),
-        });
+        };
       }
     } finally {
-      entry.deadlineController.abort("terminal");
       await Promise.all(admissionSettlements);
       if (lease !== undefined) await this.#terminate(lease);
       channel?.close();
       delete entry.lease;
       delete entry.channel;
       delete entry.transfer;
+      if (entry.state !== "terminal") {
+        this.#settle(
+          entry,
+          entry.cancellation === undefined
+            ? (candidate ?? {
+                taskId: entry.request.taskId,
+                attemptId: entry.request.attemptId,
+                status: "failed",
+                diagnostic: diagnostic(
+                  "EXECUTOR_THREAD_EXIT",
+                  "Thread executor attempt ended without a result",
+                  this.#clock.now(),
+                ),
+                executor: this.#executorMetadata(lease),
+                startedAt,
+                completedAt: this.#clock.now().toISOString(),
+              })
+            : this.#cancelledResult(entry, entry.cancellation),
+        );
+      }
     }
   }
 
@@ -1410,7 +1430,9 @@ export class ThreadExecutor implements Executor {
   #settleAdmissions(failure: RuntimeDiagnostic): void {
     this.#queue.splice(0);
     for (const entry of this.#attempts.values()) {
-      if (entry.state === "terminal" || entry.channel !== undefined) continue;
+      if (entry.state === "terminal" || entry.channel !== undefined || entry.lease !== undefined) {
+        continue;
+      }
       const queued = entry.state === "accepted";
       delete entry.transfer;
       const now = this.#clock.now().toISOString();
