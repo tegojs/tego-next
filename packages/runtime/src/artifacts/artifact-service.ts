@@ -90,6 +90,12 @@ interface Version {
   readonly patch: number;
 }
 
+interface RangeVersion {
+  readonly precision: 1 | 2 | 3;
+  readonly version: Version;
+  readonly wildcard: boolean;
+}
+
 function parseVersion(value: string): Version | undefined {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+].*)?$/u.exec(value);
   if (match === null) return undefined;
@@ -100,24 +106,78 @@ function parseVersion(value: string): Version | undefined {
   };
 }
 
+function parseRangeVersion(value: string): RangeVersion | undefined {
+  const parts = value.split(".");
+  if (parts.length < 1 || parts.length > 3) return undefined;
+  const numbers: number[] = [];
+  let wildcard = false;
+  for (const [index, part] of parts.entries()) {
+    if (part === "*" || part.toLowerCase() === "x") {
+      wildcard = true;
+      numbers.push(0);
+      if (parts.slice(index + 1).some((nested) => nested !== "*" && nested.toLowerCase() !== "x")) {
+        return undefined;
+      }
+      continue;
+    }
+    if (wildcard || !/^(?:0|[1-9]\d*)$/u.test(part)) return undefined;
+    const number = Number(part);
+    if (!Number.isSafeInteger(number)) return undefined;
+    numbers.push(number);
+  }
+  return {
+    precision: parts.length as 1 | 2 | 3,
+    version: {
+      major: numbers[0] ?? 0,
+      minor: numbers[1] ?? 0,
+      patch: numbers[2] ?? 0,
+    },
+    wildcard,
+  };
+}
+
 function compareVersion(left: Version, right: Version): number {
   return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+}
+
+function upperBound(target: RangeVersion): Version {
+  if (target.precision === 1) {
+    return { major: target.version.major + 1, minor: 0, patch: 0 };
+  }
+  return {
+    major: target.version.major,
+    minor: target.version.minor + 1,
+    patch: 0,
+  };
 }
 
 function satisfiesComparator(version: Version, comparator: string): boolean {
   if (comparator === "*" || comparator === "") return true;
   if (comparator.startsWith("^")) {
-    const minimum = parseVersion(comparator.slice(1));
+    const target = parseRangeVersion(comparator.slice(1));
+    if (target === undefined || target.wildcard) return false;
+    const minimum = target.version;
+    const maximum =
+      minimum.major > 0
+        ? { major: minimum.major + 1, minor: 0, patch: 0 }
+        : minimum.minor > 0
+          ? { major: 0, minor: minimum.minor + 1, patch: 0 }
+          : { major: 0, minor: 0, patch: minimum.patch + 1 };
+    return compareVersion(version, minimum) >= 0 && compareVersion(version, maximum) < 0;
+  }
+  if (comparator.startsWith("~")) {
+    const target = parseRangeVersion(comparator.slice(1));
     return (
-      minimum !== undefined &&
-      compareVersion(version, minimum) >= 0 &&
-      version.major === minimum.major
+      target !== undefined &&
+      !target.wildcard &&
+      compareVersion(version, target.version) >= 0 &&
+      compareVersion(version, upperBound(target)) < 0
     );
   }
   const match = /^(>=|<=|>|<|=)?(.+)$/u.exec(comparator);
-  const target = match === null ? undefined : parseVersion(match[2] ?? "");
+  const target = match === null ? undefined : parseRangeVersion(match[2] ?? "");
   if (match === null || target === undefined) return false;
-  const order = compareVersion(version, target);
+  const order = compareVersion(version, target.version);
   switch (match[1] ?? "=") {
     case ">":
       return order > 0;
@@ -128,7 +188,9 @@ function satisfiesComparator(version: Version, comparator: string): boolean {
     case "<=":
       return order <= 0;
     default:
-      return order === 0;
+      return target.precision === 3 && !target.wildcard
+        ? order === 0
+        : order >= 0 && compareVersion(version, upperBound(target)) < 0;
   }
 }
 
