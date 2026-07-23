@@ -27,7 +27,6 @@ interface ExampleRecord extends JsonObject {
 }
 
 const zero = parseRevision("0");
-const outboxCreatedAt = "2026-07-23T00:00:00.000Z";
 
 function key(namespace: string, id: string): StateKey<ExampleRecord> {
   return { namespace, collection: "examples", id };
@@ -444,6 +443,7 @@ export function stateStoreConformance(
       await withStore(factory, async (store) => {
         const operationId = parseOperationId("operation-outbox");
         const messageId = parseMessageId("message-outbox");
+        const outboxCreatedAt = new Date().toISOString();
         await store.transact({}, async (transaction) => {
           await transaction.enqueueOutbox({
             availableAt: outboxCreatedAt,
@@ -467,7 +467,7 @@ export function stateStoreConformance(
         assert.equal(claim.claimEpoch, parseFencingEpoch("1"));
         assert.equal(claim.message.messageId, messageId);
 
-        const retryAt = "2026-07-23T00:01:00.000Z";
+        const retryAt = new Date(Date.now() + 60_000).toISOString();
         const retried = await store.acknowledgeOutbox({
           claimEpoch: claim.claimEpoch,
           messageId,
@@ -475,14 +475,12 @@ export function stateStoreConformance(
           owner: claim.owner,
           retryAt,
         });
-        assert.deepEqual(retried, {
-          acknowledgedAt: outboxCreatedAt,
-          attempt: 1,
-          duplicate: false,
-          messageId,
-          outcome: "retry",
-          retryAt,
-        });
+        assert.equal(retried.attempt, 1);
+        assert.equal(retried.duplicate, false);
+        assert.equal(retried.messageId, messageId);
+        assert.equal(retried.outcome, "retry");
+        assert.equal(retried.retryAt, retryAt);
+        assert.equal(new Date(retried.acknowledgedAt).toISOString(), retried.acknowledgedAt);
         assert.deepEqual(
           await store.acknowledgeOutbox({
             claimEpoch: claim.claimEpoch,
@@ -497,6 +495,92 @@ export function stateStoreConformance(
           await store.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "too-early" }),
           [],
         );
+      });
+    });
+
+    test("duplicate acknowledgement with newer authority advances the durable control-plane fence", async () => {
+      await withStore(factory, async (store) => {
+        const createdAt = new Date().toISOString();
+        await store.transact({}, async (transaction) => {
+          for (const suffix of ["first", "second"]) {
+            await transaction.enqueueOutbox({
+              availableAt: createdAt,
+              createdAt,
+              messageId: parseMessageId(`message-fenced-${suffix}`),
+              operationId: parseOperationId(`operation-fenced-${suffix}`),
+              payload: { suffix },
+              topic: "component.lifecycle",
+            });
+          }
+          return null;
+        });
+        const [claim] = await store.claimOutbox({
+          fencing: { resource: "runtime", epoch: parseFencingEpoch("1") },
+          leaseDurationMs: 30_000,
+          limit: 1,
+          owner: "owner",
+        });
+        assert.ok(claim);
+        const request = {
+          claimEpoch: claim.claimEpoch,
+          messageId: claim.message.messageId,
+          outcome: "completed",
+          owner: claim.owner,
+        } as const;
+        await store.acknowledgeOutbox({
+          ...request,
+          fencing: { resource: "runtime", epoch: parseFencingEpoch("1") },
+        });
+        assert.equal(
+          (
+            await store.acknowledgeOutbox({
+              ...request,
+              fencing: { resource: "runtime", epoch: parseFencingEpoch("3") },
+            })
+          ).duplicate,
+          true,
+        );
+        await assert.rejects(
+          store.claimOutbox({
+            fencing: { resource: "runtime", epoch: parseFencingEpoch("2") },
+            leaseDurationMs: 30_000,
+            limit: 1,
+            owner: "stale-owner",
+          }),
+          expectDiagnostic("STATE_FENCE_STALE"),
+        );
+      });
+    });
+
+    test("outbox claims are isolated by topic", async () => {
+      await withStore(factory, async (store) => {
+        const createdAt = new Date().toISOString();
+        await store.transact({}, async (transaction) => {
+          for (const [suffix, topic] of [
+            ["a-unrelated", "task.assignment"],
+            ["z-lifecycle", "component.lifecycle"],
+          ] as const) {
+            await transaction.enqueueOutbox({
+              availableAt: createdAt,
+              createdAt,
+              messageId: parseMessageId(`message-topic-${suffix}`),
+              operationId: parseOperationId(`operation-topic-${suffix}`),
+              payload: { suffix },
+              topic,
+            });
+          }
+          return null;
+        });
+
+        const [claim] = await store.claimOutbox({
+          leaseDurationMs: 30_000,
+          limit: 1,
+          owner: "lifecycle-owner",
+          topic: "component.lifecycle",
+        });
+        assert.ok(claim);
+        assert.equal(claim.message.topic, "component.lifecycle");
+        assert.equal(claim.message.messageId, parseMessageId("message-topic-z-lifecycle"));
       });
     });
 

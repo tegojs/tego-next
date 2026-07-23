@@ -1,0 +1,835 @@
+import {
+  DiagnosticError,
+  diagnosticCode,
+  parsePluginDeployment,
+  parsePluginInstallation,
+  runtimeDiagnostic,
+  serializeCause,
+  type ArtifactDigest,
+  type ApplicationId,
+  type Clock,
+  type ExecutorKind,
+  type JsonObject,
+  type OperationId,
+  type OutboxClaim,
+  type PluginDeployment,
+  type PluginInstallation,
+  type RuntimeAuthority,
+  type RuntimeDiagnostic,
+  type StateKey,
+  type StateStore,
+} from "@tegojs/contracts";
+import type {
+  ArtifactService,
+  ValidatedPluginArtifact,
+  ValidateArtifactRequest,
+} from "../artifacts/artifact-service.js";
+import {
+  resolveCapabilities,
+  type CapabilityResolutionDeployment,
+} from "../capabilities/resolver.js";
+import { validatePermissionGrant } from "../permissions/permission-set.js";
+import { transitionComponentLifecycle } from "./component-lifecycle.js";
+import {
+  planReconcile,
+  type ArtifactDeploymentGate,
+  type ComponentInstance,
+  type ReconcileEffect,
+  type ReconcileEffectKind,
+  type ReconcilePlanStep,
+} from "./plan.js";
+import type { PlacementWorker } from "./placement.js";
+import { deterministicRetryDelay } from "./retry.js";
+
+const namespace = "tego";
+const claimLeaseMs = 30_000;
+
+export interface ComponentEffectExecutor {
+  readonly supportedExecutors: readonly ExecutorKind[];
+  perform(effect: ReconcileEffect): Promise<void>;
+}
+
+export interface ReconcileArtifactGate {
+  validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact>;
+}
+
+export interface ReconcilerOptions {
+  readonly state: StateStore;
+  readonly clock: Clock;
+  readonly effects: ComponentEffectExecutor;
+  readonly artifactGate: ReconcileArtifactGate | Pick<ArtifactService, "validate">;
+  readonly authority?: RuntimeAuthority;
+  readonly workers?: readonly PlacementWorker[];
+  readonly owner?: string;
+  readonly loadDeployments?: () => Promise<readonly PluginDeployment[]>;
+  readonly loadInstallations?: () => Promise<readonly PluginInstallation[]>;
+  readonly interruptAfterEffect?: boolean;
+}
+
+interface PersistedComponentInstance extends JsonObject {
+  readonly instanceId: string;
+  readonly applicationId: ApplicationId;
+  readonly pluginId: ComponentInstance["pluginId"];
+  readonly componentId: ComponentInstance["componentId"];
+  readonly deploymentGeneration: ComponentInstance["deploymentGeneration"];
+  readonly observedGeneration: ComponentInstance["observedGeneration"];
+  readonly lifecycle: ComponentInstance["lifecycle"];
+  readonly executor: ComponentInstance["executor"];
+  readonly workerId?: string;
+  readonly artifactDigest?: ArtifactDigest;
+  readonly attempt?: number;
+  readonly retryAt?: string;
+  readonly retryEffect?: ReconcileEffectKind;
+  readonly diagnostic?: RuntimeDiagnostic;
+  readonly completedOperationId?: OperationId;
+}
+
+interface DeploymentObservation extends JsonObject {
+  readonly applicationId: PluginDeployment["applicationId"];
+  readonly pluginId: PluginDeployment["pluginId"];
+  readonly generation: PluginDeployment["generation"];
+  readonly status: "blocked" | "converging" | "failed" | "ready";
+  readonly diagnostics: readonly JsonObject[];
+  readonly updatedAt: string;
+}
+
+function deploymentKey(deployment: PluginDeployment): string {
+  return `${deployment.applicationId}/${deployment.pluginId}`;
+}
+
+function instanceKey(instanceId: string): StateKey<PersistedComponentInstance> {
+  return {
+    namespace,
+    collection: "component-instances",
+    id: instanceId,
+  };
+}
+
+function observationKey(deployment: PluginDeployment): StateKey<DeploymentObservation> {
+  return {
+    namespace,
+    collection: "deployment-observations",
+    id: deploymentKey(deployment),
+  };
+}
+
+function conflictCode(error: unknown): string | undefined {
+  return (
+    diagnosticCode(error) ??
+    (typeof error === "object" &&
+    error !== null &&
+    "diagnostic" in error &&
+    typeof (error as { diagnostic?: { code?: unknown } }).diagnostic?.code === "string"
+      ? (error as { diagnostic: { code: string } }).diagnostic.code
+      : undefined)
+  );
+}
+
+function effectDiagnostic(
+  effect: ReconcileEffect,
+  error: unknown,
+  observedAt: string,
+): RuntimeDiagnostic {
+  return runtimeDiagnostic({
+    code:
+      effect.kind === "start"
+        ? "LIFECYCLE_START_FAILED"
+        : (`LIFECYCLE_${effect.kind.toUpperCase()}_FAILED` as `LIFECYCLE_${string}`),
+    message: `Component ${effect.kind} effect failed`,
+    source: {
+      kind: "plugin",
+      id: `${effect.pluginId}/${effect.componentId}`,
+    },
+    retryable: true,
+    details: {
+      componentId: effect.componentId,
+      deploymentGeneration: effect.deploymentGeneration,
+      instanceId: effect.instanceId,
+      operationId: effect.operationId,
+      pluginId: effect.pluginId,
+    },
+    cause: serializeCause(error),
+    observedAt,
+  });
+}
+
+export class Reconciler {
+  readonly #options: ReconcilerOptions;
+  readonly #owner: string;
+  readonly #diagnosticsByDeployment = new Map<string, readonly RuntimeDiagnostic[]>();
+  readonly #readyDeployments = new Set<string>();
+  #deployments: readonly PluginDeployment[] = [];
+  #running = false;
+  #tail: Promise<void> = Promise.resolve();
+  #interrupted = false;
+  #lastCommitAuthority: RuntimeAuthority | undefined;
+  #replanCount = 0;
+
+  constructor(options: ReconcilerOptions) {
+    this.#options = options;
+    this.#owner = options.owner ?? "reconciler";
+  }
+
+  get kernelRunning(): boolean {
+    return this.#running;
+  }
+
+  get lastCommitAuthority(): RuntimeAuthority | undefined {
+    return this.#lastCommitAuthority;
+  }
+
+  get replanCount(): number {
+    return this.#replanCount;
+  }
+
+  async start(): Promise<void> {
+    if (this.#running) return;
+    this.#running = true;
+    await this.wake();
+  }
+
+  wake(): Promise<void> {
+    if (!this.#running) return Promise.resolve();
+    const pass = this.#tail.then(() => this.#reconcilePass());
+    this.#tail = pass.catch(() => undefined);
+    return pass;
+  }
+
+  async stop(): Promise<void> {
+    this.#running = false;
+    await this.#tail;
+  }
+
+  diagnostics(): readonly RuntimeDiagnostic[] {
+    return [...this.#diagnosticsByDeployment.entries()]
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .flatMap(([, diagnostics]) => diagnostics);
+  }
+
+  applicationReady(): boolean {
+    for (const deployment of this.#deployments) {
+      if (
+        deployment.state === "active" &&
+        deployment.essential &&
+        !this.#readyDeployments.has(deploymentKey(deployment))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async #reconcilePass(): Promise<void> {
+    if (!this.#running) return;
+    const [deployments, installations, instances] = await Promise.all([
+      this.#loadDeployments(),
+      this.#loadInstallations(),
+      this.#loadInstances(),
+    ]);
+    this.#deployments = deployments;
+    this.#diagnosticsByDeployment.clear();
+    this.#readyDeployments.clear();
+
+    for (const deployment of [...deployments].sort((left, right) =>
+      deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0,
+    )) {
+      const gate = await this.#gateDeployment(deployment, deployments, installations, instances);
+      if (gate instanceof DiagnosticError) {
+        await this.#recordBlocked(deployment, [gate.diagnostic]);
+        continue;
+      }
+      const plan = planReconcile({
+        deployment,
+        gate,
+        instances: instances.filter(
+          (instance) =>
+            instance.applicationId === deployment.applicationId &&
+            instance.pluginId === deployment.pluginId,
+        ),
+        now: this.#options.clock.now().toISOString(),
+        supportedExecutors: this.#options.effects.supportedExecutors,
+        ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+      });
+      if (plan.blocked) {
+        const diagnostics = plan.diagnostics.map((diagnostic) =>
+          runtimeDiagnostic({
+            code: diagnostic.code as
+              | `DEPLOYMENT_${string}`
+              | `PERMISSION_${string}`
+              | `CAPABILITY_${string}`,
+            message:
+              typeof diagnostic.message === "string"
+                ? diagnostic.message
+                : "Deployment pre-execution gate rejected the deployment",
+            source: { kind: "deployment", id: deploymentKey(deployment) },
+            details: diagnostic,
+            observedAt: this.#options.clock.now().toISOString(),
+          }),
+        );
+        await this.#recordBlocked(deployment, diagnostics);
+        continue;
+      }
+      for (const step of plan.steps) {
+        await this.#persistStep(deployment, step);
+      }
+    }
+
+    const claims = await this.#options.state.claimOutbox({
+      owner: this.#owner,
+      leaseDurationMs: claimLeaseMs,
+      limit: 1,
+      topic: "component.lifecycle",
+      ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
+    });
+    const claim = claims[0];
+    if (claim !== undefined) await this.#executeClaim(claim);
+    await this.#refreshReadiness();
+  }
+
+  async #loadDeployments(): Promise<readonly PluginDeployment[]> {
+    if (this.#options.loadDeployments !== undefined) {
+      return this.#options.loadDeployments();
+    }
+    const deployments: PluginDeployment[] = [];
+    for await (const record of this.#options.state.scan({
+      namespace,
+      collection: "deployments",
+    })) {
+      deployments.push(parsePluginDeployment(record.value));
+    }
+    return deployments;
+  }
+
+  async #loadInstallations(): Promise<readonly PluginInstallation[]> {
+    if (this.#options.loadInstallations !== undefined) {
+      return this.#options.loadInstallations();
+    }
+    const installations: PluginInstallation[] = [];
+    for await (const record of this.#options.state.scan({
+      namespace,
+      collection: "installations",
+    })) {
+      installations.push(parsePluginInstallation(record.value));
+    }
+    return installations;
+  }
+
+  async #loadInstances(): Promise<readonly ComponentInstance[]> {
+    const instances: ComponentInstance[] = [];
+    for await (const record of this.#options.state.scan<PersistedComponentInstance>({
+      namespace,
+      collection: "component-instances",
+    })) {
+      instances.push({ ...record.value, revision: record.revision });
+    }
+    return instances;
+  }
+
+  async #gateDeployment(
+    deployment: PluginDeployment,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly ComponentInstance[],
+  ): Promise<ArtifactDeploymentGate | DiagnosticError> {
+    const installation = installations.find(
+      (candidate) =>
+        candidate.pluginId === deployment.pluginId &&
+        candidate.version === deployment.version &&
+        candidate.digest === deployment.artifactDigest,
+    );
+    if (installation === undefined) {
+      return new DiagnosticError(
+        runtimeDiagnostic({
+          code: "DEPLOYMENT_INSTALLATION_MISSING",
+          message: "Deployment does not reference an installed artifact",
+          source: { kind: "deployment", id: deploymentKey(deployment) },
+          details: {
+            artifactDigest: deployment.artifactDigest,
+            pluginId: deployment.pluginId,
+            version: deployment.version,
+          },
+          observedAt: this.#options.clock.now().toISOString(),
+        }),
+      );
+    }
+
+    let artifact: ValidatedPluginArtifact;
+    if (deployment.state === "active") {
+      try {
+        artifact = await this.#options.artifactGate.validate({
+          digest: deployment.artifactDigest,
+        });
+      } catch (error) {
+        if (error instanceof DiagnosticError) return error;
+        return new DiagnosticError(
+          runtimeDiagnostic({
+            code: "ARTIFACT_VALIDATION_FAILED",
+            message: "Deployment artifact validation failed",
+            source: { kind: "artifact", id: deployment.artifactDigest },
+            cause: serializeCause(error),
+            observedAt: this.#options.clock.now().toISOString(),
+          }),
+        );
+      }
+    } else {
+      artifact = {
+        digest: installation.digest,
+        files: { schemaVersion: "1.0", files: [] },
+        manifest: installation.manifest,
+        ...(installation.signature === undefined ? {} : { signature: installation.signature }),
+      };
+      return {
+        artifact,
+        capabilityResolution: {
+          ok: true,
+          diagnostics: [],
+          providerLossActions: [],
+          bindings: [],
+          order: [],
+        },
+        permissionDecision: {
+          allowed: true,
+          diagnostics: [],
+          requested: installation.manifest.permissions,
+          granted: deployment.permissionGrants,
+        },
+      };
+    }
+
+    const capabilityDeployments: CapabilityResolutionDeployment[] = [];
+    for (const candidate of deployments) {
+      const candidateInstallation =
+        candidate.pluginId === deployment.pluginId
+          ? installation
+          : installations.find(
+              (installed) =>
+                installed.pluginId === candidate.pluginId &&
+                installed.version === candidate.version &&
+                installed.digest === candidate.artifactDigest,
+            );
+      if (candidateInstallation === undefined) continue;
+      const candidateInstances = instances.filter(
+        (instance) =>
+          instance.applicationId === candidate.applicationId &&
+          instance.pluginId === candidate.pluginId &&
+          instance.deploymentGeneration === candidate.generation,
+      );
+      capabilityDeployments.push({
+        identity: {
+          applicationId: candidate.applicationId,
+          pluginId: candidate.pluginId,
+        },
+        ready:
+          candidate.state === "active" &&
+          candidateInstallation.manifest.components.every((component) =>
+            candidateInstances.some(
+              (instance) =>
+                instance.componentId === component.componentId && instance.lifecycle === "ready",
+            ),
+          ),
+        provides: candidateInstallation.manifest.capabilities.provides,
+        requires: candidateInstallation.manifest.capabilities.requires,
+        bindings: candidate.capabilityBindings,
+      });
+    }
+    const globalCapabilityResolution = resolveCapabilities({
+      deployments: capabilityDeployments,
+    });
+    const matchesDeployment = (identity: {
+      readonly applicationId: string;
+      readonly pluginId: string;
+    }): boolean =>
+      identity.applicationId === deployment.applicationId &&
+      identity.pluginId === deployment.pluginId;
+    const diagnostics = globalCapabilityResolution.diagnostics.filter(
+      (diagnostic) =>
+        (diagnostic.consumer !== null && matchesDeployment(diagnostic.consumer)) ||
+        (diagnostic.consumer === null &&
+          diagnostic.candidates.some((candidate) => matchesDeployment(candidate))),
+    );
+    const capabilityResolution = {
+      ok: diagnostics.length === 0,
+      diagnostics,
+      providerLossActions: globalCapabilityResolution.providerLossActions.filter((decision) =>
+        matchesDeployment(decision.consumer),
+      ),
+      ...(globalCapabilityResolution.bindings === undefined
+        ? {}
+        : {
+            bindings: globalCapabilityResolution.bindings.filter((binding) =>
+              matchesDeployment(binding.consumer),
+            ),
+          }),
+      ...(globalCapabilityResolution.order === undefined
+        ? {}
+        : { order: globalCapabilityResolution.order }),
+    };
+    const permissionDecision = validatePermissionGrant(
+      artifact.manifest.permissions,
+      deployment.permissionGrants,
+    );
+    return { artifact, capabilityResolution, permissionDecision };
+  }
+
+  async #recordBlocked(
+    deployment: PluginDeployment,
+    diagnostics: readonly RuntimeDiagnostic[],
+  ): Promise<void> {
+    this.#diagnosticsByDeployment.set(deploymentKey(deployment), diagnostics);
+    const key = observationKey(deployment);
+    const current = await this.#options.state.read(key);
+    await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+      await transaction.put(
+        key,
+        {
+          applicationId: deployment.applicationId,
+          pluginId: deployment.pluginId,
+          generation: deployment.generation,
+          status: "blocked",
+          diagnostics,
+          updatedAt: this.#options.clock.now().toISOString(),
+        },
+        { expectedRevision: current?.revision ?? "absent" },
+      );
+      return null;
+    });
+  }
+
+  async #persistStep(deployment: PluginDeployment, step: ReconcilePlanStep): Promise<void> {
+    const desired = (await this.#loadDeployments()).find(
+      (candidate) =>
+        candidate.applicationId === deployment.applicationId &&
+        candidate.pluginId === deployment.pluginId,
+    );
+    if (
+      desired === undefined ||
+      desired.generation !== deployment.generation ||
+      desired.state !== deployment.state ||
+      desired.artifactDigest !== deployment.artifactDigest
+    ) {
+      this.#replanCount += 1;
+      return;
+    }
+    const key = instanceKey(step.instanceId);
+    const current = await this.#options.state.read(key);
+    if (
+      (step.expectedRevision === "absent" && current !== undefined) ||
+      (step.expectedRevision !== "absent" && current?.revision !== step.expectedRevision)
+    ) {
+      this.#replanCount += 1;
+      return;
+    }
+    let instance: PersistedComponentInstance;
+    if (current === undefined) {
+      instance = {
+        instanceId: step.instanceId,
+        applicationId: step.effect.applicationId,
+        pluginId: step.effect.pluginId,
+        componentId: step.effect.componentId,
+        deploymentGeneration: step.effect.deploymentGeneration,
+        observedGeneration: step.effect.deploymentGeneration,
+        lifecycle: "created",
+        executor: step.effect.executor,
+        artifactDigest: step.effect.artifactDigest,
+        ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
+      };
+    } else {
+      instance = current.value;
+      const next = this.#preEffectLifecycle(step.effect.kind, instance);
+      if (next !== instance.lifecycle) instance = { ...instance, lifecycle: next };
+    }
+    const now = this.#options.clock.now().toISOString();
+    try {
+      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+        await transaction.put(key, instance, {
+          expectedRevision: current?.revision ?? "absent",
+        });
+        await transaction.appendOperation({
+          operationId: step.operationId,
+          kind: "component.lifecycle",
+          status: "planned",
+          state: step.effect,
+          updatedAt: now,
+        });
+        await transaction.enqueueOutbox({
+          messageId: step.messageId,
+          operationId: step.operationId,
+          topic: "component.lifecycle",
+          payload: step.effect,
+          createdAt: now,
+          availableAt: now,
+        });
+        return null;
+      });
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+    }
+    void deployment;
+  }
+
+  #preEffectLifecycle(
+    kind: ReconcileEffectKind,
+    instance: PersistedComponentInstance,
+  ): PersistedComponentInstance["lifecycle"] {
+    if (kind === "start") {
+      if (instance.lifecycle === "starting") return "starting";
+      return transitionComponentLifecycle({
+        pluginId: instance.pluginId,
+        componentId: instance.componentId,
+        current: instance.lifecycle,
+        next: "starting",
+        observedAt: this.#options.clock.now().toISOString(),
+      });
+    }
+    if (kind === "drain") {
+      if (instance.lifecycle === "draining") return "draining";
+      return transitionComponentLifecycle({
+        pluginId: instance.pluginId,
+        componentId: instance.componentId,
+        current: instance.lifecycle,
+        next: "draining",
+        observedAt: this.#options.clock.now().toISOString(),
+      });
+    }
+    if (kind === "stop") {
+      if (instance.lifecycle === "stopping") return "stopping";
+      return transitionComponentLifecycle({
+        pluginId: instance.pluginId,
+        componentId: instance.componentId,
+        current: instance.lifecycle,
+        next: "stopping",
+        observedAt: this.#options.clock.now().toISOString(),
+      });
+    }
+    return instance.lifecycle;
+  }
+
+  async #executeClaim(claim: OutboxClaim): Promise<void> {
+    const effect = claim.message.payload as ReconcileEffect;
+    const current = await this.#options.state.read(instanceKey(effect.instanceId));
+    if (current?.value.completedOperationId === effect.operationId) {
+      await this.#acknowledge(claim, "completed");
+      return;
+    }
+    await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+      await transaction.appendOperation({
+        operationId: effect.operationId,
+        kind: "component.lifecycle",
+        status: "executing",
+        state: effect,
+        updatedAt: this.#options.clock.now().toISOString(),
+      });
+      return null;
+    });
+    try {
+      await this.#options.effects.perform(effect);
+    } catch (error) {
+      await this.#commitFailedEffect(effect, claim, error);
+      return;
+    }
+    if (this.#options.interruptAfterEffect && !this.#interrupted) {
+      this.#interrupted = true;
+      return;
+    }
+    await this.#commitEffect(effect, claim, "completed");
+  }
+
+  async #commitEffect(
+    effect: ReconcileEffect,
+    claim: OutboxClaim,
+    outcome: "completed",
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const key = instanceKey(effect.instanceId);
+      const current = await this.#options.state.read(key);
+      if (current === undefined) return;
+      const lifecycle = this.#successfulLifecycle(effect.kind, current.value);
+      try {
+        await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          await transaction.put(
+            key,
+            {
+              ...current.value,
+              lifecycle,
+              observedGeneration: effect.deploymentGeneration,
+              completedOperationId: effect.operationId,
+            },
+            { expectedRevision: current.revision },
+          );
+          await transaction.appendOperation({
+            operationId: effect.operationId,
+            kind: "component.lifecycle",
+            status: "completed",
+            state: {
+              effect,
+              lifecycle,
+            },
+            updatedAt: this.#options.clock.now().toISOString(),
+          });
+          return null;
+        });
+        this.#lastCommitAuthority = this.#options.authority;
+        await this.#acknowledge(claim, outcome);
+        return;
+      } catch (error) {
+        if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+        this.#replanCount += 1;
+      }
+    }
+  }
+
+  #successfulLifecycle(
+    kind: ReconcileEffectKind,
+    instance: PersistedComponentInstance,
+  ): PersistedComponentInstance["lifecycle"] {
+    const next =
+      kind === "prepare"
+        ? "preparing"
+        : kind === "start"
+          ? "ready"
+          : kind === "stop"
+            ? "stopped"
+            : "draining";
+    if (instance.lifecycle === next) return next;
+    return transitionComponentLifecycle({
+      pluginId: instance.pluginId,
+      componentId: instance.componentId,
+      current: instance.lifecycle,
+      next,
+      observedAt: this.#options.clock.now().toISOString(),
+    });
+  }
+
+  async #commitFailedEffect(
+    effect: ReconcileEffect,
+    claim: OutboxClaim,
+    error: unknown,
+  ): Promise<void> {
+    const key = instanceKey(effect.instanceId);
+    const observedAt = this.#options.clock.now().toISOString();
+    const diagnostic = effectDiagnostic(effect, error, observedAt);
+    const retryDelay = deterministicRetryDelay({
+      attempt: claim.attempt,
+      baseDelayMs: 1_000,
+      maxDelayMs: 60_000,
+      operationId: effect.operationId,
+    });
+    const retryAt = new Date(this.#options.clock.now().getTime() + retryDelay).toISOString();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.#options.state.read(key);
+      if (current === undefined) return;
+      try {
+        await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          const lifecycle =
+            current.value.lifecycle === "failed"
+              ? "failed"
+              : transitionComponentLifecycle({
+                  pluginId: current.value.pluginId,
+                  componentId: current.value.componentId,
+                  current: current.value.lifecycle,
+                  next: "failed",
+                  observedAt,
+                });
+          await transaction.put(
+            key,
+            {
+              ...current.value,
+              lifecycle,
+              attempt: claim.attempt,
+              retryAt,
+              retryEffect: effect.kind,
+              diagnostic,
+            },
+            { expectedRevision: current.revision },
+          );
+          await transaction.appendOperation({
+            operationId: effect.operationId,
+            kind: "component.lifecycle",
+            status: "failed",
+            state: { diagnostic, effect, retryAt },
+            updatedAt: observedAt,
+          });
+          return null;
+        });
+        this.#lastCommitAuthority = this.#options.authority;
+        const deployment = this.#deployments.find(
+          (candidate) =>
+            candidate.applicationId === effect.applicationId &&
+            candidate.pluginId === effect.pluginId,
+        );
+        this.#diagnosticsByDeployment.set(
+          deployment === undefined ? `unknown/${effect.pluginId}` : deploymentKey(deployment),
+          [diagnostic],
+        );
+        await this.#options.state.acknowledgeOutbox({
+          messageId: claim.message.messageId,
+          owner: claim.owner,
+          claimEpoch: claim.claimEpoch,
+          outcome: "retry",
+          retryAt,
+          ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
+        });
+        return;
+      } catch (commitError) {
+        if (conflictCode(commitError) !== "STATE_REVISION_CONFLICT") throw commitError;
+        this.#replanCount += 1;
+      }
+    }
+  }
+
+  async #refreshReadiness(): Promise<void> {
+    const instances = await this.#loadInstances();
+    for (const deployment of this.#deployments) {
+      if (deployment.state !== "active") continue;
+      const deploymentInstances = instances.filter(
+        (instance) =>
+          instance.applicationId === deployment.applicationId &&
+          instance.pluginId === deployment.pluginId &&
+          instance.deploymentGeneration === deployment.generation,
+      );
+      const failedDiagnostics = deploymentInstances.flatMap((instance) =>
+        instance.diagnostic === undefined ? [] : [instance.diagnostic],
+      );
+      if (failedDiagnostics.length > 0) {
+        this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
+      }
+      const installation = (await this.#loadInstallations()).find(
+        (candidate) =>
+          candidate.pluginId === deployment.pluginId &&
+          candidate.digest === deployment.artifactDigest,
+      );
+      if (installation === undefined) continue;
+      const ready = installation.manifest.components.every((component) =>
+        deploymentInstances.some(
+          (instance) =>
+            instance.componentId === component.componentId && instance.lifecycle === "ready",
+        ),
+      );
+      if (ready) {
+        this.#readyDeployments.add(deploymentKey(deployment));
+        this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
+      }
+    }
+  }
+
+  #transactionOptions(): {
+    readonly fencing?: RuntimeAuthority;
+  } {
+    return this.#options.authority === undefined ? {} : { fencing: this.#options.authority };
+  }
+
+  async #acknowledge(claim: OutboxClaim, outcome: "completed"): Promise<void> {
+    await this.#options.state.acknowledgeOutbox({
+      messageId: claim.message.messageId,
+      owner: claim.owner,
+      claimEpoch: claim.claimEpoch,
+      outcome,
+      ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
+    });
+  }
+}

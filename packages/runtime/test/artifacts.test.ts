@@ -168,6 +168,12 @@ class InstallationStateStore implements StateStore {
   }
   async *scan<T extends JsonValue>(_query: StateQuery<T>): AsyncIterable<ScannedState<T>> {}
   async *scanRecoverableOperations(): AsyncIterable<never> {}
+  claimOutbox(): ReturnType<StateStore["claimOutbox"]> {
+    return Promise.resolve([]);
+  }
+  acknowledgeOutbox(): ReturnType<StateStore["acknowledgeOutbox"]> {
+    return Promise.reject(new Error("outbox is not used by artifact tests"));
+  }
   async *watch(_cursor: Revision): AsyncIterable<StateChange> {}
 }
 

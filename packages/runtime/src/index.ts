@@ -61,4 +61,40 @@ export {
   type DeploymentReadiness,
   type RuntimeReadinessInput,
 } from "./readiness.js";
+export {
+  componentApplicationReady,
+  transitionComponentLifecycle,
+  type ComponentInstanceObservation,
+  type ComponentLifecycleState,
+  type ComponentReadinessInput,
+  type ComponentTransitionInput,
+} from "./reconcile/component-lifecycle.js";
+export {
+  planReconcile,
+  type ArtifactDeploymentGate,
+  type ComponentInstance,
+  type ReconcileEffect,
+  type ReconcileEffectKind,
+  type ReconcilePlan,
+  type ReconcilePlanStep,
+  type ReconcileSnapshot,
+} from "./reconcile/plan.js";
+export {
+  planPlacement,
+  type ComponentPlacement,
+  type PlacementDecision,
+  type PlacementDiagnostic,
+  type PlacementInput,
+  type PlacementWorker,
+} from "./reconcile/placement.js";
+export {
+  Reconciler,
+  type ComponentEffectExecutor,
+  type ReconcileArtifactGate,
+  type ReconcilerOptions,
+} from "./reconcile/reconciler.js";
+export {
+  deterministicRetryDelay,
+  type RetryDelayInput,
+} from "./reconcile/retry.js";
 export { transitionRuntimeState } from "./runtime-state.js";

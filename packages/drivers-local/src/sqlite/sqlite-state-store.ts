@@ -4,6 +4,8 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DiagnosticError,
+  parseFencingEpoch,
+  parseMessageId,
   parseOperationId,
   parseRevision,
   runtimeDiagnostic,
@@ -14,6 +16,10 @@ import {
   type JsonValue,
   type OperationJournalEntry,
   type OperationJournalQuery,
+  type OutboxAcknowledgement,
+  type OutboxAcknowledgementRequest,
+  type OutboxClaim,
+  type OutboxClaimRequest,
   type OutboxMessage,
   type PersistedOperationJournalEntry,
   type Revision,
@@ -124,6 +130,68 @@ function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): num
     compareCodeUnits(left.namespace, right.namespace) ||
     compareCodeUnits(left.collection, right.collection) ||
     compareCodeUnits(left.id, right.id)
+  );
+}
+
+function validTimestamp(value: string): boolean {
+  return Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function assertOutboxClaimRequest(request: OutboxClaimRequest, clock: Clock): number {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.owner) ||
+    (request.topic !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.topic)) ||
+    !Number.isSafeInteger(request.leaseDurationMs) ||
+    request.leaseDurationMs <= 0 ||
+    request.leaseDurationMs > 86_400_000 ||
+    (request.limit !== undefined &&
+      (!Number.isSafeInteger(request.limit) || request.limit <= 0 || request.limit > 100))
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      "Outbox claim request is invalid",
+      {
+        leaseDurationMs: request.leaseDurationMs,
+        limit: request.limit ?? null,
+        owner: request.owner,
+        topic: request.topic ?? null,
+      },
+      clock,
+    );
+  }
+  return request.limit ?? 1;
+}
+
+function assertOutboxAcknowledgementRequest(
+  request: OutboxAcknowledgementRequest,
+  clock: Clock,
+): void {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.owner) ||
+    (request.outcome === "retry" &&
+      (request.retryAt === undefined || !validTimestamp(request.retryAt))) ||
+    (request.outcome === "completed" && request.retryAt !== undefined)
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      "Outbox acknowledgement request is invalid",
+      {
+        messageId: request.messageId,
+        outcome: request.outcome,
+        owner: request.owner,
+        retryAt: request.retryAt ?? null,
+      },
+      clock,
+    );
+  }
+}
+
+function sameOutboxMessage(left: OutboxMessage, right: OutboxMessage): boolean {
+  return (
+    left.messageId === right.messageId &&
+    left.operationId === right.operationId &&
+    left.topic === right.topic &&
+    JSON.stringify(left.payload) === JSON.stringify(right.payload)
   );
 }
 
@@ -348,9 +416,11 @@ class SqliteTransaction implements StateTransaction {
     this.#assertActive();
     this.#outbox.push({
       messageId: message.messageId,
+      operationId: message.operationId,
       topic: message.topic,
       payload: cloneJson(message.payload, this.#clock),
       createdAt: message.createdAt,
+      availableAt: message.availableAt,
     });
   }
 
@@ -669,6 +739,281 @@ export class SqliteStateStore implements StateStore {
     }
   }
 
+  claimOutbox(request: OutboxClaimRequest): Promise<readonly OutboxClaim[]> {
+    this.#assertOpen();
+    const limit = assertOutboxClaimRequest(request, this.#clock);
+    return this.#trackExecution(
+      this.#enqueueCommit(() => {
+        this.#assertCommitAllowed();
+        const database = this.#database();
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          const advancesFence = this.#assertFence(database, request.fencing);
+          const now = this.#clock.now();
+          const claimedAt = now.toISOString();
+          const rows = database
+            .prepare(
+              `
+                SELECT
+                  message_id,
+                  operation_id,
+                  topic,
+                  payload_json,
+                  created_at,
+                  available_at,
+                  attempt
+                FROM outbox
+                WHERE acknowledgement_outcome IS NOT 'completed'
+                  AND (? IS NULL OR topic = ?)
+                  AND available_at <= ?
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+                ORDER BY available_at, revision, message_id
+                LIMIT ?
+              `,
+              { readBigInts: true },
+            )
+            .all(request.topic ?? null, request.topic ?? null, claimedAt, claimedAt, limit);
+          const claimed = rows.map((row): OutboxClaim => {
+            const messageId = parseMessageId(requiredText(row, "message_id", this.#clock));
+            const attemptValue = row.attempt;
+            if (
+              typeof attemptValue !== "bigint" ||
+              attemptValue < 0n ||
+              attemptValue >= BigInt(Number.MAX_SAFE_INTEGER)
+            ) {
+              throw stateError(
+                "STATE_DATA_INVALID",
+                "SQLite outbox contains an invalid delivery attempt",
+                { messageId },
+                this.#clock,
+              );
+            }
+            const attempt = Number(attemptValue + 1n);
+            const claimEpoch = parseFencingEpoch(attempt.toString());
+            const expiresAt = new Date(now.getTime() + request.leaseDurationMs).toISOString();
+            const message: OutboxMessage = {
+              messageId,
+              operationId: parseOperationId(requiredText(row, "operation_id", this.#clock)),
+              topic: requiredText(row, "topic", this.#clock),
+              payload: decodeJson(
+                requiredText(row, "payload_json", this.#clock),
+                { messageId },
+                this.#clock,
+              ),
+              createdAt: requiredText(row, "created_at", this.#clock),
+              availableAt: requiredText(row, "available_at", this.#clock),
+            };
+            return {
+              message,
+              owner: request.owner,
+              claimEpoch,
+              attempt,
+              claimedAt,
+              expiresAt,
+            };
+          });
+
+          if (claimed.length > 0 || advancesFence) {
+            const revisionInsert = database
+              .prepare("INSERT INTO revisions DEFAULT VALUES", { readBigInts: true })
+              .run();
+            const revision = revisionInsert.lastInsertRowid;
+            const update = database.prepare(`
+              UPDATE outbox SET
+                attempt = ?,
+                claim_owner = ?,
+                claim_epoch = ?,
+                claimed_at = ?,
+                claim_expires_at = ?,
+                acknowledgement_outcome = NULL,
+                acknowledgement_owner = NULL,
+                acknowledgement_claim_epoch = NULL,
+                acknowledgement_retry_at = NULL,
+                acknowledged_at = NULL,
+                revision = ?
+              WHERE message_id = ?
+            `);
+            for (const claim of claimed) {
+              update.run(
+                claim.attempt,
+                claim.owner,
+                claim.claimEpoch,
+                claim.claimedAt,
+                claim.expiresAt,
+                revision,
+                claim.message.messageId,
+              );
+            }
+            if (advancesFence) this.#advanceFence(database, request.fencing);
+          }
+          database.exec("COMMIT");
+          return claimed.map((claim) => cloneJson(claim, this.#clock));
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      }),
+    );
+  }
+
+  acknowledgeOutbox(request: OutboxAcknowledgementRequest): Promise<OutboxAcknowledgement> {
+    this.#assertOpen();
+    assertOutboxAcknowledgementRequest(request, this.#clock);
+    return this.#trackExecution(
+      this.#enqueueCommit(() => {
+        this.#assertCommitAllowed();
+        const database = this.#database();
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          const advancesFence = this.#assertFence(database, request.fencing);
+          const row = database
+            .prepare(
+              `
+                SELECT
+                  attempt,
+                  claim_owner,
+                  claim_epoch,
+                  acknowledgement_outcome,
+                  acknowledgement_owner,
+                  acknowledgement_claim_epoch,
+                  acknowledgement_retry_at,
+                  acknowledged_at
+                FROM outbox
+                WHERE message_id = ?
+              `,
+              { readBigInts: true },
+            )
+            .get(request.messageId);
+          if (row === undefined) {
+            throw stateError(
+              "STATE_QUERY_INVALID",
+              "Outbox message does not exist",
+              { messageId: request.messageId },
+              this.#clock,
+            );
+          }
+          const acknowledgementOutcome = row.acknowledgement_outcome;
+          const acknowledgementOwner = row.acknowledgement_owner;
+          const acknowledgementClaimEpoch = row.acknowledgement_claim_epoch;
+          if (
+            (acknowledgementOutcome === "completed" || acknowledgementOutcome === "retry") &&
+            acknowledgementOwner === request.owner &&
+            acknowledgementClaimEpoch === request.claimEpoch
+          ) {
+            const retryAt =
+              row.acknowledgement_retry_at === null
+                ? undefined
+                : requiredText(row, "acknowledgement_retry_at", this.#clock);
+            if (acknowledgementOutcome !== request.outcome || retryAt !== request.retryAt) {
+              throw stateError(
+                "STATE_IDEMPOTENCY_CONFLICT",
+                "Outbox claim was acknowledged with a different outcome",
+                { claimEpoch: request.claimEpoch, messageId: request.messageId },
+                this.#clock,
+              );
+            }
+            const attempt = row.attempt;
+            if (typeof attempt !== "bigint" || attempt > BigInt(Number.MAX_SAFE_INTEGER)) {
+              throw stateError(
+                "STATE_DATA_INVALID",
+                "SQLite outbox contains an invalid delivery attempt",
+                { messageId: request.messageId },
+                this.#clock,
+              );
+            }
+            const duplicate: OutboxAcknowledgement = {
+              messageId: request.messageId,
+              outcome: acknowledgementOutcome,
+              attempt: Number(attempt),
+              acknowledgedAt: requiredText(row, "acknowledged_at", this.#clock),
+              duplicate: true,
+              ...(retryAt === undefined ? {} : { retryAt }),
+            };
+            if (advancesFence) {
+              database.prepare("INSERT INTO revisions DEFAULT VALUES", { readBigInts: true }).run();
+              this.#advanceFence(database, request.fencing);
+            }
+            database.exec("COMMIT");
+            return duplicate;
+          }
+
+          const claimOwner = row.claim_owner;
+          const claimEpoch = row.claim_epoch;
+          if (claimOwner !== request.owner || claimEpoch !== request.claimEpoch) {
+            throw stateError(
+              "STATE_FENCE_STALE",
+              "Outbox acknowledgement claim fence is stale",
+              {
+                actualClaimEpoch: typeof claimEpoch === "string" ? claimEpoch : null,
+                messageId: request.messageId,
+                requestedClaimEpoch: request.claimEpoch,
+              },
+              this.#clock,
+            );
+          }
+          const attemptValue = row.attempt;
+          if (
+            typeof attemptValue !== "bigint" ||
+            attemptValue <= 0n ||
+            attemptValue > BigInt(Number.MAX_SAFE_INTEGER)
+          ) {
+            throw stateError(
+              "STATE_DATA_INVALID",
+              "SQLite outbox contains an invalid delivery attempt",
+              { messageId: request.messageId },
+              this.#clock,
+            );
+          }
+          const acknowledgedAt = this.#clock.now().toISOString();
+          const revisionInsert = database
+            .prepare("INSERT INTO revisions DEFAULT VALUES", { readBigInts: true })
+            .run();
+          database
+            .prepare(
+              `
+                UPDATE outbox SET
+                  available_at = ?,
+                  claim_owner = NULL,
+                  claim_epoch = NULL,
+                  claimed_at = NULL,
+                  claim_expires_at = NULL,
+                  acknowledgement_outcome = ?,
+                  acknowledgement_owner = ?,
+                  acknowledgement_claim_epoch = ?,
+                  acknowledgement_retry_at = ?,
+                  acknowledged_at = ?,
+                  revision = ?
+                WHERE message_id = ?
+              `,
+            )
+            .run(
+              request.retryAt ?? acknowledgedAt,
+              request.outcome,
+              request.owner,
+              request.claimEpoch,
+              request.retryAt ?? null,
+              acknowledgedAt,
+              revisionInsert.lastInsertRowid,
+              request.messageId,
+            );
+          if (advancesFence) this.#advanceFence(database, request.fencing);
+          database.exec("COMMIT");
+          return {
+            messageId: request.messageId,
+            outcome: request.outcome,
+            attempt: Number(attemptValue),
+            acknowledgedAt,
+            duplicate: false,
+            ...(request.retryAt === undefined ? {} : { retryAt: request.retryAt }),
+          };
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      }),
+    );
+  }
+
   #decodeOperation(row: Readonly<Record<string, SQLOutputValue>>): PersistedOperationJournalEntry {
     const status = requiredText(row, "status", this.#clock);
     if (!["completed", "executing", "failed", "planned"].includes(status)) {
@@ -811,6 +1156,56 @@ export class SqliteStateStore implements StateStore {
         }
       }
 
+      const newOutbox: OutboxMessage[] = [];
+      for (const message of staged.outbox) {
+        if (!validTimestamp(message.createdAt) || !validTimestamp(message.availableAt)) {
+          throw stateError(
+            "STATE_DATA_INVALID",
+            "Outbox timestamps must be canonical ISO timestamps",
+            { messageId: message.messageId },
+            this.#clock,
+          );
+        }
+        const row = database
+          .prepare(
+            `
+              SELECT
+                operation_id,
+                topic,
+                payload_json,
+                created_at,
+                available_at
+              FROM outbox
+              WHERE message_id = ?
+            `,
+          )
+          .get(message.messageId);
+        if (row === undefined) {
+          newOutbox.push(message);
+          continue;
+        }
+        const existing: OutboxMessage = {
+          messageId: message.messageId,
+          operationId: parseOperationId(requiredText(row, "operation_id", this.#clock)),
+          topic: requiredText(row, "topic", this.#clock),
+          payload: decodeJson(
+            requiredText(row, "payload_json", this.#clock),
+            { messageId: message.messageId },
+            this.#clock,
+          ),
+          createdAt: requiredText(row, "created_at", this.#clock),
+          availableAt: requiredText(row, "available_at", this.#clock),
+        };
+        if (!sameOutboxMessage(existing, message)) {
+          throw stateError(
+            "STATE_IDEMPOTENCY_CONFLICT",
+            "Outbox message identity was reused with different content",
+            { messageId: message.messageId },
+            this.#clock,
+          );
+        }
+      }
+
       let advancesFence = false;
       const fencing = options.fencing;
       if (fencing !== undefined) {
@@ -836,10 +1231,7 @@ export class SqliteStateStore implements StateStore {
       }
 
       const mutates =
-        applied.length > 0 ||
-        staged.operations.length > 0 ||
-        staged.outbox.length > 0 ||
-        advancesFence;
+        applied.length > 0 || staged.operations.length > 0 || newOutbox.length > 0 || advancesFence;
       if (mutates) {
         const revisionInsert = database
           .prepare("INSERT INTO revisions DEFAULT VALUES", { readBigInts: true })
@@ -922,25 +1314,28 @@ export class SqliteStateStore implements StateStore {
             );
         }
 
-        for (const message of staged.outbox) {
+        for (const message of newOutbox) {
           database
             .prepare(
               `
                 INSERT INTO outbox(
-                  message_id, topic, payload_json, created_at, revision
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
-                  topic = excluded.topic,
-                  payload_json = excluded.payload_json,
-                  created_at = excluded.created_at,
-                  revision = excluded.revision
+                  message_id,
+                  operation_id,
+                  topic,
+                  payload_json,
+                  created_at,
+                  available_at,
+                  revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
               `,
             )
             .run(
               message.messageId,
+              message.operationId,
               message.topic,
               canonicalJson(message.payload),
               message.createdAt,
+              message.availableAt,
               revisionInteger,
             );
         }
@@ -1116,6 +1511,41 @@ export class SqliteStateStore implements StateStore {
         this.#clock,
       );
     }
+  }
+
+  #assertFence(database: DatabaseSync, fencing: StateTransactionOptions["fencing"]): boolean {
+    if (fencing === undefined) return false;
+    const row = database
+      .prepare("SELECT epoch FROM fences WHERE resource = ?")
+      .get(fencing.resource);
+    const currentEpoch =
+      row === undefined ? undefined : BigInt(requiredText(row, "epoch", this.#clock));
+    const requestedEpoch = BigInt(fencing.epoch);
+    if (currentEpoch !== undefined && requestedEpoch < currentEpoch) {
+      throw stateError(
+        "STATE_FENCE_STALE",
+        "State transaction fencing epoch is stale",
+        {
+          resource: fencing.resource,
+          requestedEpoch: fencing.epoch,
+          currentEpoch: currentEpoch.toString(),
+        },
+        this.#clock,
+      );
+    }
+    return currentEpoch === undefined || requestedEpoch > currentEpoch;
+  }
+
+  #advanceFence(database: DatabaseSync, fencing: StateTransactionOptions["fencing"]): void {
+    if (fencing === undefined) return;
+    database
+      .prepare(
+        `
+          INSERT INTO fences(resource, epoch) VALUES (?, ?)
+          ON CONFLICT(resource) DO UPDATE SET epoch = excluded.epoch
+        `,
+      )
+      .run(fencing.resource, fencing.epoch);
   }
 
   #database(): DatabaseSync {

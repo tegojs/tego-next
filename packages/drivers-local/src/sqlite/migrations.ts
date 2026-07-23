@@ -61,6 +61,55 @@ const migrations = [
       epoch TEXT NOT NULL
     ) STRICT, WITHOUT ROWID;
   `,
+  `
+    ALTER TABLE outbox RENAME TO outbox_v1;
+
+    CREATE TABLE outbox (
+      message_id TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      available_at TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+      claim_owner TEXT,
+      claim_epoch TEXT,
+      claimed_at TEXT,
+      claim_expires_at TEXT,
+      acknowledgement_outcome TEXT CHECK (
+        acknowledgement_outcome IS NULL OR acknowledgement_outcome IN ('completed', 'retry')
+      ),
+      acknowledgement_owner TEXT,
+      acknowledgement_claim_epoch TEXT,
+      acknowledgement_retry_at TEXT,
+      acknowledged_at TEXT,
+      revision INTEGER NOT NULL REFERENCES revisions(revision)
+    ) STRICT, WITHOUT ROWID;
+
+    INSERT INTO outbox(
+      message_id,
+      operation_id,
+      topic,
+      payload_json,
+      created_at,
+      available_at,
+      revision
+    )
+    SELECT
+      message_id,
+      message_id,
+      topic,
+      payload_json,
+      created_at,
+      created_at,
+      revision
+    FROM outbox_v1;
+
+    DROP TABLE outbox_v1;
+
+    CREATE INDEX outbox_delivery
+      ON outbox(available_at, message_id);
+  `,
 ] as const;
 
 export const sqliteSchemaVersion = migrations.length;

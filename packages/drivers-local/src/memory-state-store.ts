@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   DiagnosticError,
   compareOperationJournalCursors,
+  parseFencingEpoch,
   parseRevision,
   runtimeDiagnostic,
   type Clock,
@@ -10,6 +11,10 @@ import {
   type JsonValue,
   type OperationJournalEntry,
   type OperationJournalQuery,
+  type OutboxAcknowledgement,
+  type OutboxAcknowledgementRequest,
+  type OutboxClaim,
+  type OutboxClaimRequest,
   type OutboxMessage,
   type PersistedOperationJournalEntry,
   type Revision,
@@ -70,6 +75,14 @@ interface IdempotencyIdentity {
   readonly fingerprint: string;
 }
 
+interface StoredOutboxMessage {
+  message: OutboxMessage;
+  attempt: number;
+  claim?: OutboxClaim;
+  acknowledgement?: OutboxAcknowledgement;
+  acknowledgedClaim?: OutboxClaim;
+}
+
 export interface MemoryStateStoreOptions {
   readonly clock?: Clock;
 }
@@ -102,9 +115,72 @@ function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function validTimestamp(value: string): boolean {
+  return Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function assertOutboxClaimRequest(request: OutboxClaimRequest, clock: Clock): number {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.owner) ||
+    (request.topic !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.topic)) ||
+    !Number.isSafeInteger(request.leaseDurationMs) ||
+    request.leaseDurationMs <= 0 ||
+    request.leaseDurationMs > 86_400_000 ||
+    (request.limit !== undefined &&
+      (!Number.isSafeInteger(request.limit) || request.limit <= 0 || request.limit > 100))
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      "Outbox claim request is invalid",
+      {
+        leaseDurationMs: request.leaseDurationMs,
+        limit: request.limit ?? null,
+        owner: request.owner,
+        topic: request.topic ?? null,
+      },
+      clock,
+    );
+  }
+  return request.limit ?? 1;
+}
+
+function assertOutboxAcknowledgementRequest(
+  request: OutboxAcknowledgementRequest,
+  clock: Clock,
+): void {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.owner) ||
+    (request.outcome === "retry" &&
+      (request.retryAt === undefined || !validTimestamp(request.retryAt))) ||
+    (request.outcome === "completed" && request.retryAt !== undefined)
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      "Outbox acknowledgement request is invalid",
+      {
+        messageId: request.messageId,
+        outcome: request.outcome,
+        owner: request.owner,
+        retryAt: request.retryAt ?? null,
+      },
+      clock,
+    );
+  }
+}
+
+function sameOutboxMessage(left: OutboxMessage, right: OutboxMessage): boolean {
+  return (
+    left.messageId === right.messageId &&
+    left.operationId === right.operationId &&
+    left.topic === right.topic &&
+    JSON.stringify(left.payload) === JSON.stringify(right.payload)
+  );
+}
+
 function stateError(
   code:
     | "STATE_CLOSED"
+    | "STATE_DATA_INVALID"
     | "STATE_FENCE_STALE"
     | "STATE_IDEMPOTENCY_CONFLICT"
     | "STATE_QUERY_INVALID"
@@ -367,7 +443,7 @@ export class MemoryStateStore implements StateStore {
   readonly #clock: Clock;
   readonly #records = new Map<string, StoredRecord>();
   readonly #operations = new Map<string, PersistedOperationJournalEntry>();
-  readonly #outbox = new Map<string, OutboxMessage>();
+  readonly #outbox = new Map<string, StoredOutboxMessage>();
   readonly #fences = new Map<string, bigint>();
   readonly #changes: StateChange[] = [];
   readonly #watchers = new Set<MemoryWatchIterator>();
@@ -474,6 +550,136 @@ export class MemoryStateStore implements StateStore {
     }
   }
 
+  claimOutbox(request: OutboxClaimRequest): Promise<readonly OutboxClaim[]> {
+    this.#assertOpen();
+    const limit = assertOutboxClaimRequest(request, this.#clock);
+    return this.#enqueueCommit(() => {
+      this.#assertOpen();
+      const advancesFence = this.#assertFence(request.fencing);
+      const now = this.#clock.now();
+      const claimedAt = now.toISOString();
+      const claimed: OutboxClaim[] = [];
+      for (const record of [...this.#outbox.values()].sort((left, right) =>
+        compareCodeUnits(left.message.availableAt, right.message.availableAt),
+      )) {
+        if (
+          record.acknowledgement?.outcome === "completed" ||
+          (request.topic !== undefined && record.message.topic !== request.topic) ||
+          Date.parse(record.message.availableAt) > now.getTime() ||
+          (record.claim !== undefined && Date.parse(record.claim.expiresAt) > now.getTime())
+        ) {
+          continue;
+        }
+        const attempt = record.attempt + 1;
+        if (!Number.isSafeInteger(attempt)) {
+          throw stateError(
+            "STATE_DATA_INVALID",
+            "Outbox delivery attempt exceeds the safe integer range",
+            { messageId: record.message.messageId },
+            this.#clock,
+          );
+        }
+        const claim: OutboxClaim = {
+          message: cloneJson(record.message),
+          owner: request.owner,
+          claimEpoch: parseFencingEpoch(attempt.toString()),
+          attempt,
+          claimedAt,
+          expiresAt: new Date(now.getTime() + request.leaseDurationMs).toISOString(),
+        };
+        record.attempt = attempt;
+        record.claim = claim;
+        delete record.acknowledgement;
+        delete record.acknowledgedClaim;
+        claimed.push(cloneJson(claim));
+        if (claimed.length === limit) break;
+      }
+      if (claimed.length > 0 || advancesFence) {
+        this.#revision += 1n;
+        this.#advanceFence(request.fencing);
+      }
+      return claimed;
+    });
+  }
+
+  acknowledgeOutbox(request: OutboxAcknowledgementRequest): Promise<OutboxAcknowledgement> {
+    this.#assertOpen();
+    assertOutboxAcknowledgementRequest(request, this.#clock);
+    return this.#enqueueCommit(() => {
+      this.#assertOpen();
+      const advancesFence = this.#assertFence(request.fencing);
+      const record = this.#outbox.get(request.messageId);
+      if (record === undefined) {
+        throw stateError(
+          "STATE_QUERY_INVALID",
+          "Outbox message does not exist",
+          { messageId: request.messageId },
+          this.#clock,
+        );
+      }
+      const acknowledgedClaim = record.acknowledgedClaim;
+      if (
+        record.acknowledgement !== undefined &&
+        acknowledgedClaim?.owner === request.owner &&
+        acknowledgedClaim.claimEpoch === request.claimEpoch
+      ) {
+        if (
+          record.acknowledgement.outcome !== request.outcome ||
+          record.acknowledgement.retryAt !== request.retryAt
+        ) {
+          throw stateError(
+            "STATE_IDEMPOTENCY_CONFLICT",
+            "Outbox claim was acknowledged with a different outcome",
+            { claimEpoch: request.claimEpoch, messageId: request.messageId },
+            this.#clock,
+          );
+        }
+        if (advancesFence) {
+          this.#revision += 1n;
+          this.#advanceFence(request.fencing);
+        }
+        return { ...cloneJson(record.acknowledgement), duplicate: true };
+      }
+      const claim = record.claim;
+      if (
+        claim === undefined ||
+        claim.owner !== request.owner ||
+        claim.claimEpoch !== request.claimEpoch
+      ) {
+        throw stateError(
+          "STATE_FENCE_STALE",
+          "Outbox acknowledgement claim fence is stale",
+          {
+            actualClaimEpoch: claim?.claimEpoch ?? null,
+            messageId: request.messageId,
+            requestedClaimEpoch: request.claimEpoch,
+          },
+          this.#clock,
+        );
+      }
+      const acknowledgement: OutboxAcknowledgement = {
+        messageId: request.messageId,
+        outcome: request.outcome,
+        attempt: claim.attempt,
+        acknowledgedAt: this.#clock.now().toISOString(),
+        duplicate: false,
+        ...(request.retryAt === undefined ? {} : { retryAt: request.retryAt }),
+      };
+      record.acknowledgement = acknowledgement;
+      record.acknowledgedClaim = claim;
+      delete record.claim;
+      if (request.outcome === "retry") {
+        record.message = {
+          ...record.message,
+          availableAt: request.retryAt as string,
+        };
+      }
+      this.#revision += 1n;
+      if (advancesFence) this.#advanceFence(request.fencing);
+      return cloneJson(acknowledgement);
+    });
+  }
+
   watch(cursor: Revision): AsyncIterable<StateChange> {
     this.#assertOpen();
     const numericCursor = BigInt(cursor);
@@ -570,6 +776,29 @@ export class MemoryStateStore implements StateStore {
       }
     }
 
+    const newOutbox: OutboxMessage[] = [];
+    for (const message of staged.outbox) {
+      if (!validTimestamp(message.createdAt) || !validTimestamp(message.availableAt)) {
+        throw stateError(
+          "STATE_DATA_INVALID",
+          "Outbox timestamps must be canonical ISO timestamps",
+          { messageId: message.messageId },
+          this.#clock,
+        );
+      }
+      const existing = this.#outbox.get(message.messageId);
+      if (existing === undefined) {
+        newOutbox.push(message);
+      } else if (!sameOutboxMessage(existing.message, message)) {
+        throw stateError(
+          "STATE_IDEMPOTENCY_CONFLICT",
+          "Outbox message identity was reused with different content",
+          { messageId: message.messageId },
+          this.#clock,
+        );
+      }
+    }
+
     let advancesFence = false;
     const fencing = options.fencing;
     if (fencing !== undefined) {
@@ -591,10 +820,7 @@ export class MemoryStateStore implements StateStore {
     }
 
     const mutates =
-      applied.length > 0 ||
-      staged.operations.length > 0 ||
-      staged.outbox.length > 0 ||
-      advancesFence;
+      applied.length > 0 || staged.operations.length > 0 || newOutbox.length > 0 || advancesFence;
     if (mutates) {
       const revision = parseRevision((this.#revision + 1n).toString());
       for (const mutation of applied) {
@@ -618,8 +844,11 @@ export class MemoryStateStore implements StateStore {
           revision,
         });
       }
-      for (const message of staged.outbox) {
-        this.#outbox.set(message.messageId, structuredClone(message));
+      for (const message of newOutbox) {
+        this.#outbox.set(message.messageId, {
+          message: structuredClone(message),
+          attempt: 0,
+        });
       }
       if (fencing !== undefined && advancesFence) {
         this.#fences.set(fencing.resource, BigInt(fencing.epoch));
@@ -668,6 +897,31 @@ export class MemoryStateStore implements StateStore {
         },
         this.#clock,
       );
+    }
+  }
+
+  #assertFence(fencing: StateTransactionOptions["fencing"]): boolean {
+    if (fencing === undefined) return false;
+    const requestedEpoch = BigInt(fencing.epoch);
+    const currentEpoch = this.#fences.get(fencing.resource);
+    if (currentEpoch !== undefined && requestedEpoch < currentEpoch) {
+      throw stateError(
+        "STATE_FENCE_STALE",
+        "State transaction fencing epoch is stale",
+        {
+          resource: fencing.resource,
+          requestedEpoch: fencing.epoch,
+          currentEpoch: currentEpoch.toString(),
+        },
+        this.#clock,
+      );
+    }
+    return currentEpoch === undefined || requestedEpoch > currentEpoch;
+  }
+
+  #advanceFence(fencing: StateTransactionOptions["fencing"]): void {
+    if (fencing !== undefined) {
+      this.#fences.set(fencing.resource, BigInt(fencing.epoch));
     }
   }
 

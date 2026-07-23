@@ -47,18 +47,22 @@ test("@spec:plugin-deployment/kernel-owned-component-lifecycle/illegal-transitio
     () => transition("created", "ready"),
     (error: unknown) => {
       assert.equal(diagnosticCode(error), "LIFECYCLE_TRANSITION_INVALID");
-      assert.deepEqual(
-        (error as { diagnostic?: { details?: unknown } }).diagnostic?.details,
-        {
-          componentId,
-          current: "created",
-          next: "ready",
-          pluginId,
-        },
-      );
+      assert.deepEqual((error as { diagnostic?: { details?: unknown } }).diagnostic?.details, {
+        componentId,
+        current: "created",
+        next: "ready",
+        pluginId,
+      });
       return true;
     },
   );
+});
+
+test("interrupted startup can drain and failed shutdown can retry stopping", () => {
+  for (const state of ["created", "preparing", "starting"] satisfies ComponentLifecycleState[]) {
+    assert.equal(transition(state, "draining"), "draining");
+  }
+  assert.equal(transition("failed", "stopping"), "stopping");
 });
 
 test("component failures are isolated from kernel liveness and only essential failures block readiness", () => {

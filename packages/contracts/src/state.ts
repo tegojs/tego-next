@@ -36,11 +36,13 @@ export interface StateWriteOptions {
   readonly expectedRevision?: ExpectedRevision;
 }
 
+export interface StateFencing extends JsonObject {
+  readonly resource: string;
+  readonly epoch: FencingEpoch;
+}
+
 interface StateTransactionBaseOptions {
-  readonly fencing?: {
-    readonly resource: string;
-    readonly epoch: FencingEpoch;
-  };
+  readonly fencing?: StateFencing;
 }
 
 export interface NonIdempotentStateTransactionOptions extends StateTransactionBaseOptions {
@@ -99,11 +101,50 @@ export function compareOperationJournalCursors(
   return left.operationId < right.operationId ? -1 : left.operationId > right.operationId ? 1 : 0;
 }
 
-export interface OutboxMessage {
+export interface OutboxMessage extends JsonObject {
   readonly messageId: MessageId;
+  readonly operationId: OperationId;
   readonly topic: string;
   readonly payload: JsonValue;
   readonly createdAt: string;
+  readonly availableAt: string;
+}
+
+export interface OutboxClaimRequest {
+  readonly owner: string;
+  readonly leaseDurationMs: number;
+  readonly limit?: number;
+  readonly topic?: string;
+  readonly fencing?: StateFencing;
+}
+
+export interface OutboxClaim extends JsonObject {
+  readonly message: OutboxMessage;
+  readonly owner: string;
+  readonly claimEpoch: FencingEpoch;
+  readonly attempt: number;
+  readonly claimedAt: string;
+  readonly expiresAt: string;
+}
+
+export type OutboxAcknowledgementOutcome = "completed" | "retry";
+
+export interface OutboxAcknowledgementRequest {
+  readonly messageId: MessageId;
+  readonly owner: string;
+  readonly claimEpoch: FencingEpoch;
+  readonly outcome: OutboxAcknowledgementOutcome;
+  readonly retryAt?: string;
+  readonly fencing?: StateFencing;
+}
+
+export interface OutboxAcknowledgement extends JsonObject {
+  readonly messageId: MessageId;
+  readonly outcome: OutboxAcknowledgementOutcome;
+  readonly attempt: number;
+  readonly acknowledgedAt: string;
+  readonly duplicate: boolean;
+  readonly retryAt?: string;
 }
 
 export interface DriverHealth extends JsonObject {
@@ -133,6 +174,8 @@ export interface StateStore {
   scanRecoverableOperations(
     query?: OperationJournalQuery,
   ): AsyncIterable<PersistedOperationJournalEntry>;
+  claimOutbox(request: OutboxClaimRequest): Promise<readonly OutboxClaim[]>;
+  acknowledgeOutbox(request: OutboxAcknowledgementRequest): Promise<OutboxAcknowledgement>;
   watch(cursor: Revision): AsyncIterable<StateChange>;
   health(): Promise<DriverHealth>;
   close(): Promise<void>;

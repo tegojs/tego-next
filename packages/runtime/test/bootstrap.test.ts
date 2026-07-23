@@ -134,6 +134,14 @@ class ControlledStateStore implements StateStore {
     };
   }
 
+  claimOutbox(): ReturnType<StateStore["claimOutbox"]> {
+    return Promise.resolve([]);
+  }
+
+  acknowledgeOutbox(): ReturnType<StateStore["acknowledgeOutbox"]> {
+    return Promise.reject(new Error("outbox is not used by bootstrap tests"));
+  }
+
   watch(_cursor: ReturnType<typeof parseRevision>): AsyncIterable<StateChange> {
     return emptyAsyncIterable();
   }

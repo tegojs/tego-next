@@ -15,7 +15,6 @@ import {
   type DriverHealth,
   type ExecutorKind,
   type FencingEpoch,
-  type JsonObject,
   type JsonValue,
   type OperationJournalQuery,
   type OutboxAcknowledgement,
@@ -97,10 +96,7 @@ function manifest(
   };
 }
 
-function installation(
-  version = "1.0.0",
-  digest: ArtifactDigest = digestOne,
-): PluginInstallation {
+function installation(version = "1.0.0", digest: ArtifactDigest = digestOne): PluginInstallation {
   return {
     pluginId,
     version,
@@ -110,10 +106,7 @@ function installation(
   };
 }
 
-function deployment(
-  generation = "1",
-  options: Partial<PluginDeployment> = {},
-): PluginDeployment {
+function deployment(generation = "1", options: Partial<PluginDeployment> = {}): PluginDeployment {
   return {
     applicationId,
     pluginId,
@@ -191,9 +184,9 @@ test("planReconcile creates stable one-effect steps and duplicate reconciliation
       {
         effect: "prepare",
         generation: "1",
-        instanceId: "app.org.example.echo.echo-service.g1",
-        messageId: "reconcile.app.org.example.echo.echo-service.g1.prepare",
-        operationId: "reconcile.app.org.example.echo.echo-service.g1.prepare",
+        instanceId: "app.org_dexample_decho.echo-service.g1",
+        messageId: "reconcile.app.org_dexample_decho.echo-service.g1.prepare",
+        operationId: "reconcile.app.org_dexample_decho.echo-service.g1.prepare",
       },
     ],
   );
@@ -203,6 +196,7 @@ test("planReconcile creates stable one-effect steps and duplicate reconciliation
   );
 
   const ready: ComponentInstance = {
+    applicationId,
     componentId,
     deploymentGeneration: parseGeneration("1"),
     executor: "process",
@@ -210,13 +204,14 @@ test("planReconcile creates stable one-effect steps and duplicate reconciliation
     lifecycle: "ready",
     observedGeneration: parseGeneration("1"),
     pluginId,
-    revision: "1",
+    revision: parseRevision("1"),
   };
   assert.deepEqual(planReconcile(snapshot(deployment(), [ready])).steps, []);
 });
 
 test("plans enable, disable, upgrade, drain, and rollback without combining external effects", () => {
   const oldReady: ComponentInstance = {
+    applicationId,
     componentId,
     deploymentGeneration: parseGeneration("1"),
     executor: "process",
@@ -224,11 +219,9 @@ test("plans enable, disable, upgrade, drain, and rollback without combining exte
     lifecycle: "ready",
     observedGeneration: parseGeneration("1"),
     pluginId,
-    revision: "2",
+    revision: parseRevision("2"),
   };
-  const disabled = planReconcile(
-    snapshot(deployment("2", { state: "disabled" }), [oldReady]),
-  );
+  const disabled = planReconcile(snapshot(deployment("2", { state: "disabled" }), [oldReady]));
   assert.deepEqual(
     disabled.steps.map((step: ReconcilePlanStep) => step.effect.kind),
     ["drain"],
@@ -249,10 +242,7 @@ test("plans enable, disable, upgrade, drain, and rollback without combining exte
     upgraded.steps.map((step: ReconcilePlanStep) => step.effect.kind),
     ["drain", "prepare"],
   );
-  assert.equal(
-    new Set(upgraded.steps.map((step: ReconcilePlanStep) => step.operationId)).size,
-    2,
-  );
+  assert.equal(new Set(upgraded.steps.map((step: ReconcilePlanStep) => step.operationId)).size, 2);
 
   const rollback = planReconcile(
     snapshot(deployment("3"), [
@@ -271,6 +261,126 @@ test("plans enable, disable, upgrade, drain, and rollback without combining exte
   assert.equal(rollback.steps.at(-1)?.deploymentGeneration, "3");
 });
 
+test("duplicate live instances for one component generation are inconsistent and never execute", () => {
+  const first: ComponentInstance = {
+    applicationId,
+    componentId,
+    deploymentGeneration: parseGeneration("1"),
+    executor: "process",
+    instanceId: "app.org.example.echo.echo-service.g1",
+    lifecycle: "ready",
+    observedGeneration: parseGeneration("1"),
+    pluginId,
+    revision: parseRevision("1"),
+  };
+  const result = planReconcile(
+    snapshot(deployment(), [
+      first,
+      {
+        ...first,
+        instanceId: "app.org.example.echo.echo-service.g1-duplicate",
+        revision: parseRevision("2"),
+      },
+    ]),
+  );
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.steps, []);
+  assert.equal(result.diagnostics[0]?.code, "DEPLOYMENT_INSTANCE_INCONSISTENT");
+});
+
+test("instances belonging to another application never satisfy or drain this deployment", () => {
+  const foreign: ComponentInstance = {
+    applicationId: parseApplicationId("other-app"),
+    componentId,
+    deploymentGeneration: parseGeneration("1"),
+    executor: "process",
+    instanceId: "other-app.org.example.echo.echo-service.g1",
+    lifecycle: "ready",
+    observedGeneration: parseGeneration("1"),
+    pluginId,
+    revision: parseRevision("1"),
+  };
+
+  const result = planReconcile(snapshot(deployment(), [foreign]));
+  assert.deepEqual(
+    result.steps.map((step) => step.effect.kind),
+    ["prepare"],
+  );
+});
+
+test("one unavailable component placement blocks every step for the deployment", () => {
+  const value = installation();
+  const result = planReconcile({
+    ...snapshot(),
+    gate: {
+      ...gate(value),
+      artifact: {
+        ...gate(value).artifact,
+        manifest: {
+          ...value.manifest,
+          components: [
+            ...(value.manifest.components ?? []),
+            {
+              componentId: parseComponentId("remote-only"),
+              kind: "service",
+              entrypoint: "components/remote.js",
+              executors: ["remote"],
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.steps, []);
+  assert.equal(result.diagnostics[0]?.code, "DEPLOYMENT_EXECUTOR_UNAVAILABLE");
+});
+
+test("stable instance identities cannot collide when identity segments contain dots", () => {
+  function customSnapshot(app: string, plugin: string): ReconcileSnapshot {
+    const customDeployment = {
+      ...deployment(),
+      applicationId: parseApplicationId(app),
+      pluginId: parsePluginId(plugin),
+    };
+    const customManifest = {
+      ...manifest("1.0.0", digestOne),
+      pluginId: customDeployment.pluginId,
+    };
+    return {
+      ...snapshot(customDeployment),
+      gate: {
+        ...gate(),
+        artifact: {
+          ...gate().artifact,
+          manifest: customManifest,
+        },
+        capabilityResolution: {
+          ok: true,
+          diagnostics: [],
+          providerLossActions: [],
+          bindings: [],
+          order: [
+            {
+              applicationId: customDeployment.applicationId,
+              pluginId: customDeployment.pluginId,
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  const left = planReconcile(customSnapshot("a.b", "c")).steps[0];
+  const right = planReconcile(customSnapshot("a", "b.c")).steps[0];
+  assert.ok(left);
+  assert.ok(right);
+  assert.notEqual(left.instanceId, right.instanceId);
+  assert.notEqual(left.operationId, right.operationId);
+});
+
 test("retry delay is capped exponential backoff with deterministic operation jitter", () => {
   const operationId = parseOperationId("reconcile.app.echo.g1.start");
   const delays = [1, 2, 3, 20].map((attempt) =>
@@ -281,10 +391,12 @@ test("retry delay is capped exponential backoff with deterministic operation jit
       operationId,
     }),
   );
-  assert.equal(delays[0] >= 100 && delays[0] < 125, true);
-  assert.equal(delays[1] >= 200 && delays[1] < 250, true);
-  assert.equal(delays[2] >= 400 && delays[2] < 500, true);
-  assert.equal(delays[3], 1_000);
+  assert.equal(delays.length, 4);
+  const [firstDelay = 0, secondDelay = 0, thirdDelay = 0, cappedDelay = 0] = delays;
+  assert.equal(firstDelay >= 100 && firstDelay < 125, true);
+  assert.equal(secondDelay >= 200 && secondDelay < 250, true);
+  assert.equal(thirdDelay >= 400 && thirdDelay < 500, true);
+  assert.equal(cappedDelay, 1_000);
   assert.deepEqual(
     delays,
     [1, 2, 3, 20].map((attempt) =>
@@ -323,6 +435,8 @@ class TestStateStore implements StateStore {
   >();
   revision = 0n;
   failNextObservedCommit = false;
+  failNextFailureCommit = false;
+  failNextAcknowledgement = false;
   readonly #clock: Clock;
   #open = false;
 
@@ -365,7 +479,9 @@ class TestStateStore implements StateStore {
         puts.push({
           key: key as StateKey<JsonValue>,
           value: structuredClone(value),
-          expectedRevision: writeOptions.expectedRevision,
+          ...(writeOptions.expectedRevision === undefined
+            ? {}
+            : { expectedRevision: writeOptions.expectedRevision }),
         });
       },
       delete: async () => {},
@@ -379,9 +495,22 @@ class TestStateStore implements StateStore {
     const result = await work(transaction);
     if (
       this.failNextObservedCommit &&
-      puts.some((put) => put.key.collection === "component-instances")
+      puts.some((put) => put.key.collection === "component-instances") &&
+      operations.some((operation) => operation.status === "completed")
     ) {
       this.failNextObservedCommit = false;
+      const error = new Error("state revision conflict") as Error & {
+        diagnostic?: { code: string };
+      };
+      error.diagnostic = { code: "STATE_REVISION_CONFLICT" };
+      throw error;
+    }
+    if (
+      this.failNextFailureCommit &&
+      puts.some((put) => put.key.collection === "component-instances") &&
+      operations.some((operation) => operation.status === "failed")
+    ) {
+      this.failNextFailureCommit = false;
       const error = new Error("state revision conflict") as Error & {
         diagnostic?: { code: string };
       };
@@ -472,6 +601,7 @@ class TestStateStore implements StateStore {
     )) {
       if (
         record.acknowledgement?.outcome === "completed" ||
+        (request.topic !== undefined && record.message.topic !== request.topic) ||
         Date.parse(record.message.availableAt) > now ||
         (record.claim !== undefined && Date.parse(record.claim.expiresAt) > now)
       ) {
@@ -488,16 +618,18 @@ class TestStateStore implements StateStore {
       };
       record.attempt = attempt;
       record.claim = claim;
-      record.acknowledgement = undefined;
+      delete record.acknowledgement;
       claimed.push(structuredClone(claim));
       if (claimed.length === (request.limit ?? 1)) break;
     }
     return claimed;
   }
 
-  async acknowledgeOutbox(
-    request: OutboxAcknowledgementRequest,
-  ): Promise<OutboxAcknowledgement> {
+  async acknowledgeOutbox(request: OutboxAcknowledgementRequest): Promise<OutboxAcknowledgement> {
+    if (this.failNextAcknowledgement) {
+      this.failNextAcknowledgement = false;
+      throw new Error("acknowledgement unavailable");
+    }
     const record = this.outbox.get(request.messageId);
     assert.ok(record?.claim);
     if (record.acknowledgement !== undefined) {
@@ -519,7 +651,7 @@ class TestStateStore implements StateStore {
         ...record.message,
         availableAt: request.retryAt ?? this.#clock.now().toISOString(),
       };
-      record.claim = undefined;
+      delete record.claim;
     }
     return structuredClone(acknowledgement);
   }
@@ -629,7 +761,9 @@ test("journaled execution persists before effect, commits with expected revision
     true,
   );
   assert.equal(
-    [...state.records.values()].some((entry) => entry.lifecycle === "ready"),
+    [...state.records.values()].some(
+      (entry) => (entry.value as { readonly lifecycle?: string }).lifecycle === "ready",
+    ),
     true,
   );
   assert.equal(reconciler.lastCommitAuthority?.epoch, authority.epoch);
@@ -663,7 +797,9 @@ test("restart before acknowledgement reuses stable identity and leaves one live 
   await second.wake();
 
   const live = [...state.records.values()].filter(
-    (entry) => entry.lifecycle !== "stopped" && entry.lifecycle !== "failed",
+    (entry) =>
+      (entry.value as { readonly lifecycle?: string }).lifecycle !== "stopped" &&
+      (entry.value as { readonly lifecycle?: string }).lifecycle !== "failed",
   );
   assert.equal(live.length, 1);
   assert.equal(effects.uniqueOperations.size, 2);
@@ -671,11 +807,64 @@ test("restart before acknowledgement reuses stable identity and leaves one live 
     effects.performed.every(
       (effect) =>
         effect.messageId ===
-        parseMessageId(`reconcile.app.org.example.echo.echo-service.g1.${effect.kind}`),
+        parseMessageId(`reconcile.app.org_dexample_decho.echo-service.g1.${effect.kind}`),
     ),
     true,
   );
   await second.stop();
+});
+
+test("restart after observed commit but before acknowledgement does not repeat the external effect", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const effects = new RecordingEffects();
+  const options = {
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  };
+  state.failNextAcknowledgement = true;
+  const first = new Reconciler(options);
+  await assert.rejects(first.start(), /acknowledgement unavailable/u);
+  await first.stop();
+
+  clock.advance(31_000);
+  const second = new Reconciler(options);
+  await second.start();
+
+  assert.equal(effects.calls.length, 1);
+  assert.equal(
+    [...state.operations.values()].filter((entry) => entry.status === "completed").length,
+    1,
+  );
+  await second.stop();
+});
+
+test("stale desired state invalidates a planned effect before it is journaled", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const effects = new RecordingEffects();
+  let loads = 0;
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => {
+      loads += 1;
+      return [deployment(loads === 1 ? "1" : "2")];
+    },
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.replanCount, 1);
+  await reconciler.stop();
 });
 
 test("component start failure records failure and only essential deployment readiness changes", async () => {
@@ -704,6 +893,40 @@ test("component start failure records failure and only essential deployment read
         .some((item: { readonly code: string }) => item.code === "LIFECYCLE_START_FAILED"),
       true,
     );
+    await reconciler.wake();
+    assert.equal(
+      reconciler
+        .diagnostics()
+        .some((item: { readonly code: string }) => item.code === "LIFECYCLE_START_FAILED"),
+      true,
+    );
     await reconciler.stop();
   }
+});
+
+test("failed effect conditional commits reread after a revision conflict", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  effects.failStart = true;
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  state.failNextFailureCommit = true;
+  await reconciler.wake();
+
+  assert.equal(reconciler.replanCount, 1);
+  assert.equal(
+    [...state.operations.values()].some((operation) => operation.status === "failed"),
+    true,
+  );
+  assert.equal(reconciler.kernelRunning, true);
+  await reconciler.stop();
 });
