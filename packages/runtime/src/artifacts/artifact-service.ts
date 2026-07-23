@@ -202,7 +202,11 @@ export class ArtifactService {
             throw artifactError(
               "ARTIFACT_INSTALLATION_CORRUPT",
               "Plugin version index refers to a missing installation record",
-              { digest: candidate.digest, pluginId: candidate.pluginId, version: candidate.version },
+              {
+                digest: candidate.digest,
+                pluginId: candidate.pluginId,
+                version: candidate.version,
+              },
             );
           }
           return parsePluginInstallation(stored.value);
@@ -246,20 +250,16 @@ export class ArtifactService {
     };
   }
 
-  #parseVersionIndex(
-    value: JsonObject,
-    candidate: PluginInstallation,
-  ): ArtifactDigest {
+  #parseVersionIndex(value: JsonObject, candidate: PluginInstallation): ArtifactDigest {
     if (
       value.pluginId !== candidate.pluginId ||
       value.version !== candidate.version ||
       typeof value.digest !== "string"
     ) {
-      throw artifactError(
-        "ARTIFACT_INSTALLATION_CORRUPT",
-        "Plugin version index is invalid",
-        { pluginId: candidate.pluginId, version: candidate.version },
-      );
+      throw artifactError("ARTIFACT_INSTALLATION_CORRUPT", "Plugin version index is invalid", {
+        pluginId: candidate.pluginId,
+        version: candidate.version,
+      });
     }
     return value.digest as ArtifactDigest;
   }

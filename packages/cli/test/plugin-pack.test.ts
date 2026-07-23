@@ -52,7 +52,9 @@ test("packs unchanged ESM plugin inputs into identical deterministic archives", 
     assert.deepEqual(await readFile(firstPath), await readFile(secondPath));
     assert.equal(
       first.digest,
-      `sha256:${createHash("sha256").update(await readFile(firstPath)).digest("hex")}`,
+      `sha256:${createHash("sha256")
+        .update(await readFile(firstPath))
+        .digest("hex")}`,
     );
   } finally {
     await rm(directory, { force: true, recursive: true });

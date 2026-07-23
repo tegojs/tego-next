@@ -31,9 +31,7 @@ export function createPluginManifestFixture(
 }
 
 export function artifactDigest(bytes: Uint8Array): ArtifactDigest {
-  return parseArtifactDigest(
-    `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
-  );
+  return parseArtifactDigest(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
 }
 
 export async function* artifactBytesSource(

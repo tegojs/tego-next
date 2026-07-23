@@ -143,10 +143,7 @@ function decodeNullTerminated(bytes: Uint8Array, fieldName: string): string {
   try {
     return decoder.decode(bytes.subarray(0, end));
   } catch {
-    throw artifactError(
-      "ARTIFACT_ARCHIVE_MALFORMED",
-      `Tar ${fieldName} is not valid UTF-8`,
-    );
+    throw artifactError("ARTIFACT_ARCHIVE_MALFORMED", `Tar ${fieldName} is not valid UTF-8`);
   }
 }
 
@@ -188,11 +185,10 @@ function validateChecksum(header: Uint8Array): void {
     actual += index >= 148 && index < 156 ? 0x20 : (header[index] ?? 0);
   }
   if (actual !== expected) {
-    throw artifactError(
-      "ARTIFACT_HEADER_CHECKSUM_INVALID",
-      "Tar header checksum does not match",
-      { actual, expected },
-    );
+    throw artifactError("ARTIFACT_HEADER_CHECKSUM_INVALID", "Tar header checksum does not match", {
+      actual,
+      expected,
+    });
   }
 }
 
@@ -280,10 +276,7 @@ function parseFilesMetadata(input: unknown): ArtifactFilesMetadata {
     (input as { schemaVersion?: unknown }).schemaVersion !== "1.0" ||
     !Array.isArray((input as { files?: unknown }).files)
   ) {
-    throw artifactError(
-      "ARTIFACT_METADATA_INVALID",
-      "metadata/files.json has an invalid shape",
-    );
+    throw artifactError("ARTIFACT_METADATA_INVALID", "metadata/files.json has an invalid shape");
   }
   const records: ArtifactFileRecord[] = [];
   const seen = new Set<string>();
@@ -335,16 +328,9 @@ export async function readPluginArtifact(
     DEFAULT_MAX_ENTRY_BYTES,
     "maxEntryBytes",
   );
-  const maxEntries = boundedPositiveInteger(
-    limits.maxEntries,
-    DEFAULT_MAX_ENTRIES,
-    "maxEntries",
-  );
+  const maxEntries = boundedPositiveInteger(limits.maxEntries, DEFAULT_MAX_ENTRIES, "maxEntries");
   const reader = new BoundedStreamReader(source, maxArchiveBytes);
-  const entries = new Map<
-    string,
-    { readonly digest: ArtifactDigest; readonly size: number }
-  >();
+  const entries = new Map<string, { readonly digest: ArtifactDigest; readonly size: number }>();
   let manifestBytes: Uint8Array | undefined;
   let filesBytes: Uint8Array | undefined;
   let zeroBlocks = 0;
@@ -370,18 +356,14 @@ export async function readPluginArtifact(
 
     const parsed = parseHeader(header);
     if (entries.has(parsed.path)) {
-      throw artifactError(
-        "ARTIFACT_ENTRY_DUPLICATE",
-        "Artifact contains a duplicate entry",
-        { path: parsed.path },
-      );
+      throw artifactError("ARTIFACT_ENTRY_DUPLICATE", "Artifact contains a duplicate entry", {
+        path: parsed.path,
+      });
     }
     if (entries.size >= maxEntries) {
-      throw artifactError(
-        "ARTIFACT_ENTRY_COUNT_EXCEEDED",
-        "Artifact contains too many entries",
-        { maxEntries },
-      );
+      throw artifactError("ARTIFACT_ENTRY_COUNT_EXCEEDED", "Artifact contains too many entries", {
+        maxEntries,
+      });
     }
     if (parsed.size > maxEntryBytes) {
       throw artifactError(

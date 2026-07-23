@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { join, relative, sep } from "node:path";
 import {
   DiagnosticError,
   parseArtifactDigest,
@@ -97,8 +97,9 @@ export async function packPlugin(options: PackPluginOptions): Promise<PackedPlug
 
   const buildDirectory = options.buildDirectory ?? join(options.pluginDirectory, "build");
   const actualOutput = await listFiles(buildDirectory);
-  const declaredOutput = [...new Set(manifest.components.map((component) => component.entrypoint))]
-    .sort();
+  const declaredOutput = [
+    ...new Set(manifest.components.map((component) => component.entrypoint)),
+  ].sort();
   for (const path of declaredOutput) assertPortableArtifactPath(path);
   for (const path of actualOutput) {
     if (!declaredOutput.includes(path)) {

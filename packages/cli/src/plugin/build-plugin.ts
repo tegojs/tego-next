@@ -14,16 +14,12 @@ export async function buildPlugin(options: BuildPluginOptions): Promise<void> {
   const tsconfigPath = options.tsconfigPath ?? join(options.pluginDirectory, "tsconfig.json");
   const require = createRequire(import.meta.url);
   const compilerPath = join(dirname(require.resolve("typescript/package.json")), "bin", "tsc");
-  const child = spawn(
-    process.execPath,
-    [compilerPath, "-p", tsconfigPath],
-    {
-      cwd: options.pluginDirectory,
-      env: process.env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+  const child = spawn(process.execPath, [compilerPath, "-p", tsconfigPath], {
+    cwd: options.pluginDirectory,
+    env: process.env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   const chunks: Buffer[] = [];
   let outputBytes = 0;
   const collect = (chunk: Buffer) => {

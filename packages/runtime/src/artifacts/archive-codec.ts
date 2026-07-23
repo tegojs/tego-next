@@ -35,7 +35,10 @@ export function assertPortableArtifactPath(path: string): void {
     path.startsWith("\\\\") ||
     PORTABLE_DRIVE_PATH.test(path) ||
     path.includes("\\") ||
-    /[\u0000-\u001f\u007f]/u.test(path) ||
+    [...path].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    }) ||
     segments.some(
       (segment) =>
         segment.length === 0 ||

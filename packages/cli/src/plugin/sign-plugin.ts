@@ -1,10 +1,6 @@
 import { createHash, sign } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import {
-  DiagnosticError,
-  parseArtifactDigest,
-  runtimeDiagnostic,
-} from "@tegojs/contracts";
+import { DiagnosticError, parseArtifactDigest, runtimeDiagnostic } from "@tegojs/contracts";
 import { canonicalJsonBytes, type ArtifactSignatureEnvelope } from "@tegojs/runtime";
 
 const KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -29,9 +25,7 @@ export async function signArtifact(
     );
   }
   const bytes = await readFile(options.artifactPath);
-  const digest = parseArtifactDigest(
-    `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
-  );
+  const digest = parseArtifactDigest(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
   let signature: string;
   try {
     signature = sign(
