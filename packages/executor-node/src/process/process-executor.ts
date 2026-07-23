@@ -113,6 +113,7 @@ interface AttemptEntry {
   readonly result: PromiseWithResolvers<ExecutionResult>;
   readonly completed: PromiseWithResolvers<void>;
   readonly deadlineController: AbortController;
+  readonly admissionController: AbortController;
   state: "accepted" | "running" | "terminal";
   terminal?: ExecutionResult;
   process?: HostedProcess;
@@ -138,6 +139,10 @@ interface TerminationOutcome {
   readonly exit?: Awaited<ReturnType<HostedProcess["kill"]>>;
   readonly diagnostic?: RuntimeDiagnostic;
 }
+
+type AdmissionRace<T> =
+  | { readonly cancelled: true }
+  | { readonly cancelled: false; readonly value: T };
 
 function attemptKey(taskId: TaskId, attemptId: AttemptId): string {
   return `${taskId.length}:${taskId}${attemptId}`;
@@ -627,6 +632,7 @@ export class ProcessExecutor implements Executor {
       result,
       completed: Promise.withResolvers<void>(),
       deadlineController: new AbortController(),
+      admissionController: new AbortController(),
       state: "accepted",
       handle: Object.freeze({
         taskId: request.taskId,
@@ -780,7 +786,12 @@ export class ProcessExecutor implements Executor {
     let channel: ProcessChannel | undefined;
     const startedAt = this.#clock.now().toISOString();
     try {
-      const component = await this.#resolve(entry.request);
+      const resolution = await this.#raceAdmission(entry, this.#resolve(entry.request));
+      if (resolution.cancelled) {
+        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
+        return;
+      }
+      const component = resolution.value;
       if (this.#fatalDiagnostic !== undefined) {
         this.#settleFatal(entry, this.#fatalDiagnostic);
         return;
@@ -789,14 +800,32 @@ export class ProcessExecutor implements Executor {
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
-      process_ = await this.#options.processHost.spawn({
-        entrypoint: this.#processEntrypoint,
-        environment: {},
-      });
+      const spawning = await this.#raceAdmission(
+        entry,
+        this.#options.processHost.spawn({
+          entrypoint: this.#processEntrypoint,
+          environment: {},
+        }),
+        async (lateProcess) => {
+          await lateProcess.stdin.close().catch(() => undefined);
+          await this.#terminate(lateProcess);
+        },
+      );
+      if (spawning.cancelled) {
+        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
+        return;
+      }
+      process_ = spawning.value;
       entry.process = process_;
       if (this.#fatalDiagnostic !== undefined) {
         await this.#terminate(process_);
         this.#settleFatal(entry, this.#fatalDiagnostic);
+        return;
+      }
+      if (entry.cancellation !== undefined) {
+        await process_.stdin.close().catch(() => undefined);
+        await this.#terminate(process_);
+        this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
       channel = new ProcessChannel(process_, this.#options, component);
@@ -1093,6 +1122,7 @@ export class ProcessExecutor implements Executor {
   ): Promise<void> {
     if (entry.state === "terminal") return;
     entry.cancellation ??= cancellation;
+    entry.admissionController.abort(entry.cancellation);
     if (entry.state === "accepted") {
       const index = this.#queue.indexOf(entry);
       if (index >= 0) this.#queue.splice(index, 1);
@@ -1149,6 +1179,7 @@ export class ProcessExecutor implements Executor {
     if (entry.state === "terminal") return false;
     entry.state = "terminal";
     entry.deadlineController.abort("terminal");
+    entry.admissionController.abort("terminal");
     entry.terminal = deepFreeze(parseExecutionResult(cloneComponentHostValue(result)));
     return true;
   }
@@ -1187,6 +1218,45 @@ export class ProcessExecutor implements Executor {
         .catch(() => undefined);
       return { diagnostic: failure };
     }
+  }
+
+  #raceAdmission<T>(
+    entry: AttemptEntry,
+    operation: Promise<T>,
+    onLateValue?: (value: T) => void | Promise<void>,
+  ): Promise<AdmissionRace<T>> {
+    const signal = entry.admissionController.signal;
+    return new Promise<AdmissionRace<T>>((resolve, reject) => {
+      let waiting = true;
+      const cleanup = () => signal.removeEventListener("abort", cancel);
+      const cancel = () => {
+        if (!waiting) return;
+        waiting = false;
+        cleanup();
+        resolve({ cancelled: true });
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+      void operation.then(
+        (value) => {
+          if (!waiting) {
+            if (onLateValue !== undefined) {
+              void Promise.resolve(onLateValue(value)).catch(() => undefined);
+            }
+            return;
+          }
+          waiting = false;
+          cleanup();
+          resolve({ cancelled: false, value });
+        },
+        (error: unknown) => {
+          if (!waiting) return;
+          waiting = false;
+          cleanup();
+          reject(error);
+        },
+      );
+    });
   }
 
   #failQueued(failure: RuntimeDiagnostic): void {

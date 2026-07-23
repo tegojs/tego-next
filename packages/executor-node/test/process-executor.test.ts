@@ -516,9 +516,7 @@ test("child permission validation accepts canonical narrowed grants for every pe
   );
   try {
     const result = await (
-      await executor.submit(
-        request({ mode: "echo", value: "narrowed" }, "narrowed-permissions"),
-      )
+      await executor.submit(request({ mode: "echo", value: "narrowed" }, "narrowed-permissions"))
     ).result;
     assert.equal(result.status, "succeeded");
     assert.equal(result.output, "narrowed");
