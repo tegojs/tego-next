@@ -13,6 +13,7 @@ import {
 } from "@tegojs/contracts";
 import { FakeClock } from "@tegojs/testkit";
 import {
+  artifactPublishSyncDirectories,
   createLocalDrivers,
   FilesystemArtifactStore,
   LocalCoordinationProvider,
@@ -200,6 +201,25 @@ test("POSIX publish errors other than a target collision are not hidden", async 
       },
     }),
     (actual: unknown) => actual === error,
+  );
+});
+
+test("new artifact shards durably sync both the shard and its parent", () => {
+  assert.deepEqual(
+    artifactPublishSyncDirectories({
+      artifactDirectory: "/data/artifacts",
+      shardDirectory: "/data/artifacts/ab",
+      shardCreated: true,
+    }),
+    ["/data/artifacts/ab", "/data/artifacts"],
+  );
+  assert.deepEqual(
+    artifactPublishSyncDirectories({
+      artifactDirectory: "/data/artifacts",
+      shardDirectory: "/data/artifacts/ab",
+      shardCreated: false,
+    }),
+    ["/data/artifacts/ab"],
   );
 });
 
