@@ -807,7 +807,6 @@ export class ProcessExecutor implements Executor {
           environment: {},
         }),
         async (lateProcess) => {
-          await lateProcess.stdin.close().catch(() => undefined);
           await this.#terminate(lateProcess);
         },
       );
@@ -823,7 +822,6 @@ export class ProcessExecutor implements Executor {
         return;
       }
       if (entry.cancellation !== undefined) {
-        await process_.stdin.close().catch(() => undefined);
         await this.#terminate(process_);
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
