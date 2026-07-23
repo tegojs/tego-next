@@ -1,4 +1,5 @@
-import { realpath } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { extname, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -10,7 +11,29 @@ import {
 } from "@tegojs/contracts";
 import { cloneComponentHostValue } from "./protocol.js";
 
-const ROOT_DIGEST_BINDINGS = new Map<string, ArtifactDigest>();
+const PREPARED_ARTIFACT = Symbol("tego.prepared-artifact");
+
+interface FileIdentity {
+  readonly dev: number;
+  readonly ino: number;
+  readonly type: "directory" | "file" | "other" | "symlink";
+}
+
+interface RootDigestBinding {
+  readonly artifactDigest: ArtifactDigest;
+  readonly lstat: FileIdentity;
+  readonly stat: FileIdentity;
+}
+
+const ROOT_DIGEST_BINDINGS = new Map<string, RootDigestBinding>();
+
+export interface PreparedArtifactBinding {
+  readonly [PREPARED_ARTIFACT]: true;
+  readonly artifactDigest: ArtifactDigest;
+  readonly artifactRoot: string;
+  readonly lstat: FileIdentity;
+  readonly stat: FileIdentity;
+}
 
 export interface LoadedComponentDefinition {
   readonly protocol: "tego.component/1.0";
@@ -24,8 +47,7 @@ export interface LoadedComponentDefinition {
 }
 
 export interface LoadPreparedComponentInput {
-  readonly artifactDigest: ArtifactDigest;
-  readonly artifactRoot: string;
+  readonly prepared: PreparedArtifactBinding;
   readonly entrypoint: string;
   readonly expectedKind: "service" | "task";
 }
@@ -35,6 +57,7 @@ function loaderError(
     | "ARTIFACT_ENTRY_OUTSIDE_ROOT"
     | "ARTIFACT_DIGEST_ROOT_CONFLICT"
     | "ARTIFACT_MODULE_FORMAT_INVALID"
+    | "ARTIFACT_ROOT_IDENTITY_MISMATCH"
     | "EXECUTOR_COMPONENT_DEFINITION_INVALID",
   message: string,
 ): DiagnosticError {
@@ -57,20 +80,89 @@ function confined(root: string, path: string): boolean {
   );
 }
 
-export async function bindPreparedArtifactRoot(
+function fileIdentity(value: Stats): FileIdentity {
+  return Object.freeze({
+    dev: value.dev,
+    ino: value.ino,
+    type: value.isSymbolicLink()
+      ? "symlink"
+      : value.isDirectory()
+        ? "directory"
+        : value.isFile()
+          ? "file"
+          : "other",
+  });
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.type === right.type;
+}
+
+export async function prepareArtifactBinding(
   artifactDigest: ArtifactDigest,
   artifactRoot: string,
-): Promise<string> {
+): Promise<PreparedArtifactBinding> {
   const root = await realpath(artifactRoot);
-  const boundDigest = ROOT_DIGEST_BINDINGS.get(root);
-  if (boundDigest !== undefined && boundDigest !== artifactDigest) {
+  const rootLstat = fileIdentity(await lstat(artifactRoot));
+  const rootStat = fileIdentity(await stat(artifactRoot));
+  if (root !== artifactRoot || rootLstat.type !== "directory" || rootStat.type !== "directory") {
     throw loaderError(
-      "ARTIFACT_DIGEST_ROOT_CONFLICT",
-      "Prepared artifact root is already bound to another immutable digest",
+      "ARTIFACT_ROOT_IDENTITY_MISMATCH",
+      "Prepared artifact root must be a canonical non-symlink directory",
     );
   }
-  ROOT_DIGEST_BINDINGS.set(root, artifactDigest);
-  return root;
+  const existing = ROOT_DIGEST_BINDINGS.get(root);
+  if (existing !== undefined) {
+    if (existing.artifactDigest !== artifactDigest) {
+      throw loaderError(
+        "ARTIFACT_DIGEST_ROOT_CONFLICT",
+        "Prepared artifact root is already bound to another immutable digest",
+      );
+    }
+    if (!sameIdentity(existing.lstat, rootLstat) || !sameIdentity(existing.stat, rootStat)) {
+      throw loaderError(
+        "ARTIFACT_ROOT_IDENTITY_MISMATCH",
+        "Prepared artifact root filesystem identity changed",
+      );
+    }
+  }
+  ROOT_DIGEST_BINDINGS.set(root, {
+    artifactDigest,
+    lstat: rootLstat,
+    stat: rootStat,
+  });
+  return Object.freeze({
+    [PREPARED_ARTIFACT]: true as const,
+    artifactDigest,
+    artifactRoot: root,
+    lstat: rootLstat,
+    stat: rootStat,
+  });
+}
+
+async function validatePreparedArtifact(
+  binding: PreparedArtifactBinding,
+): Promise<PreparedArtifactBinding> {
+  if (binding[PREPARED_ARTIFACT] !== true) {
+    throw loaderError(
+      "ARTIFACT_ROOT_IDENTITY_MISMATCH",
+      "Component import requires a host-prepared artifact binding",
+    );
+  }
+  const root = await realpath(binding.artifactRoot);
+  const rootLstat = fileIdentity(await lstat(binding.artifactRoot));
+  const rootStat = fileIdentity(await stat(binding.artifactRoot));
+  if (
+    root !== binding.artifactRoot ||
+    !sameIdentity(binding.lstat, rootLstat) ||
+    !sameIdentity(binding.stat, rootStat)
+  ) {
+    throw loaderError(
+      "ARTIFACT_ROOT_IDENTITY_MISMATCH",
+      "Prepared artifact root filesystem identity changed before import",
+    );
+  }
+  return binding;
 }
 
 function freezeJson<T extends JsonValue>(value: T): T {
@@ -185,7 +277,8 @@ export async function loadPreparedComponent(
       "Component entrypoint must be JavaScript ESM",
     );
   }
-  const root = await bindPreparedArtifactRoot(input.artifactDigest, input.artifactRoot);
+  const binding = await validatePreparedArtifact(input.prepared);
+  const root = binding.artifactRoot;
   const candidate = resolve(root, input.entrypoint);
   if (!confined(root, candidate)) {
     throw loaderError(

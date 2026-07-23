@@ -678,10 +678,7 @@ test("failed stop cleanup is terminal and repeats its canonical result without r
   assert.equal(first.diagnostics.length, 2);
   assert.equal(repeated.ok, false);
   assert.equal(repeated.state, "failed");
-  assert.deepEqual(
-    { ...repeated, commandId: first.commandId },
-    first,
-  );
+  assert.deepEqual({ ...repeated, commandId: first.commandId }, first);
   assert.deepEqual(calls, { dispose: 1, stop: 1 });
 
   const start = await host.handle(
@@ -730,9 +727,7 @@ test("transition hook reentrancy returns promptly without waiting on the active 
           const reentrantType = type === "start" ? "drain" : type === "drain" ? "stop" : "start";
           reentrant.push(
             await within(
-              host.handle(
-                command(reentrantType, `reentrant-${type}`, { artifactDigest: digest }),
-              ),
+              host.handle(command(reentrantType, `reentrant-${type}`, { artifactDigest: digest })),
             ),
           );
         },
@@ -883,7 +878,9 @@ test("non-cooperative runs respect hard capacity while cancel and drain remain a
   assert.ok(duringControl.commands <= 256);
   assert.ok(duringControl.controlCommands <= 32);
   assert.equal((await cancellation).ok, true);
-  assert.equal((await pending[0]!).ok, true);
+  const firstRun = pending[0];
+  assert.ok(firstRun);
+  assert.equal((await firstRun).ok, true);
   assert.equal(
     (await host.handle(command("drain", "drain-at-capacity", { artifactDigest: digest }))).ok,
     true,

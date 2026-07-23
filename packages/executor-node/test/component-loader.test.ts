@@ -3,14 +3,15 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { parseArtifactDigest } from "@tegojs/contracts";
-import { loadPreparedComponent } from "../src/index.js";
 import * as publicApi from "../src/index.js";
+import { loadPreparedComponent, prepareArtifactBinding } from "../src/host/component-loader.js";
 
 const digestA = parseArtifactDigest(`sha256:${"1".repeat(64)}`);
 const digestB = parseArtifactDigest(`sha256:${"2".repeat(64)}`);
 
 test("raw artifact binding and loading helpers are not public package API", () => {
   assert.equal("bindPreparedArtifactRoot" in publicApi, false);
+  assert.equal("prepareArtifactBinding" in publicApi, false);
   assert.equal("loadPreparedComponent" in publicApi, false);
 });
 
@@ -35,20 +36,15 @@ test("one physical artifact root cannot be rebound to another digest", async (t)
     'export default { protocol: "tego.component/1.0", kind: "task", run: async () => "v1" };',
   );
 
+  const prepared = await prepareArtifactBinding(digestA, root);
   await loadPreparedComponent({
-    artifactDigest: digestA,
-    artifactRoot: root,
+    prepared,
     entrypoint: "components/component.js",
     expectedKind: "task",
   });
 
   await assert.rejects(
-    loadPreparedComponent({
-      artifactDigest: digestB,
-      artifactRoot: root,
-      entrypoint: "components/component.js",
-      expectedKind: "task",
-    }),
+    prepareArtifactBinding(digestB, root),
     (error: unknown) =>
       typeof error === "object" &&
       error !== null &&
@@ -71,14 +67,12 @@ test("different digest roots isolate the complete static module graph", async (t
   const secondRoot = await artifactRoot(t, entrypoint, 'export const version = "v2";');
 
   const first = await loadPreparedComponent({
-    artifactDigest: digestA,
-    artifactRoot: firstRoot,
+    prepared: await prepareArtifactBinding(digestA, firstRoot),
     entrypoint: "components/component.js",
     expectedKind: "task",
   });
   const second = await loadPreparedComponent({
-    artifactDigest: digestB,
-    artifactRoot: secondRoot,
+    prepared: await prepareArtifactBinding(digestB, secondRoot),
     entrypoint: "components/component.js",
     expectedKind: "task",
   });
@@ -106,8 +100,7 @@ test("loader captures hooks and snapshots metadata without retaining the plugin 
   );
 
   const loaded = await loadPreparedComponent({
-    artifactDigest: digestA,
-    artifactRoot: root,
+    prepared: await prepareArtifactBinding(digestA, root),
     entrypoint: "components/component.js",
     expectedKind: "task",
   });

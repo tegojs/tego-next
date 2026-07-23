@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute } from "node:path";
 import {
   DiagnosticError,
@@ -17,9 +18,10 @@ import {
   type SecretProvider,
 } from "@tegojs/contracts";
 import {
-  bindPreparedArtifactRoot,
   loadPreparedComponent,
+  prepareArtifactBinding,
   type LoadedComponentDefinition,
+  type PreparedArtifactBinding,
 } from "./component-loader.js";
 import {
   cloneComponentHostValue,
@@ -55,6 +57,10 @@ export interface ResolvedComponentArtifact {
 }
 
 export interface ComponentArtifactResolver {
+  /**
+   * Resolves a digest to an immutable artifact-store root. The trusted store
+   * owns content immutability for the lifetime of the returned digest.
+   */
   resolve(artifactDigest: ArtifactDigest): Promise<ResolvedComponentArtifact>;
 }
 
@@ -79,7 +85,7 @@ export interface ComponentHostOptions {
 
 interface PreparedComponent {
   readonly payload: PrepareComponentHostPayload;
-  readonly artifactRoot: string;
+  readonly artifact: PreparedArtifactBinding;
   readonly manifest: PluginManifest;
   readonly entrypoint: string;
   readonly kind: "service" | "task";
@@ -101,6 +107,11 @@ interface ActiveRun {
   settled: boolean;
 }
 
+interface ActiveTransition {
+  readonly fingerprint: string;
+  readonly result: Promise<ComponentHostResult>;
+}
+
 type HookName = "drain" | "health" | "run" | "start" | "stop";
 
 const SENSITIVE_KEY = /(?:credential|password|secret|token)/iu;
@@ -108,7 +119,16 @@ const DIAGNOSTIC_CODE =
   /^(?:BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_[A-Z0-9_]+$/u;
 const MAX_TIMER_DELAY = 2_147_483_647;
 export const COMPONENT_HOST_COMMAND_RETENTION_LIMIT = 256;
+export const COMPONENT_HOST_CONTROL_COMMAND_RETENTION_LIMIT = 32;
 export const COMPONENT_HOST_RUN_RETENTION_LIMIT = 256;
+const CONTROL_COMMANDS = new Set<ComponentHostCommand["type"]>(["cancel", "drain", "stop"]);
+const TRANSITION_COMMANDS = new Set<ComponentHostCommand["type"]>([
+  "prepare",
+  "import",
+  "start",
+  "drain",
+  "stop",
+]);
 
 const SYSTEM_CLOCK: ComponentHostClock = Object.freeze({
   now: () => new Date(),
@@ -159,13 +179,17 @@ export class ComponentHost {
   readonly #options: ComponentHostOptions;
   readonly #clock: ComponentHostClock;
   readonly #commands = new Map<string, CachedCommand>();
+  readonly #controlCommands = new Map<string, CachedCommand>();
   readonly #runs = new Map<string, ActiveRun>();
   readonly #secretValues = new Set<string>();
-  #transitions: Promise<void> = Promise.resolve();
+  readonly #transitionContext = new AsyncLocalStorage<boolean>();
+  #activeTransition: ActiveTransition | undefined;
+  #acceptingRuns = false;
   #state: ComponentHostState = "new";
   #prepared: PreparedComponent | undefined;
   #definition: LoadedComponentDefinition | undefined;
   #disposables: ReturnType<ComponentHost["createDisposables"]> | undefined;
+  #stopOutcome: ComponentHostResult | undefined;
 
   constructor(options: ComponentHostOptions) {
     this.#options = options;
@@ -179,11 +203,29 @@ export class ComponentHost {
     } catch (error) {
       return this.#failure("invalid", "invalid", error);
     }
+    if (
+      TRANSITION_COMMANDS.has(command.type) &&
+      this.#activeTransition !== undefined &&
+      this.#transitionContext.getStore() === true
+    ) {
+      return this.#failure(
+        command.commandId,
+        command.type,
+        this.#diagnosticError(
+          "LIFECYCLE_TRANSITION_ILLEGAL_REENTRANCY",
+          "A lifecycle hook cannot synchronously await another host transition",
+        ),
+      );
+    }
     const fingerprint = JSON.stringify(command);
-    const cached = this.#commands.get(command.commandId);
+    const cached =
+      this.#commands.get(command.commandId) ?? this.#controlCommands.get(command.commandId);
     if (cached !== undefined) {
       if (cached.fingerprint === fingerprint) {
-        this.#touch(this.#commands, command.commandId, cached);
+        const cache = this.#commands.has(command.commandId)
+          ? this.#commands
+          : this.#controlCommands;
+        this.#touch(cache, command.commandId, cached);
         return cached.result;
       }
       return this.#failure(
@@ -199,40 +241,44 @@ export class ComponentHost {
         ),
       );
     }
-    const result = this.#dispatch(command).then((value) => this.#validateResult(value));
+    const control = CONTROL_COMMANDS.has(command.type);
+    const cache = control ? this.#controlCommands : this.#commands;
+    const limit = control
+      ? COMPONENT_HOST_CONTROL_COMMAND_RETENTION_LIMIT
+      : COMPONENT_HOST_COMMAND_RETENTION_LIMIT;
+    if (!this.#makeRoom(cache, limit)) {
+      return this.#failure(
+        command.commandId,
+        command.type,
+        this.#diagnosticError(
+          "EXECUTOR_COMPONENT_HOST_CAPACITY_EXCEEDED",
+          "Component host command capacity is exhausted",
+        ),
+      );
+    }
+    const dispatched = TRANSITION_COMMANDS.has(command.type)
+      ? this.#submitTransition(command)
+      : this.#dispatch(command);
+    const result = dispatched.then((value) => this.#validateResult(value));
     const entry: CachedCommand = { fingerprint, result, settled: false };
-    this.#commands.set(command.commandId, entry);
+    cache.set(command.commandId, entry);
     void result.then(
       () => {
         entry.settled = true;
-        this.#prune(this.#commands, COMPONENT_HOST_COMMAND_RETENTION_LIMIT);
       },
       () => {
         entry.settled = true;
-        this.#prune(this.#commands, COMPONENT_HOST_COMMAND_RETENTION_LIMIT);
       },
     );
-    this.#prune(this.#commands, COMPONENT_HOST_COMMAND_RETENTION_LIMIT);
     return result;
   }
 
-  retention(): Readonly<{ commands: number; runs: number }> {
-    return Object.freeze({ commands: this.#commands.size, runs: this.#runs.size });
-  }
-
-  async #transition(
-    command: ComponentHostCommand,
-    operation: () => Promise<ComponentHostResult> | ComponentHostResult,
-  ): Promise<ComponentHostResult> {
-    const result = this.#transitions.then(async () => {
-      this.#assertDeadline(command);
-      return await operation();
+  retention(): Readonly<{ commands: number; controlCommands: number; runs: number }> {
+    return Object.freeze({
+      commands: this.#commands.size,
+      controlCommands: this.#controlCommands.size,
+      runs: this.#runs.size,
     });
-    this.#transitions = result.then(
-      () => {},
-      () => {},
-    );
-    return result;
   }
 
   #touch<T>(cache: Map<string, T>, key: string, value: T): void {
@@ -240,12 +286,64 @@ export class ComponentHost {
     cache.set(key, value);
   }
 
-  #prune<T extends { readonly settled: boolean }>(cache: Map<string, T>, limit: number): void {
-    while (cache.size > limit) {
+  #makeRoom<T extends { readonly settled: boolean }>(
+    cache: Map<string, T>,
+    limit: number,
+  ): boolean {
+    while (cache.size >= limit) {
       const settled = [...cache].find(([, value]) => value.settled);
-      if (settled === undefined) return;
+      if (settled === undefined) return false;
       cache.delete(settled[0]);
     }
+    return true;
+  }
+
+  #submitTransition(command: ComponentHostCommand): Promise<ComponentHostResult> {
+    const fingerprint = JSON.stringify({
+      deadline: command.deadline,
+      payload: command.payload,
+      type: command.type,
+    });
+    const active = this.#activeTransition;
+    if (active !== undefined) {
+      if (active.fingerprint === fingerprint) {
+        return active.result.then((result) => this.#forCommand(result, command));
+      }
+      return Promise.resolve(
+        this.#failure(
+          command.commandId,
+          command.type,
+          this.#diagnosticError(
+            "LIFECYCLE_TRANSITION_IN_PROGRESS",
+            "Another lifecycle transition is already in progress",
+          ),
+        ),
+      );
+    }
+    const acceptingRuns = this.#acceptingRuns;
+    if (command.type === "drain" || command.type === "stop") {
+      this.#acceptingRuns = false;
+    }
+    let result!: Promise<ComponentHostResult>;
+    result = Promise.resolve()
+      .then(() => this.#transitionContext.run(true, () => this.#dispatch(command)))
+      .then((outcome) => {
+        if (
+          !outcome.ok &&
+          outcome.state !== "failed" &&
+          (command.type === "drain" || command.type === "stop")
+        ) {
+          this.#acceptingRuns = acceptingRuns;
+        }
+        return outcome;
+      })
+      .finally(() => {
+        if (this.#activeTransition?.result === result) {
+          this.#activeTransition = undefined;
+        }
+      });
+    this.#activeTransition = { fingerprint, result };
+    return result;
   }
 
   async #dispatch(command: ComponentHostCommand): Promise<ComponentHostResult> {
@@ -266,19 +364,19 @@ export class ComponentHost {
     try {
       switch (command.type) {
         case "prepare":
-          return await this.#transition(command, () => this.#prepare(command));
+          return await this.#prepare(command);
         case "import":
-          return await this.#transition(command, () => this.#import(command));
+          return await this.#import(command);
         case "start":
-          return await this.#transition(command, () => this.#start(command));
+          return await this.#start(command);
         case "health":
           return await this.#health(command);
         case "run":
           return await this.#run(command);
         case "drain":
-          return await this.#transition(command, () => this.#drain(command));
+          return await this.#drain(command);
         case "stop":
-          return await this.#transition(command, () => this.#stop(command));
+          return await this.#stop(command);
         case "cancel":
           return this.#cancel(command);
       }
@@ -315,7 +413,7 @@ export class ComponentHost {
         "Prepared artifact root must be absolute",
       );
     }
-    const artifactRoot = await bindPreparedArtifactRoot(resolvedDigest, resolved.artifactRoot);
+    const artifact = await prepareArtifactBinding(resolvedDigest, resolved.artifactRoot);
     if (
       payload.identity.pluginId !== manifest.pluginId ||
       payload.identity.componentId !== payload.componentId
@@ -345,7 +443,7 @@ export class ComponentHost {
     }
     this.#prepared = {
       payload: freezeJson(payload),
-      artifactRoot,
+      artifact,
       manifest,
       entrypoint: component.entrypoint,
       kind: component.kind,
@@ -369,8 +467,7 @@ export class ComponentHost {
     }
     this.#assertDigest(command.payload.artifactDigest);
     this.#definition = await loadPreparedComponent({
-      artifactDigest: command.payload.artifactDigest,
-      artifactRoot: this.#prepared.artifactRoot,
+      prepared: this.#prepared.artifact,
       entrypoint: this.#prepared.entrypoint,
       expectedKind: this.#prepared.kind,
     });
@@ -386,6 +483,7 @@ export class ComponentHost {
     if (this.#state !== "imported") throw this.#lifecycleError("start", "imported");
     await this.#invokeLifecycleHook("start", command.deadline);
     this.#state = "started";
+    this.#acceptingRuns = true;
     return this.#success(command, { status: "started" });
   }
 
@@ -403,6 +501,15 @@ export class ComponentHost {
 
   async #run(command: RunComponentHostCommand): Promise<ComponentHostResult> {
     this.#assertDigest(command.payload.artifactDigest);
+    if (!this.#acceptingRuns) {
+      if (this.#activeTransition !== undefined) {
+        throw this.#diagnosticError(
+          "LIFECYCLE_TRANSITION_IN_PROGRESS",
+          "Component run intake is closed while a lifecycle transition is in progress",
+        );
+      }
+      throw this.#lifecycleError("run", "started with open run intake");
+    }
     if (this.#state !== "started") throw this.#lifecycleError("run", "started");
     const execution = command.payload.execution;
     if (
@@ -438,6 +545,12 @@ export class ComponentHost {
         "Task component does not define a run hook",
       );
     }
+    if (!this.#makeRoom(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT)) {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMPONENT_HOST_CAPACITY_EXCEEDED",
+        "Component host run capacity is exhausted",
+      );
+    }
     const controller = new AbortController();
     const active: ActiveRun = {
       controller,
@@ -451,14 +564,11 @@ export class ComponentHost {
     void active.result.then(
       () => {
         active.settled = true;
-        this.#prune(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT);
       },
       () => {
         active.settled = true;
-        this.#prune(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT);
       },
     );
-    this.#prune(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT);
     return this.#success(command, await active.result);
   }
 
@@ -509,20 +619,29 @@ export class ComponentHost {
 
   async #stop(command: ArtifactComponentHostCommand): Promise<ComponentHostResult> {
     this.#assertDigest(command.payload.artifactDigest);
-    if (this.#state === "stopped") return this.#success(command, { status: "stopped" });
+    if (this.#stopOutcome !== undefined) {
+      return this.#forCommand(this.#stopOutcome, command);
+    }
     if (!["prepared", "imported", "draining"].includes(this.#state)) {
       throw this.#lifecycleError("stop", "prepared, imported, or draining");
     }
+    const diagnostics: RuntimeDiagnostic[] = [];
     if (this.#definition !== undefined) {
-      await this.#invokeLifecycleHook("stop", command.deadline, this.#state);
+      try {
+        await this.#invokeLifecycleHook("stop", command.deadline, this.#state);
+      } catch (error) {
+        diagnostics.push(this.#asDiagnostic(error));
+      }
     }
-    const diagnostics = [...((await this.#disposables?.dispose()) ?? [])];
-    if (diagnostics.length > 0) {
-      return this.#result(command.commandId, command.type, false, undefined, diagnostics);
-    }
+    diagnostics.push(...((await this.#disposables?.dispose()) ?? []));
     this.#options.capabilityBoundary.clear();
-    this.#state = "stopped";
-    return this.#success(command, { status: "stopped" });
+    this.#acceptingRuns = false;
+    this.#state = diagnostics.length === 0 ? "stopped" : "failed";
+    this.#stopOutcome =
+      diagnostics.length === 0
+        ? this.#success(command, { status: "stopped" })
+        : this.#result(command.commandId, command.type, false, undefined, diagnostics);
+    return this.#stopOutcome;
   }
 
   #cancel(
@@ -856,17 +975,16 @@ export class ComponentHost {
     }
   }
 
-  #assertDeadline(command: ComponentHostCommand): void {
-    if (Date.parse(command.deadline) <= this.#clock.now().getTime()) {
-      throw this.#diagnosticError(
-        "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
-        "Component host command deadline has elapsed",
-      );
-    }
-  }
-
   #success(command: ComponentHostCommand, value: JsonValue): ComponentHostResult {
     return this.#result(command.commandId, command.type, true, value, []);
+  }
+
+  #forCommand(result: ComponentHostResult, command: ComponentHostCommand): ComponentHostResult {
+    return {
+      ...result,
+      commandId: command.commandId,
+      type: command.type,
+    };
   }
 
   #failure(

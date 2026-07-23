@@ -44,6 +44,7 @@ export type ComponentHostState =
   | "imported"
   | "started"
   | "draining"
+  | "failed"
   | "stopped";
 
 export interface ComponentHostIdentity extends JsonObject {
@@ -382,7 +383,9 @@ export function parseComponentHostResult(input: unknown): ComponentHostResult {
   if (typeof result.ok !== "boolean") throw wireError("Component host result ok is invalid");
   if (
     typeof result.state !== "string" ||
-    !["new", "prepared", "imported", "started", "draining", "stopped"].includes(result.state)
+    !["new", "prepared", "imported", "started", "draining", "failed", "stopped"].includes(
+      result.state,
+    )
   ) {
     throw wireError("Component host result state is invalid");
   }
