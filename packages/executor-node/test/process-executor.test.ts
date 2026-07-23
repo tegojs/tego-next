@@ -914,6 +914,17 @@ test("drain and close leave no active child process", async () => {
   assert.equal((await executor.health()).active, 0);
 });
 
+test("drain still replays an existing terminal attempt handle", async () => {
+  const executor = new ProcessExecutor(await options());
+  const execution = request({ mode: "echo", value: "cached" }, "drain-replay");
+  const handle = await executor.submit(execution);
+  const result = await handle.result;
+  await executor.drain({});
+  const duplicate = await executor.submit(execution);
+  assert.strictEqual(duplicate, handle);
+  assert.strictEqual(await duplicate.result, result);
+});
+
 test("executor drain releases owned children without closing the injected process driver", async () => {
   const processHost = new TestProcessHost();
   const executor = new ProcessExecutor(await options({ processHost }));
@@ -1142,6 +1153,35 @@ test("failed final kill quarantines the executor and reports unhealthy capacity"
       executor.submit(request({ mode: "echo", value: "blocked" }, "after-rejected-kill")),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_DRAINING",
     );
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("fatal quarantine still replays the existing failed attempt handle", async () => {
+  const started = Promise.withResolvers<void>();
+  const processHost = new RejectingKillProcessHost();
+  const executor = new ProcessExecutor(
+    await options({
+      processHost,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "quarantine-replay");
+  const handle = await executor.submit(execution);
+  try {
+    await started.promise;
+    await executor.cancel(execution.taskId, execution.attemptId);
+    clock.advanceBy(100);
+    const result = await handle.result;
+    assert.equal(result.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    const duplicate = await executor.submit(execution);
+    assert.strictEqual(duplicate, handle);
+    assert.strictEqual(await duplicate.result, result);
   } finally {
     await processHost.close();
   }
