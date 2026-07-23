@@ -155,7 +155,7 @@ Commit: `git add . && git commit -m "build: initialize Node 26 TypeScript 7 work
 - Produces: branded string identities, `RuntimeDiagnostic`, `RuntimeConfiguration`, `PluginManifest`, `PluginInstallation`, `PluginDeployment`, `ExecutionRequest`, `ExecutionResult`, and `WorkerEnvelope`.
 - Produces: `parseSchema<T>(schema, input): T` and `serializeWireValue(value): JsonValue`.
 
-- [ ] **Step 1: Write and commit failing contract tests**
+- [x] **Step 1: Write and commit failing contract tests**
 
 Cover:
 
@@ -181,7 +181,7 @@ Expected: FAIL because the package exports do not exist.
 
 Commit: `git add packages/contracts && git commit -m "test: define runtime wire contracts"`
 
-- [ ] **Step 2: Implement identities and diagnostics**
+- [x] **Step 2: Implement identities and diagnostics**
 
 Use `type Brand<T, Name extends string> = T & { readonly __brand: Name }`.
 Construct identities through validating functions; do not export unsafe casts.
@@ -199,14 +199,14 @@ The required top-level diagnostic groups are `BOOTSTRAP`, `ARTIFACT`,
 `DEPLOYMENT`, `CAPABILITY`, `PERMISSION`, `LIFECYCLE`, `EXECUTOR`, `WORKER`,
 `COORDINATION`, `STATE`, and `PROTOCOL`.
 
-- [ ] **Step 3: Implement Ajv-backed runtime validators**
+- [x] **Step 3: Implement Ajv-backed runtime validators**
 
 Create one Ajv 2020 instance with strict mode and format support. Compile schemas
 once at module initialization. `parsePluginManifest`, `parseExecutionRequest`,
 and `parseWorkerEnvelope` must translate Ajv issues into deterministic
 `RuntimeDiagnostic.details.issues`, sorted by instance path and keyword.
 
-- [ ] **Step 4: Verify round trips and commit**
+- [x] **Step 4: Verify round trips and commit**
 
 Run:
 

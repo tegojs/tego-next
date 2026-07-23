@@ -7,11 +7,11 @@
 
 ## 2. Runtime Contracts
 
-- [ ] 2.1 Write failing contract tests and implement branded identities, revisions, generations, task IDs, attempt IDs, operation IDs, and structured runtime errors
-- [ ] 2.2 Write failing schema tests and implement runtime validators for bootstrap configuration and driver health
-- [ ] 2.3 Write failing schema tests and implement manifest, installation, deployment, component, capability, permission, and placement contracts
-- [ ] 2.4 Write failing schema tests and implement execution request/result and Worker message-envelope contracts
-- [ ] 2.5 Write serialization round-trip and protocol-compatibility tests for every public wire contract
+- [x] 2.1 Write failing contract tests and implement branded identities, revisions, generations, task IDs, attempt IDs, operation IDs, and structured runtime errors
+- [x] 2.2 Write failing schema tests and implement runtime validators for bootstrap configuration and driver health
+- [x] 2.3 Write failing schema tests and implement manifest, installation, deployment, component, capability, permission, and placement contracts
+- [x] 2.4 Write failing schema tests and implement execution request/result and Worker message-envelope contracts
+- [x] 2.5 Write serialization round-trip and protocol-compatibility tests for every public wire contract
 
 ## 3. State and Coordination Drivers
 
