@@ -32,6 +32,7 @@ const systemClock: Clock = {
 export interface FilesystemArtifactStoreOptions {
   readonly rootDirectory: string;
   readonly clock?: Clock;
+  readonly openReadHandle?: (path: string) => Promise<ArtifactReadHandle>;
   readonly platform?: NodeJS.Platform;
 }
 
@@ -116,6 +117,10 @@ export interface ArtifactRandomAccessReader {
   ): Promise<{ readonly bytesRead: number }>;
 }
 
+export interface ArtifactReadHandle extends ArtifactRandomAccessReader {
+  close(): Promise<void>;
+}
+
 const ARTIFACT_READ_CHUNK_BYTES = 64 * 1024;
 
 export async function hashArtifactHandle(
@@ -145,9 +150,10 @@ export class FilesystemArtifactStore implements ArtifactStore {
   readonly #rootDirectory: string;
   readonly #artifactDirectory: string;
   readonly #clock: Clock;
+  readonly #openReadHandle: (path: string) => Promise<ArtifactReadHandle>;
   readonly #platform: NodeJS.Platform;
   readonly #operations = new Set<Promise<unknown>>();
-  readonly #readHandles = new Set<FileHandle>();
+  readonly #readHandles = new Set<ArtifactReadHandle>();
   #openPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #lifecycle: "closed" | "closing" | "created" | "open" | "opening" = "created";
@@ -156,6 +162,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
     this.#rootDirectory = options.rootDirectory;
     this.#artifactDirectory = join(options.rootDirectory, "artifacts");
     this.#clock = options.clock ?? systemClock;
+    this.#openReadHandle = options.openReadHandle ?? ((path) => open(path, "r"));
     this.#platform = options.platform ?? process.platform;
   }
 
@@ -214,28 +221,39 @@ export class FilesystemArtifactStore implements ArtifactStore {
     const parsed = parseArtifactDigest(digest);
     const operation = this.#openVerified(parsed);
     this.#operations.add(operation);
-    let handle: FileHandle | undefined;
+    let handle: ArtifactReadHandle | undefined;
     try {
       handle = await operation;
     } finally {
       this.#operations.delete(operation);
     }
     try {
-      const buffer = Buffer.allocUnsafe(ARTIFACT_READ_CHUNK_BYTES);
-      let position = 0;
-      while (true) {
-        if (this.#lifecycle !== "open") return;
-        let bytesRead: number;
-        try {
-          ({ bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position));
-        } catch (error) {
+      try {
+        const buffer = Buffer.allocUnsafe(ARTIFACT_READ_CHUNK_BYTES);
+        let position = 0;
+        while (true) {
           if (this.#lifecycle !== "open") return;
-          throw error;
+          let bytesRead: number;
+          try {
+            ({ bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position));
+          } catch (error) {
+            if (this.#lifecycle !== "open") return;
+            throw error;
+          }
+          if (bytesRead === 0) break;
+          if (this.#lifecycle !== "open") return;
+          position += bytesRead;
+          yield Buffer.from(buffer.subarray(0, bytesRead));
         }
-        if (bytesRead === 0) break;
-        if (this.#lifecycle !== "open") return;
-        position += bytesRead;
-        yield Buffer.from(buffer.subarray(0, bytesRead));
+      } catch (error) {
+        if (handle !== undefined) {
+          this.#readHandles.delete(handle);
+          try {
+            await handle.close();
+          } catch {}
+          handle = undefined;
+        }
+        throw error;
       }
     } finally {
       if (handle !== undefined) this.#readHandles.delete(handle);
@@ -329,8 +347,8 @@ export class FilesystemArtifactStore implements ArtifactStore {
     }
   }
 
-  async #openVerified(digest: ArtifactDigest): Promise<FileHandle> {
-    const handle = await open(this.pathFor(digest), "r");
+  async #openVerified(digest: ArtifactDigest): Promise<ArtifactReadHandle> {
+    const handle = await this.#openReadHandle(this.pathFor(digest));
     try {
       const actual = await hashArtifactHandle(handle);
       if (actual !== digest) {
@@ -339,7 +357,9 @@ export class FilesystemArtifactStore implements ArtifactStore {
       this.#readHandles.add(handle);
       return handle;
     } catch (error) {
-      await handle.close();
+      try {
+        await handle.close();
+      } catch {}
       throw error;
     }
   }
