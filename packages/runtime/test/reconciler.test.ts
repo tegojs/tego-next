@@ -682,7 +682,7 @@ async function createHarnessStore(clock: Clock): Promise<TestStateStore> {
 }
 
 class RecordingEffects implements ComponentEffectExecutor {
-  readonly supportedExecutors = ["process"] as const;
+  supportedExecutors: readonly ExecutorKind[] = ["process"];
   readonly performed: ReconcileEffect[] = [];
   readonly uniqueOperations = new Set<string>();
   readonly calls: ReconcileEffect[] = [];
@@ -947,6 +947,200 @@ test("canonical lifecycle identities cannot be retargeted to another persisted i
     assert.equal(reconciler.diagnostics()[0]?.code, "PROTOCOL_MESSAGE_INVALID");
     await reconciler.stop();
   }
+});
+
+test("claimed effects revalidate current placement before journaling or performing", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  effects.supportedExecutors = ["thread"];
+  const state = await createHarnessStore(clock);
+  const value = installation();
+  const currentManifest: PluginManifest = {
+    ...value.manifest,
+    components: [
+      {
+        componentId,
+        kind: "service",
+        entrypoint: "components/echo.js",
+        executors: ["process", "thread"],
+      },
+    ],
+    permissions: [{ kind: "executor", executors: ["process", "thread"] }],
+  };
+  const desired = deployment("1", {
+    permissionGrants: [{ kind: "executor", executors: ["process", "thread"] }],
+  });
+  const effect = planReconcile(snapshot()).steps[0]?.effect;
+  assert.ok(effect);
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: effect.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: effect.artifactDigest,
+        componentId,
+        deploymentGeneration: effect.deploymentGeneration,
+        executor: effect.executor,
+        instanceId: effect.instanceId,
+        lifecycle: "created",
+        observedGeneration: effect.deploymentGeneration,
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: effect.messageId,
+      operationId: effect.operationId,
+      payload: effect,
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async () => ({ ...gate().artifact, manifest: currentManifest }),
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [{ ...value, manifest: currentManifest }],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.replanCount, 1);
+  assert.equal(
+    [...state.operations.values()].some((operation) => operation.status === "executing"),
+    false,
+  );
+  await reconciler.stop();
+});
+
+test("canonical effects with stale pre-lifecycle state never invoke the executor", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const preparing: ComponentInstance = {
+    applicationId,
+    componentId,
+    deploymentGeneration: parseGeneration("1"),
+    executor: "process",
+    instanceId: "ignored-by-planner",
+    lifecycle: "preparing",
+    observedGeneration: parseGeneration("1"),
+    pluginId,
+    revision: parseRevision("1"),
+  };
+  const effect = planReconcile(snapshot(deployment(), [preparing])).steps[0]?.effect;
+  assert.equal(effect?.kind, "start");
+  assert.ok(effect);
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: effect.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: effect.artifactDigest,
+        componentId,
+        deploymentGeneration: effect.deploymentGeneration,
+        executor: effect.executor,
+        instanceId: effect.instanceId,
+        lifecycle: "ready",
+        observedGeneration: effect.deploymentGeneration,
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: effect.messageId,
+      operationId: effect.operationId,
+      payload: effect,
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.replanCount, 1);
+  assert.equal(
+    [...state.operations.values()].some((operation) => operation.status === "executing"),
+    false,
+  );
+  await reconciler.stop();
+});
+
+test("non-canonical persisted instance identities remain durably inconsistent across wakes", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: "non-canonical-instance",
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: "process",
+        instanceId: "non-canonical-instance",
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  await reconciler.wake();
+
+  const observation = [...state.records.values()].find(
+    (record) => record.key.collection === "deployment-observations",
+  );
+  assert.equal(
+    (observation?.value as { readonly status?: string } | undefined)?.status,
+    "inconsistent",
+  );
+  assert.deepEqual(effects.calls, []);
+  await reconciler.stop();
 });
 
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
