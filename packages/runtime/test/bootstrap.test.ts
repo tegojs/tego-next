@@ -25,6 +25,7 @@ import {
   type PersistedOperationJournalEntry,
   type RuntimeConfiguration,
   type RuntimeDrivers,
+  type SecretProvider,
   type ScannedState,
   type StateChange,
   type StateKey,
@@ -240,27 +241,57 @@ class ControlledArtifacts implements ArtifactStore {
   }
 }
 
+class ControlledSecrets implements SecretProvider {
+  readonly developmentOnly = false;
+  readonly #log: string[];
+
+  constructor(log: string[]) {
+    this.#log = log;
+  }
+
+  async open(): Promise<void> {
+    this.#log.push("secrets.open");
+  }
+
+  async get(_name: string): Promise<string | undefined> {
+    return undefined;
+  }
+
+  async health(): Promise<DriverHealth> {
+    this.#log.push("secrets.health");
+    return healthy();
+  }
+
+  async close(): Promise<void> {
+    this.#log.push("secrets.close");
+  }
+}
+
 function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] = []): {
   readonly drivers: RuntimeDrivers;
   readonly state: ControlledStateStore;
   readonly coordination: ControlledCoordination;
   readonly artifacts: ControlledArtifacts;
+  readonly secrets: ControlledSecrets;
   readonly log: string[];
 } {
   const log: string[] = [];
   const state = new ControlledStateStore(log, recovered);
   const coordination = new ControlledCoordination(log);
   const artifacts = new ControlledArtifacts(log);
+  const secrets = new ControlledSecrets(log);
   return {
     drivers: {
       state,
       coordination,
       artifacts,
+      secrets,
       clock,
     },
     state,
     coordination,
     artifacts,
+    secrets,
     log,
   };
 }
@@ -289,10 +320,11 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     tasks: 0,
     workers: 0,
   });
-  assert.deepEqual(log.slice(0, 8), [
+  assert.deepEqual(log.slice(0, 9), [
     "state.open",
     "coordination.open",
     "artifacts.open",
+    "secrets.open",
     "state.scan:installations",
     "state.scan:deployments",
     "state.scan:tasks",
@@ -302,7 +334,12 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
 
   await runtime.stop();
   assert.equal((await runtime.status()).lifecycle, "stopped");
-  assert.deepEqual(log.slice(-3), ["artifacts.close", "coordination.close", "state.close"]);
+  assert.deepEqual(log.slice(-4), [
+    "secrets.close",
+    "artifacts.close",
+    "coordination.close",
+    "state.close",
+  ]);
 });
 
 test("driver open failure closes previously opened drivers in reverse order", async () => {
@@ -402,14 +439,14 @@ test("concurrent and repeated start and stop calls are idempotent", async () => 
   assert.equal(firstStart, secondStart);
   await Promise.all([firstStart, secondStart]);
   await runtime.start();
-  assert.equal(log.filter((entry) => entry.endsWith(".open")).length, 3);
+  assert.equal(log.filter((entry) => entry.endsWith(".open")).length, 4);
 
   const firstStop = runtime.stop();
   const secondStop = runtime.stop();
   assert.equal(firstStop, secondStop);
   await Promise.all([firstStop, secondStop]);
   await runtime.stop();
-  assert.equal(log.filter((entry) => entry.endsWith(".close")).length, 3);
+  assert.equal(log.filter((entry) => entry.endsWith(".close")).length, 4);
 });
 
 test("stop racing with start prevents runtime resurrection", async () => {
@@ -498,7 +535,12 @@ test("runtime rejects leadership for a different campaign resource before runnin
   assert.equal(status.lifecycle, "failed");
   assert.equal(status.acceptingOperations, false);
   assert.equal(log.includes("state.health"), false);
-  assert.deepEqual(log.slice(-3), ["artifacts.close", "coordination.close", "state.close"]);
+  assert.deepEqual(log.slice(-4), [
+    "secrets.close",
+    "artifacts.close",
+    "coordination.close",
+    "state.close",
+  ]);
 });
 
 test("runtime lifecycle transitions are pure and reject illegal edges", () => {
