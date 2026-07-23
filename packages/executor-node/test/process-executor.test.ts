@@ -23,7 +23,9 @@ import {
 } from "@tegojs/testkit";
 import {
   PROCESS_EXECUTOR_MAX_FRAME_BYTES,
+  ProcessFrameDecoder,
   ProcessExecutor,
+  encodeProcessFrame,
   selectExecutor,
   type ProcessExecutorOptions,
 } from "../src/index.js";
@@ -136,6 +138,55 @@ const conformanceFixture: ExecutorConformanceFixture = {
 };
 
 executorConformance(async () => new ProcessExecutor(await options()), conformanceFixture);
+
+test("process framing handles partial, coalesced, truncated, and invalid frames", () => {
+  const first = encodeProcessFrame({ sequence: 1 });
+  const second = encodeProcessFrame({ sequence: 2 });
+  const decoder = new ProcessFrameDecoder();
+  assert.deepEqual(decoder.push(first.subarray(0, 2)), []);
+  assert.deepEqual(decoder.push(first.subarray(2)), [{ sequence: 1 }]);
+  assert.deepEqual(decoder.push(Buffer.concat([Buffer.from(first), Buffer.from(second)])), [
+    { sequence: 1 },
+    { sequence: 2 },
+  ]);
+  decoder.finish();
+
+  const truncated = new ProcessFrameDecoder();
+  truncated.push(first.subarray(0, first.byteLength - 1));
+  assert.throws(
+    () => truncated.finish(),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_PROCESS_FRAME_TRUNCATED",
+  );
+
+  const invalidJson = Buffer.alloc(5);
+  invalidJson.writeUInt32BE(1, 0);
+  invalidJson[4] = "{".charCodeAt(0);
+  assert.throws(
+    () => new ProcessFrameDecoder().push(invalidJson),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_PROCESS_FRAME_INVALID",
+  );
+});
+
+test("process framing rejects an oversized declared length before buffering its payload", () => {
+  const malicious = Buffer.alloc(PROCESS_EXECUTOR_MAX_FRAME_BYTES + 5);
+  malicious.writeUInt32BE(PROCESS_EXECUTOR_MAX_FRAME_BYTES + 1, 0);
+  let parseCalls = 0;
+  const originalParse = JSON.parse;
+  JSON.parse = ((...arguments_: Parameters<typeof JSON.parse>) => {
+    parseCalls += 1;
+    return originalParse(...arguments_);
+  }) as typeof JSON.parse;
+  try {
+    assert.throws(
+      () => new ProcessFrameDecoder().push(malicious),
+      (error: unknown) =>
+        diagnosticCode(error) === "PROTOCOL_PROCESS_FRAME_LENGTH_INVALID",
+    );
+    assert.equal(parseCalls, 0);
+  } finally {
+    JSON.parse = originalParse;
+  }
+});
 
 test("@spec:executor-runtime/executor-failure-containment/crash-replacement", async () => {
   const executor = new ProcessExecutor(await options({ maxConcurrency: 1 }));
