@@ -304,12 +304,7 @@ test("driver open failure closes previously opened drivers in reverse order", as
   const runtime = createRuntime(configuration, drivers);
 
   await assert.rejects(runtime.start(), /coordination open failed/u);
-  assert.deepEqual(log, [
-    "state.open",
-    "coordination.open",
-    "coordination.close",
-    "state.close",
-  ]);
+  assert.deepEqual(log, ["state.open", "coordination.open", "coordination.close", "state.close"]);
   assert.equal((await runtime.status()).lifecycle, "failed");
 });
 
@@ -338,9 +333,7 @@ test("multi-main rejects every local storage boundary before opening drivers", a
       runtime.start(),
       (error: unknown) =>
         diagnosticCode(error) ===
-        (mismatch === "state"
-          ? "BOOTSTRAP_STATE_NOT_SHARED"
-          : "BOOTSTRAP_ARTIFACTS_NOT_SHARED"),
+        (mismatch === "state" ? "BOOTSTRAP_STATE_NOT_SHARED" : "BOOTSTRAP_ARTIFACTS_NOT_SHARED"),
     );
     assert.deepEqual(log, []);
   }
@@ -449,7 +442,7 @@ test("runtime event iterators terminate on stop, including pending and late iter
 });
 
 test("runtime validates health, status, events, and acquired authority before exposure", async () => {
-  const { coordination, drivers, state } = controlledDrivers();
+  const { drivers, state } = controlledDrivers();
   state.healthResult = { status: "unknown", checkedAt: 1n };
   const runtime = createRuntime(configuration, drivers);
   const events = runtime.events[Symbol.asyncIterator]();
@@ -461,10 +454,7 @@ test("runtime validates health, status, events, and acquired authority before ex
   assert.deepEqual(parseRuntimeStatus(JSON.parse(JSON.stringify(status))), status);
   const event = await events.next();
   assert.equal(event.done, false);
-  assert.deepEqual(
-    parseRuntimeEvent(JSON.parse(JSON.stringify(event.value))),
-    event.value,
-  );
+  assert.deepEqual(parseRuntimeEvent(JSON.parse(JSON.stringify(event.value))), event.value);
   await runtime.stop();
 
   const invalid = controlledDrivers();

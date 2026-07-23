@@ -1,7 +1,7 @@
 import type { Clock } from "./clock.js";
 import type { ArtifactDigest, FencingEpoch, Revision } from "./identity.js";
-import type { JsonValue } from "./json.js";
-import type { DriverHealth, StateStore } from "./state.js";
+import type { JsonObject, JsonValue } from "./json.js";
+import type { DriverHealth, StateStore, StorageScope } from "./state.js";
 
 export interface ManagedDriver {
   open(): Promise<void>;
@@ -13,7 +13,7 @@ export interface CampaignRequest {
   readonly resource: string;
 }
 
-export interface Leadership {
+export interface Leadership extends JsonObject {
   readonly resource: string;
   readonly epoch: FencingEpoch;
 }
@@ -64,6 +64,7 @@ export interface CoordinationProvider extends ManagedDriver {
 }
 
 export interface ArtifactStore extends ManagedDriver {
+  readonly scope: StorageScope;
   put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void>;
   read(digest: ArtifactDigest): AsyncIterable<Uint8Array>;
 }

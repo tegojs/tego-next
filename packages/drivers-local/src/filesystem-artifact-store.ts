@@ -109,6 +109,7 @@ async function writeChunk(handle: FileHandle, chunk: Uint8Array): Promise<void> 
 }
 
 export class FilesystemArtifactStore implements ArtifactStore {
+  readonly scope = "local" as const;
   readonly #rootDirectory: string;
   readonly #artifactDirectory: string;
   readonly #clock: Clock;

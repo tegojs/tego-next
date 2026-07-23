@@ -413,26 +413,14 @@ test("every exported public wire contract survives serialization and validating 
 
 test("runtime boundary validators reject malformed health, authority, status, and events", () => {
   for (const [value, parse, code] of [
-    [
-      { status: "unknown", checkedAt: 1n },
-      parseDriverHealth,
-      "PROTOCOL_DRIVER_HEALTH_INVALID",
-    ],
-    [
-      { resource: "", epoch: "not-decimal" },
-      parseLeadership,
-      "COORDINATION_LEADERSHIP_INVALID",
-    ],
+    [{ status: "unknown", checkedAt: 1n }, parseDriverHealth, "PROTOCOL_DRIVER_HEALTH_INVALID"],
+    [{ resource: "", epoch: "not-decimal" }, parseLeadership, "COORDINATION_LEADERSHIP_INVALID"],
     [
       { ...validRuntimeStatus, readiness: 1n },
       parseRuntimeStatus,
       "PROTOCOL_RUNTIME_STATUS_INVALID",
     ],
-    [
-      { ...validRuntimeEvent, occurredAt: 1n },
-      parseRuntimeEvent,
-      "PROTOCOL_RUNTIME_EVENT_INVALID",
-    ],
+    [{ ...validRuntimeEvent, occurredAt: 1n }, parseRuntimeEvent, "PROTOCOL_RUNTIME_EVENT_INVALID"],
   ] as const) {
     assert.throws(
       () => parse(value),

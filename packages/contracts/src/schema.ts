@@ -9,9 +9,11 @@ import {
   runtimeDiagnostic,
 } from "./diagnostic.js";
 import type { ExecutionRequest, ExecutionResult } from "./execution.js";
+import type { Leadership } from "./drivers.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
 import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
-import type { RuntimeConfiguration } from "./runtime.js";
+import type { RuntimeConfiguration, RuntimeEvent, RuntimeStatus } from "./runtime.js";
+import type { DriverHealth } from "./state.js";
 import type { WorkerEnvelope } from "./worker.js";
 
 export type JsonSchema = boolean | JsonObject;
@@ -215,6 +217,116 @@ const runtimeConfigurationSchema = {
   },
   $defs: {
     identity: { type: "string", pattern: IDENTITY_PATTERN },
+  },
+} as const;
+
+const driverHealthSchema = {
+  $id: "https://tegojs.dev/schemas/driver-health-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["status", "checkedAt"],
+  properties: {
+    status: { enum: ["degraded", "healthy", "unhealthy"] },
+    checkedAt: { type: "string", format: "date-time" },
+    message: { type: "string" },
+  },
+} as const;
+
+const leadershipSchema = {
+  $id: "https://tegojs.dev/schemas/leadership-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["resource", "epoch"],
+  properties: {
+    resource: { type: "string", minLength: 1 },
+    epoch: { type: "string", pattern: DECIMAL_PATTERN },
+  },
+} as const;
+
+const runtimeLifecycleStates = [
+  "created",
+  "opening",
+  "recovering",
+  "electing",
+  "running",
+  "draining",
+  "stopping",
+  "stopped",
+  "failed",
+] as const;
+
+const runtimeStatusSchema = {
+  $id: "https://tegojs.dev/schemas/runtime-status-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "identity",
+    "mode",
+    "lifecycle",
+    "liveness",
+    "readiness",
+    "acceptingOperations",
+    "drivers",
+    "counts",
+  ],
+  properties: {
+    identity: {
+      type: "object",
+      additionalProperties: false,
+      required: ["runtimeId", "applicationId", "nodeId"],
+      properties: {
+        runtimeId: { type: "string", pattern: IDENTITY_PATTERN },
+        applicationId: { type: "string", pattern: IDENTITY_PATTERN },
+        nodeId: { type: "string", pattern: IDENTITY_PATTERN },
+      },
+    },
+    mode: { enum: ["multi-main", "single-main"] },
+    lifecycle: { enum: runtimeLifecycleStates },
+    liveness: { type: "boolean" },
+    readiness: { type: "boolean" },
+    acceptingOperations: { type: "boolean" },
+    drivers: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "health"],
+        properties: {
+          name: { enum: ["artifacts", "coordination", "state"] },
+          health: { $ref: driverHealthSchema.$id },
+        },
+      },
+    },
+    counts: {
+      type: "object",
+      additionalProperties: false,
+      required: ["deployments", "installations", "recoverableOperations", "tasks", "workers"],
+      properties: {
+        deployments: { type: "integer", minimum: 0 },
+        installations: { type: "integer", minimum: 0 },
+        recoverableOperations: { type: "integer", minimum: 0 },
+        tasks: { type: "integer", minimum: 0 },
+        workers: { type: "integer", minimum: 0 },
+      },
+    },
+    authority: { $ref: leadershipSchema.$id },
+  },
+} as const;
+
+const runtimeEventSchema = {
+  $id: "https://tegojs.dev/schemas/runtime-event-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["type", "previous", "current", "occurredAt"],
+  properties: {
+    type: { const: "runtime.lifecycle" },
+    previous: { enum: runtimeLifecycleStates },
+    current: { enum: runtimeLifecycleStates },
+    occurredAt: { type: "string", format: "date-time" },
   },
 } as const;
 
@@ -481,6 +593,10 @@ ajv.addKeyword({
 
 const validateJsonValue = ajv.compile(jsonValueSchema);
 const validateRuntimeConfiguration = ajv.compile(runtimeConfigurationSchema);
+const validateDriverHealth = ajv.compile(driverHealthSchema);
+const validateLeadership = ajv.compile(leadershipSchema);
+const validateRuntimeStatus = ajv.compile(runtimeStatusSchema);
+const validateRuntimeEvent = ajv.compile(runtimeEventSchema);
 const validateRuntimeDiagnostic = ajv.compile(runtimeDiagnosticSchema);
 const validatePluginManifest = ajv.compile(pluginManifestSchema);
 const validatePluginInstallation = ajv.compile(pluginInstallationSchema);
@@ -576,6 +692,46 @@ export function parseRuntimeConfiguration(input: unknown): RuntimeConfiguration 
     "BOOTSTRAP_CONFIGURATION_INVALID",
     "Runtime configuration is invalid",
     { kind: "runtime", id: "configuration" },
+  );
+}
+
+export function parseDriverHealth(input: unknown): DriverHealth {
+  return parseWithValidator(
+    validateDriverHealth,
+    input,
+    "PROTOCOL_DRIVER_HEALTH_INVALID",
+    "Driver health is invalid",
+    { kind: "protocol", id: "driver-health" },
+  );
+}
+
+export function parseLeadership(input: unknown): Leadership {
+  return parseWithValidator(
+    validateLeadership,
+    input,
+    "COORDINATION_LEADERSHIP_INVALID",
+    "Coordination leadership is invalid",
+    { kind: "coordination", id: "leadership" },
+  );
+}
+
+export function parseRuntimeStatus(input: unknown): RuntimeStatus {
+  return parseWithValidator(
+    validateRuntimeStatus,
+    input,
+    "PROTOCOL_RUNTIME_STATUS_INVALID",
+    "Runtime status is invalid",
+    { kind: "protocol", id: "runtime-status" },
+  );
+}
+
+export function parseRuntimeEvent(input: unknown): RuntimeEvent {
+  return parseWithValidator(
+    validateRuntimeEvent,
+    input,
+    "PROTOCOL_RUNTIME_EVENT_INVALID",
+    "Runtime event is invalid",
+    { kind: "protocol", id: "runtime-event" },
   );
 }
 

@@ -1,4 +1,5 @@
 import {
+  parseDriverHealth,
   serializeCause,
   type DriverHealth,
   type ManagedDriver,
@@ -26,8 +27,8 @@ export class DriverSupervisor {
 
   async open(): Promise<void> {
     for (const named of this.#drivers) {
-      await named.driver.open();
       this.#opened.push(named);
+      await named.driver.open();
     }
   }
 
@@ -36,7 +37,7 @@ export class DriverSupervisor {
       this.#opened.map(async ({ name, driver }) => {
         let health: DriverHealth;
         try {
-          health = await driver.health();
+          health = structuredClone(parseDriverHealth(await driver.health()));
         } catch (error) {
           health = {
             status: "unhealthy",

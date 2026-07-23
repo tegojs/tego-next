@@ -363,6 +363,7 @@ class MemoryWatchIterator implements AsyncIterator<StateChange>, AsyncIterable<S
 }
 
 export class MemoryStateStore implements StateStore {
+  readonly scope = "local" as const;
   readonly #clock: Clock;
   readonly #records = new Map<string, StoredRecord>();
   readonly #operations = new Map<string, PersistedOperationJournalEntry>();

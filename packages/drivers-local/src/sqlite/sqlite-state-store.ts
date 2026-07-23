@@ -471,6 +471,7 @@ function broadcastChanges(databaseIdentity: string, changes: readonly StateChang
 }
 
 export class SqliteStateStore implements StateStore {
+  readonly scope = "local" as const;
   readonly #databasePath: string;
   readonly #databaseIdentity: string;
   readonly #clock: Clock;

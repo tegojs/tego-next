@@ -30,6 +30,7 @@ export interface StateChange {
 }
 
 export type ExpectedRevision = Revision | "absent" | undefined;
+export type StorageScope = "local" | "shared";
 
 export interface StateWriteOptions {
   readonly expectedRevision?: ExpectedRevision;
@@ -121,6 +122,7 @@ export interface StateTransaction {
 }
 
 export interface StateStore {
+  readonly scope: StorageScope;
   open(): Promise<void>;
   transact<T extends JsonValue>(
     options: StateTransactionOptions,

@@ -1,6 +1,9 @@
 import {
   DiagnosticError,
+  parseLeadership,
   parseRuntimeConfiguration,
+  parseRuntimeEvent,
+  parseRuntimeStatus,
   runtimeDiagnostic,
   serializeCause,
   type Leadership,
@@ -105,6 +108,7 @@ class TegoRuntime implements Runtime {
   #recovery: RuntimeRecoverySnapshot = {
     installationCount: 0,
     deploymentCount: 0,
+    deploymentReadiness: [],
     taskCount: 0,
     operations: [],
   };
@@ -152,14 +156,21 @@ class TegoRuntime implements Runtime {
       if (this.#stopRequested) return;
 
       this.#setLifecycle("recovering");
-      this.#recovery = await recoverRuntimeState(this.#drivers.state);
+      this.#recovery = await recoverRuntimeState(
+        this.#drivers.state,
+        this.#configuration.applicationId,
+      );
       this.operations.setRecovered(this.#recovery.operations);
       if (this.#stopRequested) return;
 
       this.#setLifecycle("electing");
-      this.#leadership = await this.#drivers.coordination.campaign({
-        resource: `runtime:${this.#configuration.runtimeId}`,
-      });
+      this.#leadership = structuredClone(
+        parseLeadership(
+          await this.#drivers.coordination.campaign({
+            resource: `runtime:${this.#configuration.runtimeId}`,
+          }),
+        ),
+      );
       if (this.#stopRequested) return;
 
       this.#setLifecycle("running");
@@ -221,7 +232,7 @@ class TegoRuntime implements Runtime {
       readiness: isRuntimeReady({
         lifecycle: this.#lifecycle,
         drivers: driverHealth,
-        deployments: [],
+        deployments: this.#recovery.deploymentReadiness,
       }),
       acceptingOperations: this.operations.accepting,
       drivers: this.#driverHealth,
@@ -241,14 +252,12 @@ class TegoRuntime implements Runtime {
             },
           }),
     } satisfies RuntimeStatus;
-    return structuredClone(status);
+    return structuredClone(parseRuntimeStatus(status));
   }
 
   #assertCoordinationScope(): void {
-    if (
-      this.#configuration.mode === "multi-main" &&
-      this.#drivers.coordination.scope !== "distributed"
-    ) {
+    if (this.#configuration.mode !== "multi-main") return;
+    if (this.#drivers.coordination.scope !== "distributed") {
       throw new DiagnosticError(
         runtimeDiagnostic({
           code: "BOOTSTRAP_COORDINATION_NOT_DISTRIBUTED",
@@ -257,6 +266,34 @@ class TegoRuntime implements Runtime {
           details: {
             mode: this.#configuration.mode,
             coordinationScope: this.#drivers.coordination.scope,
+          },
+          observedAt: this.#drivers.clock.now().toISOString(),
+        }),
+      );
+    }
+    if (this.#drivers.state.scope !== "shared") {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "BOOTSTRAP_STATE_NOT_SHARED",
+          message: "multi-main mode requires shared state storage",
+          source: { kind: "runtime", id: this.#configuration.runtimeId },
+          details: {
+            mode: this.#configuration.mode,
+            stateScope: this.#drivers.state.scope,
+          },
+          observedAt: this.#drivers.clock.now().toISOString(),
+        }),
+      );
+    }
+    if (this.#drivers.artifacts.scope !== "shared") {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "BOOTSTRAP_ARTIFACTS_NOT_SHARED",
+          message: "multi-main mode requires shared artifact storage",
+          source: { kind: "runtime", id: this.#configuration.runtimeId },
+          details: {
+            mode: this.#configuration.mode,
+            artifactScope: this.#drivers.artifacts.scope,
           },
           observedAt: this.#drivers.clock.now().toISOString(),
         }),
@@ -271,12 +308,14 @@ class TegoRuntime implements Runtime {
       next,
       this.#drivers.clock.now().toISOString(),
     );
-    this.#eventStream.publish({
-      type: "runtime.lifecycle",
-      previous,
-      current: next,
-      occurredAt: this.#drivers.clock.now().toISOString(),
-    });
+    this.#eventStream.publish(
+      parseRuntimeEvent({
+        type: "runtime.lifecycle",
+        previous,
+        current: next,
+        occurredAt: this.#drivers.clock.now().toISOString(),
+      }),
+    );
   }
 
   #transitionError(message: string): DiagnosticError {

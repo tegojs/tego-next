@@ -1,14 +1,18 @@
 import type {
+  ApplicationId,
   OperationJournalCursor,
   PersistedOperationJournalEntry,
   StateStore,
 } from "@tegojs/contracts";
+import { parsePluginDeployment } from "@tegojs/contracts";
+import type { DeploymentReadiness } from "./readiness.js";
 
 const recoveryPageSize = 100;
 
 export interface RuntimeRecoverySnapshot {
   readonly installationCount: number;
   readonly deploymentCount: number;
+  readonly deploymentReadiness: readonly DeploymentReadiness[];
   readonly taskCount: number;
   readonly operations: readonly PersistedOperationJournalEntry[];
 }
@@ -25,6 +29,29 @@ async function countCollection(
     count += 1;
   }
   return count;
+}
+
+async function recoverDeployments(
+  state: StateStore,
+  applicationId: ApplicationId,
+): Promise<{
+  readonly count: number;
+  readonly readiness: readonly DeploymentReadiness[];
+}> {
+  const readiness: DeploymentReadiness[] = [];
+  for await (const record of state.scan({
+    namespace: "tego",
+    collection: "deployments",
+  })) {
+    const deployment = parsePluginDeployment(record.value);
+    if (deployment.applicationId !== applicationId) continue;
+    readiness.push({
+      desired: deployment.state === "active",
+      essential: deployment.essential,
+      ready: false,
+    });
+  }
+  return { count: readiness.length, readiness };
 }
 
 async function recoverOperations(
@@ -53,14 +80,18 @@ async function recoverOperations(
   }
 }
 
-export async function recoverRuntimeState(state: StateStore): Promise<RuntimeRecoverySnapshot> {
+export async function recoverRuntimeState(
+  state: StateStore,
+  applicationId: ApplicationId,
+): Promise<RuntimeRecoverySnapshot> {
   const installationCount = await countCollection(state, "installations");
-  const deploymentCount = await countCollection(state, "deployments");
+  const deployments = await recoverDeployments(state, applicationId);
   const taskCount = await countCollection(state, "tasks");
   const operations = await recoverOperations(state);
   return {
     installationCount,
-    deploymentCount,
+    deploymentCount: deployments.count,
+    deploymentReadiness: deployments.readiness,
     taskCount,
     operations,
   };
