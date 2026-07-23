@@ -228,7 +228,7 @@ async function readSecureFile(
   }
 }
 
-function assertEsm(bytes: Uint8Array, path: string): string {
+function decodeJavaScript(bytes: Uint8Array, path: string): string {
   let source: string;
   try {
     source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -236,17 +236,6 @@ function assertEsm(bytes: Uint8Array, path: string): string {
     throw artifactError(
       "ARTIFACT_MODULE_FORMAT_UNSUPPORTED",
       "Plugin build output must be valid UTF-8 JavaScript",
-      path,
-    );
-  }
-  if (
-    /\brequire\s*\(/u.test(source) ||
-    /\bmodule\s*\.\s*exports\b/u.test(source) ||
-    /\bexports\s*\./u.test(source)
-  ) {
-    throw artifactError(
-      "ARTIFACT_MODULE_FORMAT_UNSUPPORTED",
-      "Plugin build output contains CommonJS syntax",
       path,
     );
   }
@@ -351,7 +340,7 @@ export async function packPlugin(options: PackPluginOptions): Promise<PackedPlug
         );
       }
       const bytes = await readSecureFile(buildDirectory, path, maxEntryBytes);
-      const source = assertEsm(bytes, path);
+      const source = decodeJavaScript(bytes, path);
       for (const specifier of auditJavaScriptModules(source).runtimeImports) {
         runtimeImports.add(specifier);
       }

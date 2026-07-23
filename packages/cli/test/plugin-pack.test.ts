@@ -304,7 +304,7 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
         '// require("left-pad"); module.exports = {};',
         'const one = "require(\\"left-pad\\")";',
         "const two = 'module.exports = {}; exports.value = 1';",
-        "const three = `require(\"left-pad\") and module.exports`;",
+        'const three = `require("left-pad") and module.exports`;',
         "export default [one, two, three];",
       ].join("\n"),
     ],
@@ -313,15 +313,9 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
       String.raw`const ratio = 10 / 2 / 5; const pattern = /import\(\"left-pad\"\)/u;` +
         "\nexport default { pattern, ratio };\n",
     ],
-    [
-      "static plugin SDK import",
-      'import sdk from "@tegojs/plugin-sdk";\nexport default sdk;\n',
-    ],
+    ["static plugin SDK import", 'import sdk from "@tegojs/plugin-sdk";\nexport default sdk;\n'],
     ["plugin SDK export", 'export { default } from "@tegojs/plugin-sdk";\n'],
-    [
-      "dynamic plugin SDK import",
-      'export default () => import("@tegojs/plugin-sdk");\n',
-    ],
+    ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
     [
       "plugin SDK import in template expression",
       'const load = () => `sdk: ${import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
