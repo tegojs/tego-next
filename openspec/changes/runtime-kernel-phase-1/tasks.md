@@ -25,11 +25,11 @@
 
 ## 4. Runtime Bootstrap and Recovery
 
-- [ ] 4.1 Write bootstrap state-machine tests and implement explicit driver construction, startup ordering, health aggregation, and cleanup on failure
-- [ ] 4.2 Write empty-runtime tests and implement independent start, status, readiness, and stop behavior
+- [x] 4.1 Write bootstrap state-machine tests and implement explicit driver construction, startup ordering, health aggregation, and cleanup on failure
+- [x] 4.2 Write empty-runtime tests and implement independent start, status, readiness, and stop behavior
 - [ ] 4.3 Write recovery tests and implement replay of installations, deployments, operation journals, and unfinished tasks
 - [ ] 4.4 Write multi-Main leadership tests and implement fenced leader-only reconciliation with follower diagnostics
-- [ ] 4.5 Write essential-readiness tests and implement separate kernel liveness and application readiness
+- [x] 4.5 Write essential-readiness tests and implement separate kernel liveness and application readiness
 
 ## 5. Plugin Artifacts
 

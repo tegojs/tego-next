@@ -369,7 +369,7 @@ Commit: `git add packages/drivers-local && git commit -m "feat: add durable loca
 - Produces: `createRuntime(configuration, drivers): Runtime`.
 - Produces: `Runtime.start`, `Runtime.status`, `Runtime.stop`, and `Runtime.events`.
 
-- [ ] **Step 1: Write and commit failing bootstrap scenarios**
+- [x] **Step 1: Write and commit failing bootstrap scenarios**
 
 Cover empty lifecycle, reverse cleanup after partial open, multi-Main rejection
 with local coordination, recovery-before-accepting-operations, essential
@@ -382,13 +382,13 @@ Expected: FAIL because `createRuntime` is not exported.
 
 Commit: `git add packages/runtime && git commit -m "test: define runtime bootstrap lifecycle"`
 
-- [ ] **Step 2: Implement pure runtime transition and readiness functions**
+- [x] **Step 2: Implement pure runtime transition and readiness functions**
 
 The transition function returns a new state or `LIFECYCLE_TRANSITION_INVALID`.
 Readiness returns false only when runtime is not running, drivers are unhealthy,
 or an essential desired deployment is not ready.
 
-- [ ] **Step 3: Implement bootstrap and recovery ordering**
+- [x] **Step 3: Implement bootstrap and recovery ordering**
 
 Open the drivers present in the phase-one runtime contract in dependency order;
 recover state by using only public state-store queries; obtain authority; start
@@ -397,7 +397,7 @@ reverse order. `ProcessHost` and `SecretProvider` join the bootstrap contract in
 Tasks 10 and 9 respectively, when their real consumers and conformance tests
 exist; placeholder providers are forbidden.
 
-- [ ] **Step 4: Run focused and local integration tests, then commit**
+- [x] **Step 4: Run focused and local integration tests, then commit**
 
 Run:
 
