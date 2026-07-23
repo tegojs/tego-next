@@ -556,6 +556,38 @@ test("unawaited event floods are backpressured and cannot exhaust the parent", a
   }
 });
 
+test("event backpressure budget is shared across attempts until sinks settle", async () => {
+  const factory = new TrackingWorkerFactory();
+  const eventGate = Promise.withResolvers<void>();
+  let eventCalls = 0;
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      events: {
+        async emit() {
+          eventCalls += 1;
+          await eventGate.promise;
+        },
+      },
+    }),
+  );
+  try {
+    const first = await (
+      await executor.submit(request({ mode: "flood-events" }, "flood-events-first"))
+    ).result;
+    assert.equal(first.status, "failed");
+    assert.ok(eventCalls <= 64);
+
+    const second = await (
+      await executor.submit(request({ mode: "flood-events" }, "flood-events-second"))
+    ).result;
+    assert.equal(second.status, "failed");
+    assert.ok(eventCalls <= 64, `shared sink budget grew to ${eventCalls}`);
+  } finally {
+    eventGate.resolve();
+    await executor.drain({});
+  }
+});
+
 test("transferable duplicate submission replays the existing handle after ownership moves", async () => {
   const factory = new TrackingWorkerFactory();
   const executor = new ThreadExecutor(await options(factory));
@@ -772,6 +804,37 @@ test("successful component output remains non-terminal until worker cleanup sett
   assert.equal(resultSettled, true);
   assert.equal(drainSettled, true);
   assert.equal((await executor.health()).active, 0);
+});
+
+test("failed component output remains non-terminal until worker cleanup settles", async () => {
+  const factory = new GatedTerminationFactory();
+  const executor = new ThreadExecutor(await options(factory, { maxConcurrency: 1 }));
+  const execution = request({ mode: "large-output" }, "failed-cleanup-gate");
+  const handle = await executor.submit(execution);
+  await factory.terminationStarted.promise;
+  let resultSettled = false;
+  try {
+    void handle.result.then(() => {
+      resultSettled = true;
+    });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(await executor.observe(execution.taskId, execution.attemptId), {
+        state: "running",
+      });
+      assert.equal(resultSettled, false);
+      assert.equal(factory.active, 1);
+      assert.equal((await executor.probe()).availableCapacity, 0);
+    } finally {
+      factory.gate.resolve();
+    }
+    assert.equal((await handle.result).status, "failed");
+    assert.equal(resultSettled, true);
+    assert.equal(factory.active, 0);
+  } finally {
+    factory.gate.resolve();
+    await executor.drain({});
+  }
 });
 
 test("cancellation during worker cleanup wins the single terminal decision", async () => {
