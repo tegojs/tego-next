@@ -48,6 +48,9 @@ export const THREAD_EXECUTOR_MAX_RETAINED_ATTEMPTS = 256;
 export const THREAD_EXECUTOR_MAX_QUEUE = 256;
 export const THREAD_EXECUTOR_MAX_CONCURRENCY = 64;
 const THREAD_CHANNEL_MAX_PENDING = 64;
+const THREAD_CHANNEL_MAX_PENDING_BYTES = 4 * THREAD_EXECUTOR_MAX_MESSAGE_BYTES;
+const THREAD_CHANNEL_MAX_INBOUND = 64;
+const THREAD_CHANNEL_MAX_INBOUND_BYTES = 4 * THREAD_EXECUTOR_MAX_MESSAGE_BYTES;
 const MAX_CLOCK_SLEEP_MS = 2_147_483_647;
 
 const systemClock: Clock = {
@@ -260,7 +263,15 @@ function messageError(code: RuntimeDiagnostic["code"], message: string): Diagnos
   );
 }
 
-function validateThreadMessage(value: unknown, oversizedCode: RuntimeDiagnostic["code"]): void {
+interface ThreadMessageMetrics {
+  readonly bytes: number;
+  readonly nodes: number;
+}
+
+function validateThreadMessage(
+  value: unknown,
+  oversizedCode: RuntimeDiagnostic["code"],
+): ThreadMessageMetrics {
   const pending: Array<{ readonly value: unknown; readonly depth: number }> = [{ value, depth: 0 }];
   const seen = new Set<object>();
   let nodes = 0;
@@ -314,6 +325,7 @@ function validateThreadMessage(value: unknown, oversizedCode: RuntimeDiagnostic[
       throw messageError(oversizedCode, "Thread message exceeds the configured wire limit");
     }
   }
+  return { bytes, nodes };
 }
 
 class NodeThreadWorker implements ThreadWorker {
@@ -364,12 +376,53 @@ class ThreadChannel {
   readonly #pending = new Map<
     string,
     {
+      readonly bytes: number;
       readonly resolve: (value: unknown) => void;
       readonly reject: (error: Error) => void;
     }
   >();
   #nextId = 0;
+  #pendingBytes = 0;
+  #inbound = 0;
+  #inboundBytes = 0;
   #closedError: Error | undefined;
+  readonly #onMessage = (value: unknown): void => {
+    try {
+      const metrics = validateThreadMessage(value, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED");
+      const message = incoming(value);
+      const tracked = ["diagnostic", "event", "rpc-request"].includes(message.kind);
+      if (
+        tracked &&
+        (this.#inbound >= THREAD_CHANNEL_MAX_INBOUND ||
+          this.#inboundBytes + metrics.bytes > THREAD_CHANNEL_MAX_INBOUND_BYTES)
+      ) {
+        this.#fail(new Error("Thread channel inbound capacity is exhausted"));
+        this.#port.close();
+        return;
+      }
+      if (tracked) {
+        this.#inbound += 1;
+        this.#inboundBytes += metrics.bytes;
+      }
+      void this.#dispatch(message)
+        .catch((error: unknown) => {
+          this.#fail(error instanceof Error ? error : new Error(String(error)));
+        })
+        .finally(() => {
+          if (!tracked) return;
+          this.#inbound -= 1;
+          this.#inboundBytes -= metrics.bytes;
+        });
+    } catch (error) {
+      this.#fail(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
+  readonly #onMessageError = (): void => {
+    this.#fail(new Error("Worker thread message could not be deserialized"));
+  };
+  readonly #onClose = (): void => {
+    this.#fail(new Error("Worker thread broker port closed"));
+  };
 
   constructor(
     lease: WorkerLease,
@@ -386,24 +439,18 @@ class ThreadChannel {
     }
     const channel = new MessageChannel();
     this.#port = channel.port1;
-    this.#port.on("message", (value: unknown) => {
-      try {
-        validateThreadMessage(value, "EXECUTOR_OUTPUT_LIMIT_EXCEEDED");
-        void this.#dispatch(incoming(value)).catch((error: unknown) => {
-          this.#fail(error instanceof Error ? error : new Error(String(error)));
-        });
-      } catch (error) {
-        this.#fail(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    this.#port.on("messageerror", () => {
-      this.#fail(new Error("Worker thread message could not be deserialized"));
-    });
-    this.#port.on("close", () => {
-      this.#fail(new Error("Worker thread broker port closed"));
-    });
+    this.#port.on("message", this.#onMessage);
+    this.#port.on("messageerror", this.#onMessageError);
+    this.#port.on("close", this.#onClose);
     this.#port.start();
-    lease.worker.postMessage({ kind: "connect", port: channel.port2 }, [channel.port2]);
+    try {
+      lease.worker.postMessage({ kind: "connect", port: channel.port2 }, [channel.port2]);
+    } catch (error) {
+      this.#detach();
+      channel.port1.close();
+      channel.port2.close();
+      throw error;
+    }
     void lease.exited.then(({ code, error }) => {
       this.#fail(
         error ??
@@ -419,7 +466,14 @@ class ThreadChannel {
   }
 
   close(): void {
+    this.#detach();
     this.#port.close();
+  }
+
+  #detach(): void {
+    this.#port.off("message", this.#onMessage);
+    this.#port.off("messageerror", this.#onMessageError);
+    this.#port.off("close", this.#onClose);
   }
 
   request(
@@ -432,12 +486,23 @@ class ThreadChannel {
     }
     const id = `message-${++this.#nextId}`;
     const value = { ...message, id };
+    let metrics: ThreadMessageMetrics;
+    try {
+      metrics = validateThreadMessage(value, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (this.#pendingBytes + metrics.bytes > THREAD_CHANNEL_MAX_PENDING_BYTES) {
+      return Promise.reject(new Error("Thread channel pending byte capacity is exhausted"));
+    }
     return new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      this.#pending.set(id, { bytes: metrics.bytes, resolve, reject });
+      this.#pendingBytes += metrics.bytes;
       try {
         this.#send(value, transferList);
       } catch (error) {
         this.#pending.delete(id);
+        this.#pendingBytes -= metrics.bytes;
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -454,6 +519,7 @@ class ThreadChannel {
       const pending = this.#pending.get(message.id);
       if (pending === undefined) return;
       this.#pending.delete(message.id);
+      this.#pendingBytes -= pending.bytes;
       if (message.kind === "response-error") {
         pending.reject(
           executorError(
@@ -474,6 +540,7 @@ class ThreadChannel {
       return;
     }
     if (message.kind === "diagnostic") {
+      if (message.id === undefined) throw new Error("Thread diagnostic identity is missing");
       const level = message.level;
       if (level !== undefined && ["debug", "error", "info", "warn"].includes(level)) {
         try {
@@ -482,10 +549,22 @@ class ThreadChannel {
           // Diagnostic sinks cannot alter execution state.
         }
       }
+      this.#send({ kind: "ack", id: message.id, ok: true });
       return;
     }
     if (message.kind === "event" && message.type !== undefined && message.payload !== undefined) {
-      await this.#options.events?.emit(message.type, message.payload);
+      if (message.id === undefined) throw new Error("Thread event identity is missing");
+      try {
+        await this.#options.events?.emit(message.type, message.payload);
+        this.#send({ kind: "ack", id: message.id, ok: true });
+      } catch (error) {
+        this.#send({
+          kind: "ack",
+          id: message.id,
+          ok: false,
+          message: error instanceof Error ? error.message : "Thread event sink failed",
+        });
+      }
       return;
     }
     if (message.kind === "fatal") {
@@ -610,6 +689,7 @@ class ThreadChannel {
     this.#closedError = error;
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
+    this.#pendingBytes = 0;
   }
 }
 
@@ -687,12 +767,12 @@ export class ThreadExecutor implements Executor {
   async submit(input: ExecutionRequest | ThreadExecutionRequest): Promise<ExecutionHandle> {
     const wrapped = this.#isThreadExecutionRequest(input);
     const parsed = parseExecutionRequest(wrapped?.execution ?? input);
-    validateThreadMessage({ kind: "execution", request: parsed }, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
     const request = deepFreeze(parseExecutionRequest(cloneComponentHostValue(parsed)));
     const key = attemptKey(request.taskId, request.attemptId);
-    const transferFingerprint = wrapped === undefined ? "" : this.#transferFingerprint(wrapped);
-    const fingerprint = `${JSON.stringify(request)}:${transferFingerprint}`;
     const existing = this.#attempts.get(key);
+    const transferFingerprint =
+      wrapped === undefined ? "" : this.#transferFingerprint(wrapped, existing !== undefined);
+    const fingerprint = `${JSON.stringify(request)}:${transferFingerprint}`;
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
         throw executorError(
@@ -704,6 +784,7 @@ export class ThreadExecutor implements Executor {
       this.#touch(existing);
       return existing.handle;
     }
+    this.#validateRunEnvelope(request, wrapped?.transfer.buffers ?? []);
     if (!this.#accepting) {
       throw executorError(
         "EXECUTOR_DRAINING",
@@ -726,13 +807,14 @@ export class ThreadExecutor implements Executor {
         this.#clock.now(),
       );
     }
-    const transfer =
-      wrapped === undefined
-        ? undefined
-        : {
-            buffers: this.#claimTransfer(wrapped.transfer),
-            fingerprint: transferFingerprint,
-          };
+    let transfer: ClaimedTransfer | undefined;
+    if (wrapped !== undefined) {
+      const buffers = this.#claimTransfer(wrapped.transfer);
+      if (wrapped.transfer.ownership === "transfer") {
+        threadTransferFingerprints.set(wrapped, transferFingerprint);
+      }
+      transfer = { buffers, fingerprint: transferFingerprint };
+    }
     const result = Promise.withResolvers<ExecutionResult>();
     const entry: AttemptEntry = {
       key,
@@ -966,7 +1048,12 @@ export class ThreadExecutor implements Executor {
         completedAt: this.#clock.now().toISOString(),
       };
       await this.#shutdownWorker(channel, lease, component.artifactDigest, controlDeadline);
-      this.#settle(entry, executionResult);
+      this.#settle(
+        entry,
+        entry.cancellation === undefined
+          ? executionResult
+          : this.#cancelledResult(entry, entry.cancellation),
+      );
     } catch (error) {
       if (entry.state !== "terminal") {
         const code =
@@ -1221,7 +1308,10 @@ export class ThreadExecutor implements Executor {
       taskId: entry.request.taskId,
       attemptId: entry.request.attemptId,
       status,
-      executor: { kind: "thread", metadata: { executorId: this.id } },
+      executor: {
+        kind: "thread",
+        metadata: { executorId: this.id, securityIsolation: false },
+      },
       startedAt: now,
       completedAt: now,
     };
@@ -1329,7 +1419,10 @@ export class ThreadExecutor implements Executor {
         attemptId: entry.request.attemptId,
         status: "failed",
         diagnostic: failure,
-        executor: { kind: "thread", metadata: { executorId: this.id } },
+        executor: {
+          kind: "thread",
+          metadata: { executorId: this.id, securityIsolation: false },
+        },
         startedAt: now,
         completedAt: now,
       });
@@ -1361,10 +1454,12 @@ export class ThreadExecutor implements Executor {
       : undefined;
   }
 
-  #transferFingerprint(request: ThreadExecutionRequest): string {
-    const cached = threadTransferFingerprints.get(request);
-    if (cached !== undefined) return cached;
+  #transferFingerprint(request: ThreadExecutionRequest, allowCached: boolean): string {
     const { transfer } = request;
+    if (allowCached && transfer.ownership === "transfer") {
+      const cached = threadTransferFingerprints.get(request);
+      if (cached !== undefined) return cached;
+    }
     if (transfer.ownership !== "clone" && transfer.ownership !== "transfer") {
       throw executorError(
         "EXECUTOR_THREAD_TRANSFER_INVALID",
@@ -1400,11 +1495,38 @@ export class ThreadExecutor implements Executor {
       }
     }
     const hash = createHash("sha256");
-    hash.update(transfer.ownership);
-    for (const buffer of transfer.buffers) hash.update(new Uint8Array(buffer));
-    const fingerprint = hash.digest("hex");
-    threadTransferFingerprints.set(request, fingerprint);
-    return fingerprint;
+    hash.update(`${transfer.ownership}\0`);
+    const count = Buffer.allocUnsafe(4);
+    count.writeUInt32BE(transfer.buffers.length);
+    hash.update(count);
+    for (const buffer of transfer.buffers) {
+      const length = Buffer.allocUnsafe(4);
+      length.writeUInt32BE(buffer.byteLength);
+      hash.update(length);
+      hash.update(new Uint8Array(buffer));
+    }
+    return hash.digest("hex");
+  }
+
+  #validateRunEnvelope(request: ExecutionRequest, attachments: readonly ArrayBuffer[]): void {
+    validateThreadMessage(
+      {
+        kind: "command",
+        id: "message-99999999999999999999",
+        command: {
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: "run",
+          deadline: request.deadline,
+          type: "run",
+          payload: {
+            artifactDigest: `sha256:${"0".repeat(64)}`,
+            execution: request,
+          },
+        },
+        ...(attachments.length === 0 ? {} : { attachments }),
+      },
+      "EXECUTOR_INPUT_LIMIT_EXCEEDED",
+    );
   }
 
   #claimTransfer(transfer: ThreadTransferOptions): readonly ArrayBuffer[] {

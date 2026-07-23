@@ -39,24 +39,36 @@ interface RpcResponseMessage {
   readonly message?: string;
 }
 
-type ParentMessage = BootstrapMessage | CommandMessage | RpcResponseMessage;
+interface AckMessage {
+  readonly kind: "ack";
+  readonly id: string;
+  readonly ok: boolean;
+  readonly message?: string;
+}
 
-const MAX_RPC_INFLIGHT = 64;
+type ParentMessage = AckMessage | BootstrapMessage | CommandMessage | RpcResponseMessage;
+
+const MAX_OUTBOUND_PENDING = 64;
+const MAX_OUTBOUND_PENDING_BYTES = 4 * 1024 * 1024;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const MAX_MESSAGE_DEPTH = 64;
 const MAX_MESSAGE_NODES = 100_000;
 let host: ComponentHost | undefined;
 let broker: MessagePort | undefined;
+let brokerClose: (() => void) | undefined;
+let brokerSend: ((value: Record<string, unknown>) => void) | undefined;
 let nextRpcId = 0;
-const pendingRpc = new Map<
+let pendingOutboundBytes = 0;
+const pendingOutbound = new Map<
   string,
   {
+    readonly bytes: number;
     readonly resolve: (value: JsonValue | undefined) => void;
     readonly reject: (error: Error) => void;
   }
 >();
 
-function validateMessage(value: unknown): void {
+function validateMessage(value: unknown): number {
   const pending: Array<{ readonly value: unknown; readonly depth: number }> = [{ value, depth: 0 }];
   const ancestors = new Set<object>();
   let nodes = 0;
@@ -87,12 +99,13 @@ function validateMessage(value: unknown): void {
       throw new Error("Thread message exceeds the configured wire limit");
     }
   }
+  return bytes;
 }
 
 function send(value: Record<string, unknown>): void {
-  if (broker === undefined) throw new Error("Thread broker is unavailable");
+  if (brokerSend === undefined) throw new Error("Thread broker is unavailable");
   validateMessage(value);
-  broker.postMessage(value);
+  brokerSend(value);
 }
 
 function respond(id: string, result: unknown): void {
@@ -164,23 +177,74 @@ function parentMessage(input: unknown): ParentMessage {
       ...(typeof value.message === "string" ? { message: value.message } : {}),
     };
   }
+  if (value.kind === "ack") {
+    return {
+      kind: "ack",
+      id: value.id,
+      ok: value.ok === true,
+      ...(typeof value.message === "string" ? { message: value.message } : {}),
+    };
+  }
   throw new Error("Thread message kind is invalid");
 }
 
-function rpc(type: "capability" | "secret", payload: JsonValue): Promise<JsonValue | undefined> {
-  if (pendingRpc.size >= MAX_RPC_INFLIGHT) {
-    return Promise.reject(new Error("Parent RPC capacity is exhausted"));
+function requestParent(
+  message: Record<string, unknown>,
+  overflow: "close" | "drop" = "close",
+): Promise<JsonValue | undefined> {
+  const id = `outbound-${++nextRpcId}`;
+  const value = { ...message, id };
+  let bytes: number;
+  try {
+    bytes = validateMessage(value);
+  } catch (error) {
+    return Promise.reject(error);
   }
-  const id = `rpc-${++nextRpcId}`;
+  if (
+    pendingOutbound.size >= MAX_OUTBOUND_PENDING ||
+    pendingOutboundBytes + bytes > MAX_OUTBOUND_PENDING_BYTES
+  ) {
+    if (overflow === "drop") return Promise.resolve(undefined);
+    brokerClose?.();
+    return Promise.reject(new Error("Parent broker pending capacity is exhausted"));
+  }
   return new Promise<JsonValue | undefined>((resolve, reject) => {
-    pendingRpc.set(id, { resolve, reject });
+    pendingOutbound.set(id, { bytes, resolve, reject });
+    pendingOutboundBytes += bytes;
     try {
-      send({ kind: "rpc-request", id, type, payload });
+      send(value);
     } catch (error) {
-      pendingRpc.delete(id);
+      pendingOutbound.delete(id);
+      pendingOutboundBytes -= bytes;
       reject(error instanceof Error ? error : new Error(String(error)));
     }
   });
+}
+
+function rpc(type: "capability" | "secret", payload: JsonValue): Promise<JsonValue | undefined> {
+  return requestParent({ kind: "rpc-request", type, payload });
+}
+
+function diagnosticMessage(level: string, values: readonly unknown[]): void {
+  void requestParent({ kind: "diagnostic", level, values }, "drop").catch(() => undefined);
+}
+
+function settleOutbound(message: AckMessage | RpcResponseMessage): void {
+  const pending = pendingOutbound.get(message.id);
+  if (pending === undefined) return;
+  pendingOutbound.delete(message.id);
+  pendingOutboundBytes -= pending.bytes;
+  if (message.ok) {
+    pending.resolve(message.kind === "rpc-response" ? message.value : undefined);
+  } else {
+    pending.reject(new Error(message.message ?? "Parent broker request failed"));
+  }
+}
+
+function rejectOutbound(error: Error): void {
+  for (const pending of pendingOutbound.values()) pending.reject(error);
+  pendingOutbound.clear();
+  pendingOutboundBytes = 0;
 }
 
 function permissionBoundary(): ComponentPermissionBoundary {
@@ -351,50 +415,22 @@ async function bootstrap(message: BootstrapMessage): Promise<void> {
     secretProvider,
     clock,
     logger: {
-      debug: (...values) => {
-        try {
-          send({ kind: "diagnostic", level: "debug", values });
-        } catch {
-          // Diagnostics cannot affect component execution.
-        }
-      },
-      error: (...values) => {
-        try {
-          send({ kind: "diagnostic", level: "error", values });
-        } catch {
-          // Diagnostics cannot affect component execution.
-        }
-      },
-      info: (...values) => {
-        try {
-          send({ kind: "diagnostic", level: "info", values });
-        } catch {
-          // Diagnostics cannot affect component execution.
-        }
-      },
-      warn: (...values) => {
-        try {
-          send({ kind: "diagnostic", level: "warn", values });
-        } catch {
-          // Diagnostics cannot affect component execution.
-        }
-      },
+      debug: (...values) => diagnosticMessage("debug", values),
+      error: (...values) => diagnosticMessage("error", values),
+      info: (...values) => diagnosticMessage("info", values),
+      warn: (...values) => diagnosticMessage("warn", values),
     },
     events: {
       emit: async (type, payload) => {
-        send({ kind: "event", type, payload });
+        await requestParent({ kind: "event", type, payload });
       },
     },
   });
 }
 
 async function handle(message: ParentMessage): Promise<void> {
-  if (message.kind === "rpc-response") {
-    const pending = pendingRpc.get(message.id);
-    if (pending === undefined) return;
-    pendingRpc.delete(message.id);
-    if (message.ok) pending.resolve(message.value);
-    else pending.reject(new Error(message.message ?? "Parent RPC failed"));
+  if (message.kind === "ack" || message.kind === "rpc-response") {
+    settleOutbound(message);
     return;
   }
   if (message.kind === "bootstrap") {
@@ -427,7 +463,13 @@ function connect(value: unknown): void {
   }
   if (broker !== undefined) throw new Error("Thread broker is already connected");
   broker = message.port;
-  broker.on("message", (input: unknown) => {
+  const postMessage = broker.postMessage.bind(broker);
+  const close = broker.close.bind(broker);
+  const on = broker.on.bind(broker);
+  const start = broker.start.bind(broker);
+  brokerSend = (outbound) => postMessage(outbound);
+  brokerClose = close;
+  on("message", (input: unknown) => {
     let message_: ParentMessage;
     try {
       validateMessage(input);
@@ -447,13 +489,10 @@ function connect(value: unknown): void {
       });
     });
   });
-  broker.on("close", () => {
-    for (const pending of pendingRpc.values()) {
-      pending.reject(new Error("Parent thread channel closed"));
-    }
-    pendingRpc.clear();
+  on("close", () => {
+    rejectOutbound(new Error("Parent thread channel closed"));
   });
-  broker.start();
+  start();
 }
 
 if (parentPort === null) throw new Error("Thread entry requires a parent port");

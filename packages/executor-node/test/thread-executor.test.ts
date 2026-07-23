@@ -545,9 +545,8 @@ test("unawaited event floods are backpressured and cannot exhaust the parent", a
     }),
   );
   try {
-    const result = await (
-      await executor.submit(request({ mode: "flood-events" }, "flood-events"))
-    ).result;
+    const result = await (await executor.submit(request({ mode: "flood-events" }, "flood-events")))
+      .result;
     assert.equal(result.status, "failed");
     assert.ok(eventCalls <= 64, `event sink received ${eventCalls} unbounded calls`);
     assert.equal(factory.active, 0);
@@ -608,10 +607,7 @@ test("the exact run envelope is bounded before transferable ownership moves", as
     await assert.rejects(
       executor.submit(
         threadExecutionRequest(
-          request(
-            { mode: "echo", value: "x".repeat(700_000) },
-            "combined-transfer-limit",
-          ),
+          request({ mode: "echo", value: "x".repeat(700_000) }, "combined-transfer-limit"),
           { buffers: [buffer], ownership: "transfer" },
         ),
       ),
@@ -647,10 +643,7 @@ test("clone fingerprints are recomputed after caller buffer mutation", async () 
 test("transfer fingerprints frame attachment count and individual lengths", async () => {
   const factory = new TrackingWorkerFactory();
   const executor = new ThreadExecutor(await options(factory));
-  const execution = request(
-    { mode: "echo", value: "fingerprint-framing" },
-    "fingerprint-framing",
-  );
+  const execution = request({ mode: "echo", value: "fingerprint-framing" }, "fingerprint-framing");
   try {
     await executor.submit(
       threadExecutionRequest(execution, {
