@@ -584,6 +584,38 @@ export function stateStoreConformance(
       });
     });
 
+    test("outbox claims preserve journal enqueue order instead of message-id order", async () => {
+      await withStore(factory, async (store) => {
+        const createdAt = new Date().toISOString();
+        for (const [messageId, operationId] of [
+          ["z-first", "operation-first"],
+          ["a-second", "operation-second"],
+        ] as const) {
+          await store.transact({}, async (transaction) => {
+            await transaction.enqueueOutbox({
+              availableAt: createdAt,
+              createdAt,
+              messageId: parseMessageId(messageId),
+              operationId: parseOperationId(operationId),
+              payload: { messageId },
+              topic: "component.lifecycle",
+            });
+            return null;
+          });
+        }
+
+        const claims = await store.claimOutbox({
+          leaseDurationMs: 30_000,
+          limit: 2,
+          owner: "ordered-owner",
+        });
+        assert.deepEqual(
+          claims.map((claim) => claim.message.messageId),
+          [parseMessageId("z-first"), parseMessageId("a-second")],
+        );
+      });
+    });
+
     test("@spec:runtime-operations/reusable-conformance-test-kits/close-cleanup", async () => {
       const store = await factory();
       await store.open();

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseComponentId,
   parseFencingEpoch,
   parseGeneration,
@@ -732,6 +733,116 @@ test("Reconciler gates artifact, capabilities, permissions, placement, and execu
   await reconciler.stop();
 });
 
+test("an unready capability consumer does not block its provider from bootstrapping", async () => {
+  const providerId = parsePluginId("a-provider");
+  const consumerId = parsePluginId("z-consumer");
+  const capability = parseCapabilityName("org.example.echo");
+  const providerDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const component = (id: string) => ({
+    componentId: parseComponentId(id),
+    kind: "service" as const,
+    entrypoint: `components/${id}.js`,
+    executors: ["process" as const],
+  });
+  const providerManifest: PluginManifest = {
+    ...manifest("1.0.0", providerDigest),
+    pluginId: providerId,
+    components: [component("provider")],
+    capabilities: {
+      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      requires: [],
+    },
+  };
+  const consumerManifest: PluginManifest = {
+    ...manifest("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    components: [component("consumer")],
+    capabilities: {
+      provides: [],
+      requires: [{ name: capability, protocolRange: "^1.0.0" }],
+    },
+  };
+  const deployments = [
+    deployment("1", { pluginId: providerId, artifactDigest: providerDigest }),
+    deployment("1", { pluginId: consumerId, artifactDigest: consumerDigest }),
+  ];
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerDigest),
+      pluginId: providerId,
+      manifest: providerManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map([
+    [providerDigest, { ...gate().artifact, digest: providerDigest, manifest: providerManifest }],
+    [consumerDigest, { ...gate().artifact, digest: consumerDigest, manifest: consumerManifest }],
+  ]);
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate(request) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => installations,
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    effects.performed.map((effect) => effect.pluginId),
+    [providerId],
+  );
+  assert.equal(reconciler.diagnostics()[0]?.code, "CAPABILITY_REQUIRED_UNAVAILABLE");
+  await reconciler.stop();
+});
+
+test("malformed lifecycle outbox payloads are diagnosed without invoking effects", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: parseMessageId("malformed-lifecycle-message"),
+      operationId: parseOperationId("malformed-lifecycle-operation"),
+      payload: { malformed: true },
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [],
+    loadInstallations: async () => [],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.diagnostics()[0]?.code, "PROTOCOL_MESSAGE_INVALID");
+  await reconciler.stop();
+});
+
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();
@@ -887,6 +998,13 @@ test("component start failure records failure and only essential deployment read
 
     assert.equal(reconciler.kernelRunning, true);
     assert.equal(reconciler.applicationReady(), !essential);
+    const observation = [...state.records.values()].find(
+      (entry) => entry.key.collection === "deployment-observations",
+    );
+    assert.equal(
+      (observation?.value as { readonly status?: string } | undefined)?.status,
+      "failed",
+    );
     assert.equal(
       reconciler
         .diagnostics()
@@ -902,6 +1020,33 @@ test("component start failure records failure and only essential deployment read
     );
     await reconciler.stop();
   }
+});
+
+test("deployment observations progress from converging to ready", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  const status = () =>
+    (
+      [...state.records.values()].find(
+        (entry) => entry.key.collection === "deployment-observations",
+      )?.value as { readonly status?: string } | undefined
+    )?.status;
+  assert.equal(status(), "converging");
+
+  await reconciler.wake();
+  assert.equal(status(), "ready");
+  await reconciler.stop();
 });
 
 test("failed effect conditional commits reread after a revision conflict", async () => {
