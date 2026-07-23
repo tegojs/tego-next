@@ -1,4 +1,5 @@
 import type { MessageId, Sequence, SessionId } from "./identity.js";
+import type { JsonObject, JsonValue } from "./json.js";
 
 export type WorkerProtocolVersion = "1.0";
 export type WorkerMessageType =
@@ -13,7 +14,7 @@ export type WorkerMessageType =
   | "task.result"
   | "worker.register";
 
-export interface WorkerEnvelope<T = unknown> {
+export interface WorkerEnvelope<T extends JsonValue = JsonValue> extends JsonObject {
   readonly protocol: WorkerProtocolVersion;
   readonly messageId: MessageId;
   readonly sessionId: SessionId;

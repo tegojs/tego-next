@@ -1,18 +1,20 @@
 import Ajv2020Module, { type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
 import addFormatsModule from "ajv-formats";
-
+import type { CapabilityBinding, CapabilityDefinition, CapabilityIdentity } from "./capability.js";
 import {
   type DiagnosticCode,
   DiagnosticError,
   type DiagnosticSource,
+  type RuntimeDiagnostic,
   runtimeDiagnostic,
 } from "./diagnostic.js";
-import type { ExecutionRequest } from "./execution.js";
+import type { ExecutionRequest, ExecutionResult } from "./execution.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
-import type { PluginManifest } from "./plugin.js";
+import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
+import type { RuntimeConfiguration } from "./runtime.js";
 import type { WorkerEnvelope } from "./worker.js";
 
-export type JsonSchema = boolean | Readonly<Record<string, unknown>>;
+export type JsonSchema = boolean | JsonObject;
 
 export interface SchemaIssue {
   readonly instancePath: string;
@@ -26,9 +28,95 @@ const IDENTITY_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 const DECIMAL_PATTERN = "^(?:0|[1-9]\\d*)$";
 const SEMVER_PATTERN =
   "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$";
+const DIAGNOSTIC_CODE_PATTERN =
+  "^(?:BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_.+$";
+const JSON_VALUE_SCHEMA_ID = "https://tegojs.dev/schemas/json-value.json";
+const DIAGNOSTIC_SCHEMA_ID = "https://tegojs.dev/schemas/runtime-diagnostic-1.0.json";
+const PLUGIN_MANIFEST_SCHEMA_ID = "https://tegojs.dev/schemas/plugin-manifest-1.0.json";
+const CAPABILITY_IDENTITY_SCHEMA_ID = "https://tegojs.dev/schemas/capability-identity-1.0.json";
+
+function isJsonValue(input: unknown, ancestors = new Set<object>()): boolean {
+  if (
+    input === null ||
+    typeof input === "string" ||
+    typeof input === "boolean" ||
+    (typeof input === "number" && Number.isFinite(input))
+  ) {
+    return true;
+  }
+  if (typeof input !== "object" || ancestors.has(input)) {
+    return false;
+  }
+
+  ancestors.add(input);
+  try {
+    if (Array.isArray(input)) {
+      for (let index = 0; index < input.length; index += 1) {
+        if (!Object.hasOwn(input, index) || !isJsonValue(input[index], ancestors)) {
+          return false;
+        }
+      }
+      return Reflect.ownKeys(input).every(
+        (key) =>
+          key === "length" ||
+          (typeof key === "string" && /^(?:0|[1-9]\d*)$/u.test(key) && Number(key) < input.length),
+      );
+    }
+
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return false;
+    }
+    for (const key of Reflect.ownKeys(input)) {
+      if (typeof key !== "string") {
+        return false;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor) ||
+        !isJsonValue(descriptor.value, ancestors)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  } finally {
+    ancestors.delete(input);
+  }
+}
+
+const jsonValueSchema = {
+  $id: JSON_VALUE_SCHEMA_ID,
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  tegoJsonValue: true,
+  $ref: "#/$defs/value",
+  $defs: {
+    value: {
+      anyOf: [
+        { type: "null" },
+        { type: "boolean" },
+        { type: "number" },
+        { type: "string" },
+        { type: "array", items: { $ref: "#/$defs/value" } },
+        {
+          type: "object",
+          additionalProperties: { $ref: "#/$defs/value" },
+        },
+      ],
+    },
+  },
+} as const;
+
+const jsonObjectSchema = {
+  type: "object",
+  tegoJsonValue: true,
+  additionalProperties: { $ref: JSON_VALUE_SCHEMA_ID },
+} as const;
 
 const pluginManifestSchema = {
-  $id: "https://tegojs.dev/schemas/plugin-manifest-1.0.json",
+  $id: PLUGIN_MANIFEST_SCHEMA_ID,
   $schema: "https://json-schema.org/draft/2020-12/schema",
   type: "object",
   additionalProperties: false,
@@ -116,10 +204,182 @@ const pluginManifestSchema = {
         },
       },
     },
-    metadata: { type: "object" },
+    metadata: jsonObjectSchema,
   },
   $defs: {
     identity: { type: "string", pattern: IDENTITY_PATTERN },
+  },
+} as const;
+
+const runtimeConfigurationSchema = {
+  $id: "https://tegojs.dev/schemas/runtime-configuration-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["mode", "runtimeId", "applicationId", "nodeId"],
+  properties: {
+    mode: { enum: ["multi-main", "single-main"] },
+    runtimeId: { $ref: "#/$defs/identity" },
+    applicationId: { $ref: "#/$defs/identity" },
+    nodeId: { $ref: "#/$defs/identity" },
+  },
+  $defs: {
+    identity: { type: "string", pattern: IDENTITY_PATTERN },
+  },
+} as const;
+
+const runtimeDiagnosticSchema = {
+  $id: DIAGNOSTIC_SCHEMA_ID,
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["code", "severity", "message", "source", "retryable", "observedAt"],
+  properties: {
+    code: { type: "string", pattern: DIAGNOSTIC_CODE_PATTERN },
+    severity: { enum: ["error", "info", "warning"] },
+    message: { type: "string", minLength: 1 },
+    source: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind"],
+      properties: {
+        kind: {
+          enum: [
+            "artifact",
+            "capability",
+            "coordination",
+            "deployment",
+            "executor",
+            "plugin",
+            "protocol",
+            "runtime",
+            "schema",
+            "state",
+            "worker",
+          ],
+        },
+        id: { type: "string", minLength: 1 },
+      },
+    },
+    retryable: { type: "boolean" },
+    details: { $ref: JSON_VALUE_SCHEMA_ID },
+    cause: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "message"],
+      properties: {
+        name: { type: "string", minLength: 1 },
+        message: { type: "string" },
+        code: { type: "string", minLength: 1 },
+        stack: { type: "string" },
+      },
+    },
+    observedAt: { type: "string", format: "date-time" },
+  },
+} as const;
+
+const pluginInstallationSchema = {
+  $id: "https://tegojs.dev/schemas/plugin-installation-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["pluginId", "version", "digest", "manifest", "installedAt"],
+  properties: {
+    pluginId: { type: "string", pattern: IDENTITY_PATTERN },
+    version: { type: "string", pattern: SEMVER_PATTERN },
+    digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    manifest: { $ref: PLUGIN_MANIFEST_SCHEMA_ID },
+    installedAt: { type: "string", format: "date-time" },
+    signature: {
+      type: "object",
+      additionalProperties: false,
+      required: ["algorithm", "keyId", "verified"],
+      properties: {
+        algorithm: { const: "Ed25519" },
+        keyId: { type: "string", pattern: IDENTITY_PATTERN },
+        verified: { type: "boolean" },
+      },
+    },
+  },
+} as const;
+
+const pluginDeploymentSchema = {
+  $id: "https://tegojs.dev/schemas/plugin-deployment-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "applicationId",
+    "pluginId",
+    "version",
+    "artifactDigest",
+    "generation",
+    "state",
+    "essential",
+    "configuration",
+    "permissionGrants",
+    "capabilityBindings",
+  ],
+  properties: {
+    applicationId: { type: "string", pattern: IDENTITY_PATTERN },
+    pluginId: { type: "string", pattern: IDENTITY_PATTERN },
+    version: { type: "string", pattern: SEMVER_PATTERN },
+    artifactDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    generation: { type: "string", pattern: DECIMAL_PATTERN },
+    state: { enum: ["active", "disabled"] },
+    essential: { type: "boolean" },
+    configuration: { $ref: JSON_VALUE_SCHEMA_ID },
+    permissionGrants: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", minLength: 1 },
+    },
+    capabilityBindings: {
+      type: "object",
+      tegoJsonValue: true,
+      additionalProperties: { type: "string", pattern: IDENTITY_PATTERN },
+    },
+  },
+} as const;
+
+const capabilityIdentitySchema = {
+  $id: CAPABILITY_IDENTITY_SCHEMA_ID,
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["name", "protocolVersion"],
+  properties: {
+    name: { type: "string", pattern: IDENTITY_PATTERN },
+    protocolVersion: { type: "string", minLength: 1 },
+  },
+} as const;
+
+const capabilityDefinitionSchema = {
+  $id: "https://tegojs.dev/schemas/capability-definition-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["identity", "requestSchema", "responseSchema"],
+  properties: {
+    identity: { $ref: CAPABILITY_IDENTITY_SCHEMA_ID },
+    requestSchema: {
+      anyOf: [{ type: "boolean" }, jsonObjectSchema],
+    },
+    responseSchema: {
+      anyOf: [{ type: "boolean" }, jsonObjectSchema],
+    },
+  },
+} as const;
+
+const capabilityBindingSchema = {
+  $id: "https://tegojs.dev/schemas/capability-binding-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["capability", "providerPluginId"],
+  properties: {
+    capability: { $ref: CAPABILITY_IDENTITY_SCHEMA_ID },
+    providerPluginId: { type: "string", pattern: IDENTITY_PATTERN },
   },
 } as const;
 
@@ -144,12 +404,41 @@ const executionRequestSchema = {
     applicationId: { $ref: "#/$defs/identity" },
     pluginId: { $ref: "#/$defs/identity" },
     componentId: { $ref: "#/$defs/identity" },
-    input: true,
+    input: { $ref: JSON_VALUE_SCHEMA_ID },
     deadline: { type: "string", format: "date-time" },
     orphanPolicy: { enum: ["cancel", "finish-and-buffer", "finish-and-persist"] },
   },
   $defs: {
     identity: { type: "string", pattern: IDENTITY_PATTERN },
+  },
+} as const;
+
+const executionResultSchema = {
+  $id: "https://tegojs.dev/schemas/execution-result-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["taskId", "attemptId", "status", "executor", "startedAt", "completedAt"],
+  properties: {
+    taskId: { type: "string", pattern: IDENTITY_PATTERN },
+    attemptId: { type: "string", pattern: IDENTITY_PATTERN },
+    status: {
+      enum: ["cancelled", "failed", "rejected", "succeeded", "timed-out"],
+    },
+    output: { $ref: JSON_VALUE_SCHEMA_ID },
+    diagnostic: { $ref: DIAGNOSTIC_SCHEMA_ID },
+    executor: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind"],
+      properties: {
+        kind: { enum: ["process", "remote", "thread"] },
+        workerId: { type: "string", pattern: IDENTITY_PATTERN },
+        metadata: jsonObjectSchema,
+      },
+    },
+    startedAt: { type: "string", format: "date-time" },
+    completedAt: { type: "string", format: "date-time" },
   },
 } as const;
 
@@ -180,7 +469,7 @@ const workerEnvelopeSchema = {
       ],
     },
     sentAt: { type: "string", format: "date-time" },
-    payload: true,
+    payload: { $ref: JSON_VALUE_SCHEMA_ID },
   },
   $defs: {
     identity: { type: "string", pattern: IDENTITY_PATTERN },
@@ -193,11 +482,26 @@ const ajv = new Ajv2020Module.default({
   validateFormats: true,
 });
 addFormatsModule.default(ajv);
+ajv.addKeyword({
+  keyword: "tegoJsonValue",
+  schemaType: "boolean",
+  errors: false,
+  validate: (enabled: boolean, data: unknown) => !enabled || isJsonValue(data),
+});
 
+ajv.compile(jsonValueSchema);
+const validateRuntimeConfiguration = ajv.compile(runtimeConfigurationSchema);
+const validateRuntimeDiagnostic = ajv.compile(runtimeDiagnosticSchema);
 const validatePluginManifest = ajv.compile(pluginManifestSchema);
+const validatePluginInstallation = ajv.compile(pluginInstallationSchema);
+const validatePluginDeployment = ajv.compile(pluginDeploymentSchema);
+const validateCapabilityIdentity = ajv.compile(capabilityIdentitySchema);
+const validateCapabilityDefinition = ajv.compile(capabilityDefinitionSchema);
+const validateCapabilityBinding = ajv.compile(capabilityBindingSchema);
 const validateExecutionRequest = ajv.compile(executionRequestSchema);
+const validateExecutionResult = ajv.compile(executionResultSchema);
 const validateWorkerEnvelope = ajv.compile(workerEnvelopeSchema);
-const schemaCache = new WeakMap<Readonly<Record<string, unknown>>, ValidateFunction>();
+const schemaCache = new WeakMap<JsonObject, ValidateFunction>();
 
 function issueFromAjv(error: ErrorObject): SchemaIssue {
   return {
@@ -271,6 +575,26 @@ function compatibilityError(code: DiagnosticCode, message: string): DiagnosticEr
   );
 }
 
+export function parseRuntimeConfiguration(input: unknown): RuntimeConfiguration {
+  return parseWithValidator(
+    validateRuntimeConfiguration,
+    input,
+    "BOOTSTRAP_CONFIGURATION_INVALID",
+    "Runtime configuration is invalid",
+    { kind: "runtime", id: "configuration" },
+  );
+}
+
+export function parseRuntimeDiagnostic(input: unknown): RuntimeDiagnostic {
+  return parseWithValidator(
+    validateRuntimeDiagnostic,
+    input,
+    "PROTOCOL_DIAGNOSTIC_INVALID",
+    "Runtime diagnostic is invalid",
+    { kind: "protocol", id: "diagnostic" },
+  );
+}
+
 export function parsePluginManifest(input: unknown): PluginManifest {
   const moduleFormat = field(input, "moduleFormat");
   if (moduleFormat !== undefined && moduleFormat !== "esm") {
@@ -295,6 +619,56 @@ export function parsePluginManifest(input: unknown): PluginManifest {
   );
 }
 
+export function parsePluginInstallation(input: unknown): PluginInstallation {
+  return parseWithValidator(
+    validatePluginInstallation,
+    input,
+    "ARTIFACT_INSTALLATION_INVALID",
+    "Plugin installation is invalid",
+    { kind: "artifact", id: "installation" },
+  );
+}
+
+export function parsePluginDeployment(input: unknown): PluginDeployment {
+  return parseWithValidator(
+    validatePluginDeployment,
+    input,
+    "DEPLOYMENT_RECORD_INVALID",
+    "Plugin deployment is invalid",
+    { kind: "deployment", id: "desired-state" },
+  );
+}
+
+export function parseCapabilityIdentity(input: unknown): CapabilityIdentity {
+  return parseWithValidator(
+    validateCapabilityIdentity,
+    input,
+    "CAPABILITY_IDENTITY_INVALID",
+    "Capability identity is invalid",
+    { kind: "capability", id: "identity" },
+  );
+}
+
+export function parseCapabilityDefinition(input: unknown): CapabilityDefinition {
+  return parseWithValidator(
+    validateCapabilityDefinition,
+    input,
+    "CAPABILITY_DEFINITION_INVALID",
+    "Capability definition is invalid",
+    { kind: "capability", id: "definition" },
+  );
+}
+
+export function parseCapabilityBinding(input: unknown): CapabilityBinding {
+  return parseWithValidator(
+    validateCapabilityBinding,
+    input,
+    "CAPABILITY_BINDING_INVALID",
+    "Capability binding is invalid",
+    { kind: "capability", id: "binding" },
+  );
+}
+
 export function parseExecutionRequest(input: unknown): ExecutionRequest {
   return parseWithValidator(
     validateExecutionRequest,
@@ -305,7 +679,19 @@ export function parseExecutionRequest(input: unknown): ExecutionRequest {
   );
 }
 
-export function parseWorkerEnvelope<T = JsonValue>(input: unknown): WorkerEnvelope<T> {
+export function parseExecutionResult(input: unknown): ExecutionResult {
+  return parseWithValidator(
+    validateExecutionResult,
+    input,
+    "EXECUTOR_RESULT_INVALID",
+    "Execution result is invalid",
+    { kind: "executor", id: "result" },
+  );
+}
+
+export function parseWorkerEnvelope<T extends JsonValue = JsonValue>(
+  input: unknown,
+): WorkerEnvelope<T> {
   const protocol = field(input, "protocol");
   if (protocol !== undefined && protocol !== "1.0") {
     throw new DiagnosticError(

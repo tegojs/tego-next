@@ -1,8 +1,8 @@
 import { DiagnosticError, runtimeDiagnostic } from "./diagnostic.js";
 
 export type JsonPrimitive = boolean | null | number | string;
-export type JsonArray = JsonValue[];
-export type JsonObject = { [key: string]: JsonValue };
+export type JsonArray = readonly JsonValue[];
+export type JsonObject = { readonly [key: string]: JsonValue };
 export type JsonValue = JsonArray | JsonObject | JsonPrimitive;
 
 function wireValueError(path: string, value: unknown, reason: string): DiagnosticError {
@@ -64,7 +64,12 @@ function serialize(value: unknown, path: string, ancestors: Set<object>): JsonVa
 
     const result: JsonObject = {};
     for (const key of Object.keys(value).sort()) {
-      result[key] = serialize((value as Record<string, unknown>)[key], `${path}/${key}`, ancestors);
+      Object.defineProperty(result, key, {
+        configurable: true,
+        enumerable: true,
+        value: serialize((value as Record<string, unknown>)[key], `${path}/${key}`, ancestors),
+        writable: true,
+      });
     }
     return result;
   } finally {

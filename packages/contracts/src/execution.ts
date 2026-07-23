@@ -11,7 +11,7 @@ import type { JsonObject, JsonValue } from "./json.js";
 
 export type OrphanPolicy = "cancel" | "finish-and-buffer" | "finish-and-persist";
 
-export interface ExecutionRequest {
+export interface ExecutionRequest extends JsonObject {
   readonly taskId: TaskId;
   readonly attemptId: AttemptId;
   readonly applicationId: ApplicationId;
@@ -29,17 +29,19 @@ export type ExecutionTerminalStatus =
   | "succeeded"
   | "timed-out";
 
-export interface ExecutionResult {
+export interface ExecutionExecutor extends JsonObject {
+  readonly kind: "process" | "remote" | "thread";
+  readonly workerId?: WorkerId;
+  readonly metadata?: JsonObject;
+}
+
+export interface ExecutionResult extends JsonObject {
   readonly taskId: TaskId;
   readonly attemptId: AttemptId;
   readonly status: ExecutionTerminalStatus;
   readonly output?: JsonValue;
   readonly diagnostic?: RuntimeDiagnostic;
-  readonly executor: {
-    readonly kind: "process" | "remote" | "thread";
-    readonly workerId?: WorkerId;
-    readonly metadata?: JsonObject;
-  };
+  readonly executor: ExecutionExecutor;
   readonly startedAt: string;
   readonly completedAt: string;
 }

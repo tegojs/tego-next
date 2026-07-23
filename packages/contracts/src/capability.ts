@@ -1,18 +1,19 @@
 import type { CapabilityName, PluginId } from "./identity.js";
+import type { JsonObject } from "./json.js";
 import type { JsonSchema } from "./schema.js";
 
-export interface CapabilityIdentity {
+export interface CapabilityIdentity extends JsonObject {
   readonly name: CapabilityName;
   readonly protocolVersion: string;
 }
 
-export interface CapabilityDefinition {
+export interface CapabilityDefinition extends JsonObject {
   readonly identity: CapabilityIdentity;
   readonly requestSchema: JsonSchema;
   readonly responseSchema: JsonSchema;
 }
 
-export interface CapabilityBinding {
+export interface CapabilityBinding extends JsonObject {
   readonly capability: CapabilityIdentity;
   readonly providerPluginId: PluginId;
 }

@@ -2,18 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  DiagnosticError,
   type CapabilityBinding,
   type CapabilityDefinition,
   type CapabilityIdentity,
+  DiagnosticError,
   diagnosticCode,
   type ExecutionRequest,
   type ExecutionResult,
-  type JsonValue,
   type JsonSchema,
-  parseArtifactDigest,
+  type JsonValue,
+  type PluginDeployment,
+  type PluginInstallation,
   type PluginManifest,
   parseApplicationId,
+  parseArtifactDigest,
   parseAttemptId,
   parseCapabilityBinding,
   parseCapabilityDefinition,
@@ -25,23 +27,21 @@ import {
   parseGeneration,
   parseMessageId,
   parseNodeId,
-  parsePluginId,
   parsePluginDeployment,
+  parsePluginId,
   parsePluginInstallation,
   parsePluginManifest,
-  parseRuntimeId,
   parseRuntimeConfiguration,
   parseRuntimeDiagnostic,
+  parseRuntimeId,
   parseSchema,
   parseSequence,
   parseSessionId,
   parseTaskId,
   parseWorkerEnvelope,
-  serializeWireValue,
-  type PluginDeployment,
-  type PluginInstallation,
   type RuntimeConfiguration,
   type RuntimeDiagnostic,
+  serializeWireValue,
   type WorkerEnvelope,
 } from "../src/index.js";
 
@@ -349,10 +349,7 @@ test("every exported public wire contract survives serialization and validating 
     roundTrip(validCapabilityBinding, parseCapabilityBinding),
     validCapabilityBinding,
   );
-  assert.deepEqual(
-    roundTrip(validExecutionRequest, parseExecutionRequest),
-    validExecutionRequest,
-  );
+  assert.deepEqual(roundTrip(validExecutionRequest, parseExecutionRequest), validExecutionRequest);
   assert.deepEqual(roundTrip(validExecutionResult, parseExecutionResult), validExecutionResult);
   assert.deepEqual(roundTrip(validWorkerEnvelope, parseWorkerEnvelope), validWorkerEnvelope);
   assert.deepEqual(roundTrip(validDiagnostic, parseRuntimeDiagnostic), validDiagnostic);
@@ -379,8 +376,8 @@ test("JSON-bearing contract fields reject non-JSON values recursively", () => {
 
 test("WorkerEnvelope payloads are statically constrained to JsonValue", () => {
   // @ts-expect-error bigint is not a valid wire payload
-  const invalidEnvelope: WorkerEnvelope<{ revision: bigint }> = validWorkerEnvelope;
-  assert.ok(invalidEnvelope);
+  const invalidEnvelope = null as unknown as WorkerEnvelope<{ revision: bigint }>;
+  assert.equal(invalidEnvelope, null);
 });
 
 test("serializeWireValue preserves an own __proto__ property without prototype pollution", () => {

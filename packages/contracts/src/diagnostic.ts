@@ -1,4 +1,4 @@
-import type { JsonValue } from "./json.js";
+import type { JsonObject, JsonValue } from "./json.js";
 
 export const DIAGNOSTIC_GROUPS = [
   "BOOTSTRAP",
@@ -18,7 +18,7 @@ export type DiagnosticGroup = (typeof DIAGNOSTIC_GROUPS)[number];
 export type DiagnosticCode = `${DiagnosticGroup}_${string}`;
 export type DiagnosticSeverity = "error" | "info" | "warning";
 
-export interface DiagnosticSource {
+export interface DiagnosticSource extends JsonObject {
   readonly kind:
     | "artifact"
     | "capability"
@@ -34,14 +34,14 @@ export interface DiagnosticSource {
   readonly id?: string;
 }
 
-export interface SerializedCause {
+export interface SerializedCause extends JsonObject {
   readonly name: string;
   readonly message: string;
   readonly code?: string;
   readonly stack?: string;
 }
 
-export interface RuntimeDiagnostic {
+export interface RuntimeDiagnostic extends JsonObject {
   readonly code: DiagnosticCode;
   readonly severity: DiagnosticSeverity;
   readonly message: string;

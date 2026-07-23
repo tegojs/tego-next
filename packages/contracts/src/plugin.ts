@@ -11,27 +11,31 @@ export type PluginModuleFormat = "esm";
 export type ComponentKind = "service" | "task";
 export type ExecutorKind = "process" | "remote" | "thread";
 
-export interface PluginComponent {
+export interface PluginComponent extends JsonObject {
   readonly componentId: ComponentId;
   readonly kind: ComponentKind;
   readonly entrypoint: string;
   readonly executors: readonly ExecutorKind[];
 }
 
-export interface PluginCapabilitySet {
-  readonly provides: readonly {
-    readonly name: string;
-    readonly protocolVersion: string;
-  }[];
-  readonly requires: readonly {
-    readonly name: string;
-    readonly protocolRange: string;
-    readonly optional?: boolean;
-    readonly lossPolicy?: "degrade" | "fail" | "suspend";
-  }[];
+export interface PluginCapabilityProvision extends JsonObject {
+  readonly name: string;
+  readonly protocolVersion: string;
 }
 
-export interface PluginManifest {
+export interface PluginCapabilityRequirement extends JsonObject {
+  readonly name: string;
+  readonly protocolRange: string;
+  readonly optional?: boolean;
+  readonly lossPolicy?: "degrade" | "fail" | "suspend";
+}
+
+export interface PluginCapabilitySet extends JsonObject {
+  readonly provides: readonly PluginCapabilityProvision[];
+  readonly requires: readonly PluginCapabilityRequirement[];
+}
+
+export interface PluginManifest extends JsonObject {
   readonly schemaVersion: "1.0";
   readonly pluginId: PluginId;
   readonly version: string;
@@ -45,22 +49,24 @@ export interface PluginManifest {
   readonly metadata?: JsonObject;
 }
 
-export interface PluginInstallation {
+export interface PluginSignature extends JsonObject {
+  readonly algorithm: "Ed25519";
+  readonly keyId: string;
+  readonly verified: boolean;
+}
+
+export interface PluginInstallation extends JsonObject {
   readonly pluginId: PluginId;
   readonly version: string;
   readonly digest: ArtifactDigest;
   readonly manifest: PluginManifest;
   readonly installedAt: string;
-  readonly signature?: {
-    readonly algorithm: "Ed25519";
-    readonly keyId: string;
-    readonly verified: boolean;
-  };
+  readonly signature?: PluginSignature;
 }
 
 export type PluginDeploymentState = "active" | "disabled";
 
-export interface PluginDeployment {
+export interface PluginDeployment extends JsonObject {
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
   readonly version: string;
