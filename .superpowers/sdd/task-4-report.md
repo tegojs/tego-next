@@ -317,9 +317,8 @@ modified.
 - Publication uses same-directory rename. On Windows collision-style errors, an
   already complete matching target is retained and the temporary file is removed.
   Hard errors propagate.
-- POSIX durability syncs the shard directory after rename and also syncs
-  `artifacts/` when the shard directory was newly created. Creating `artifacts/`
-  syncs its data-directory parent.
+- POSIX durability syncs the shard directory and `artifacts/` after every
+  publication. Creating `artifacts/` syncs its data-directory parent.
 - Reads collect and hash all chunks before yielding any bytes, so corrupt content
   never reaches a component consumer.
 
@@ -376,3 +375,143 @@ Known bounded trade-offs:
   single-main local-driver scope.
 - Windows behavior is covered through a factored deterministic collision policy.
   No macOS run is presented as a Windows filesystem integration test.
+
+## Formal Review Follow-up: Concurrent Artifact Parent Durability
+
+### Status
+
+Complete. The formal-review blocker is resolved.
+
+### Commits
+
+- RED `3a93cb7` — `test: cover concurrent artifact directory durability`
+- GREEN `319be93` — `fix: serialize artifact parent durability`
+
+### Root Cause
+
+The earlier durability policy assigned the `artifacts/` parent fsync only to the
+writer whose `mkdir()` call created a shard. That writer did not perform the
+parent fsync until after streaming and publication.
+
+This made the obligation unsafe to transfer between concurrent operations:
+
+1. writer A created a shard and paused before its parent fsync;
+2. writer B observed the existing shard, published, synced only the shard, and
+   returned;
+3. a crash before writer A's parent fsync could lose writer B's acknowledged
+   artifact.
+
+The same ownership flaw affected retry: after a transient parent-fsync failure,
+the retry observed an existing shard and could return without retrying the parent
+fsync.
+
+### RED Evidence
+
+Command:
+
+```text
+volta run --node 26.5.0 npm run build -w @tegojs/drivers-local
+volta run --node 26.5.0 node --test \
+  --test-name-pattern="every artifact publication|concurrent same-shard|transient parent fsync" \
+  packages/drivers-local/dist/test/local-drivers.test.js
+```
+
+Result:
+
+```text
+tests 3
+pass 0
+fail 3
+duration_ms 145.095
+```
+
+The failures proved:
+
+- an existing-shard publication omitted `artifacts/`;
+- a second same-shard writer could complete while the first writer's parent sync
+  was paused, without syncing the parent itself;
+- retry after a transient parent-fsync failure still omitted the parent.
+
+There were no real-time sleeps. The interleaving used deferred promises.
+
+### Implementation
+
+`artifactPublishSyncDirectories()` now returns the shard directory and
+`artifacts/` for every publication, regardless of which writer created the shard.
+Each successful POSIX `put()` therefore owns and completes both fsync operations
+before it resolves.
+
+This one policy change handles both concurrent first writes and retry after a
+transient parent-fsync failure. Windows retains its explicit no-directory-fsync
+platform policy.
+
+### GREEN Evidence
+
+Focused build and local-driver tests:
+
+```text
+volta run --node 26.5.0 npm run build -w @tegojs/drivers-local
+volta run --node 26.5.0 node --test packages/drivers-local/dist/test/*.test.js
+```
+
+Result:
+
+```text
+tests 55
+suites 2
+pass 55
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 552.682209
+```
+
+Focused typecheck:
+
+```text
+volta run --node 26.5.0 npm run typecheck \
+  -w @tegojs/contracts \
+  -w @tegojs/testkit \
+  -w @tegojs/drivers-local
+```
+
+Result: exit 0 for all three workspaces.
+
+Root architecture:
+
+```text
+volta run --node 26.5.0 node --test tests/architecture/*.test.mjs
+```
+
+Result:
+
+```text
+tests 18
+pass 18
+fail 0
+duration_ms 170.106333
+```
+
+Format, lint, and whitespace:
+
+```text
+volta run --node 26.5.0 npm run format:check
+volta run --node 26.5.0 npm run lint
+git diff --check
+```
+
+Result:
+
+```text
+Checked 47 files. No formatting fixes required.
+Checked 47 files. No lint fixes required.
+```
+
+`git diff --check` exited 0.
+
+### Concerns
+
+No remaining concern from this formal-review finding. The fix intentionally pays
+one parent-directory fsync per publication to make each successful `put()`
+self-contained and crash-durable.
