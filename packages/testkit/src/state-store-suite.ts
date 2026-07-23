@@ -247,6 +247,105 @@ export function stateStoreConformance(
       });
     });
 
+    test("@spec:runtime-operations/reusable-conformance-test-kits/reentrant-idempotency-replay", async () => {
+      await withStore(factory, async (store) => {
+        let nestedWorkInvocations = 0;
+        let nestedResult!: Promise<JsonValue>;
+        const options = {
+          idempotencyKey: "reentrant-key",
+          idempotencyFingerprint: "same-request",
+        } as const;
+
+        const outerResult = await store.transact<JsonValue>(options, async () => {
+          nestedResult = store.transact<JsonValue>(options, async () => {
+            nestedWorkInvocations += 1;
+            return { source: "nested" };
+          });
+          await Promise.resolve();
+          return { source: "outer" };
+        });
+
+        assert.deepEqual(outerResult, { source: "outer" });
+        assert.deepEqual(await nestedResult, outerResult);
+        assert.equal(nestedWorkInvocations, 0);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/reentrant-idempotency-conflict", async () => {
+      await withStore(factory, async (store) => {
+        let nestedWorkInvocations = 0;
+        let nestedRejection!: Promise<void>;
+
+        const outerResult = await store.transact<JsonValue>(
+          {
+            idempotencyKey: "reentrant-conflict-key",
+            idempotencyFingerprint: "outer-request",
+          },
+          async () => {
+            const nested = store.transact(
+              {
+                idempotencyKey: "reentrant-conflict-key",
+                idempotencyFingerprint: "nested-request",
+              },
+              async () => {
+                nestedWorkInvocations += 1;
+                return null;
+              },
+            );
+            nestedRejection = assert.rejects(
+              nested,
+              expectDiagnostic("STATE_IDEMPOTENCY_CONFLICT"),
+            );
+            await Promise.resolve();
+            return { source: "outer" };
+          },
+        );
+
+        assert.deepEqual(outerResult, { source: "outer" });
+        await nestedRejection;
+        assert.equal(nestedWorkInvocations, 0);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/reentrant-idempotency-failure", async () => {
+      await withStore(factory, async (store) => {
+        let nestedWorkInvocations = 0;
+        let nestedOutcome!: Promise<
+          | { readonly error: unknown; readonly status: "rejected" }
+          | { readonly status: "fulfilled"; readonly value: JsonValue }
+        >;
+        const options = {
+          idempotencyKey: "reentrant-failure-key",
+          idempotencyFingerprint: "failing-request",
+        } as const;
+
+        await assert.rejects(
+          store.transact(options, async () => {
+            const nested = store.transact(options, async () => {
+              nestedWorkInvocations += 1;
+              return { source: "nested" };
+            });
+            nestedOutcome = nested.then(
+              (value) => ({ status: "fulfilled", value }),
+              (error: unknown) => ({ status: "rejected", error }),
+            );
+            await Promise.resolve();
+            throw new Error("outer failure");
+          }),
+          /outer failure/u,
+        );
+        const outcome = await nestedOutcome;
+        assert.equal(outcome.status, "rejected");
+        if (outcome.status === "rejected") {
+          assert.match(String(outcome.error), /outer failure/u);
+        }
+        assert.equal(nestedWorkInvocations, 0);
+
+        const retry = await store.transact(options, async () => ({ source: "retry" }));
+        assert.deepEqual(retry, { source: "retry" });
+      });
+    });
+
     test("@spec:runtime-operations/reusable-conformance-test-kits/idempotency-conflict", async () => {
       await withStore(factory, async (store) => {
         let invocations = 0;
