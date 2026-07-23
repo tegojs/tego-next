@@ -298,16 +298,20 @@ function analyzeImports(source) {
   let componentLoaderFunction;
   for (let index = 0; index < tokens.length; index += 1) {
     if (
+      tokens[index - 2]?.value !== "export" ||
+      tokens[index - 1]?.value !== "async" ||
       tokens[index]?.value !== "function" ||
       tokens[index + 1]?.type !== "identifier" ||
-      tokens[index + 1]?.value !== "loadPreparedComponent"
+      tokens[index + 1]?.value !== "loadPreparedComponent" ||
+      tokens[index + 2]?.value !== "(" ||
+      tokens[index + 3]?.type !== "identifier" ||
+      tokens[index + 3]?.value !== "input" ||
+      tokens[index + 4]?.value !== ")" ||
+      tokens[index + 5]?.value !== "{"
     ) {
       continue;
     }
-    const open = tokens.findIndex(
-      (token, candidate) => candidate > index + 1 && token.value === "{",
-    );
-    if (open === -1) break;
+    const open = index + 5;
     const close = tokens.findIndex(
       (token, candidate) =>
         candidate > open && token.value === "}" && scopeDepths[candidate] === scopeDepths[open],
