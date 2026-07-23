@@ -142,3 +142,58 @@ predates Task 6 and is assigned to later plan tasks.
 - Runtime validation buffers only the bounded manifest and files metadata.
   The local `ArtifactStore` remains the authority for verifying the full
   content-addressed archive digest before bytes are exposed.
+
+## Formal Review Remediation
+
+The formal and security review returned `REQUEST CHANGES`. The findings were
+reproduced with failing tests before implementation changes:
+
+| Review cycle | RED | GREEN |
+| --- | --- | --- |
+| Runtime identity, range, collision, and archive limits | `65665d4` | `b30ad44` |
+| Bounded local artifact verification | `246b649` | `6b90f2c` |
+| Build and pack confinement | `183d643` | `e027eff` |
+| Mixed invalid ranges and fake Node built-ins | `cf1cbfb` | `a6bc3e2` |
+| Symlinked build-configuration ancestors | `fad0d78` | `d644ee4` |
+
+The remediation closes all seven requested findings:
+
+- build and pack paths are canonicalized, confined below the real plugin root,
+  checked for symlink ancestors, and read with no-follow descriptor checks plus
+  post-read identity verification;
+- build output is emitted into a private temporary directory below the plugin
+  root and removed on success and failure;
+- unsupported comparators invalidate the complete compatibility expression,
+  including otherwise-satisfiable `||` alternatives;
+- artifact verification uses a reusable 64 KiB buffer and yields bounded chunks
+  only after the complete file digest is verified;
+- archive and metadata paths reject case-folding, Unicode-normalization, and
+  portable Windows-device collisions, including COM/LPT superscript forms;
+- `ArtifactService` independently hashes the complete stream and compares the
+  observed digest with the requested content address;
+- packaging rejects bare third-party imports and fake `node:` built-ins, records
+  audited built-in runtime imports in the SBOM, and enforces entry count,
+  per-entry size, and total archive-size limits before concatenation.
+
+Ed25519 signatures now also require canonical base64 with the exact encoded
+length. The earlier statement that the local `ArtifactStore` is the sole
+authority for complete-stream digest verification is superseded: both the
+filesystem store and `ArtifactService` now verify the content address at their
+respective trust boundaries.
+
+Final review verification, executed with Node.js `26.5.0`:
+
+- combined contracts, testkit, runtime, local-driver, and CLI matrix: 166/166
+  PASS;
+- runtime artifact and bootstrap suite: 72/72 PASS;
+- CLI plugin-pack suite: 16/16 PASS;
+- 8 MiB verification probe: maximum read and yielded chunk size remained at or
+  below 64 KiB;
+- targeted typecheck for all implemented workspaces: PASS;
+- architecture suite: 18/18 PASS;
+- Biome format and lint: PASS;
+- `git diff --check`: PASS;
+- SQLite restart smoke: a freshly built echo plugin was packed, persisted
+  through `FilesystemArtifactStore`, installed through `ArtifactService`, then
+  recovered by immutable `(pluginId, version, digest)` identity after reopening
+  `SqliteStateStore`.
