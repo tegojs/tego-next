@@ -204,7 +204,7 @@ test("POSIX publish errors other than a target collision are not hidden", async 
   );
 });
 
-test("new artifact shards durably sync both the shard and its parent", () => {
+test("every artifact publication durably syncs both the shard and its parent", () => {
   assert.deepEqual(
     artifactPublishSyncDirectories({
       artifactDirectory: "/data/artifacts",
@@ -219,8 +219,64 @@ test("new artifact shards durably sync both the shard and its parent", () => {
       shardDirectory: "/data/artifacts/ab",
       shardCreated: false,
     }),
-    ["/data/artifacts/ab"],
+    ["/data/artifacts/ab", "/data/artifacts"],
   );
+});
+
+test("a concurrent same-shard writer cannot acknowledge before the parent is durable", async () => {
+  const artifactDirectory = "/data/artifacts";
+  const shardDirectory = "/data/artifacts/ab";
+  const firstParentSyncStarted = Promise.withResolvers<void>();
+  const releaseFirstParentSync = Promise.withResolvers<void>();
+  const completedSyncs: string[] = [];
+
+  async function executePlan(writer: string, shardCreated: boolean): Promise<void> {
+    for (const directory of artifactPublishSyncDirectories({
+      artifactDirectory,
+      shardDirectory,
+      shardCreated,
+    })) {
+      if (writer === "first" && directory === artifactDirectory) {
+        firstParentSyncStarted.resolve();
+        await releaseFirstParentSync.promise;
+      }
+      completedSyncs.push(`${writer}:${directory}`);
+    }
+  }
+
+  const firstPublish = executePlan("first", true);
+  await firstParentSyncStarted.promise;
+  await executePlan("second", false);
+  const secondSyncedParent = completedSyncs.includes(`second:${artifactDirectory}`);
+  releaseFirstParentSync.resolve();
+  await firstPublish;
+
+  assert.equal(secondSyncedParent, true);
+});
+
+test("retry after a transient parent fsync failure still syncs the parent", async () => {
+  const artifactDirectory = "/data/artifacts";
+  const shardDirectory = "/data/artifacts/ab";
+  let failParentSync = true;
+
+  async function executePlan(shardCreated: boolean): Promise<readonly string[]> {
+    const completed: string[] = [];
+    for (const directory of artifactPublishSyncDirectories({
+      artifactDirectory,
+      shardDirectory,
+      shardCreated,
+    })) {
+      if (directory === artifactDirectory && failParentSync) {
+        failParentSync = false;
+        throw new Error("transient parent fsync failure");
+      }
+      completed.push(directory);
+    }
+    return completed;
+  }
+
+  await assert.rejects(executePlan(true), /transient parent fsync failure/u);
+  assert.deepEqual(await executePlan(false), [shardDirectory, artifactDirectory]);
 });
 
 test("createLocalDrivers composes durable state, local authority, and filesystem artifacts", async () => {
