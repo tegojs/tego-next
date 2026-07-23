@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute } from "node:path";
 import {
   DiagnosticError,
@@ -108,7 +107,6 @@ interface ActiveRun {
 }
 
 interface ActiveTransition {
-  readonly fingerprint: string;
   readonly result: Promise<ComponentHostResult>;
 }
 
@@ -182,7 +180,6 @@ export class ComponentHost {
   readonly #controlCommands = new Map<string, CachedCommand>();
   readonly #runs = new Map<string, ActiveRun>();
   readonly #secretValues = new Set<string>();
-  readonly #transitionContext = new AsyncLocalStorage<boolean>();
   #activeTransition: ActiveTransition | undefined;
   #acceptingRuns = false;
   #state: ComponentHostState = "new";
@@ -202,20 +199,6 @@ export class ComponentHost {
       command = parseComponentHostCommand(input);
     } catch (error) {
       return this.#failure("invalid", "invalid", error);
-    }
-    if (
-      TRANSITION_COMMANDS.has(command.type) &&
-      this.#activeTransition !== undefined &&
-      this.#transitionContext.getStore() === true
-    ) {
-      return this.#failure(
-        command.commandId,
-        command.type,
-        this.#diagnosticError(
-          "LIFECYCLE_TRANSITION_ILLEGAL_REENTRANCY",
-          "A lifecycle hook cannot synchronously await another host transition",
-        ),
-      );
     }
     const fingerprint = JSON.stringify(command);
     const cached =
@@ -299,16 +282,8 @@ export class ComponentHost {
   }
 
   #submitTransition(command: ComponentHostCommand): Promise<ComponentHostResult> {
-    const fingerprint = JSON.stringify({
-      deadline: command.deadline,
-      payload: command.payload,
-      type: command.type,
-    });
     const active = this.#activeTransition;
     if (active !== undefined) {
-      if (active.fingerprint === fingerprint) {
-        return active.result.then((result) => this.#forCommand(result, command));
-      }
       return Promise.resolve(
         this.#failure(
           command.commandId,
@@ -326,7 +301,7 @@ export class ComponentHost {
     }
     let result!: Promise<ComponentHostResult>;
     result = Promise.resolve()
-      .then(() => this.#transitionContext.run(true, () => this.#dispatch(command)))
+      .then(() => this.#dispatch(command))
       .then((outcome) => {
         if (
           !outcome.ok &&
@@ -342,7 +317,7 @@ export class ComponentHost {
           this.#activeTransition = undefined;
         }
       });
-    this.#activeTransition = { fingerprint, result };
+    this.#activeTransition = { result };
     return result;
   }
 
