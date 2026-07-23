@@ -1,13 +1,17 @@
 import { verify } from "node:crypto";
 import {
   DiagnosticError,
+  diagnosticCode,
+  parsePluginInstallation,
   runtimeDiagnostic,
   type ArtifactDigest,
   type ArtifactStore,
   type Clock,
   type JsonObject,
   type PluginManifest,
+  type PluginInstallation,
   type PluginSignature,
+  type StateKey,
   type StateStore,
 } from "@tegojs/contracts";
 import {
@@ -60,6 +64,8 @@ export interface ValidatedPluginArtifact {
   readonly manifest: PluginManifest;
   readonly signature?: PluginSignature;
 }
+
+export type InstallArtifactRequest = ValidateArtifactRequest;
 
 function artifactError(code: `ARTIFACT_${string}`, message: string, details?: JsonObject) {
   return new DiagnosticError(
@@ -134,14 +140,18 @@ function satisfiesRange(value: string, range: string): boolean {
 
 export class ArtifactService {
   readonly #artifacts: ArtifactStore;
+  readonly #clock: Clock;
   readonly #compatibility: ArtifactCompatibility;
   readonly #limits: ArtifactReadLimits;
+  readonly #state: StateStore;
   readonly #trust: ArtifactTrustConfiguration;
 
   constructor(options: ArtifactServiceOptions) {
     this.#artifacts = options.artifacts;
+    this.#clock = options.clock;
     this.#compatibility = options.compatibility;
     this.#limits = options.limits ?? {};
+    this.#state = options.state;
     this.#trust = options.trust ?? { keys: [], mode: "optional" };
   }
 
@@ -158,6 +168,65 @@ export class ArtifactService {
       manifest,
       ...(signature === undefined ? {} : { signature }),
     };
+  }
+
+  async install(request: InstallArtifactRequest): Promise<PluginInstallation> {
+    const validated = await this.validate(request);
+    const key = this.#installationKey(validated.manifest);
+    const candidate: PluginInstallation = {
+      pluginId: validated.manifest.pluginId,
+      version: validated.manifest.version,
+      digest: validated.digest,
+      manifest: validated.manifest,
+      installedAt: this.#clock.now().toISOString(),
+      ...(validated.signature === undefined ? {} : { signature: validated.signature }),
+    };
+
+    try {
+      return await this.#state.transact({}, async (transaction) => {
+        const stored = await transaction.get(key);
+        if (stored !== undefined) {
+          return this.#resolveExistingInstallation(
+            parsePluginInstallation(stored.value),
+            candidate,
+          );
+        }
+        await transaction.put(key, candidate, { expectedRevision: "absent" });
+        return candidate;
+      });
+    } catch (error) {
+      if (diagnosticCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      const stored = await this.#state.read(key);
+      if (stored === undefined) throw error;
+      return this.#resolveExistingInstallation(parsePluginInstallation(stored.value), candidate);
+    }
+  }
+
+  #installationKey(manifest: PluginManifest): StateKey<PluginInstallation> {
+    return {
+      namespace: "tego",
+      collection: "installations",
+      id: `${manifest.pluginId}@${manifest.version}`,
+    };
+  }
+
+  #resolveExistingInstallation(
+    existing: PluginInstallation,
+    candidate: PluginInstallation,
+  ): PluginInstallation {
+    if (existing.digest === candidate.digest) {
+      return existing;
+    }
+    throw artifactError(
+      "ARTIFACT_INSTALLATION_CONFLICT",
+      "A different artifact digest is already installed for this plugin version",
+      {
+        existingDigest: existing.digest,
+        pluginId: candidate.pluginId,
+        requestedDigest: candidate.digest,
+        version: candidate.version,
+      },
+    );
   }
 
   #verifySignature(request: ValidateArtifactRequest): PluginSignature | undefined {

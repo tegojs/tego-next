@@ -5,6 +5,7 @@ export {
   type ArtifactSignatureEnvelope,
   type ArtifactTrustConfiguration,
   type ArtifactTrustKey,
+  type InstallArtifactRequest,
   type ValidateArtifactRequest,
   type ValidatedPluginArtifact,
 } from "./artifacts/artifact-service.js";
