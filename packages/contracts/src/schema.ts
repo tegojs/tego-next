@@ -52,7 +52,13 @@ function isJsonValue(input: unknown, ancestors = new Set<object>()): boolean {
   try {
     if (Array.isArray(input)) {
       for (let index = 0; index < input.length; index += 1) {
-        if (!Object.hasOwn(input, index) || !isJsonValue(input[index], ancestors)) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
+        if (
+          descriptor === undefined ||
+          !descriptor.enumerable ||
+          !("value" in descriptor) ||
+          !isJsonValue(descriptor.value, ancestors)
+        ) {
           return false;
         }
       }
@@ -91,22 +97,6 @@ const jsonValueSchema = {
   $id: JSON_VALUE_SCHEMA_ID,
   $schema: "https://json-schema.org/draft/2020-12/schema",
   tegoJsonValue: true,
-  $ref: "#/$defs/value",
-  $defs: {
-    value: {
-      anyOf: [
-        { type: "null" },
-        { type: "boolean" },
-        { type: "number" },
-        { type: "string" },
-        { type: "array", items: { $ref: "#/$defs/value" } },
-        {
-          type: "object",
-          additionalProperties: { $ref: "#/$defs/value" },
-        },
-      ],
-    },
-  },
 } as const;
 
 const jsonObjectSchema = {
@@ -489,7 +479,7 @@ ajv.addKeyword({
   validate: (enabled: boolean, data: unknown) => !enabled || isJsonValue(data),
 });
 
-ajv.compile(jsonValueSchema);
+const validateJsonValue = ajv.compile(jsonValueSchema);
 const validateRuntimeConfiguration = ajv.compile(runtimeConfigurationSchema);
 const validateRuntimeDiagnostic = ajv.compile(runtimeDiagnosticSchema);
 const validatePluginManifest = ajv.compile(pluginManifestSchema);
@@ -552,6 +542,9 @@ function parseWithValidator<T>(
   message: string,
   source: DiagnosticSource,
 ): T {
+  if (!validateJsonValue(input)) {
+    throw validationError(code, message, source, validateJsonValue.errors);
+  }
   if (!validate(input)) {
     throw validationError(code, message, source, validate.errors);
   }
@@ -562,7 +555,8 @@ function field(input: unknown, key: string): unknown {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return undefined;
   }
-  return (input as Record<string, unknown>)[key];
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
 }
 
 function compatibilityError(code: DiagnosticCode, message: string): DiagnosticError {

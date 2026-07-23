@@ -54,7 +54,33 @@ function serialize(value: unknown, path: string, ancestors: Set<object>): JsonVa
 
   try {
     if (Array.isArray(value)) {
-      return value.map((item, index) => serialize(item, `${path}/${index}`, ancestors));
+      const descriptors: PropertyDescriptor[] = [];
+      const allowedKeys = new Set<PropertyKey>(["length"]);
+
+      for (let index = 0; index < value.length; index += 1) {
+        const key = String(index);
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor === undefined) {
+          throw wireValueError(`${path}/${key}`, value, "arrays must be dense");
+        }
+        if (!descriptor.enumerable || !("value" in descriptor)) {
+          throw wireValueError(
+            `${path}/${key}`,
+            value,
+            "array elements must be enumerable data properties",
+          );
+        }
+        allowedKeys.add(key);
+        descriptors.push(descriptor);
+      }
+
+      if (Reflect.ownKeys(value).some((key) => !allowedKeys.has(key))) {
+        throw wireValueError(path, value, "extended array properties are not supported");
+      }
+
+      return descriptors.map((descriptor, index) =>
+        serialize(descriptor.value, `${path}/${index}`, ancestors),
+      );
     }
 
     const prototype = Object.getPrototypeOf(value);
