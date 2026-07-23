@@ -738,22 +738,22 @@ test("cancellation races delayed spawn and terminates the late child before boot
     void executor.drain({}).then(() => {
       drained = true;
     });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(result, undefined);
+    assert.equal(drained, false);
+    processHost.gate.resolve();
+    await processHost.returned.promise;
     await eventually(
       () => {
         assert.equal(result?.status, "cancelled");
         assert.equal(drained, true);
+        assert.equal(processHost.activeProcessCount, 0);
       },
       {
-        attempts: 100,
+        attempts: 1_000,
         advance: () => new Promise((resolve) => setImmediate(resolve)),
       },
     );
-    processHost.gate.resolve();
-    await processHost.returned.promise;
-    await eventually(() => assert.equal(processHost.activeProcessCount, 0), {
-      attempts: 1_000,
-      advance: () => new Promise((resolve) => setImmediate(resolve)),
-    });
     assert.equal(processHost.spawnCount, 1);
   } finally {
     processHost.gate.resolve();
@@ -770,10 +770,11 @@ test("late-spawn cancellation cannot be blocked by stalled stdin closure", async
   try {
     await executor.cancel(execution.taskId, execution.attemptId);
     clock.advanceBy(100);
-    assert.equal((await handle.result).status, "cancelled");
-    await executor.drain({});
+    const draining = executor.drain({});
     processHost.gate.resolve();
     await processHost.returned.promise;
+    assert.equal((await handle.result).status, "cancelled");
+    await draining;
     await eventually(() => assert.equal(processHost.activeProcessCount, 0), {
       attempts: 100,
       advance: () => new Promise((resolve) => setImmediate(resolve)),

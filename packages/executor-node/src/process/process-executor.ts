@@ -144,6 +144,11 @@ type AdmissionRace<T> =
   | { readonly cancelled: true }
   | { readonly cancelled: false; readonly value: T };
 
+interface AdmissionOperation<T> {
+  readonly outcome: Promise<AdmissionRace<T>>;
+  readonly settled: Promise<void>;
+}
+
 function attemptKey(taskId: TaskId, attemptId: AttemptId): string {
   return `${taskId.length}:${taskId}${attemptId}`;
 }
@@ -784,9 +789,10 @@ export class ProcessExecutor implements Executor {
   async #run(entry: AttemptEntry): Promise<void> {
     let process_: HostedProcess | undefined;
     let channel: ProcessChannel | undefined;
+    let admissionSettlement = Promise.resolve();
     const startedAt = this.#clock.now().toISOString();
     try {
-      const resolution = await this.#raceAdmission(entry, this.#resolve(entry.request));
+      const resolution = await this.#raceAdmission(entry, this.#resolve(entry.request)).outcome;
       if (resolution.cancelled) {
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
         return;
@@ -800,7 +806,7 @@ export class ProcessExecutor implements Executor {
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
-      const spawning = await this.#raceAdmission(
+      const spawnAdmission = this.#raceAdmission(
         entry,
         this.#options.processHost.spawn({
           entrypoint: this.#processEntrypoint,
@@ -810,6 +816,8 @@ export class ProcessExecutor implements Executor {
           await this.#terminate(lateProcess);
         },
       );
+      admissionSettlement = spawnAdmission.settled;
+      const spawning = await spawnAdmission.outcome;
       if (spawning.cancelled) {
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation ?? "cancelled"));
         return;
@@ -951,6 +959,7 @@ export class ProcessExecutor implements Executor {
       }
     } finally {
       entry.deadlineController.abort("terminal");
+      await admissionSettlement;
       if (process_ !== undefined) {
         await process_.stdin.close().catch(() => undefined);
         await this.#terminate(process_);
@@ -1222,39 +1231,44 @@ export class ProcessExecutor implements Executor {
     entry: AttemptEntry,
     operation: Promise<T>,
     onLateValue?: (value: T) => void | Promise<void>,
-  ): Promise<AdmissionRace<T>> {
+  ): AdmissionOperation<T> {
     const signal = entry.admissionController.signal;
-    return new Promise<AdmissionRace<T>>((resolve, reject) => {
-      let waiting = true;
-      const cleanup = () => signal.removeEventListener("abort", cancel);
-      const cancel = () => {
-        if (!waiting) return;
+    const outcome = Promise.withResolvers<AdmissionRace<T>>();
+    const settled = Promise.withResolvers<void>();
+    let waiting = true;
+    const cleanup = () => signal.removeEventListener("abort", cancel);
+    const cancel = () => {
+      if (!waiting) return;
+      waiting = false;
+      cleanup();
+      outcome.resolve({ cancelled: true });
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    if (signal.aborted) cancel();
+    void operation.then(
+      (value) => {
+        if (!waiting) {
+          void Promise.resolve(onLateValue?.(value)).then(settled.resolve, settled.resolve);
+          return;
+        }
         waiting = false;
         cleanup();
-        resolve({ cancelled: true });
-      };
-      signal.addEventListener("abort", cancel, { once: true });
-      if (signal.aborted) cancel();
-      void operation.then(
-        (value) => {
-          if (!waiting) {
-            if (onLateValue !== undefined) {
-              void Promise.resolve(onLateValue(value)).catch(() => undefined);
-            }
-            return;
-          }
+        outcome.resolve({ cancelled: false, value });
+        settled.resolve();
+      },
+      (error: unknown) => {
+        if (waiting) {
           waiting = false;
           cleanup();
-          resolve({ cancelled: false, value });
-        },
-        (error: unknown) => {
-          if (!waiting) return;
-          waiting = false;
-          cleanup();
-          reject(error);
-        },
-      );
-    });
+          outcome.reject(error);
+        }
+        settled.resolve();
+      },
+    );
+    return {
+      outcome: outcome.promise,
+      settled: settled.promise,
+    };
   }
 
   #failQueued(failure: RuntimeDiagnostic): void {
