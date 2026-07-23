@@ -64,6 +64,40 @@ export interface OperationJournalEntry {
   readonly updatedAt: string;
 }
 
+export interface PersistedOperationJournalEntry extends OperationJournalEntry {
+  readonly revision: Revision;
+}
+
+export interface OperationJournalCursor {
+  readonly revision: Revision;
+  readonly operationId: OperationId;
+}
+
+export interface OperationJournalQuery {
+  /**
+   * Excludes the cursor itself. Results begin at the first non-terminal entry
+   * whose `(revision, operationId)` position is greater than this position.
+   */
+  readonly after?: OperationJournalCursor;
+  readonly limit?: number;
+}
+
+export function compareOperationJournalCursors(
+  left: OperationJournalCursor,
+  right: OperationJournalCursor,
+): -1 | 0 | 1 {
+  const revisionOrder =
+    BigInt(left.revision) < BigInt(right.revision)
+      ? -1
+      : BigInt(left.revision) > BigInt(right.revision)
+        ? 1
+        : 0;
+  if (revisionOrder !== 0) {
+    return revisionOrder;
+  }
+  return left.operationId < right.operationId ? -1 : left.operationId > right.operationId ? 1 : 0;
+}
+
 export interface OutboxMessage {
   readonly messageId: MessageId;
   readonly topic: string;
@@ -94,6 +128,9 @@ export interface StateStore {
   ): Promise<T>;
   read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined>;
   scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>>;
+  scanRecoverableOperations(
+    query?: OperationJournalQuery,
+  ): AsyncIterable<PersistedOperationJournalEntry>;
   watch(cursor: Revision): AsyncIterable<StateChange>;
   health(): Promise<DriverHealth>;
   close(): Promise<void>;

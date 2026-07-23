@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DiagnosticError,
+  compareOperationJournalCursors,
   parseRevision,
   runtimeDiagnostic,
   type Clock,
@@ -8,7 +9,9 @@ import {
   type ExpectedRevision,
   type JsonValue,
   type OperationJournalEntry,
+  type OperationJournalQuery,
   type OutboxMessage,
+  type PersistedOperationJournalEntry,
   type Revision,
   type ScannedState,
   type StateChange,
@@ -104,6 +107,7 @@ function stateError(
     | "STATE_CLOSED"
     | "STATE_FENCE_STALE"
     | "STATE_IDEMPOTENCY_CONFLICT"
+    | "STATE_QUERY_INVALID"
     | "STATE_REVISION_CONFLICT",
   message: string,
   details: JsonValue,
@@ -361,7 +365,7 @@ class MemoryWatchIterator implements AsyncIterator<StateChange>, AsyncIterable<S
 export class MemoryStateStore implements StateStore {
   readonly #clock: Clock;
   readonly #records = new Map<string, StoredRecord>();
-  readonly #operations = new Map<string, OperationJournalEntry>();
+  readonly #operations = new Map<string, PersistedOperationJournalEntry>();
   readonly #outbox = new Map<string, OutboxMessage>();
   readonly #fences = new Map<string, bigint>();
   readonly #changes: StateChange[] = [];
@@ -447,6 +451,26 @@ export class MemoryStateStore implements StateStore {
     for (const record of matching) {
       this.#assertOpen();
       yield scannedRecord<T>(record);
+    }
+  }
+
+  async *scanRecoverableOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    this.#assertOpen();
+    this.#assertOperationQuery(query);
+    const matching = [...this.#operations.values()]
+      .filter(
+        (entry) =>
+          (entry.status === "executing" || entry.status === "planned") &&
+          (query.after === undefined ||
+            compareOperationJournalCursors(entry, query.after) > 0),
+      )
+      .sort(compareOperationJournalCursors);
+    const limit = query.limit ?? matching.length;
+    for (const entry of matching.slice(0, limit)) {
+      this.#assertOpen();
+      yield structuredClone(entry);
     }
   }
 
@@ -589,7 +613,10 @@ export class MemoryStateStore implements StateStore {
         this.#records.set(identifier, record);
       }
       for (const entry of staged.operations) {
-        this.#operations.set(entry.operationId, structuredClone(entry));
+        this.#operations.set(entry.operationId, {
+          ...structuredClone(entry),
+          revision,
+        });
       }
       for (const message of staged.outbox) {
         this.#outbox.set(message.messageId, structuredClone(message));
@@ -647,6 +674,20 @@ export class MemoryStateStore implements StateStore {
   #assertOpen(): void {
     if (this.#lifecycle !== "open") {
       throw this.#closedError();
+    }
+  }
+
+  #assertOperationQuery(query: OperationJournalQuery): void {
+    if (
+      query.limit !== undefined &&
+      (!Number.isSafeInteger(query.limit) || query.limit <= 0)
+    ) {
+      throw stateError(
+        "STATE_QUERY_INVALID",
+        "Operation journal query limit must be a positive safe integer",
+        { limit: query.limit },
+        this.#clock,
+      );
     }
   }
 

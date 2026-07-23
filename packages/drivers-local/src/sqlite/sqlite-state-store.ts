@@ -12,9 +12,10 @@ import {
   type DriverHealth,
   type ExpectedRevision,
   type JsonValue,
-  type OperationId,
   type OperationJournalEntry,
+  type OperationJournalQuery,
   type OutboxMessage,
+  type PersistedOperationJournalEntry,
   type Revision,
   type ScannedState,
   type StateChange,
@@ -85,6 +86,7 @@ function stateError(
     | "STATE_DATA_INVALID"
     | "STATE_FENCE_STALE"
     | "STATE_IDEMPOTENCY_CONFLICT"
+    | "STATE_QUERY_INVALID"
     | "STATE_REVISION_CONFLICT",
   message: string,
   details: JsonValue,
@@ -621,31 +623,71 @@ export class SqliteStateStore implements StateStore {
     };
   }
 
-  async readOperation(operationId: OperationId): Promise<OperationJournalEntry | undefined> {
+  async *scanRecoverableOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
-    const row = this.#database()
-      .prepare(
-        "SELECT operation_id, kind, status, state_json, updated_at FROM operations WHERE operation_id = ?",
-      )
-      .get(operationId);
-    if (row === undefined) {
-      return undefined;
+    this.#assertOperationQuery(query);
+    const columns = "operation_id, kind, status, state_json, updated_at, revision";
+    const after = query.after;
+    const rows =
+      after === undefined
+        ? this.#database()
+            .prepare(
+              `
+                SELECT ${columns}
+                FROM operations
+                WHERE status IN ('executing', 'planned')
+                ORDER BY revision, operation_id
+                ${query.limit === undefined ? "" : "LIMIT ?"}
+              `,
+              { readBigInts: true },
+            )
+            .all(...(query.limit === undefined ? [] : [query.limit]))
+        : this.#database()
+            .prepare(
+              `
+                SELECT ${columns}
+                FROM operations
+                WHERE status IN ('executing', 'planned')
+                  AND (revision > ? OR (revision = ? AND operation_id > ?))
+                ORDER BY revision, operation_id
+                ${query.limit === undefined ? "" : "LIMIT ?"}
+              `,
+              { readBigInts: true },
+            )
+            .all(
+              BigInt(after.revision),
+              BigInt(after.revision),
+              after.operationId,
+              ...(query.limit === undefined ? [] : [query.limit]),
+            );
+    for (const row of rows) {
+      this.#assertOpen();
+      yield this.#decodeOperation(row);
     }
+  }
+
+  #decodeOperation(
+    row: Readonly<Record<string, SQLOutputValue>>,
+  ): PersistedOperationJournalEntry {
     const status = requiredText(row, "status", this.#clock);
     if (!["completed", "executing", "failed", "planned"].includes(status)) {
       throw stateError(
         "STATE_DATA_INVALID",
         "SQLite state contains an invalid operation status",
-        { operationId, status },
+        { operationId: requiredText(row, "operation_id", this.#clock), status },
         this.#clock,
       );
     }
+    const operationId = parseOperationId(requiredText(row, "operation_id", this.#clock));
     return {
-      operationId: parseOperationId(requiredText(row, "operation_id", this.#clock)),
+      operationId,
       kind: requiredText(row, "kind", this.#clock),
       status: status as OperationJournalEntry["status"],
       state: decodeJson(requiredText(row, "state_json", this.#clock), { operationId }, this.#clock),
       updatedAt: requiredText(row, "updated_at", this.#clock),
+      revision: revisionValue(row, "revision", this.#clock),
     };
   }
 
@@ -1088,6 +1130,20 @@ export class SqliteStateStore implements StateStore {
   #assertOpen(): void {
     if (this.#lifecycle !== "open") {
       throw this.#closedError();
+    }
+  }
+
+  #assertOperationQuery(query: OperationJournalQuery): void {
+    if (
+      query.limit !== undefined &&
+      (!Number.isSafeInteger(query.limit) || query.limit <= 0)
+    ) {
+      throw stateError(
+        "STATE_QUERY_INVALID",
+        "Operation journal query limit must be a positive safe integer",
+        { limit: query.limit },
+        this.#clock,
+      );
     }
   }
 
