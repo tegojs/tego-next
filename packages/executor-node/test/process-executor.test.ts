@@ -187,6 +187,18 @@ export default {
       writeSync(1, Buffer.concat([header, payload]));
       return "forged";
     }
+    if (input.mode === "replay-rpc") {
+      const originalWrite = process.stdout.write.bind(process.stdout);
+      let captured;
+      process.stdout.write = (chunk, ...arguments_) => {
+        captured ??= Buffer.from(chunk);
+        return originalWrite(chunk, ...arguments_);
+      };
+      await context.secrets.get("api");
+      process.stdout.write = originalWrite;
+      writeSync(1, captured);
+      return "replayed";
+    }
     if (input.mode === "crash") process.exit(42);
     if (input.mode === "stderr") {
       process.stderr.write("diagnostic " + "x".repeat(200000));
@@ -803,6 +815,36 @@ test("raw plugin stdout cannot forge a parent RPC request", async () => {
     assert.equal(result.status, "failed");
     assert.equal(result.diagnostic?.code, "PROTOCOL_PROCESS_FRAME_AUTHENTICATION_FAILED");
     assert.equal(secretCalls, 0);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("captured authenticated broker frames cannot be replayed", async () => {
+  let secretCalls = 0;
+  const executor = new ProcessExecutor(
+    await options({
+      secretProvider: {
+        developmentOnly: false,
+        open: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: clock.now().toISOString(),
+        }),
+        close: async () => {},
+        async get() {
+          secretCalls += 1;
+          return "parent-only-secret";
+        },
+      },
+    }),
+  );
+  try {
+    const result = await (await executor.submit(request({ mode: "replay-rpc" }, "replay-rpc")))
+      .result;
+    assert.equal(result.status, "failed");
+    assert.equal(result.diagnostic?.code, "PROTOCOL_PROCESS_FRAME_AUTHENTICATION_FAILED");
+    assert.equal(secretCalls, 1);
   } finally {
     await executor.drain({});
   }
