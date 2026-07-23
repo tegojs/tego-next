@@ -172,6 +172,102 @@ test("closing during verification terminates the read before its first yield", a
   assert.equal(first.done, true);
 });
 
+test("artifact read handle cleanup preserves primary errors", async (context) => {
+  await context.test("verification error wins over close error", async () => {
+    const rootDirectory = await temporaryDirectory("verify-close-error");
+    const verificationError = new Error("verification failed");
+    const closeError = new Error("verification handle close failed");
+    let closeCalls = 0;
+    const store = new FilesystemArtifactStore({
+      rootDirectory,
+      openReadHandle: async () => ({
+        async read() {
+          throw verificationError;
+        },
+        async close() {
+          closeCalls += 1;
+          throw closeError;
+        },
+      }),
+    } as never);
+    await store.open();
+
+    const iterator = store.read(digest(Buffer.from("expected")))[Symbol.asyncIterator]();
+    await assert.rejects(iterator.next(), (error: unknown) => error === verificationError);
+    assert.equal(closeCalls, 1);
+    await store.close();
+  });
+
+  await context.test("stream read error wins over close error", async () => {
+    const rootDirectory = await temporaryDirectory("read-close-error");
+    const content = Buffer.from("verified");
+    const readError = new Error("stream read failed");
+    const closeError = new Error("stream handle close failed");
+    let verificationComplete = false;
+    let closeCalls = 0;
+    const store = new FilesystemArtifactStore({
+      rootDirectory,
+      openReadHandle: async () => ({
+        async read(buffer: Uint8Array, offset: number, length: number, position: number) {
+          if (verificationComplete) throw readError;
+          if (position >= content.byteLength) {
+            verificationComplete = true;
+            return { bytesRead: 0 };
+          }
+          const bytesRead = Math.min(length, content.byteLength - position);
+          buffer.set(content.subarray(position, position + bytesRead), offset);
+          return { bytesRead };
+        },
+        async close() {
+          closeCalls += 1;
+          throw closeError;
+        },
+      }),
+    } as never);
+    await store.open();
+
+    const iterator = store.read(digest(content))[Symbol.asyncIterator]();
+    await assert.rejects(iterator.next(), (error: unknown) => error === readError);
+    assert.equal(closeCalls, 1);
+    await store.close();
+  });
+
+  await context.test("close error surfaces when reading otherwise succeeds", async () => {
+    const rootDirectory = await temporaryDirectory("close-only-error");
+    const content = Buffer.from("verified");
+    const closeError = new Error("stream handle close failed");
+    let pass = 0;
+    let closeCalls = 0;
+    const store = new FilesystemArtifactStore({
+      rootDirectory,
+      openReadHandle: async () => ({
+        async read(buffer: Uint8Array, offset: number, length: number, position: number) {
+          if (position >= content.byteLength) {
+            pass += 1;
+            return { bytesRead: 0 };
+          }
+          const bytesRead = Math.min(length, content.byteLength - position);
+          buffer.set(content.subarray(position, position + bytesRead), offset);
+          return { bytesRead };
+        },
+        async close() {
+          closeCalls += 1;
+          throw closeError;
+        },
+      }),
+    } as never);
+    await store.open();
+
+    const iterator = store.read(digest(content))[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    assert.equal(first.done, false);
+    assert.equal(pass, 1);
+    await assert.rejects(iterator.next(), (error: unknown) => error === closeError);
+    assert.equal(closeCalls, 1);
+    await store.close();
+  });
+});
+
 test("artifact verification uses a bounded reusable buffer and streams bounded chunks", async () => {
   const size = 8 * 1024 * 1024;
   const content = Buffer.alloc(size, 0x61);
