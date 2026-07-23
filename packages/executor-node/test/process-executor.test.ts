@@ -291,10 +291,7 @@ class PostOutcomeCancellationProcessHost extends TestProcessHost {
   override spawn(request: ProcessSpawnRequest): Promise<HostedProcess> {
     const spawning = super.spawn(request);
     return {
-      then: (
-        resolve: (value: HostedProcess) => unknown,
-        reject: (error: unknown) => unknown,
-      ) =>
+      then: (resolve: (value: HostedProcess) => unknown, reject: (error: unknown) => unknown) =>
         spawning.then((hosted) => {
           const result = resolve({
             pid: hosted.pid,
@@ -331,10 +328,7 @@ class PostOutcomeFatalProcessHost extends TestProcessHost {
     const index = this.spawnCount;
     const spawning = super.spawn(request);
     return {
-      then: (
-        resolve: (value: HostedProcess) => unknown,
-        reject: (error: unknown) => unknown,
-      ) =>
+      then: (resolve: (value: HostedProcess) => unknown, reject: (error: unknown) => unknown) =>
         spawning.then((hosted) => {
           const wrapped: HostedProcess =
             index === 1
@@ -1027,10 +1021,7 @@ test("post-outcome cancellation retains direct termination settlement", async ()
 
     processHost.waitGate.resolve();
     await draining;
-    assert.equal(
-      (await handle.result).diagnostic?.code,
-      "EXECUTOR_PROCESS_KILL_FAILED",
-    );
+    assert.equal((await handle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
     assert.equal(processHost.activeProcessCount, 0);
   } finally {
     processHost.waitGate.resolve();
@@ -1670,13 +1661,13 @@ test("fatal quarantine settles delayed spawn while drain tracks its late child c
       drained = true;
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(delayedResult?.status, "failed");
-    assert.equal(delayedResult?.diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
+    assert.equal(delayedResult, undefined);
     assert.equal(drained, false);
 
     processHost.delayedGate.resolve();
     await processHost.delayedReturned.promise;
     await draining;
+    assert.equal((await delayedHandle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
     assert.equal(processHost.spawnCount, 2);
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal((await executor.health()).active, 1);
@@ -1701,7 +1692,10 @@ test("post-outcome fatal quarantine retains direct termination settlement", asyn
     }),
   );
   const primary = request({ mode: "ignore-cancel" }, "post-outcome-fatal-primary");
-  const victim = request({ mode: "echo", value: "must-not-bootstrap" }, "post-outcome-fatal-victim");
+  const victim = request(
+    { mode: "echo", value: "must-not-bootstrap" },
+    "post-outcome-fatal-victim",
+  );
   const primaryHandle = await executor.submit(primary);
   await started.promise;
   await executor.cancel(primary.taskId, primary.attemptId);
@@ -1726,10 +1720,7 @@ test("post-outcome fatal quarantine retains direct termination settlement", asyn
 
     processHost.victimWaitGate.resolve();
     await draining;
-    assert.equal(
-      (await victimHandle.result).diagnostic?.code,
-      "EXECUTOR_PROCESS_KILL_FAILED",
-    );
+    assert.equal((await victimHandle.result).diagnostic?.code, "EXECUTOR_PROCESS_KILL_FAILED");
     assert.equal(processHost.activeProcessCount, 1);
   } finally {
     processHost.victimWaitGate.resolve();

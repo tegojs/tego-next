@@ -792,6 +792,12 @@ export class ProcessExecutor implements Executor {
     let process_: HostedProcess | undefined;
     let channel: ProcessChannel | undefined;
     let admissionSettlement = Promise.resolve();
+    let requiredTerminationSettlement = Promise.resolve();
+    const terminateBeforeChannel = async (hosted: HostedProcess): Promise<TerminationOutcome> => {
+      const termination = await this.#terminate(hosted);
+      requiredTerminationSettlement = termination.settled;
+      return termination;
+    };
     const startedAt = this.#clock.now().toISOString();
     try {
       const resolution = await this.#raceAdmission(entry, this.#resolve(entry.request)).outcome;
@@ -828,12 +834,12 @@ export class ProcessExecutor implements Executor {
       process_ = spawning.value;
       entry.process = process_;
       if (this.#fatalDiagnostic !== undefined) {
-        await this.#terminate(process_);
+        await terminateBeforeChannel(process_);
         this.#settleFatal(entry, this.#fatalDiagnostic);
         return;
       }
       if (entry.cancellation !== undefined) {
-        await this.#terminate(process_);
+        await terminateBeforeChannel(process_);
         this.#settle(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
@@ -925,7 +931,12 @@ export class ProcessExecutor implements Executor {
       await this.#shutdownChild(channel, process_, component.artifactDigest, controlDeadline);
     } catch (error) {
       if (entry.state !== "terminal") {
-        const termination = process_ === undefined ? undefined : await this.#terminate(process_);
+        const termination =
+          process_ === undefined
+            ? undefined
+            : channel === undefined
+              ? await terminateBeforeChannel(process_)
+              : await this.#terminate(process_);
         const code =
           termination?.diagnostic !== undefined
             ? termination.diagnostic.code
@@ -964,8 +975,8 @@ export class ProcessExecutor implements Executor {
       entry.deadlineController.abort("terminal");
       await admissionSettlement;
       if (process_ !== undefined) {
-        await process_.stdin.close().catch(() => undefined);
         await this.#terminate(process_);
+        await requiredTerminationSettlement;
       }
       delete entry.process;
       delete entry.channel;
@@ -1297,8 +1308,10 @@ export class ProcessExecutor implements Executor {
       if (entry.state === "terminal" || entry.channel !== undefined) continue;
       const queued = entry.state === "accepted";
       this.#settleFatal(entry, failure);
-      if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
-      if (queued) entry.completed.resolve();
+      if (queued) {
+        if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
+        entry.completed.resolve();
+      }
     }
   }
 
