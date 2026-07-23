@@ -82,10 +82,6 @@ function compareIdentity(left: PluginDeploymentIdentity, right: PluginDeployment
   );
 }
 
-function sameIdentity(left: PluginDeploymentIdentity, right: PluginDeploymentIdentity): boolean {
-  return left.applicationId === right.applicationId && left.pluginId === right.pluginId;
-}
-
 function diagnostic(
   code: CapabilityResolutionDiagnosticCode,
   message: string,
