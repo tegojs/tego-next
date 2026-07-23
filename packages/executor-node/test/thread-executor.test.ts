@@ -845,6 +845,7 @@ test("active cancellation waits for worker termination before releasing capacity
   const started = Promise.withResolvers<void>();
   const executor = new ThreadExecutor(
     await options(factory, {
+      cleanupGraceMs: 1_000,
       maxConcurrency: 1,
       events: {
         async emit(type) {
@@ -913,6 +914,7 @@ test("successful component output remains non-terminal until worker cleanup sett
   const componentFinished = Promise.withResolvers<void>();
   const executor = new ThreadExecutor(
     await options(factory, {
+      cleanupGraceMs: 1_000,
       maxConcurrency: 1,
       events: {
         async emit(type) {
@@ -1110,6 +1112,7 @@ test("deadline during worker cleanup wins the single terminal decision", async (
   const componentFinished = Promise.withResolvers<void>();
   const executor = new ThreadExecutor(
     await options(factory, {
+      cleanupGraceMs: 1_000,
       maxConcurrency: 1,
       events: {
         async emit(type) {

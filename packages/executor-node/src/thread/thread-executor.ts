@@ -190,6 +190,11 @@ interface WorkerLease {
   readonly exited: Promise<{ readonly code?: number; readonly error?: Error }>;
 }
 
+interface ThreadTerminationOutcome {
+  readonly diagnostic?: RuntimeDiagnostic;
+  readonly settled: Promise<void>;
+}
+
 interface ThreadInboundBudget {
   bytes: number;
   count: number;
@@ -713,8 +718,9 @@ export class ThreadExecutor implements Executor {
   readonly #attempts = new Map<string, AttemptEntry>();
   readonly #queue: AttemptEntry[] = [];
   readonly #inboundBudget: ThreadInboundBudget = { bytes: 0, count: 0 };
-  readonly #termination = new WeakMap<ThreadWorker, Promise<void>>();
+  readonly #termination = new WeakMap<ThreadWorker, Promise<ThreadTerminationOutcome>>();
   readonly #quarantined = new Set<WorkerLease>();
+  readonly #quarantineSettlements = new Map<WorkerLease, Promise<void>>();
   #active = 0;
   #accepting = true;
   #drainPromise: Promise<void> | undefined;
@@ -888,7 +894,7 @@ export class ThreadExecutor implements Executor {
       }
       try {
         await Promise.all([...this.#attempts.values()].map((entry) => entry.completed.promise));
-        await Promise.all([...this.#quarantined].map((lease) => lease.exited));
+        await Promise.all([...this.#quarantineSettlements.values()]);
       } finally {
         deadlineController.abort("drained");
       }
@@ -902,6 +908,12 @@ export class ThreadExecutor implements Executor {
   }
 
   async health(): Promise<ExecutorHealth> {
+    const attached = new Set(
+      [...this.#attempts.values()].flatMap((entry) =>
+        entry.lease === undefined ? [] : [entry.lease],
+      ),
+    );
+    const detachedQuarantines = [...this.#quarantined].filter((lease) => !attached.has(lease));
     return {
       status: this.#fatalDiagnostic === undefined ? "healthy" : "unhealthy",
       checkedAt: this.#clock.now().toISOString(),
@@ -911,7 +923,7 @@ export class ThreadExecutor implements Executor {
       id: this.id,
       type: this.type,
       accepting: this.#accepting,
-      active: this.#active + this.#quarantined.size,
+      active: this.#active + detachedQuarantines.length,
       queued: this.#queue.length,
       retainedAttempts: this.#attempts.size,
     };
@@ -1082,7 +1094,7 @@ export class ThreadExecutor implements Executor {
       }
     } finally {
       await Promise.all(admissionSettlements);
-      if (lease !== undefined) await this.#terminate(lease);
+      const termination = lease === undefined ? undefined : await this.#terminate(lease);
       channel?.close();
       delete entry.lease;
       delete entry.channel;
@@ -1090,21 +1102,23 @@ export class ThreadExecutor implements Executor {
       if (entry.state !== "terminal") {
         this.#settle(
           entry,
-          entry.cancellation === undefined
-            ? (candidate ?? {
-                taskId: entry.request.taskId,
-                attemptId: entry.request.attemptId,
-                status: "failed",
-                diagnostic: diagnostic(
-                  "EXECUTOR_THREAD_EXIT",
-                  "Thread executor attempt ended without a result",
-                  this.#clock.now(),
-                ),
-                executor: this.#executorMetadata(lease),
-                startedAt,
-                completedAt: this.#clock.now().toISOString(),
-              })
-            : this.#cancelledResult(entry, entry.cancellation),
+          termination?.diagnostic !== undefined
+            ? this.#terminationFailureResult(entry, termination.diagnostic, lease, startedAt)
+            : entry.cancellation === undefined
+              ? (candidate ?? {
+                  taskId: entry.request.taskId,
+                  attemptId: entry.request.attemptId,
+                  status: "failed",
+                  diagnostic: diagnostic(
+                    "EXECUTOR_THREAD_EXIT",
+                    "Thread executor attempt ended without a result",
+                    this.#clock.now(),
+                  ),
+                  executor: this.#executorMetadata(lease),
+                  startedAt,
+                  completedAt: this.#clock.now().toISOString(),
+                })
+              : this.#cancelledResult(entry, entry.cancellation),
         );
       }
     }
@@ -1244,7 +1258,10 @@ export class ThreadExecutor implements Executor {
     })();
     await this.#withinCleanupGrace(lifecycle);
     channel.close();
-    await this.#terminate(lease);
+    const termination = await this.#terminate(lease);
+    if (termination.diagnostic !== undefined) {
+      throw new DiagnosticError(termination.diagnostic);
+    }
   }
 
   async #withinCleanupGrace(operation: Promise<unknown>): Promise<boolean> {
@@ -1317,7 +1334,10 @@ export class ThreadExecutor implements Executor {
       .sleep(this.#cancellationGraceMs, entry.deadlineController.signal)
       .then(async () => {
         if (entry.state === "terminal" || entry.lease === undefined) return;
-        await this.#terminate(entry.lease);
+        const termination = await this.#terminate(entry.lease);
+        if (termination.diagnostic !== undefined) {
+          entry.channel?.abort(new DiagnosticError(termination.diagnostic));
+        }
       })
       .catch(() => undefined);
   }
@@ -1362,34 +1382,91 @@ export class ThreadExecutor implements Executor {
     return { worker, exited: exit.promise };
   }
 
-  async #terminate(lease: WorkerLease): Promise<void> {
+  async #terminate(lease: WorkerLease): Promise<ThreadTerminationOutcome> {
     const existing = this.#termination.get(lease.worker);
     if (existing !== undefined) return existing;
     const terminating = (async () => {
-      try {
-        await lease.worker.terminate();
-        await lease.exited;
-      } catch (error) {
-        const failure = diagnostic(
-          "EXECUTOR_THREAD_TERMINATION_FAILED",
-          error instanceof Error ? error.message : "Worker thread termination failed",
-          this.#clock.now(),
+      const timeoutController = new AbortController();
+      const timeout = this.#clock
+        .sleep(this.#cleanupGraceMs, timeoutController.signal)
+        .then(() => ({ kind: "timeout" as const }));
+      const exit = lease.exited.then((value) => ({ kind: "exit" as const, value }));
+      const termination = Promise.resolve()
+        .then(() => lease.worker.terminate())
+        .then(
+          () => ({ kind: "terminated" as const }),
+          (error: unknown) => ({ kind: "rejected" as const, error }),
         );
-        this.#fatalDiagnostic ??= failure;
-        this.#accepting = false;
-        this.#quarantined.add(lease);
-        this.#settleAdmissions(this.#fatalDiagnostic);
-        try {
-          this.#options.logger?.error(failure.message, failure);
-        } catch {
-          // Quarantine must not depend on a logger.
-        }
-        await lease.exited;
-        this.#quarantined.delete(lease);
+      const first = await Promise.race([exit, termination, timeout]);
+      if (first.kind === "exit") {
+        timeoutController.abort("worker-exited");
+        return { settled: Promise.resolve() };
       }
+      if (first.kind === "terminated") {
+        const settled = await Promise.race([exit, timeout]);
+        if (settled.kind === "exit") {
+          timeoutController.abort("worker-exited");
+          return { settled: Promise.resolve() };
+        }
+      }
+      timeoutController.abort("worker-quarantined");
+      const message =
+        first.kind === "rejected" && first.error instanceof Error
+          ? first.error.message
+          : "Worker thread termination did not settle before its cleanup deadline";
+      return this.#enterFatalQuarantine(
+        diagnostic("EXECUTOR_THREAD_TERMINATION_FAILED", message, this.#clock.now()),
+        lease,
+      );
     })();
     this.#termination.set(lease.worker, terminating);
     return terminating;
+  }
+
+  #enterFatalQuarantine(failure: RuntimeDiagnostic, lease: WorkerLease): ThreadTerminationOutcome {
+    const existing = this.#quarantineSettlements.get(lease);
+    if (existing !== undefined) {
+      return {
+        ...(this.#fatalDiagnostic === undefined ? {} : { diagnostic: this.#fatalDiagnostic }),
+        settled: existing,
+      };
+    }
+    const transitioning = this.#fatalDiagnostic === undefined;
+    this.#fatalDiagnostic ??= failure;
+    const fatal = this.#fatalDiagnostic;
+    this.#accepting = false;
+    this.#quarantined.add(lease);
+    const settled = lease.exited.then(() => {
+      this.#quarantined.delete(lease);
+      this.#quarantineSettlements.delete(lease);
+    });
+    this.#quarantineSettlements.set(lease, settled);
+    this.#settleAdmissions(fatal);
+    if (transitioning) {
+      try {
+        this.#options.logger?.error(fatal.message, fatal);
+      } catch {
+        // Quarantine must not depend on a logger.
+      }
+    }
+    return { diagnostic: fatal, settled };
+  }
+
+  #terminationFailureResult(
+    entry: AttemptEntry,
+    failure: RuntimeDiagnostic,
+    lease: WorkerLease | undefined,
+    startedAt: string,
+  ): ExecutionResult {
+    return {
+      taskId: entry.request.taskId,
+      attemptId: entry.request.attemptId,
+      status: "failed",
+      diagnostic: failure,
+      executor: this.#executorMetadata(lease),
+      startedAt,
+      completedAt: this.#clock.now().toISOString(),
+    };
   }
 
   #raceAdmission<T>(entry: AttemptEntry, operation: Promise<T>): AdmissionOperation<T> {
