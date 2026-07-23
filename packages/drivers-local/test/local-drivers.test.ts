@@ -138,6 +138,28 @@ test("artifact reads verify all bytes before yielding any content", async () => 
   await store.close();
 });
 
+test("artifact publish cannot accept bytes mutated during an asynchronous write", async () => {
+  const rootDirectory = await temporaryDirectory("mutable-source");
+  const store = new FilesystemArtifactStore({ rootDirectory });
+  await store.open();
+  const mutableChunk = Buffer.alloc(64 * 1024 * 1024, 0x61);
+  const expected = digest(mutableChunk);
+  const mutationFinished = Promise.withResolvers<void>();
+
+  async function* source(): AsyncIterable<Uint8Array> {
+    setImmediate(() => {
+      mutableChunk.fill(0x62);
+      mutationFinished.resolve();
+    });
+    yield mutableChunk;
+  }
+
+  await store.put(expected, source());
+  await mutationFinished.promise;
+  assert.equal(digest(await readFile(store.pathFor(expected))), expected);
+  await store.close();
+});
+
 test("Windows publish collision handling preserves a completed target deterministically", async () => {
   const calls: string[] = [];
   await publishTempFileAtomically({
