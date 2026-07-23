@@ -367,8 +367,7 @@ function providerLossDecisions(
     const requirement = normalizeRequirement(requirementSource);
     const provider = byIdentity.get(identityKey(previous.provider));
     const available =
-      provider?.ready === true &&
-      compatibleProvisions(provider, requirement).length > 0;
+      provider?.ready === true && compatibleProvisions(provider, requirement).length > 0;
     if (!available) {
       actions.push({
         action: requirement.lossPolicy,
