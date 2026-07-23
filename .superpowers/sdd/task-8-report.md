@@ -68,6 +68,42 @@ The implementation now provides:
 16. `4971feb fix: validate persisted instance storage identity`
     - GREEN by retaining state-record keys, requiring key/value/derived identity agreement, and
       filtering planning, execution-time gates, and readiness through the same canonical boundary.
+17. `8ebf431 test: cover stale lifecycle placement replacement`
+    - RED on real Memory and SQLite stores because planning attempted to overwrite a pending stable
+      process effect with a thread payload before claiming the stale message.
+18. `6d8f5b0 fix: quarantine stale lifecycle placement before replan`
+    - GREEN by claiming one existing lifecycle message before planning, deferring the replacement
+      effect to the next wake, and rebinding a not-yet-prepared instance to current placement.
+19. `4ff7fd6 test: cover teardown of removed old components`
+    - RED across Memory/SQLite upgrade and rollback cases; the removed old component never invoked
+      drain or stop.
+20. `0be608c fix: execute teardown from persisted instance placement`
+    - GREEN by limiting current-manifest placement checks to startup and executing old-generation
+      teardown from its persisted immutable artifact/executor/worker tuple.
+21. `53cf95d test: cover failed prepare retry convergence`
+    - RED on Memory and SQLite because the due failed prepare was terminally acknowledged and never
+      invoked a second time.
+22. `2fe6413 fix: retry due failed lifecycle effects`
+    - GREEN by admitting only due failed states whose persisted `retryEffect` matches the claimed
+      lifecycle effect.
+23. `913a391 test: cover current instance context mismatches`
+    - RED for artifact-digest and observed-generation mismatches across essential readiness and
+      capability-provider readiness on both real stores.
+24. `25bf66a fix: validate current instance deployment context`
+    - GREEN through one context predicate shared by planning, execution-time capabilities, and
+      readiness, with durable inconsistent observations.
+25. `2f2aad1 test: define same-transaction outbox identity semantics`
+    - RED shared conformance on Memory and SQLite; conflicting duplicate message IDs in one
+      transaction were accepted last-write-wins.
+26. `fd8442b fix: enforce staged outbox identity semantics`
+    - GREEN by staging messages in insertion-ordered maps, deduplicating canonical equals, and
+      atomically rejecting operation/topic/payload conflicts.
+27. `5127071 test: cover leased stale placement replacement`
+    - Independent-review RED on Memory and SQLite when another owner held the stale message lease;
+      planning still raised an idempotency conflict.
+28. `f773d5d fix: defer leased lifecycle replacement conflicts`
+    - GREEN by treating the single-message planning transaction's outbox identity conflict as a
+      deferred replan without changing the active lease or authority fence.
 
 ## RED Evidence
 
@@ -89,22 +125,33 @@ The implementation now provides:
   terminal acknowledgement semantics.
 - Independent-review storage-boundary regression run: 0/2 passed; the queued consumer effect ran and
   an essential deployment was marked ready from a canonical value stored under the wrong state key.
+- Real-driver placement-replacement regression: both Memory and SQLite raised
+  `STATE_IDEMPOTENCY_CONFLICT` before the stale process effect could be quarantined.
+- Removed-component teardown regression: all four upgrade/rollback plus Memory/SQLite cases invoked
+  neither drain nor stop.
+- Failed-prepare retry regression: both real stores invoked prepare only once and remained failed.
+- Current-context regression: all eight Memory/SQLite artifact/observed-generation readiness cases
+  accepted inconsistent current instances.
+- Same-transaction identity regression: both driver conformance runs accepted conflicting duplicate
+  payloads instead of rejecting the transaction.
+- Leased-placement regression: both real stores raised the same identity conflict while another
+  owner held an unexpired claim.
 - Each RED group was committed before its corresponding implementation fix.
 
 ## GREEN Evidence
 
 Fresh verification at the final implementation boundary:
 
-- `npm run format:check` — PASS, 88 files.
-- `npm run lint` — PASS, 88 files.
+- `npm run format:check` — PASS, 89 files.
+- `npm run lint` — PASS, 89 files.
 - Affected workspace typecheck (`contracts`, `testkit`, `drivers-local`, `runtime`) — PASS.
-- Focused lifecycle/reconciler plus Memory/SQLite state tests — PASS, 96/96.
+- Focused lifecycle/reconciler plus Memory/SQLite state tests — PASS, 98/98.
 - `npm test` — PASS:
   - CLI: 37/37
   - Runtime: 151/151
   - Testkit: 3/3
   - Architecture: 18/18
-- `npm run test:integration` — PASS, 5/5.
+- `npm run test:integration` — PASS, 35/35.
 
 Root `npm run typecheck` reaches and passes every implemented affected workspace, but the aggregate
 command remains non-green because four future placeholder workspaces do not contain `tsconfig.json`:
@@ -125,6 +172,7 @@ outside Task 8.
 - `packages/runtime/src/reconcile/retry.ts`
 - `packages/runtime/test/component-lifecycle.test.ts`
 - `packages/runtime/test/reconciler.test.ts`
+- `tests/integration/reconciler-state-stores.test.mjs`
 
 ## Design Decisions
 
@@ -144,10 +192,21 @@ outside Task 8.
 - Persisted instance records retain their state key, and only records whose key, value, and derived
   identity agree may affect planning, capability readiness, effect execution, or application
   readiness.
+- Current-generation records must also match the exact desired artifact digest and observed
+  generation; older-generation records remain valid only for teardown.
+- Existing lifecycle messages are claimed before a conflicting stable-identity replacement is
+  planned. A replacement blocked by another owner's lease is deferred until normal lease expiry,
+  preserving claim and authority fencing.
+- Removed old-generation components drain and stop from their persisted placement even when the
+  current manifest or installation no longer describes them.
+- A due failed lifecycle effect is retryable only when its persisted `retryEffect` matches the
+  claimed effect.
 - Capability resolver order drives application-scoped deployment planning; lexical order is only a
   deterministic fallback for unordered, blocked, or disabled deployments.
 - Memory and SQLite share sorted wire-value semantics, explicit outbox bounds, and retry replacement
   for corrected stable messages.
+- Memory and SQLite deduplicate canonical same-transaction outbox identities once and atomically
+  reject changed operation, topic, or payload content.
 - SQLite migration v3 persists enqueue sequence so equal-availability messages retain transaction
   order after restart.
 - Disabled deployments may drain from observed instance data even when installation metadata has
@@ -169,3 +228,10 @@ the RED/GREEN commits above. A final storage-boundary review found two additiona
 execution-time filtering gaps; after `4971feb`, the independent re-review returned **PASS**. The
 reviewer independently confirmed state-key identity validation, canonical-only execution-time
 capability inputs, a fresh 29/29 reconciler run, and `git diff --check`.
+
+The second formal re-review identified five further production-driver convergence and context
+findings. After the five RED/GREEN pairs above, independent review found one additional leased-claim
+branch, which was locked by `5127071` and fixed by `f773d5d`. The final read-only re-review returned
+**PASS**, confirming all five findings, preservation of active leases and authority fences, eventual
+corrected-placement convergence on Memory and SQLite, fresh focused 124/124 review evidence, and
+`git diff --check`.
