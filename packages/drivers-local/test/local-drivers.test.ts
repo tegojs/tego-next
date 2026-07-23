@@ -572,8 +572,7 @@ test("NodeProcessHost bounds SIGKILL settlement when the child never reports exi
       rejectionCode = diagnosticCode(error);
     });
     clock.advanceBy(5_000);
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(rejectionCode, "EXECUTOR_PROCESS_KILL_TIMEOUT");
   } finally {
     ChildProcess.prototype.kill = originalKill;

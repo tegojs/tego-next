@@ -16,6 +16,7 @@ const MAX_ARGUMENTS = 128;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
 const MAX_ENVIRONMENT_ENTRIES = 128;
 const MAX_ENVIRONMENT_BYTES = 64 * 1024;
+const PROCESS_KILL_SETTLEMENT_TIMEOUT_MS = 5_000;
 const SENSITIVE_ENVIRONMENT_NAME = /(?:credential|key|password|secret|token)/iu;
 
 const systemClock: Clock = {
@@ -80,12 +81,18 @@ class NodeHostedProcess implements HostedProcess {
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array>;
   readonly #child: ChildProcessWithoutNullStreams;
+  readonly #clock: Clock;
   readonly #exit: Promise<HostedProcessExit>;
   #inputClosed = false;
   #closePromise: Promise<void> | undefined;
 
-  constructor(child: ChildProcessWithoutNullStreams, onExit: (process: NodeHostedProcess) => void) {
+  constructor(
+    child: ChildProcessWithoutNullStreams,
+    clock: Clock,
+    onExit: (process: NodeHostedProcess) => void,
+  ) {
     this.#child = child;
+    this.#clock = clock;
     this.pid = child.pid;
     this.stdout = child.stdout as AsyncIterable<Uint8Array>;
     this.stderr = child.stderr as AsyncIterable<Uint8Array>;
@@ -142,7 +149,20 @@ class NodeHostedProcess implements HostedProcess {
     ) {
       throw processHostError("PROCESS_KILL_FAILED", "Failed to deliver SIGKILL");
     }
-    return this.#exit;
+    const timeout = new AbortController();
+    try {
+      return await Promise.race([
+        this.#exit,
+        this.#clock.sleep(PROCESS_KILL_SETTLEMENT_TIMEOUT_MS, timeout.signal).then(() => {
+          throw processHostError(
+            "PROCESS_KILL_TIMEOUT",
+            "Hosted process did not report exit after SIGKILL",
+          );
+        }),
+      ]);
+    } finally {
+      timeout.abort();
+    }
   }
 
   wait(): Promise<HostedProcessExit> {
@@ -225,7 +245,9 @@ export class NodeProcessHost implements ProcessHost {
         }),
       );
     }
-    const hosted = new NodeHostedProcess(child, (process_) => this.#processes.delete(process_));
+    const hosted = new NodeHostedProcess(child, this.#clock, (process_) =>
+      this.#processes.delete(process_),
+    );
     this.#processes.add(hosted);
     return hosted;
   }
