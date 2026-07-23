@@ -909,6 +909,7 @@ test("restart before acknowledgement reuses stable identity and leaves one live 
 
   const live = [...state.records.values()].filter(
     (entry) =>
+      entry.key.collection === "component-instances" &&
       (entry.value as { readonly lifecycle?: string }).lifecycle !== "stopped" &&
       (entry.value as { readonly lifecycle?: string }).lifecycle !== "failed",
   );
@@ -952,6 +953,66 @@ test("restart after observed commit but before acknowledgement does not repeat t
     1,
   );
   await second.stop();
+});
+
+test("a queued startup effect is discarded when desired state becomes disabled", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const effects = new RecordingEffects();
+  let desired = deployment();
+  const options = {
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  };
+  const first = new Reconciler({ ...options, interruptAfterEffect: true });
+  await first.start();
+  await first.stop();
+
+  desired = deployment("2", { state: "disabled" });
+  clock.advance(31_000);
+  const second = new Reconciler(options);
+  await second.start();
+
+  assert.equal(effects.calls.length, 1);
+  assert.equal(second.replanCount, 1);
+  await second.stop();
+});
+
+test("disabled deployments can drain persisted instances after installation removal", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const effects = new RecordingEffects();
+  const active = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+  await active.start();
+  await active.stop();
+
+  const disabled = new Reconciler({
+    artifactGate: {
+      validate: async () => {
+        throw new Error("disabled deployment must not validate an artifact");
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment("2", { state: "disabled" })],
+    loadInstallations: async () => [],
+  });
+  await disabled.start();
+
+  assert.equal(effects.performed.at(-1)?.kind, "drain");
+  await disabled.stop();
 });
 
 test("stale desired state invalidates a planned effect before it is journaled", async () => {
