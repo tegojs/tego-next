@@ -165,6 +165,7 @@ interface AttemptEntry {
   readonly admissionController: AbortController;
   state: "accepted" | "running" | "terminal";
   terminal?: ExecutionResult;
+  forced?: ExecutionResult;
   lease?: WorkerLease;
   channel?: ThreadChannel;
   transfer?: ClaimedTransfer;
@@ -960,10 +961,24 @@ export class ThreadExecutor implements Executor {
       admissionSettlements.push(resolutionAdmission.settled);
       const resolution = await resolutionAdmission.outcome;
       if (resolution.cancelled) {
-        candidate = this.#cancelledResult(entry, entry.cancellation ?? "cancelled");
+        candidate = entry.forced ?? this.#cancelledResult(entry, entry.cancellation ?? "cancelled");
         return;
       }
       const component = resolution.value;
+      if (entry.forced !== undefined || this.#fatalDiagnostic !== undefined) {
+        candidate =
+          entry.forced ??
+          this.#fatalResult(
+            entry,
+            this.#fatalDiagnostic ??
+              diagnostic(
+                "EXECUTOR_THREAD_TERMINATION_FAILED",
+                "Thread executor entered fatal containment",
+                this.#clock.now(),
+              ),
+          );
+        return;
+      }
       if (entry.cancellation !== undefined) {
         candidate = this.#cancelledResult(entry, entry.cancellation);
         return;
@@ -1093,12 +1108,13 @@ export class ThreadExecutor implements Executor {
         };
       }
     } finally {
-      await Promise.all(admissionSettlements);
+      if (entry.forced === undefined) await Promise.all(admissionSettlements);
       const termination = lease === undefined ? undefined : await this.#terminate(lease);
       channel?.close();
       delete entry.lease;
       delete entry.channel;
       delete entry.transfer;
+      delete entry.forced;
       if (entry.state !== "terminal") {
         this.#settle(
           entry,
@@ -1469,6 +1485,22 @@ export class ThreadExecutor implements Executor {
     };
   }
 
+  #fatalResult(entry: AttemptEntry, failure: RuntimeDiagnostic): ExecutionResult {
+    const now = this.#clock.now().toISOString();
+    return {
+      taskId: entry.request.taskId,
+      attemptId: entry.request.attemptId,
+      status: "failed",
+      diagnostic: failure,
+      executor: {
+        kind: "thread",
+        metadata: { executorId: this.id, securityIsolation: false },
+      },
+      startedAt: now,
+      completedAt: now,
+    };
+  }
+
   #raceAdmission<T>(entry: AttemptEntry, operation: Promise<T>): AdmissionOperation<T> {
     const signal = entry.admissionController.signal;
     const outcome = Promise.withResolvers<AdmissionRace<T>>();
@@ -1512,19 +1544,13 @@ export class ThreadExecutor implements Executor {
       }
       const queued = entry.state === "accepted";
       delete entry.transfer;
-      const now = this.#clock.now().toISOString();
-      this.#settle(entry, {
-        taskId: entry.request.taskId,
-        attemptId: entry.request.attemptId,
-        status: "failed",
-        diagnostic: failure,
-        executor: {
-          kind: "thread",
-          metadata: { executorId: this.id, securityIsolation: false },
-        },
-        startedAt: now,
-        completedAt: now,
-      });
+      const fatal = this.#fatalResult(entry, failure);
+      if (queued) {
+        this.#settle(entry, fatal);
+      } else {
+        entry.forced ??= fatal;
+        entry.admissionController.abort("fatal");
+      }
       if (queued) {
         if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
         entry.completed.resolve();

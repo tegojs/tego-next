@@ -1085,9 +1085,8 @@ test("fatal quarantine publishes stalled resolver attempts without awaiting late
   const factory = new RejectingTerminationFactory();
   const neverStarted = Promise.withResolvers<void>();
   const delayedStarted = Promise.withResolvers<void>();
-  const delayedResolver = Promise.withResolvers<
-    Awaited<ReturnType<ThreadExecutorOptions["resolveComponent"]>>
-  >();
+  const delayedResolver =
+    Promise.withResolvers<Awaited<ReturnType<ThreadExecutorOptions["resolveComponent"]>>>();
   const base = await options(factory, { maxConcurrency: 3 });
   const resolveComponent = base.resolveComponent;
   const executor = new ThreadExecutor({
