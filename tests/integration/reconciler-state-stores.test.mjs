@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseComponentId,
   parseGeneration,
   parsePluginId,
@@ -154,6 +155,14 @@ async function readOnlyInstance(store, instanceId) {
     namespace: "tego",
     collection: "component-instances",
     id: instanceId,
+  });
+}
+
+async function readObservation(store, targetPluginId = pluginId) {
+  return store.read({
+    namespace: "tego",
+    collection: "deployment-observations",
+    id: `${applicationId}/${targetPluginId}`,
   });
 }
 
@@ -379,4 +388,217 @@ test("failed prepare retries after retryAt and converges to ready", async (t) =>
     assert.equal(reconciler.applicationReady(), true);
     await reconciler.stop();
   });
+});
+
+test("current instance context mismatches cannot satisfy essential readiness", async (t) => {
+  for (const mismatch of ["artifactDigest", "observedGeneration"]) {
+    await t.test(mismatch, async (mismatchTest) => {
+      await withRealStateStores(mismatchTest, async (state, clock) => {
+        const desired = deployment();
+        const identity = planReconcile({
+          deployment: desired,
+          gate: gate(),
+          instances: [],
+          now: clock.now().toISOString(),
+          supportedExecutors: ["thread"],
+        }).steps[0]?.effect;
+        assert.ok(identity);
+        await state.transact({}, async (transaction) => {
+          await transaction.put(
+            {
+              namespace: "tego",
+              collection: "component-instances",
+              id: identity.instanceId,
+            },
+            {
+              applicationId,
+              artifactDigest: mismatch === "artifactDigest" ? digestTwo : digest,
+              componentId,
+              deploymentGeneration: parseGeneration("1"),
+              executor: "thread",
+              instanceId: identity.instanceId,
+              lifecycle: "ready",
+              observedGeneration:
+                mismatch === "observedGeneration"
+                  ? parseGeneration("2")
+                  : parseGeneration("1"),
+              pluginId,
+            },
+            { expectedRevision: "absent" },
+          );
+          return null;
+        });
+        const effects = new RecordingEffects();
+        const reconciler = new Reconciler({
+          artifactGate: { validate: async () => gate().artifact },
+          clock,
+          effects,
+          state,
+          loadDeployments: async () => [desired],
+          loadInstallations: async () => [installation()],
+        });
+
+        await reconciler.start();
+
+        assert.equal(reconciler.applicationReady(), false);
+        assert.equal(reconciler.diagnostics()[0]?.code, "DEPLOYMENT_INSTANCE_INCONSISTENT");
+        assert.equal((await readObservation(state))?.value.status, "inconsistent");
+        assert.deepEqual(effects.calls, []);
+        await reconciler.stop();
+      });
+    });
+  }
+});
+
+test("current provider context mismatches cannot satisfy required capabilities", async (t) => {
+  const providerId = parsePluginId("z-provider");
+  const consumerId = parsePluginId("a-consumer");
+  const providerComponentId = parseComponentId("provider");
+  const consumerComponentId = parseComponentId("consumer");
+  const capability = parseCapabilityName("org.example.echo");
+  const component = (id) => ({
+    componentId: parseComponentId(id),
+    kind: "service",
+    entrypoint: `components/${id}.js`,
+    executors: ["process"],
+  });
+  const providerManifest = {
+    ...manifest(),
+    pluginId: providerId,
+    components: [component("provider")],
+    permissions: [{ kind: "executor", executors: ["process"] }],
+    capabilities: {
+      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      requires: [],
+    },
+  };
+  const consumerManifest = {
+    ...manifest(),
+    pluginId: consumerId,
+    components: [component("consumer")],
+    permissions: [{ kind: "executor", executors: ["process"] }],
+    capabilities: {
+      provides: [],
+      requires: [{ name: capability, protocolRange: "^1.0.0" }],
+    },
+  };
+  const providerDeployment = {
+    ...deployment(),
+    pluginId: providerId,
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
+  };
+  const consumerDeployment = {
+    ...deployment(),
+    pluginId: consumerId,
+    artifactDigest: digestTwo,
+    essential: false,
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
+  };
+  const providerInstallation = {
+    ...installation(),
+    pluginId: providerId,
+    manifest: providerManifest,
+  };
+  const consumerInstallation = {
+    ...installation(),
+    pluginId: consumerId,
+    digest: digestTwo,
+    manifest: consumerManifest,
+  };
+  const artifacts = new Map([
+    [digest, { ...gate().artifact, manifest: providerManifest }],
+    [digestTwo, { ...gate().artifact, digest: digestTwo, manifest: consumerManifest }],
+  ]);
+  const providerGate = {
+    artifact: artifacts.get(digest),
+    capabilityResolution: {
+      ok: true,
+      diagnostics: [],
+      providerLossActions: [],
+      bindings: [],
+      order: [{ applicationId, pluginId: providerId }],
+    },
+    permissionDecision: {
+      allowed: true,
+      diagnostics: [],
+      granted: providerManifest.permissions,
+      requested: providerManifest.permissions,
+    },
+  };
+  assert.ok(providerGate.artifact);
+  for (const mismatch of ["artifactDigest", "observedGeneration"]) {
+    await t.test(mismatch, async (mismatchTest) => {
+      await withRealStateStores(mismatchTest, async (state, clock) => {
+        const identity = planReconcile({
+          deployment: providerDeployment,
+          gate: providerGate,
+          instances: [],
+          now: clock.now().toISOString(),
+          supportedExecutors: ["process"],
+        }).steps[0]?.effect;
+        assert.ok(identity);
+        await state.transact({}, async (transaction) => {
+          await transaction.put(
+            {
+              namespace: "tego",
+              collection: "component-instances",
+              id: identity.instanceId,
+            },
+            {
+              applicationId,
+              artifactDigest: mismatch === "artifactDigest" ? digestTwo : digest,
+              componentId: providerComponentId,
+              deploymentGeneration: parseGeneration("1"),
+              executor: "process",
+              instanceId: identity.instanceId,
+              lifecycle: "ready",
+              observedGeneration:
+                mismatch === "observedGeneration"
+                  ? parseGeneration("2")
+                  : parseGeneration("1"),
+              pluginId: providerId,
+            },
+            { expectedRevision: "absent" },
+          );
+          return null;
+        });
+        const effects = new RecordingEffects();
+        effects.supportedExecutors = ["process"];
+        const reconciler = new Reconciler({
+          artifactGate: {
+            validate: async (request) => {
+              const artifact = artifacts.get(request.digest);
+              assert.ok(artifact);
+              return artifact;
+            },
+          },
+          clock,
+          effects,
+          state,
+          loadDeployments: async () => [providerDeployment, consumerDeployment],
+          loadInstallations: async () => [providerInstallation, consumerInstallation],
+        });
+
+        await reconciler.start();
+
+        assert.equal(
+          effects.calls.some(
+            (effect) =>
+              effect.pluginId === consumerId &&
+              effect.componentId === consumerComponentId &&
+              effect.kind === "prepare",
+          ),
+          false,
+        );
+        assert.equal(
+          reconciler
+            .diagnostics()
+            .some((diagnostic) => diagnostic.code === "CAPABILITY_REQUIRED_UNAVAILABLE"),
+          true,
+        );
+        assert.equal((await readObservation(state, providerId))?.value.status, "inconsistent");
+        await reconciler.stop();
+      });
+    });
+  }
 });
