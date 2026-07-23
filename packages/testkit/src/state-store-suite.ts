@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  OUTBOX_PAYLOAD_MAX_BYTES,
+  OUTBOX_TOPIC_MAX_LENGTH,
   diagnosticCode,
   compareOperationJournalCursors,
   parseFencingEpoch,
@@ -641,6 +643,21 @@ export function stateStoreConformance(
           expectDiagnostic("PROTOCOL_WIRE_VALUE_INVALID"),
         );
         assert.equal(getterCalls, 0);
+        for (const [suffix, invalid] of [
+          ["undefined", undefined],
+          ["function", () => "invalid"],
+          ["exotic", new (class NonJsonValue {})()],
+        ] as const) {
+          await assert.rejects(
+            store.transact({}, async (transaction) => {
+              await transaction.put(jsonKey("wire", suffix), invalid as unknown as JsonValue, {
+                expectedRevision: "absent",
+              });
+              return null;
+            }),
+            expectDiagnostic("PROTOCOL_WIRE_VALUE_INVALID"),
+          );
+        }
 
         await store.transact({}, async (transaction) => {
           await transaction.put(
@@ -656,6 +673,21 @@ export function stateStoreConformance(
         const createdAt = new Date().toISOString();
         const messageId = parseMessageId("canonical-payload");
         const operationId = parseOperationId("canonical-operation");
+        await assert.rejects(
+          store.transact({}, async (transaction) => {
+            await transaction.enqueueOutbox({
+              availableAt: createdAt,
+              createdAt,
+              messageId: parseMessageId("accessor-payload"),
+              operationId: parseOperationId("accessor-operation"),
+              payload: accessor as JsonValue,
+              topic: "component.lifecycle",
+            });
+            return null;
+          }),
+          expectDiagnostic("PROTOCOL_WIRE_VALUE_INVALID"),
+        );
+        assert.equal(getterCalls, 0);
         await store.transact({}, async (transaction) => {
           await transaction.enqueueOutbox({
             availableAt: createdAt,
@@ -685,8 +717,8 @@ export function stateStoreConformance(
       await withStore(factory, async (store) => {
         const createdAt = new Date().toISOString();
         for (const [suffix, topic, payload] of [
-          ["topic", "x".repeat(129), {}],
-          ["payload", "component.lifecycle", { data: "x".repeat(1_048_577) }],
+          ["topic", "x".repeat(OUTBOX_TOPIC_MAX_LENGTH + 1), {}],
+          ["payload", "component.lifecycle", { data: "x".repeat(OUTBOX_PAYLOAD_MAX_BYTES + 1) }],
         ] as const) {
           await assert.rejects(
             store.transact({}, async (transaction) => {
@@ -703,6 +735,56 @@ export function stateStoreConformance(
             expectDiagnostic("STATE_DATA_INVALID"),
           );
         }
+      });
+    });
+
+    test("retry acknowledgement can be superseded by a corrected stable message", async () => {
+      await withStore(factory, async (store) => {
+        const createdAt = new Date().toISOString();
+        const messageId = parseMessageId("corrected-stable-message");
+        const operationId = parseOperationId("corrected-stable-operation");
+        await store.transact({}, async (transaction) => {
+          await transaction.enqueueOutbox({
+            availableAt: createdAt,
+            createdAt,
+            messageId,
+            operationId,
+            payload: { executor: "process" },
+            topic: "component.lifecycle",
+          });
+          return null;
+        });
+        const [original] = await store.claimOutbox({
+          leaseDurationMs: 30_000,
+          owner: "corrector",
+        });
+        assert.ok(original);
+        await store.acknowledgeOutbox({
+          claimEpoch: original.claimEpoch,
+          messageId,
+          outcome: "retry",
+          owner: original.owner,
+          retryAt: createdAt,
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.enqueueOutbox({
+            availableAt: createdAt,
+            createdAt,
+            messageId,
+            operationId,
+            payload: { executor: "thread" },
+            topic: "component.lifecycle",
+          });
+          return null;
+        });
+
+        const [corrected] = await store.claimOutbox({
+          leaseDurationMs: 30_000,
+          owner: "corrected-owner",
+        });
+        assert.ok(corrected);
+        assert.deepEqual(corrected.message.payload, { executor: "thread" });
+        assert.equal(corrected.attempt, 1);
       });
     });
 

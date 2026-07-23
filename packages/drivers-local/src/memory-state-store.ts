@@ -1,10 +1,13 @@
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DiagnosticError,
+  OUTBOX_PAYLOAD_MAX_BYTES,
+  OUTBOX_TOPIC_MAX_LENGTH,
   compareOperationJournalCursors,
   parseFencingEpoch,
   parseRevision,
   runtimeDiagnostic,
+  serializeWireValue,
   type Clock,
   type DriverHealth,
   type ExpectedRevision,
@@ -77,6 +80,7 @@ interface IdempotencyIdentity {
 
 interface StoredOutboxMessage {
   message: OutboxMessage;
+  enqueueSequence: bigint;
   attempt: number;
   claim?: OutboxClaim;
   acknowledgement?: OutboxAcknowledgement;
@@ -88,7 +92,7 @@ export interface MemoryStateStoreOptions {
 }
 
 function cloneJson<T extends JsonValue>(value: T): T {
-  return structuredClone(value) as T;
+  return serializeWireValue(value) as T;
 }
 
 function cloneKey<T extends JsonValue>(key: StateKey<T>): StateKey<T> {
@@ -173,8 +177,24 @@ function sameOutboxMessage(left: OutboxMessage, right: OutboxMessage): boolean {
     left.messageId === right.messageId &&
     left.operationId === right.operationId &&
     left.topic === right.topic &&
-    JSON.stringify(left.payload) === JSON.stringify(right.payload)
+    JSON.stringify(serializeWireValue(left.payload)) ===
+      JSON.stringify(serializeWireValue(right.payload))
   );
+}
+
+function assertOutboxMessage(message: OutboxMessage, clock: Clock): void {
+  if (
+    message.topic.length > OUTBOX_TOPIC_MAX_LENGTH ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(message.topic) ||
+    Buffer.byteLength(JSON.stringify(message.payload), "utf8") > OUTBOX_PAYLOAD_MAX_BYTES
+  ) {
+    throw stateError(
+      "STATE_DATA_INVALID",
+      "Outbox topic or payload exceeds the public contract boundary",
+      { messageId: message.messageId },
+      clock,
+    );
+  }
 }
 
 function stateError(
@@ -346,12 +366,25 @@ class MemoryTransaction implements StateTransaction {
 
   async appendOperation(entry: OperationJournalEntry): Promise<void> {
     this.#assertActive();
-    this.#operations.push(structuredClone(entry));
+    this.#operations.push({
+      operationId: entry.operationId,
+      kind: entry.kind,
+      status: entry.status,
+      state: cloneJson(entry.state),
+      updatedAt: entry.updatedAt,
+    });
   }
 
   async enqueueOutbox(message: OutboxMessage): Promise<void> {
     this.#assertActive();
-    this.#outbox.push(structuredClone(message));
+    this.#outbox.push({
+      messageId: message.messageId,
+      operationId: message.operationId,
+      topic: message.topic,
+      payload: cloneJson(message.payload),
+      createdAt: message.createdAt,
+      availableAt: message.availableAt,
+    });
   }
 
   finish(): StagedTransaction {
@@ -444,6 +477,7 @@ export class MemoryStateStore implements StateStore {
   readonly #records = new Map<string, StoredRecord>();
   readonly #operations = new Map<string, PersistedOperationJournalEntry>();
   readonly #outbox = new Map<string, StoredOutboxMessage>();
+  #outboxSequence = 0n;
   readonly #fences = new Map<string, bigint>();
   readonly #changes: StateChange[] = [];
   readonly #watchers = new Set<MemoryWatchIterator>();
@@ -559,8 +593,14 @@ export class MemoryStateStore implements StateStore {
       const now = this.#clock.now();
       const claimedAt = now.toISOString();
       const claimed: OutboxClaim[] = [];
-      for (const record of [...this.#outbox.values()].sort((left, right) =>
-        compareCodeUnits(left.message.availableAt, right.message.availableAt),
+      for (const record of [...this.#outbox.values()].sort(
+        (left, right) =>
+          compareCodeUnits(left.message.availableAt, right.message.availableAt) ||
+          (left.enqueueSequence < right.enqueueSequence
+            ? -1
+            : left.enqueueSequence > right.enqueueSequence
+              ? 1
+              : compareCodeUnits(left.message.messageId, right.message.messageId)),
       )) {
         if (
           record.acknowledgement?.outcome === "completed" ||
@@ -778,6 +818,7 @@ export class MemoryStateStore implements StateStore {
 
     const newOutbox: OutboxMessage[] = [];
     for (const message of staged.outbox) {
+      assertOutboxMessage(message, this.#clock);
       if (!validTimestamp(message.createdAt) || !validTimestamp(message.availableAt)) {
         throw stateError(
           "STATE_DATA_INVALID",
@@ -787,7 +828,7 @@ export class MemoryStateStore implements StateStore {
         );
       }
       const existing = this.#outbox.get(message.messageId);
-      if (existing === undefined) {
+      if (existing === undefined || existing.acknowledgement?.outcome === "retry") {
         newOutbox.push(message);
       } else if (!sameOutboxMessage(existing.message, message)) {
         throw stateError(
@@ -845,8 +886,10 @@ export class MemoryStateStore implements StateStore {
         });
       }
       for (const message of newOutbox) {
+        this.#outboxSequence += 1n;
         this.#outbox.set(message.messageId, {
-          message: structuredClone(message),
+          message: cloneJson(message),
+          enqueueSequence: this.#outboxSequence,
           attempt: 0,
         });
       }

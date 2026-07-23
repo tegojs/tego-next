@@ -110,6 +110,9 @@ export interface OutboxMessage extends JsonObject {
   readonly availableAt: string;
 }
 
+export const OUTBOX_TOPIC_MAX_LENGTH = 128;
+export const OUTBOX_PAYLOAD_MAX_BYTES = 1_048_576;
+
 export interface OutboxClaimRequest {
   readonly owner: string;
   readonly leaseDurationMs: number;

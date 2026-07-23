@@ -4,6 +4,8 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DiagnosticError,
+  OUTBOX_PAYLOAD_MAX_BYTES,
+  OUTBOX_TOPIC_MAX_LENGTH,
   parseFencingEpoch,
   parseMessageId,
   parseOperationId,
@@ -191,8 +193,23 @@ function sameOutboxMessage(left: OutboxMessage, right: OutboxMessage): boolean {
     left.messageId === right.messageId &&
     left.operationId === right.operationId &&
     left.topic === right.topic &&
-    JSON.stringify(left.payload) === JSON.stringify(right.payload)
+    canonicalJson(left.payload) === canonicalJson(right.payload)
   );
+}
+
+function assertOutboxMessage(message: OutboxMessage, clock: Clock): void {
+  if (
+    message.topic.length > OUTBOX_TOPIC_MAX_LENGTH ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(message.topic) ||
+    Buffer.byteLength(canonicalJson(message.payload), "utf8") > OUTBOX_PAYLOAD_MAX_BYTES
+  ) {
+    throw stateError(
+      "STATE_DATA_INVALID",
+      "Outbox topic or payload exceeds the public contract boundary",
+      { messageId: message.messageId },
+      clock,
+    );
+  }
 }
 
 function canonicalJson(value: JsonValue): string {
@@ -767,7 +784,7 @@ export class SqliteStateStore implements StateStore {
                   AND (? IS NULL OR topic = ?)
                   AND available_at <= ?
                   AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
-                ORDER BY available_at, revision, message_id
+                ORDER BY available_at, enqueue_sequence, message_id
                 LIMIT ?
               `,
               { readBigInts: true },
@@ -1158,6 +1175,7 @@ export class SqliteStateStore implements StateStore {
 
       const newOutbox: OutboxMessage[] = [];
       for (const message of staged.outbox) {
+        assertOutboxMessage(message, this.#clock);
         if (!validTimestamp(message.createdAt) || !validTimestamp(message.availableAt)) {
           throw stateError(
             "STATE_DATA_INVALID",
@@ -1174,13 +1192,18 @@ export class SqliteStateStore implements StateStore {
                 topic,
                 payload_json,
                 created_at,
-                available_at
+                available_at,
+                acknowledgement_outcome
               FROM outbox
               WHERE message_id = ?
             `,
           )
           .get(message.messageId);
         if (row === undefined) {
+          newOutbox.push(message);
+          continue;
+        }
+        if (row.acknowledgement_outcome === "retry") {
           newOutbox.push(message);
           continue;
         }
@@ -1314,7 +1337,12 @@ export class SqliteStateStore implements StateStore {
             );
         }
 
+        const maximumSequence = database
+          .prepare("SELECT MAX(enqueue_sequence) AS value FROM outbox", { readBigInts: true })
+          .get()?.value;
+        let enqueueSequence = typeof maximumSequence === "bigint" ? maximumSequence : 0n;
         for (const message of newOutbox) {
+          enqueueSequence += 1n;
           database
             .prepare(
               `
@@ -1325,8 +1353,27 @@ export class SqliteStateStore implements StateStore {
                   payload_json,
                   created_at,
                   available_at,
+                  enqueue_sequence,
                   revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                  operation_id = excluded.operation_id,
+                  topic = excluded.topic,
+                  payload_json = excluded.payload_json,
+                  created_at = excluded.created_at,
+                  available_at = excluded.available_at,
+                  attempt = 0,
+                  claim_owner = NULL,
+                  claim_epoch = NULL,
+                  claimed_at = NULL,
+                  claim_expires_at = NULL,
+                  acknowledgement_outcome = NULL,
+                  acknowledgement_owner = NULL,
+                  acknowledgement_claim_epoch = NULL,
+                  acknowledgement_retry_at = NULL,
+                  acknowledged_at = NULL,
+                  enqueue_sequence = excluded.enqueue_sequence,
+                  revision = excluded.revision
               `,
             )
             .run(
@@ -1336,6 +1383,7 @@ export class SqliteStateStore implements StateStore {
               canonicalJson(message.payload),
               message.createdAt,
               message.availableAt,
+              enqueueSequence,
               revisionInteger,
             );
         }

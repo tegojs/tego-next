@@ -946,7 +946,7 @@ export class Reconciler {
                 }),
               );
         await this.#recordBlocked(desired, diagnostics);
-        await this.#acknowledge(claim, "completed");
+        await this.#retryClaim(claim);
         return;
       }
     } else if (
@@ -993,7 +993,7 @@ export class Reconciler {
           placement.placement.workerId !== effect.workerId
         ) {
           this.#replanCount += 1;
-          await this.#acknowledge(claim, "completed");
+          await this.#retryClaim(claim);
           return;
         }
       }
@@ -1279,6 +1279,17 @@ export class Reconciler {
       });
       return null;
     });
-    await this.#acknowledge(claim, "completed");
+    await this.#retryClaim(claim);
+  }
+
+  async #retryClaim(claim: OutboxClaim): Promise<void> {
+    await this.#options.state.acknowledgeOutbox({
+      messageId: claim.message.messageId,
+      owner: claim.owner,
+      claimEpoch: claim.claimEpoch,
+      outcome: "retry",
+      retryAt: new Date(this.#options.clock.now().getTime() + 60_000).toISOString(),
+      ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
+    });
   }
 }

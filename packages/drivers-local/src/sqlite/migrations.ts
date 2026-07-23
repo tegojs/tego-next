@@ -110,6 +110,31 @@ const migrations = [
     CREATE INDEX outbox_delivery
       ON outbox(available_at, message_id);
   `,
+  `
+    ALTER TABLE outbox
+      ADD COLUMN enqueue_sequence INTEGER NOT NULL DEFAULT 0;
+
+    WITH ranked AS (
+      SELECT
+        message_id,
+        ROW_NUMBER() OVER (ORDER BY revision, message_id) AS enqueue_sequence
+      FROM outbox
+    )
+    UPDATE outbox
+    SET enqueue_sequence = (
+      SELECT ranked.enqueue_sequence
+      FROM ranked
+      WHERE ranked.message_id = outbox.message_id
+    );
+
+    DROP INDEX outbox_delivery;
+
+    CREATE UNIQUE INDEX outbox_enqueue_sequence
+      ON outbox(enqueue_sequence);
+
+    CREATE INDEX outbox_delivery
+      ON outbox(available_at, enqueue_sequence, message_id);
+  `,
 ] as const;
 
 export const sqliteSchemaVersion = migrations.length;

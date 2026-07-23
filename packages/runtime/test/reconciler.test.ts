@@ -548,7 +548,8 @@ class TestStateStore implements StateStore {
       this.operations.set(operation.operationId, { ...operation, revision });
     }
     for (const message of messages) {
-      if (!this.outbox.has(message.messageId)) {
+      const existing = this.outbox.get(message.messageId);
+      if (existing === undefined || existing.acknowledgement?.outcome === "retry") {
         this.outbox.set(message.messageId, { attempt: 0, message });
       }
     }
@@ -1049,6 +1050,7 @@ test("canonical lifecycle identities cannot be retargeted to another persisted i
 
     assert.deepEqual(effects.calls, [], effect.kind);
     assert.equal(reconciler.diagnostics()[0]?.code, "DEPLOYMENT_INSTANCE_INCONSISTENT");
+    assert.equal(state.outbox.get(effect.messageId)?.acknowledgement?.outcome, "retry");
     await reconciler.stop();
   }
 });
@@ -1126,6 +1128,114 @@ test("claimed effects revalidate current placement before journaling or performi
     [...state.operations.values()].some((operation) => operation.status === "executing"),
     false,
   );
+  effects.supportedExecutors = ["process"];
+  await reconciler.wake();
+  assert.equal(effects.performed.at(-1)?.kind, "prepare");
+  await reconciler.stop();
+});
+
+test("claimed remote effects require the current worker placement to match exactly", async () => {
+  const resources = { cpuMillis: 1_000, memoryBytes: 1_000_000, storageBytes: 1_000_000 };
+  const workerPermission = {
+    kind: "worker" as const,
+    labels: { zone: "edge" },
+    resources,
+  };
+  const remoteManifest: PluginManifest = {
+    ...manifest("1.0.0", digestOne),
+    components: [
+      {
+        componentId,
+        kind: "service",
+        entrypoint: "components/echo.js",
+        executors: ["remote"],
+      },
+    ],
+    permissions: [{ kind: "executor", executors: ["remote"] }, workerPermission],
+  };
+  const desired = deployment("1", {
+    permissionGrants: [{ kind: "executor", executors: ["remote"] }, workerPermission],
+  });
+  const remoteGate: ArtifactDeploymentGate = {
+    ...gate(),
+    artifact: { ...gate().artifact, manifest: remoteManifest },
+    permissionDecision: {
+      allowed: true,
+      diagnostics: [],
+      granted: desired.permissionGrants,
+      requested: remoteManifest.permissions,
+    },
+  };
+  const planned = planReconcile({
+    deployment: desired,
+    gate: remoteGate,
+    instances: [],
+    now: "2026-07-23T00:00:00.000Z",
+    supportedExecutors: ["remote"],
+    workers: [{ workerId: "worker-a", labels: { zone: "edge" }, resources }],
+  }).steps[0]?.effect;
+  assert.ok(planned);
+  const plannedWorkerId = planned.workerId;
+  assert.equal(plannedWorkerId, "worker-a");
+  assert.ok(plannedWorkerId);
+
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  effects.supportedExecutors = ["remote"];
+  const state = await createHarnessStore(clock);
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: planned.artifactDigest,
+        componentId,
+        deploymentGeneration: planned.deploymentGeneration,
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "created",
+        observedGeneration: planned.deploymentGeneration,
+        pluginId,
+        workerId: plannedWorkerId,
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: planned.messageId,
+      operationId: planned.operationId,
+      payload: planned,
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async () => ({ ...gate().artifact, manifest: remoteManifest }),
+    },
+    clock,
+    effects,
+    state,
+    workers: [{ workerId: "worker-b", labels: { zone: "edge" }, resources }],
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [
+      {
+        ...installation(),
+        manifest: remoteManifest,
+      },
+    ],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.replanCount, 1);
   await reconciler.stop();
 });
 

@@ -90,10 +90,18 @@ function serialize(value: unknown, path: string, ancestors: Set<object>): JsonVa
 
     const result: JsonObject = {};
     for (const key of Object.keys(value).sort()) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+        throw wireValueError(
+          `${path}/${key}`,
+          value,
+          "object members must be enumerable data properties",
+        );
+      }
       Object.defineProperty(result, key, {
         configurable: true,
         enumerable: true,
-        value: serialize((value as Record<string, unknown>)[key], `${path}/${key}`, ancestors),
+        value: serialize(descriptor.value, `${path}/${key}`, ancestors),
         writable: true,
       });
     }
