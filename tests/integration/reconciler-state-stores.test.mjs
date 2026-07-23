@@ -235,6 +235,85 @@ test("stale pending placement is quarantined before its stable identity is repla
   });
 });
 
+test("leased stale placement defers replacement until the claim expires", async (t) => {
+  await withRealStateStores(t, async (state, clock) => {
+    const desired = deployment();
+    const pending = planReconcile({
+      deployment: desired,
+      gate: gate(),
+      instances: [],
+      now: clock.now().toISOString(),
+      supportedExecutors: ["process"],
+    }).steps[0]?.effect;
+    assert.ok(pending);
+    const now = clock.now().toISOString();
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: pending.instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: digest,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: "process",
+          instanceId: pending.instanceId,
+          lifecycle: "created",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+        },
+        { expectedRevision: "absent" },
+      );
+      await transaction.enqueueOutbox({
+        availableAt: now,
+        createdAt: now,
+        messageId: pending.messageId,
+        operationId: pending.operationId,
+        payload: pending,
+        topic: "component.lifecycle",
+      });
+      return null;
+    });
+    const [leased] = await state.claimOutbox({
+      leaseDurationMs: 30_000,
+      limit: 1,
+      owner: "other-runtime",
+      topic: "component.lifecycle",
+    });
+    assert.ok(leased);
+    const effects = new RecordingEffects();
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+    assert.deepEqual(effects.calls, []);
+
+    clock.advance(30_001);
+    for (let wake = 0; wake < 3; wake += 1) {
+      await reconciler.wake();
+    }
+
+    assert.deepEqual(
+      effects.calls.map((effect) => [effect.kind, effect.executor]),
+      [
+        ["prepare", "thread"],
+        ["start", "thread"],
+      ],
+    );
+    assert.equal((await readOnlyInstance(state, pending.instanceId))?.value.lifecycle, "ready");
+    await reconciler.stop();
+  });
+});
+
 test("upgrade and rollback tear down old components removed from the current manifest", async (t) => {
   for (const scenario of [
     {
