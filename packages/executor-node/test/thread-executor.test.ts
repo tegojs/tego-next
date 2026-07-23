@@ -352,6 +352,22 @@ test("thread transfer request rejects detached and duplicate buffers before work
     );
     assert.equal(duplicate.byteLength, 8);
     assert.equal(factory.created, 0);
+
+    const invalidOwnership = new ArrayBuffer(8);
+    await assert.rejects(
+      executor.submit(
+        threadExecutionRequest(
+          request({ mode: "echo", value: "ownership" }, "invalid-ownership"),
+          {
+            buffers: [invalidOwnership],
+            ownership: "borrow" as "transfer",
+          },
+        ),
+      ),
+      /ownership|transfer/iu,
+    );
+    assert.equal(invalidOwnership.byteLength, 8);
+    assert.equal(factory.created, 0);
   } finally {
     await executor.drain({});
   }
