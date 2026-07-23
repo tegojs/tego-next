@@ -598,7 +598,11 @@ class TestStateStore implements StateStore {
     const now = this.#clock.now().getTime();
     const claimed: OutboxClaim[] = [];
     for (const record of [...this.outbox.values()].sort((left, right) =>
-      left.message.messageId < right.message.messageId ? -1 : 1,
+      left.message.availableAt < right.message.availableAt
+        ? -1
+        : left.message.availableAt > right.message.availableAt
+          ? 1
+          : 0,
     )) {
       if (
         record.acknowledgement?.outcome === "completed" ||
@@ -872,6 +876,31 @@ test("optional capability edges still enqueue providers before lexical-first con
   const clock = new ManualClock();
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    for (const generation of ["0", "1"] as const) {
+      const instanceId = `app.z-optional-provider.optional-provider.g${generation}`;
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: providerDigest,
+          componentId: parseComponentId("optional-provider"),
+          deploymentGeneration: parseGeneration(generation),
+          executor: "process",
+          instanceId,
+          lifecycle: "ready",
+          observedGeneration: parseGeneration(generation),
+          pluginId: providerId,
+        },
+        { expectedRevision: "absent" },
+      );
+    }
+    return null;
+  });
   const reconciler = new Reconciler({
     artifactGate: {
       async validate(request) {

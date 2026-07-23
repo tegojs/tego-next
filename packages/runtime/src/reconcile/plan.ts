@@ -177,6 +177,26 @@ function oldInstanceStep(
     executor: instance.executor,
     ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
   };
+  if (instance.lifecycle === "draining") {
+    const drainOperationId = reconcileEffectIdentities(
+      oldDeployment,
+      instance.componentId,
+      "drain",
+    ).operationId;
+    if (
+      instance.completedOperationId !== drainOperationId &&
+      !instance.completedOperationIds?.includes(drainOperationId)
+    ) {
+      return step(
+        oldDeployment,
+        instance.componentId,
+        "drain",
+        placement,
+        instance.revision,
+        instance.lifecycle,
+      );
+    }
+  }
   if (instance.lifecycle === "draining" || instance.lifecycle === "stopping") {
     return step(
       oldDeployment,

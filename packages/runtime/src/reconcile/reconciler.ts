@@ -309,30 +309,80 @@ export class Reconciler {
     this.#diagnosticsByDeployment.clear();
     this.#readyDeployments.clear();
 
-    for (const deployment of [...deployments].sort((left, right) =>
+    const lexicalDeployments = [...deployments].sort((left, right) =>
       deploymentKey(left) < deploymentKey(right)
         ? -1
         : deploymentKey(left) > deploymentKey(right)
           ? 1
           : 0,
-    )) {
+    );
+    const canonicalInstances = instances.filter(
+      (instance) =>
+        reconcileEffectIdentities(
+          {
+            applicationId: instance.applicationId,
+            generation: instance.deploymentGeneration,
+            pluginId: instance.pluginId,
+          },
+          instance.componentId,
+          "prepare",
+        ).instanceId === instance.instanceId,
+    );
+    const invalidByDeployment = new Map<string, readonly ComponentInstance[]>();
+    const gates = new Map<string, ArtifactDeploymentGate | DiagnosticError>();
+    const orderRanks = new Map<string, number>();
+    for (const deployment of lexicalDeployments) {
       const deploymentInstances = instances.filter(
         (instance) =>
           instance.applicationId === deployment.applicationId &&
           instance.pluginId === deployment.pluginId,
       );
       const invalidInstances = deploymentInstances.filter(
-        (instance) =>
-          reconcileEffectIdentities(
-            {
-              applicationId: instance.applicationId,
-              generation: instance.deploymentGeneration,
-              pluginId: instance.pluginId,
-            },
-            instance.componentId,
-            "prepare",
-          ).instanceId !== instance.instanceId,
+        (instance) => !canonicalInstances.includes(instance),
       );
+      if (invalidInstances.length > 0) {
+        invalidByDeployment.set(deploymentKey(deployment), invalidInstances);
+        continue;
+      }
+      const gate = await this.#gateDeployment(
+        deployment,
+        deployments,
+        installations,
+        canonicalInstances,
+      );
+      gates.set(deploymentKey(deployment), gate);
+      if (!(gate instanceof DiagnosticError)) {
+        for (const [index, identity] of (gate.capabilityResolution.order ?? []).entries()) {
+          const key = `${identity.applicationId}/${identity.pluginId}`;
+          if (!orderRanks.has(key)) orderRanks.set(key, index);
+        }
+      }
+    }
+    const orderedDeployments = lexicalDeployments.sort((left, right) => {
+      if (left.applicationId !== right.applicationId) {
+        return left.applicationId < right.applicationId ? -1 : 1;
+      }
+      const leftRank = orderRanks.get(deploymentKey(left));
+      const rightRank = orderRanks.get(deploymentKey(right));
+      if (leftRank !== undefined || rightRank !== undefined) {
+        if (leftRank === undefined) return 1;
+        if (rightRank === undefined) return -1;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+      }
+      return deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0;
+    });
+
+    for (const deployment of orderedDeployments) {
+      const deploymentInstances = canonicalInstances.filter(
+        (instance) =>
+          instance.applicationId === deployment.applicationId &&
+          instance.pluginId === deployment.pluginId,
+      );
+      const invalidInstances = invalidByDeployment.get(deploymentKey(deployment)) ?? [];
       if (invalidInstances.length > 0) {
         await this.#recordBlocked(
           deployment,
@@ -354,7 +404,8 @@ export class Reconciler {
         );
         continue;
       }
-      const gate = await this.#gateDeployment(deployment, deployments, installations, instances);
+      const gate = gates.get(deploymentKey(deployment));
+      if (gate === undefined) continue;
       if (gate instanceof DiagnosticError) {
         await this.#recordBlocked(deployment, [gate.diagnostic]);
         continue;
