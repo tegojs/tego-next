@@ -38,6 +38,12 @@ The implementation now provides:
 6. `2360149 fix: persist structured deployment observations`
    - GREEN for durable unavailable/inconsistent/degraded classifications and capability binding
      history input.
+7. `f393ce3 test: reject retargeted lifecycle effects`
+   - RED coverage for structurally valid prepare/start/drain/stop messages whose canonical instance
+     identity was changed to target another persisted instance.
+8. `aab50aa fix: validate canonical lifecycle effect identity`
+   - GREEN by recomputing canonical message/operation/instance identities and matching the loaded
+     instance tuple and current desired state before every external effect.
 
 ## RED Evidence
 
@@ -47,6 +53,8 @@ The implementation now provides:
   observations failed.
 - Stale-effect regression run: 17/19 passed; queued startup replay and installation-free shutdown
   failed.
+- Canonical-identity regression run: 21/22 passed; a retargeted prepare reached the effect executor
+  before the common validation path was added.
 - Each RED group was committed before its corresponding implementation fix.
 
 ## GREEN Evidence
@@ -56,10 +64,10 @@ Fresh verification at the final implementation boundary:
 - `npm run format:check` — PASS, 88 files.
 - `npm run lint` — PASS, 88 files.
 - Affected workspace typecheck (`contracts`, `testkit`, `drivers-local`, `runtime`) — PASS.
-- Focused runtime plus Memory/SQLite state tests — PASS, 80/80.
+- Focused runtime plus Memory/SQLite state tests — PASS, 81/81.
 - `npm test` — PASS:
   - CLI: 37/37
-  - Runtime: 143/143
+  - Runtime: 144/144
   - Testkit: 3/3
   - Architecture: 18/18
 - `npm run test:integration` — PASS, 5/5.
@@ -93,6 +101,8 @@ outside Task 8.
   replay protection for an older unacknowledged step.
 - Control-plane commit or acknowledgement errors are not classified as component-effect failures.
 - Claimed startup effects recheck desired generation/state and all pre-import gates before execution.
+- Every claimed effect recomputes its canonical identities and must match the persisted
+  application/plugin/component/generation/artifact/executor/worker tuple before journaling.
 - Disabled deployments may drain from observed instance data even when installation metadata has
   already been removed.
 
