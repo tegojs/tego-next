@@ -104,6 +104,13 @@ The implementation now provides:
 28. `f773d5d fix: defer leased lifecycle replacement conflicts`
     - GREEN by treating the single-message planning transaction's outbox identity conflict as a
       deferred replan without changing the active lease or authority fence.
+29. `8bb8d77 test: cover retried start and stop pre-states`
+    - RED for fail-once start and stop on real Memory and SQLite stores; each second external call
+      was followed by an illegal `failed -> ready/stopped` transition. The same commit locks the CAS
+      conflict rule that no external effect may run before the retry pre-state commits.
+30. `55f445d fix: persist legal retry execution pre-states`
+    - GREEN by atomically CAS-persisting `failed -> starting/stopping` with the executing journal
+      entry under the authority fence, and rereading/replanning revision conflicts before perform.
 
 ## RED Evidence
 
@@ -136,6 +143,9 @@ The implementation now provides:
   payloads instead of rejecting the transaction.
 - Leased-placement regression: both real stores raised the same identity conflict while another
   owner held an unexpired claim.
+- Retried start/stop regression: all four Memory/SQLite plus start/stop cases invoked the effect a
+  second time, then failed with `LIFECYCLE_TRANSITION_INVALID`; the injected pre-state revision
+  conflict likewise reached external execution before a CAS existed.
 - Each RED group was committed before its corresponding implementation fix.
 
 ## GREEN Evidence
@@ -145,13 +155,13 @@ Fresh verification at the final implementation boundary:
 - `npm run format:check` — PASS, 89 files.
 - `npm run lint` — PASS, 89 files.
 - Affected workspace typecheck (`contracts`, `testkit`, `drivers-local`, `runtime`) — PASS.
-- Focused lifecycle/reconciler plus Memory/SQLite state tests — PASS, 98/98.
+- Focused lifecycle/reconciler plus Memory/SQLite state tests — PASS, 99/99.
 - `npm test` — PASS:
   - CLI: 37/37
-  - Runtime: 151/151
+  - Runtime: 152/152
   - Testkit: 3/3
   - Architecture: 18/18
-- `npm run test:integration` — PASS, 35/35.
+- `npm run test:integration` — PASS, 42/42.
 
 Root `npm run typecheck` reaches and passes every implemented affected workspace, but the aggregate
 command remains non-green because four future placeholder workspaces do not contain `tsconfig.json`:
@@ -201,6 +211,9 @@ outside Task 8.
   current manifest or installation no longer describes them.
 - A due failed lifecycle effect is retryable only when its persisted `retryEffect` matches the
   claimed effect.
+- Retried start and stop effects atomically persist `starting` or `stopping` with expected revision,
+  authority fence, and the executing journal entry before external execution. A CAS conflict
+  rereads and replans without calling the executor.
 - Capability resolver order drives application-scoped deployment planning; lexical order is only a
   deterministic fallback for unordered, blocked, or disabled deployments.
 - Memory and SQLite share sorted wire-value semantics, explicit outbox bounds, and retry replacement
@@ -235,3 +248,9 @@ branch, which was locked by `5127071` and fixed by `f773d5d`. The final read-onl
 **PASS**, confirming all five findings, preservation of active leases and authority fences, eventual
 corrected-placement convergence on Memory and SQLite, fresh focused 124/124 review evidence, and
 `git diff --check`.
+
+The final formal re-review found one remaining retry lifecycle issue. After `8bb8d77` and
+`55f445d`, the independent reviewer returned **PASS**, confirming that retried start/stop CAS-persist
+their legal pre-state and executing journal under the authority fence before external execution,
+revision conflicts return without performing, success acknowledges exactly once, prepare retry
+remains intact, and fresh focused review evidence passed 136/136.
