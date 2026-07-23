@@ -120,6 +120,17 @@ export default {
       await context.events.emit("run.started", { mode: input.mode });
       return new Promise(() => {});
     }
+    if (input.mode === "secret") return context.secrets.get("api");
+    if (input.mode === "forge-rpc") {
+      const { parentPort } = await import("node:worker_threads");
+      parentPort.postMessage({
+        kind: "rpc-request",
+        id: "forged",
+        type: "secret",
+        payload: { name: "api" }
+      });
+      return "safe";
+    }
     if (input.mode === "crash") process.exit(42);
     if (input.mode === "large-output") return "x".repeat(${1024 * 1024 + 64});
     return input.value;
@@ -148,7 +159,10 @@ async function artifact() {
         executors: ["process", "thread"],
       },
     ],
-    permissions: [{ kind: "executor", executors: ["process", "thread"] }],
+    permissions: [
+      { kind: "executor", executors: ["process", "thread"] },
+      { kind: "secret", names: ["api"] },
+    ],
     capabilities: { provides: [], requires: [] },
   });
   return { artifactRoot, manifest };
@@ -330,4 +344,180 @@ test("thread worker exit settles before replacement capacity is advertised", asy
   } finally {
     await executor.drain({});
   }
+});
+
+test(
+  "thread secret RPC remains parent-gated over the private broker port",
+  { timeout: 2_000 },
+  async () => {
+    const factory = new TrackingWorkerFactory();
+    let secretCalls = 0;
+    const executor = new ThreadExecutor(
+      await options(factory, {
+        secretProvider: {
+          developmentOnly: false,
+          open: async () => {},
+          close: async () => {},
+          health: async () => ({
+            status: "healthy",
+            checkedAt: clock.now().toISOString(),
+          }),
+          async get(name) {
+            secretCalls += 1;
+            return name === "api" ? "parent-secret" : undefined;
+          },
+        },
+      }),
+    );
+    try {
+      const result = await (
+        await executor.submit(request({ mode: "secret" }, "secret-rpc"))
+      ).result;
+      assert.equal(result.status, "succeeded");
+      assert.equal(result.output, "parent-secret");
+      assert.equal(secretCalls, 1);
+    } finally {
+      await executor.drain({});
+    }
+  },
+);
+
+test("plugin parentPort messages cannot forge privileged broker RPC", async () => {
+  const factory = new TrackingWorkerFactory();
+  let secretCalls = 0;
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      secretProvider: {
+        developmentOnly: false,
+        open: async () => {},
+        close: async () => {},
+        health: async () => ({ status: "healthy", checkedAt: clock.now().toISOString() }),
+        async get() {
+          secretCalls += 1;
+          return "must-not-return";
+        },
+      },
+    }),
+  );
+  try {
+    const result = await (
+      await executor.submit(request({ mode: "forge-rpc" }, "forge-rpc"))
+    ).result;
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.output, "safe");
+    assert.equal(secretCalls, 0);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("transferable duplicate submission replays the existing handle after ownership moves", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executor = new ThreadExecutor(await options(factory));
+  const buffer = new Uint8Array([1, 2, 3]).buffer;
+  const execution = threadExecutionRequest(
+    request({ mode: "echo", value: "deduplicated" }, "transfer-deduplicate"),
+    { buffers: [buffer], ownership: "transfer" },
+  );
+  try {
+    const first = await executor.submit(execution);
+    assert.equal(buffer.byteLength, 0);
+    const duplicate = await executor.submit(execution);
+    assert.strictEqual(duplicate, first);
+    assert.equal((await duplicate.result).output, "deduplicated");
+    assert.equal(factory.created, 1);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("oversized transferable payload is rejected before ownership or worker startup", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executor = new ThreadExecutor(await options(factory));
+  const first = new ArrayBuffer(Math.floor(THREAD_EXECUTOR_MAX_MESSAGE_BYTES / 2) + 1);
+  const second = new ArrayBuffer(Math.floor(THREAD_EXECUTOR_MAX_MESSAGE_BYTES / 2) + 1);
+  try {
+    await assert.rejects(
+      executor.submit(
+        threadExecutionRequest(request({ mode: "echo", value: "too-large" }, "transfer-limit"), {
+          buffers: [first, second],
+          ownership: "transfer",
+        }),
+      ),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_INPUT_LIMIT_EXCEEDED",
+    );
+    assert.equal(first.byteLength > 0, true);
+    assert.equal(second.byteLength > 0, true);
+    assert.equal(factory.created, 0);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("active cancellation waits for worker termination before releasing capacity", async () => {
+  const factory = new TrackingWorkerFactory();
+  const started = Promise.withResolvers<void>();
+  const executor = new ThreadExecutor(
+    await options(factory, {
+      maxConcurrency: 1,
+      events: {
+        async emit(type) {
+          if (type === "run.started") started.resolve();
+        },
+      },
+    }),
+  );
+  const execution = request({ mode: "ignore-cancel" }, "forced-cancel");
+  const handle = await executor.submit(execution);
+  try {
+    await started.promise;
+    await executor.cancel(execution.taskId, execution.attemptId);
+    assert.equal(factory.active, 1);
+    assert.equal((await executor.probe()).availableCapacity, 0);
+    clock.advanceBy(100);
+    assert.equal((await handle.result).status, "cancelled");
+    assert.equal(factory.active, 0);
+    assert.equal((await executor.probe()).availableCapacity, 1);
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("resolver cancellation does not release result, drain, or capacity before admission settles", async () => {
+  const factory = new TrackingWorkerFactory();
+  const resolverStarted = Promise.withResolvers<void>();
+  const resolverGate = Promise.withResolvers<void>();
+  const base = await options(factory);
+  const executor = new ThreadExecutor({
+    ...base,
+    maxConcurrency: 1,
+    async resolveComponent(execution) {
+      resolverStarted.resolve();
+      await resolverGate.promise;
+      return base.resolveComponent(execution);
+    },
+  });
+  const execution = request({ mode: "echo", value: "late" }, "resolver-cancel");
+  const handle = await executor.submit(execution);
+  await resolverStarted.promise;
+  await executor.cancel(execution.taskId, execution.attemptId);
+  let resultSettled = false;
+  let drainSettled = false;
+  void handle.result.then(() => {
+    resultSettled = true;
+  });
+  const draining = executor.drain({}).then(() => {
+    drainSettled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(resultSettled, false);
+  assert.equal(drainSettled, false);
+  assert.equal((await executor.probe()).availableCapacity, 0);
+
+  resolverGate.resolve();
+  await draining;
+  assert.equal((await handle.result).status, "cancelled");
+  assert.equal(resultSettled, true);
+  assert.equal(drainSettled, true);
+  assert.equal(factory.created, 0);
 });
