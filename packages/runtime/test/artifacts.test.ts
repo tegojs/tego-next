@@ -308,10 +308,7 @@ test("artifact parsing closes its source iterator without masking parse failures
       },
     };
 
-    await rejectsCode(
-      () => readPluginArtifact(source),
-      "ARTIFACT_HEADER_CHECKSUM_INVALID",
-    );
+    await rejectsCode(() => readPluginArtifact(source), "ARTIFACT_HEADER_CHECKSUM_INVALID");
     assert.equal(returned, 1);
   });
 });
