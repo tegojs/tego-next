@@ -8,7 +8,6 @@ import {
   parseExecutionRequest,
   parsePermissionSet,
   parsePluginId,
-  parsePluginManifest,
   parseRuntimeDiagnostic,
   parseRuntimeId,
   parseTaskId,
@@ -20,7 +19,6 @@ import {
   type JsonObject,
   type JsonValue,
   type Permission,
-  type PluginManifest,
   type RuntimeDiagnostic,
 } from "@tegojs/contracts";
 
@@ -37,7 +35,7 @@ const COMMAND_TYPES = new Set([
 ] as const);
 const MAX_WIRE_BYTES = 1024 * 1024;
 const MAX_WIRE_DEPTH = 64;
-const MAX_WIRE_NODES = 100_000;
+const MAX_WIRE_NODES = 1_000_000;
 const COMMAND_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 
 export type ComponentHostState =
@@ -63,8 +61,6 @@ export interface ComponentHostRuntimeInfo extends JsonObject {
 
 export interface PrepareComponentHostPayload extends JsonObject {
   readonly artifactDigest: ArtifactDigest;
-  readonly artifactRoot: string;
-  readonly manifest: PluginManifest;
   readonly componentId: ComponentId;
   readonly identity: ComponentHostIdentity;
   readonly configuration: JsonValue;
@@ -86,10 +82,7 @@ export interface PrepareComponentHostCommand extends CommandBase {
 
 export interface ImportComponentHostCommand extends CommandBase {
   readonly type: "import";
-  readonly payload: {
-    readonly artifactDigest: ArtifactDigest;
-    readonly entrypoint: string;
-  };
+  readonly payload: { readonly artifactDigest: ArtifactDigest };
 }
 
 export interface ArtifactComponentHostCommand extends CommandBase {
@@ -132,7 +125,6 @@ export interface ComponentHostResult extends JsonObject {
 }
 
 interface CloneBudget {
-  bytes: number;
   nodes: number;
 }
 
@@ -144,13 +136,6 @@ function wireError(message: string): DiagnosticError {
       source: { kind: "protocol", id: "component-host" },
     }),
   );
-}
-
-function addBytes(budget: CloneBudget, value: string): void {
-  budget.bytes += Buffer.byteLength(value, "utf8");
-  if (budget.bytes > MAX_WIRE_BYTES) {
-    throw wireError("Component host value exceeds the bounded wire size limit");
-  }
 }
 
 function cloneWire(
@@ -165,10 +150,7 @@ function cloneWire(
     throw wireError("Component host value exceeds the bounded wire depth or node limit");
   }
   if (value === null || typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    addBytes(budget, value);
-    return value;
-  }
+  if (typeof value === "string") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "object" || ancestors.has(value)) {
     throw wireError(`Component host value at ${path} must be finite acyclic JSON data`);
@@ -213,7 +195,6 @@ function cloneWire(
       if (typeof key !== "string") {
         throw wireError(`Component host value at ${path} must not contain symbol properties`);
       }
-      addBytes(budget, key);
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
         throw wireError(`Component host value at ${path}/${key} must be a data property`);
@@ -232,7 +213,11 @@ function cloneWire(
 }
 
 export function cloneComponentHostValue(value: unknown): JsonValue {
-  return cloneWire(value, "$", 0, new Set(), { bytes: 0, nodes: 0 });
+  const result = cloneWire(value, "$", 0, new Set(), { nodes: 0 });
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") > MAX_WIRE_BYTES) {
+    throw wireError("Component host value exceeds the bounded wire size limit");
+  }
+  return result;
 }
 
 function objectValue(value: JsonValue, label: string): Record<string, JsonValue> {
@@ -271,12 +256,10 @@ function parsePreparePayload(value: JsonValue): PrepareComponentHostPayload {
   const payload = objectValue(value, "Prepare payload");
   exactFields(payload, [
     "artifactDigest",
-    "artifactRoot",
     "capabilityDefinitions",
     "componentId",
     "configuration",
     "identity",
-    "manifest",
     "permissionGrants",
     "runtime",
   ]);
@@ -295,8 +278,6 @@ function parsePreparePayload(value: JsonValue): PrepareComponentHostPayload {
   }
   return {
     artifactDigest: parseArtifactDigest(payload.artifactDigest),
-    artifactRoot: text(payload.artifactRoot, "Artifact root"),
-    manifest: parsePluginManifest(payload.manifest),
     componentId: parseComponentId(payload.componentId),
     identity: {
       runtimeId: parseRuntimeId(identity.runtimeId),
@@ -341,16 +322,13 @@ export function parseComponentHostCommand(input: unknown): ComponentHostCommand 
         payload: parsePreparePayload(payload),
       };
     case "import":
-      exactFields(payload, ["artifactDigest", "entrypoint"]);
+      exactFields(payload, ["artifactDigest"]);
       return {
         protocol: COMPONENT_HOST_PROTOCOL,
         commandId,
         deadline,
         type,
-        payload: {
-          artifactDigest: parseArtifactDigest(payload.artifactDigest),
-          entrypoint: text(payload.entrypoint, "Component entrypoint"),
-        },
+        payload: { artifactDigest: parseArtifactDigest(payload.artifactDigest) },
       };
     case "run":
       exactFields(payload, ["artifactDigest", "execution"]);

@@ -1,6 +1,8 @@
 import { isAbsolute } from "node:path";
 import {
   DiagnosticError,
+  parseArtifactDigest,
+  parsePluginManifest,
   runtimeDiagnostic,
   type ArtifactDigest,
   type ComponentCapabilityBoundary,
@@ -10,10 +12,15 @@ import {
   type DiagnosticCode,
   type JsonObject,
   type JsonValue,
+  type PluginManifest,
   type RuntimeDiagnostic,
   type SecretProvider,
 } from "@tegojs/contracts";
-import { loadPreparedComponent, type LoadedComponentDefinition } from "./component-loader.js";
+import {
+  bindPreparedArtifactRoot,
+  loadPreparedComponent,
+  type LoadedComponentDefinition,
+} from "./component-loader.js";
 import {
   cloneComponentHostValue,
   COMPONENT_HOST_PROTOCOL,
@@ -41,30 +48,57 @@ export interface ComponentHostEvents {
   emit(type: string, payload: JsonValue): Promise<void>;
 }
 
+export interface ResolvedComponentArtifact {
+  readonly artifactDigest: ArtifactDigest;
+  readonly artifactRoot: string;
+  readonly manifest: PluginManifest;
+}
+
+export interface ComponentArtifactResolver {
+  resolve(artifactDigest: ArtifactDigest): Promise<ResolvedComponentArtifact>;
+}
+
+export interface ComponentHostTimer {
+  cancel(): void;
+}
+
+export interface ComponentHostClock {
+  now(): Date;
+  setTimeout(callback: () => void, delay: number): ComponentHostTimer;
+}
+
 export interface ComponentHostOptions {
   readonly logger: ComponentHostLogger;
   readonly events: ComponentHostEvents;
+  readonly artifactResolver: ComponentArtifactResolver;
   readonly permissionBoundary: ComponentPermissionBoundary;
   readonly capabilityBoundary: ComponentCapabilityBoundary;
   readonly secretProvider?: SecretProvider;
-  readonly now?: () => Date;
+  readonly clock?: ComponentHostClock;
 }
 
 interface PreparedComponent {
   readonly payload: PrepareComponentHostPayload;
+  readonly artifactRoot: string;
+  readonly manifest: PluginManifest;
   readonly entrypoint: string;
   readonly kind: "service" | "task";
+  readonly fingerprint: string;
+  readonly generation: number;
 }
 
 interface CachedCommand {
   readonly fingerprint: string;
   readonly result: Promise<ComponentHostResult>;
+  settled: boolean;
 }
 
 interface ActiveRun {
   readonly controller: AbortController;
+  readonly fingerprint: string;
   cancellation: "cancelled" | "timed-out" | undefined;
   result: Promise<JsonValue>;
+  settled: boolean;
 }
 
 type HookName = "drain" | "health" | "run" | "start" | "stop";
@@ -73,6 +107,17 @@ const SENSITIVE_KEY = /(?:credential|password|secret|token)/iu;
 const DIAGNOSTIC_CODE =
   /^(?:BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_[A-Z0-9_]+$/u;
 const MAX_TIMER_DELAY = 2_147_483_647;
+export const COMPONENT_HOST_COMMAND_RETENTION_LIMIT = 256;
+export const COMPONENT_HOST_RUN_RETENTION_LIMIT = 256;
+
+const SYSTEM_CLOCK: ComponentHostClock = Object.freeze({
+  now: () => new Date(),
+  setTimeout(callback: () => void, delay: number): ComponentHostTimer {
+    const timer = setTimeout(callback, delay);
+    timer.unref();
+    return Object.freeze({ cancel: () => clearTimeout(timer) });
+  },
+});
 
 function freezeJson<T extends JsonValue>(value: T): T {
   if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
@@ -84,34 +129,39 @@ function taskKey(taskId: string, attemptId: string): string {
   return `${taskId.length}:${taskId}${attemptId}`;
 }
 
-function armDeadline(deadline: string, onDeadline: () => void): () => void {
-  let timer: NodeJS.Timeout | undefined;
+function armDeadline(
+  deadline: string,
+  clock: ComponentHostClock,
+  onDeadline: () => void,
+): () => void {
+  let timer: ComponentHostTimer | undefined;
   let cancelled = false;
   const schedule = (): void => {
     if (cancelled) return;
-    const remaining = Date.parse(deadline) - Date.now();
+    const remaining = Date.parse(deadline) - clock.now().getTime();
     if (remaining <= 0) {
       onDeadline();
       return;
     }
-    timer = setTimeout(
+    timer = clock.setTimeout(
       remaining > MAX_TIMER_DELAY ? schedule : onDeadline,
       Math.min(remaining, MAX_TIMER_DELAY),
     );
-    timer.unref();
   };
   schedule();
   return () => {
     cancelled = true;
-    if (timer !== undefined) clearTimeout(timer);
+    timer?.cancel();
   };
 }
 
 export class ComponentHost {
   readonly #options: ComponentHostOptions;
+  readonly #clock: ComponentHostClock;
   readonly #commands = new Map<string, CachedCommand>();
   readonly #runs = new Map<string, ActiveRun>();
   readonly #secretValues = new Set<string>();
+  #transitions: Promise<void> = Promise.resolve();
   #state: ComponentHostState = "new";
   #prepared: PreparedComponent | undefined;
   #definition: LoadedComponentDefinition | undefined;
@@ -119,6 +169,7 @@ export class ComponentHost {
 
   constructor(options: ComponentHostOptions) {
     this.#options = options;
+    this.#clock = options.clock ?? SYSTEM_CLOCK;
   }
 
   async handle(input: unknown): Promise<ComponentHostResult> {
@@ -131,7 +182,10 @@ export class ComponentHost {
     const fingerprint = JSON.stringify(command);
     const cached = this.#commands.get(command.commandId);
     if (cached !== undefined) {
-      if (cached.fingerprint === fingerprint) return cached.result;
+      if (cached.fingerprint === fingerprint) {
+        this.#touch(this.#commands, command.commandId, cached);
+        return cached.result;
+      }
       return this.#failure(
         command.commandId,
         command.type,
@@ -146,8 +200,52 @@ export class ComponentHost {
       );
     }
     const result = this.#dispatch(command).then((value) => this.#validateResult(value));
-    this.#commands.set(command.commandId, { fingerprint, result });
+    const entry: CachedCommand = { fingerprint, result, settled: false };
+    this.#commands.set(command.commandId, entry);
+    void result.then(
+      () => {
+        entry.settled = true;
+        this.#prune(this.#commands, COMPONENT_HOST_COMMAND_RETENTION_LIMIT);
+      },
+      () => {
+        entry.settled = true;
+        this.#prune(this.#commands, COMPONENT_HOST_COMMAND_RETENTION_LIMIT);
+      },
+    );
+    this.#prune(this.#commands, COMPONENT_HOST_COMMAND_RETENTION_LIMIT);
     return result;
+  }
+
+  retention(): Readonly<{ commands: number; runs: number }> {
+    return Object.freeze({ commands: this.#commands.size, runs: this.#runs.size });
+  }
+
+  async #transition(
+    command: ComponentHostCommand,
+    operation: () => Promise<ComponentHostResult> | ComponentHostResult,
+  ): Promise<ComponentHostResult> {
+    const result = this.#transitions.then(async () => {
+      this.#assertDeadline(command);
+      return await operation();
+    });
+    this.#transitions = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  #touch<T>(cache: Map<string, T>, key: string, value: T): void {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+
+  #prune<T extends { readonly settled: boolean }>(cache: Map<string, T>, limit: number): void {
+    while (cache.size > limit) {
+      const settled = [...cache].find(([, value]) => value.settled);
+      if (settled === undefined) return;
+      cache.delete(settled[0]);
+    }
   }
 
   async #dispatch(command: ComponentHostCommand): Promise<ComponentHostResult> {
@@ -168,19 +266,19 @@ export class ComponentHost {
     try {
       switch (command.type) {
         case "prepare":
-          return this.#prepare(command);
+          return await this.#transition(command, () => this.#prepare(command));
         case "import":
-          return await this.#import(command);
+          return await this.#transition(command, () => this.#import(command));
         case "start":
-          return await this.#start(command);
+          return await this.#transition(command, () => this.#start(command));
         case "health":
           return await this.#health(command);
         case "run":
           return await this.#run(command);
         case "drain":
-          return await this.#drain(command);
+          return await this.#transition(command, () => this.#drain(command));
         case "stop":
-          return await this.#stop(command);
+          return await this.#transition(command, () => this.#stop(command));
         case "cancel":
           return this.#cancel(command);
       }
@@ -189,27 +287,37 @@ export class ComponentHost {
     }
   }
 
-  #prepare(
+  async #prepare(
     command: Extract<ComponentHostCommand, { readonly type: "prepare" }>,
-  ): ComponentHostResult {
+  ): Promise<ComponentHostResult> {
     const payload = command.payload;
+    const fingerprint = JSON.stringify(payload);
     if (this.#state !== "new") {
-      if (
-        this.#prepared?.payload.artifactDigest === payload.artifactDigest &&
-        this.#prepared.payload.componentId === payload.componentId
-      ) {
+      if (this.#prepared?.fingerprint === fingerprint) {
         return this.#success(command, { status: "prepared" });
       }
-      throw this.#lifecycleError("prepare", "new");
+      throw this.#idempotencyError(
+        "Prepare request was repeated with different deployment content",
+      );
     }
-    if (!isAbsolute(payload.artifactRoot)) {
+    const resolved = await this.#options.artifactResolver.resolve(payload.artifactDigest);
+    const resolvedDigest = parseArtifactDigest(resolved.artifactDigest);
+    const manifest = parsePluginManifest(resolved.manifest);
+    if (resolvedDigest !== payload.artifactDigest) {
+      throw this.#diagnosticError(
+        "ARTIFACT_DIGEST_MISMATCH",
+        "Artifact resolver returned a different immutable digest",
+      );
+    }
+    if (!isAbsolute(resolved.artifactRoot)) {
       throw this.#diagnosticError(
         "ARTIFACT_ENTRY_OUTSIDE_ROOT",
         "Prepared artifact root must be absolute",
       );
     }
+    const artifactRoot = await bindPreparedArtifactRoot(resolvedDigest, resolved.artifactRoot);
     if (
-      payload.identity.pluginId !== payload.manifest.pluginId ||
+      payload.identity.pluginId !== manifest.pluginId ||
       payload.identity.componentId !== payload.componentId
     ) {
       throw this.#diagnosticError(
@@ -217,7 +325,7 @@ export class ComponentHost {
         "Prepared component identity does not match the manifest request",
       );
     }
-    const component = payload.manifest.components.find(
+    const component = manifest.components.find(
       (candidate) => candidate.componentId === payload.componentId,
     );
     if (component === undefined) {
@@ -227,7 +335,7 @@ export class ComponentHost {
       );
     }
     const grant = this.#options.permissionBoundary.validateGrant(
-      payload.manifest.permissions,
+      manifest.permissions,
       payload.permissionGrants,
     );
     if (!grant.allowed) throw this.#boundaryError(grant.diagnostics, "permission");
@@ -237,8 +345,12 @@ export class ComponentHost {
     }
     this.#prepared = {
       payload: freezeJson(payload),
+      artifactRoot,
+      manifest,
       entrypoint: component.entrypoint,
       kind: component.kind,
+      fingerprint,
+      generation: 1,
     };
     this.#disposables = this.createDisposables();
     this.#state = "prepared";
@@ -250,28 +362,16 @@ export class ComponentHost {
   ): Promise<ComponentHostResult> {
     if (this.#state === "imported" || this.#state === "started" || this.#state === "draining") {
       this.#assertDigest(command.payload.artifactDigest);
-      if (command.payload.entrypoint !== this.#prepared?.entrypoint) {
-        throw this.#diagnosticError(
-          "ARTIFACT_ENTRY_UNDECLARED",
-          "Import entrypoint is not declared for the prepared component",
-        );
-      }
       return this.#success(command, { status: "imported" });
     }
     if (this.#state !== "prepared" || this.#prepared === undefined) {
       throw this.#lifecycleError("import", "prepared");
     }
     this.#assertDigest(command.payload.artifactDigest);
-    if (command.payload.entrypoint !== this.#prepared.entrypoint) {
-      throw this.#diagnosticError(
-        "ARTIFACT_ENTRY_UNDECLARED",
-        "Import entrypoint is not declared for the prepared component",
-      );
-    }
     this.#definition = await loadPreparedComponent({
       artifactDigest: command.payload.artifactDigest,
-      artifactRoot: this.#prepared.payload.artifactRoot,
-      entrypoint: command.payload.entrypoint,
+      artifactRoot: this.#prepared.artifactRoot,
+      entrypoint: this.#prepared.entrypoint,
       expectedKind: this.#prepared.kind,
     });
     this.#state = "imported";
@@ -317,8 +417,19 @@ export class ComponentHost {
       );
     }
     const key = taskKey(execution.taskId, execution.attemptId);
+    const fingerprint = JSON.stringify({
+      artifactDigest: command.payload.artifactDigest,
+      execution,
+      generation: this.#prepared.generation,
+    });
     const existing = this.#runs.get(key);
     if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) {
+        throw this.#idempotencyError(
+          "Task attempt identity was reused with different execution content",
+        );
+      }
+      this.#touch(this.#runs, key, existing);
       return this.#success(command, await existing.result);
     }
     if (this.#definition?.run === undefined) {
@@ -330,17 +441,30 @@ export class ComponentHost {
     const controller = new AbortController();
     const active: ActiveRun = {
       controller,
+      fingerprint,
       cancellation: undefined,
       result: Promise.resolve(null),
+      settled: false,
     };
     active.result = this.#executeRun(command, active);
     this.#runs.set(key, active);
+    void active.result.then(
+      () => {
+        active.settled = true;
+        this.#prune(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT);
+      },
+      () => {
+        active.settled = true;
+        this.#prune(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT);
+      },
+    );
+    this.#prune(this.#runs, COMPONENT_HOST_RUN_RETENTION_LIMIT);
     return this.#success(command, await active.result);
   }
 
   async #executeRun(command: RunComponentHostCommand, active: ActiveRun): Promise<JsonValue> {
     const execution = command.payload.execution;
-    const clearDeadline = armDeadline(execution.deadline, () => {
+    const clearDeadline = armDeadline(execution.deadline, this.#clock, () => {
       active.cancellation = "timed-out";
       active.controller.abort("deadline");
     });
@@ -378,8 +502,8 @@ export class ComponentHost {
     this.#assertDigest(command.payload.artifactDigest);
     if (this.#state === "draining") return this.#success(command, { status: "draining" });
     if (this.#state !== "started") throw this.#lifecycleError("drain", "started");
+    await this.#invokeLifecycleHook("drain", command.deadline, "draining");
     this.#state = "draining";
-    await this.#invokeLifecycleHook("drain", command.deadline);
     return this.#success(command, { status: "draining" });
   }
 
@@ -389,20 +513,15 @@ export class ComponentHost {
     if (!["prepared", "imported", "draining"].includes(this.#state)) {
       throw this.#lifecycleError("stop", "prepared, imported, or draining");
     }
-    const diagnostics: RuntimeDiagnostic[] = [];
-    try {
-      if (this.#definition !== undefined) {
-        await this.#invokeLifecycleHook("stop", command.deadline);
-      }
-    } catch (error) {
-      diagnostics.push(this.#asDiagnostic(error));
+    if (this.#definition !== undefined) {
+      await this.#invokeLifecycleHook("stop", command.deadline, this.#state);
     }
-    diagnostics.push(...((await this.#disposables?.dispose()) ?? []));
-    this.#options.capabilityBoundary.clear();
-    this.#state = "stopped";
+    const diagnostics = [...((await this.#disposables?.dispose()) ?? [])];
     if (diagnostics.length > 0) {
       return this.#result(command.commandId, command.type, false, undefined, diagnostics);
     }
+    this.#options.capabilityBoundary.clear();
+    this.#state = "stopped";
     return this.#success(command, { status: "stopped" });
   }
 
@@ -426,20 +545,28 @@ export class ComponentHost {
     });
   }
 
-  async #invokeLifecycleHook(name: Exclude<HookName, "health" | "run">, deadline: string) {
+  async #invokeLifecycleHook(
+    name: Exclude<HookName, "health" | "run">,
+    deadline: string,
+    lifecycle: ComponentHostState = this.#state,
+  ) {
     const hook = this.#definition?.[name];
     if (hook === undefined) return;
-    await this.#invokeHook(name, deadline);
+    await this.#invokeHook(name, deadline, lifecycle);
   }
 
-  async #invokeHook(name: Exclude<HookName, "run">, deadline: string): Promise<unknown> {
+  async #invokeHook(
+    name: Exclude<HookName, "run">,
+    deadline: string,
+    lifecycle: ComponentHostState = this.#state,
+  ): Promise<unknown> {
     const hook = this.#definition?.[name];
     if (hook === undefined) return undefined;
     const controller = new AbortController();
-    const clearDeadline = armDeadline(deadline, () => controller.abort("deadline"));
+    const clearDeadline = armDeadline(deadline, this.#clock, () => controller.abort("deadline"));
     const outcome = await Promise.race([
       Promise.resolve()
-        .then(() => hook(this.#context(controller.signal, this.#state)))
+        .then(() => hook(this.#context(controller.signal, lifecycle)))
         .then(
           (value) => ({ kind: "value" as const, value }),
           (error: unknown) => ({ kind: "error" as const, error }),
@@ -574,7 +701,7 @@ export class ComponentHost {
     }
     const prepared = this.#prepared;
     if (prepared === undefined) throw this.#lifecycleError("secret", "prepared");
-    const requested = prepared.payload.manifest.permissions.some(
+    const requested = prepared.manifest.permissions.some(
       (permission) => permission.kind === "secret" && permission.names.includes(name),
     );
     if (!requested) {
@@ -729,6 +856,15 @@ export class ComponentHost {
     }
   }
 
+  #assertDeadline(command: ComponentHostCommand): void {
+    if (Date.parse(command.deadline) <= this.#clock.now().getTime()) {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+        "Component host command deadline has elapsed",
+      );
+    }
+  }
+
   #success(command: ComponentHostCommand, value: JsonValue): ComponentHostResult {
     return this.#result(command.commandId, command.type, true, value, []);
   }
@@ -805,6 +941,10 @@ export class ComponentHost {
     );
   }
 
+  #idempotencyError(message: string): DiagnosticError {
+    return this.#diagnosticError("PROTOCOL_IDEMPOTENCY_CONFLICT", message);
+  }
+
   #lifecycleError(operation: string, expected: string): DiagnosticError {
     return this.#diagnosticError(
       "LIFECYCLE_TRANSITION_INVALID",
@@ -866,6 +1006,6 @@ export class ComponentHost {
   }
 
   #now(): string {
-    return (this.#options.now?.() ?? new Date()).toISOString();
+    return this.#clock.now().toISOString();
   }
 }

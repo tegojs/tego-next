@@ -86,6 +86,54 @@ function snapshotObject<T extends JsonObject>(value: T, label: string): T {
   return snapshot as T;
 }
 
+function dataFields(
+  value: unknown,
+  label: string,
+  expected: readonly string[],
+): ReadonlyMap<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+  const keys = Reflect.ownKeys(value);
+  const allowed = new Set(expected);
+  if (
+    keys.length !== expected.length ||
+    keys.some((key) => typeof key !== "string" || !allowed.has(key))
+  ) {
+    throw new TypeError(`${label} fields are invalid`);
+  }
+  const fields = new Map<string, unknown>();
+  for (const key of expected) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new TypeError(`${label} ${key} must be an enumerable data property`);
+    }
+    fields.set(key, descriptor.value);
+  }
+  return fields;
+}
+
+function methods(
+  value: unknown,
+  label: string,
+  expected: readonly string[],
+): ReadonlyMap<string, (...values: readonly unknown[]) => unknown> {
+  const fields = dataFields(value, label, expected);
+  const result = new Map<string, (...values: readonly unknown[]) => unknown>();
+  for (const key of expected) {
+    const method = fields.get(key);
+    if (typeof method !== "function") {
+      throw new TypeError(`${label} ${key} must be a function`);
+    }
+    result.set(key, method as (...values: readonly unknown[]) => unknown);
+  }
+  return result;
+}
+
 export interface ComponentIdentity extends JsonObject {
   readonly runtimeId?: RuntimeId;
   readonly applicationId: ApplicationId | string;
@@ -162,10 +210,50 @@ export interface CreateComponentContextInput {
 }
 
 export function createComponentContext(input: CreateComponentContextInput): ComponentContext {
-  const configuration = snapshotJson(input.configuration);
-  const identity = snapshotObject(input.identity, "Component identity");
-  const lifecycle = snapshotObject(input.lifecycle, "Component lifecycle");
-  const runtime = snapshotObject(input.runtime, "Component runtime");
+  const envelope = dataFields(input, "Component context input", [
+    "identity",
+    "configuration",
+    "logger",
+    "events",
+    "capabilities",
+    "lifecycle",
+    "runtime",
+    "cancellation",
+    "disposables",
+    "secrets",
+  ]);
+  const configuration = snapshotJson(envelope.get("configuration"));
+  const identity = snapshotObject(
+    envelope.get("identity") as ComponentIdentity,
+    "Component identity",
+  );
+  const lifecycle = snapshotObject(
+    envelope.get("lifecycle") as ComponentLifecycleInfo,
+    "Component lifecycle",
+  );
+  const runtime = snapshotObject(
+    envelope.get("runtime") as ComponentRuntimeInfo,
+    "Component runtime",
+  );
+  const loggerMethods = methods(envelope.get("logger"), "Component logger", [
+    "debug",
+    "error",
+    "info",
+    "warn",
+  ]);
+  const eventMethods = methods(envelope.get("events"), "Component events", ["emit"]);
+  const capabilityMethods = methods(envelope.get("capabilities"), "Component capabilities", [
+    "call",
+  ]);
+  const secretMethods = methods(envelope.get("secrets"), "Component secrets", ["get"]);
+  const cancellation = envelope.get("cancellation");
+  const disposables = envelope.get("disposables");
+  if (!(cancellation instanceof AbortSignal)) {
+    throw new TypeError("Component cancellation must be an AbortSignal");
+  }
+  if (typeof disposables !== "object" || disposables === null) {
+    throw new TypeError("Component disposables must be an object");
+  }
   const config = Object.freeze({
     get(key?: string): JsonValue | undefined {
       if (key === undefined) return configuration;
@@ -181,19 +269,31 @@ export function createComponentContext(input: CreateComponentContextInput): Comp
     },
   }) as ComponentConfigReader;
   const logger = Object.freeze({
-    debug: (...values: readonly unknown[]) => input.logger.debug(...values),
-    error: (...values: readonly unknown[]) => input.logger.error(...values),
-    info: (...values: readonly unknown[]) => input.logger.info(...values),
-    warn: (...values: readonly unknown[]) => input.logger.warn(...values),
+    debug: (...values: readonly unknown[]) => loggerMethods.get("debug")?.(...values),
+    error: (...values: readonly unknown[]) => loggerMethods.get("error")?.(...values),
+    info: (...values: readonly unknown[]) => loggerMethods.get("info")?.(...values),
+    warn: (...values: readonly unknown[]) => loggerMethods.get("warn")?.(...values),
   });
   const events = Object.freeze({
-    emit: (type: string, payload: JsonValue) => input.events.emit(type, snapshotJson(payload)),
+    emit: async (type: string, payload: JsonValue) => {
+      await eventMethods.get("emit")?.(type, snapshotJson(payload));
+    },
   });
   const capabilities = Object.freeze({
-    call: (request: ComponentCapabilityCall) => input.capabilities.call(request),
+    call: async (request: ComponentCapabilityCall): Promise<JsonValue> => {
+      const requestSnapshot = snapshotObject(request, "Component capability request");
+      const response = await capabilityMethods.get("call")?.(requestSnapshot);
+      return snapshotJson(response);
+    },
   });
   const secrets = Object.freeze({
-    get: (name: string) => input.secrets.get(name),
+    get: async (name: string): Promise<string | undefined> => {
+      const value = await secretMethods.get("get")?.(name);
+      if (value !== undefined && typeof value !== "string") {
+        throw new TypeError("Component secret result must be a string or undefined");
+      }
+      return value as string | undefined;
+    },
   });
   return Object.freeze({
     identity,
@@ -203,8 +303,8 @@ export function createComponentContext(input: CreateComponentContextInput): Comp
     capabilities,
     lifecycle,
     runtime,
-    cancellation: input.cancellation,
-    disposables: input.disposables,
+    cancellation,
+    disposables: disposables as ComponentDisposableStack,
     secrets,
   });
 }

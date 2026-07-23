@@ -284,8 +284,45 @@ function javascriptTokens(source) {
 function analyzeImports(source) {
   const specifiers = new Set();
   const tokens = javascriptTokens(source);
+  const scopeDepths = [];
+  let scopeDepth = 0;
+  for (const token of tokens) {
+    if (token.value === "}") {
+      scopeDepth -= 1;
+    }
+    scopeDepths.push(scopeDepth);
+    if (token.value === "{") {
+      scopeDepth += 1;
+    }
+  }
+  let componentLoaderFunction;
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (
+      tokens[index]?.value !== "function" ||
+      tokens[index + 1]?.type !== "identifier" ||
+      tokens[index + 1]?.value !== "loadPreparedComponent"
+    ) {
+      continue;
+    }
+    const open = tokens.findIndex(
+      (token, candidate) => candidate > index + 1 && token.value === "{",
+    );
+    if (open === -1) break;
+    const close = tokens.findIndex(
+      (token, candidate) =>
+        candidate > open && token.value === "}" && scopeDepths[candidate] === scopeDepths[open],
+    );
+    if (close !== -1) {
+      componentLoaderFunction = { close, open };
+    }
+    break;
+  }
   let unsupportedSpecifier = false;
-  let fileUrlSpecifier = false;
+  let hasPathToFileUrlImport = false;
+  const directFileUrlSpecifierDepths = [];
+  const pathToFileUrlReferences = tokens.filter(
+    (token) => token.type === "identifier" && token.value === "pathToFileURL",
+  ).length;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -307,6 +344,20 @@ function analyzeImports(source) {
       continue;
     }
 
+    if (
+      token.value === "import" &&
+      next?.value === "{" &&
+      tokens[index + 2]?.type === "identifier" &&
+      tokens[index + 2]?.value === "pathToFileURL" &&
+      tokens[index + 3]?.value === "}" &&
+      tokens[index + 4]?.value === "from" &&
+      tokens[index + 5]?.type === "string" &&
+      !tokens[index + 5].escaped &&
+      tokens[index + 5].value === "node:url"
+    ) {
+      hasPathToFileUrlImport = true;
+    }
+
     if (token.value === "import" && next?.value === "(") {
       const argument = tokens[index + 2];
       const delimiter = tokens[index + 3]?.value;
@@ -314,13 +365,23 @@ function analyzeImports(source) {
         specifiers.add(argument.value);
       } else if (
         argument?.type === "identifier" &&
-        argument.value === "url" &&
-        tokens[index + 3]?.value === "." &&
+        argument.value === "pathToFileURL" &&
+        tokens[index + 3]?.value === "(" &&
         tokens[index + 4]?.type === "identifier" &&
-        tokens[index + 4]?.value === "href" &&
-        tokens[index + 5]?.value === ")"
+        tokens[index + 4]?.value === "entrypoint" &&
+        tokens[index + 5]?.value === ")" &&
+        tokens[index + 6]?.value === "." &&
+        tokens[index + 7]?.type === "identifier" &&
+        tokens[index + 7]?.value === "href" &&
+        tokens[index + 8]?.value === ")"
       ) {
-        fileUrlSpecifier = true;
+        directFileUrlSpecifierDepths.push({
+          depth: scopeDepths[index],
+          inComponentLoader:
+            componentLoaderFunction !== undefined &&
+            index > componentLoaderFunction.open &&
+            index < componentLoaderFunction.close,
+        });
       } else {
         unsupportedSpecifier = true;
       }
@@ -343,15 +404,24 @@ function analyzeImports(source) {
     }
   }
 
-  return { fileUrlSpecifier, specifiers, unsupportedSpecifier };
+  return {
+    directFileUrlSpecifierDepths,
+    hasPathToFileUrlImport,
+    pathToFileUrlReferences,
+    specifiers,
+    unsupportedSpecifier,
+  };
 }
 
-function isConfinedComponentFileUrlImport(workspace, file, source) {
+function isConfinedComponentFileUrlImport(workspace, file, imports) {
   return (
     workspace.manifest.name === "@tegojs/executor-node" &&
     file.pathname.endsWith("/dist/src/host/component-loader.js") &&
-    /import\s*\{\s*pathToFileURL\s*\}\s*from\s*"node:url"/u.test(source) &&
-    /const\s+url\s*=\s*pathToFileURL\(entrypoint\)/u.test(source)
+    imports.hasPathToFileUrlImport &&
+    imports.pathToFileUrlReferences === 2 &&
+    imports.directFileUrlSpecifierDepths.length === 1 &&
+    imports.directFileUrlSpecifierDepths[0].depth === 1 &&
+    imports.directFileUrlSpecifierDepths[0].inComponentLoader
   );
 }
 
@@ -478,8 +548,8 @@ export async function checkWorkspaceBoundaries(root) {
       }
       if (
         workspace.kind !== "example" &&
-        imports.fileUrlSpecifier &&
-        !isConfinedComponentFileUrlImport(workspace, file, source)
+        imports.directFileUrlSpecifierDepths.length > 0 &&
+        !isConfinedComponentFileUrlImport(workspace, file, imports)
       ) {
         violations.add(`${workspace.manifest.name} -> [unsupported import specifier]`);
       }

@@ -80,8 +80,6 @@ function prepareCommand(
     type: "prepare",
     payload: {
       artifactDigest: digest,
-      artifactRoot: fixture.directory,
-      manifest: fixture.manifest,
       componentId: parseComponentId("component"),
       identity: {
         runtimeId: parseRuntimeId("runtime-01"),
@@ -114,7 +112,10 @@ function command(
   } as ComponentHostCommand;
 }
 
-function allowedOptions(overrides: Partial<ComponentHostOptions> = {}): ComponentHostOptions {
+function allowedOptions(
+  fixture: ArtifactFixture,
+  overrides: Partial<ComponentHostOptions> = {},
+): ComponentHostOptions {
   return {
     logger: {
       debug() {},
@@ -123,6 +124,13 @@ function allowedOptions(overrides: Partial<ComponentHostOptions> = {}): Componen
       warn() {},
     },
     events: { emit: async () => {} },
+    artifactResolver: {
+      resolve: async (artifactDigest) => ({
+        artifactDigest,
+        artifactRoot: fixture.directory,
+        manifest: fixture.manifest,
+      }),
+    },
     permissionBoundary: {
       authorize: () => ({ allowed: true, diagnostics: [] }),
       validateGrant: (requested, granted) => {
@@ -279,7 +287,7 @@ test("prepare has no module side effects and import is confined to the prepared 
       export default defineComponent({ kind: "task", run: async (_context, input) => input });
     `,
   );
-  const host = new ComponentHost(allowedOptions());
+  const host = new ComponentHost(allowedOptions(fixture));
 
   const prepared = await host.handle(prepareCommand(fixture));
   assert.equal(prepared.ok, true);
@@ -288,7 +296,6 @@ test("prepare has no module side effects and import is confined to the prepared 
   const wrongDigest = await host.handle(
     command("import", "import-wrong", {
       artifactDigest: otherDigest,
-      entrypoint: "components/component.js",
     }),
   );
   assert.equal(wrongDigest.ok, false);
@@ -302,13 +309,12 @@ test("prepare has no module side effects and import is confined to the prepared 
     }),
   );
   assert.equal(undeclared.ok, false);
-  assert.equal(undeclared.diagnostics[0]?.code, "ARTIFACT_ENTRY_UNDECLARED");
+  assert.equal(undeclared.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
   assert.equal(Reflect.get(globalThis, marker), undefined);
 
   const imported = await host.handle(
     command("import", "import-01", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   assert.equal(imported.ok, true, JSON.stringify(imported));
@@ -340,13 +346,12 @@ test("loader rejects path escape, symlink escape, and CommonJS before import sid
     permissions: [],
     capabilities: { provides: [], requires: [] },
   };
-  const escapedHost = new ComponentHost(allowedOptions());
-  const escaped = await escapedHost.handle(
-    prepareCommand(
-      { directory, manifest: invalidManifest as unknown as PluginManifest },
-      { manifest: invalidManifest as unknown as PluginManifest },
-    ),
-  );
+  const escapedFixture = {
+    directory,
+    manifest: invalidManifest as unknown as PluginManifest,
+  };
+  const escapedHost = new ComponentHost(allowedOptions(escapedFixture));
+  const escaped = await escapedHost.handle(prepareCommand(escapedFixture));
   assert.equal(escaped.ok, false);
   assert.equal(Reflect.get(globalThis, escapedMarker), undefined);
 
@@ -355,12 +360,11 @@ test("loader rejects path escape, symlink escape, and CommonJS before import sid
   });
   await rm(join(symlinkFixture.directory, "components/link.js"));
   await symlink(outside, join(symlinkFixture.directory, "components/link.js"));
-  const symlinkHost = new ComponentHost(allowedOptions());
+  const symlinkHost = new ComponentHost(allowedOptions(symlinkFixture));
   assert.equal((await symlinkHost.handle(prepareCommand(symlinkFixture))).ok, true);
   const symlinkResult = await symlinkHost.handle(
     command("import", "import-symlink", {
       artifactDigest: digest,
-      entrypoint: "components/link.js",
     }),
   );
   assert.equal(symlinkResult.ok, false);
@@ -382,10 +386,9 @@ test("loader rejects path escape, symlink escape, and CommonJS before import sid
       },
     ],
   } as unknown as PluginManifest;
-  const commonJsHost = new ComponentHost(allowedOptions());
-  const commonJsResult = await commonJsHost.handle(
-    prepareCommand({ ...commonJs, manifest: commonJsManifest }, { manifest: commonJsManifest }),
-  );
+  const commonJsFixture = { ...commonJs, manifest: commonJsManifest };
+  const commonJsHost = new ComponentHost(allowedOptions(commonJsFixture));
+  const commonJsResult = await commonJsHost.handle(prepareCommand(commonJsFixture));
   assert.equal(commonJsResult.ok, false);
   assert.equal(commonJsResult.diagnostics[0]?.code, "ARTIFACT_MANIFEST_INVALID");
   assert.equal(Reflect.get(globalThis, commonJsMarker), undefined);
@@ -408,7 +411,7 @@ test("component lifecycle order and command idempotency are enforced without dup
     `,
   );
   const host = new ComponentHost(
-    allowedOptions({
+    allowedOptions(fixture, {
       events: {
         emit: async (type: string, payload: JsonValue) => {
           events.push({ type, payload });
@@ -429,7 +432,6 @@ test("component lifecycle order and command idempotency are enforced without dup
       await host.handle(
         command("import", "import-01", {
           artifactDigest: digest,
-          entrypoint: "components/component.js",
         }),
       )
     ).ok,
@@ -489,7 +491,7 @@ test("concurrent lifecycle transitions serialize and invoke each hook once", asy
   const gate = deferred();
   let starts = 0;
   const host = new ComponentHost(
-    allowedOptions({
+    allowedOptions(fixture, {
       events: {
         emit: async () => {
           starts += 1;
@@ -502,7 +504,6 @@ test("concurrent lifecycle transitions serialize and invoke each hook once", asy
   await host.handle(
     command("import", "import-serialize", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
 
@@ -545,7 +546,7 @@ test("failed drain and stop transitions preserve state and remain retryable", as
   );
   const calls = { drain: 0, stop: 0 };
   const host = new ComponentHost(
-    allowedOptions({
+    allowedOptions(fixture, {
       events: {
         emit: async (type) => {
           if (type !== "drain" && type !== "stop") return;
@@ -559,7 +560,6 @@ test("failed drain and stop transitions preserve state and remain retryable", as
   await host.handle(
     command("import", "import-retry", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-retry", { artifactDigest: digest }));
@@ -576,22 +576,21 @@ test("failed drain and stop transitions preserve state and remain retryable", as
   assert.equal(secondDrain.state, "draining");
   assert.equal(calls.drain, 2);
 
-  const firstStop = await host.handle(
-    command("stop", "stop-failed", { artifactDigest: digest }),
-  );
+  const firstStop = await host.handle(command("stop", "stop-failed", { artifactDigest: digest }));
   assert.equal(firstStop.ok, false);
   assert.equal(firstStop.state, "draining");
-  const secondStop = await host.handle(
-    command("stop", "stop-retry", { artifactDigest: digest }),
-  );
+  const secondStop = await host.handle(command("stop", "stop-retry", { artifactDigest: digest }));
   assert.equal(secondStop.ok, true);
   assert.equal(secondStop.state, "stopped");
   assert.equal(calls.stop, 2);
 });
 
 test("duplicate prepare compares the complete canonical deployment fingerprint", async (t) => {
-  const fixture = await artifactFixture(t, 'export default { protocol: "tego.component/1.0", kind: "task" };');
-  const host = new ComponentHost(allowedOptions());
+  const fixture = await artifactFixture(
+    t,
+    'export default { protocol: "tego.component/1.0", kind: "task" };',
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
   assert.equal((await host.handle(prepareCommand(fixture))).ok, true);
 
   const changedConfiguration = prepareCommand(fixture, {
@@ -623,12 +622,11 @@ test("duplicate task attempts compare full execution fingerprints and completed 
       export default defineComponent({ kind: "task", run: async (_context, input) => input });
     `,
   );
-  const host = new ComponentHost(allowedOptions());
+  const host = new ComponentHost(allowedOptions(fixture));
   await host.handle(prepareCommand(fixture));
   await host.handle(
     command("import", "import-run-retention", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-run-retention", { artifactDigest: digest }));
@@ -711,12 +709,11 @@ test("deadline acceptance and chunked timers use the same injected clock", async
       });
     },
   };
-  const host = new ComponentHost(allowedOptions({ clock } as never));
+  const host = new ComponentHost(allowedOptions(fixture, { clock }));
   await host.handle(prepareCommand(fixture));
   await host.handle(
     command("import", "import-clock", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-clock", { artifactDigest: digest }));
@@ -787,7 +784,7 @@ test("capability calls are forced through permission, request, invoke, and respo
   const order: string[] = [];
   let responseMode: "invalid" | "valid" = "valid";
   const host = new ComponentHost(
-    allowedOptions({
+    allowedOptions(fixture, {
       permissionBoundary: {
         validateGrant: (_requested, granted) => ({
           allowed: true,
@@ -837,7 +834,6 @@ test("capability calls are forced through permission, request, invoke, and respo
   await host.handle(
     command("import", "import-01", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-01", { artifactDigest: digest }));
@@ -901,7 +897,7 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
   const started = Promise.withResolvers<void>();
   let starts = 0;
   const host = new ComponentHost(
-    allowedOptions({
+    allowedOptions(fixture, {
       events: {
         emit: async (type: string) => {
           if (type === "run.started") {
@@ -916,7 +912,6 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
   await host.handle(
     command("import", "import-01", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-01", { artifactDigest: digest }));
@@ -969,12 +964,11 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
       });
     `,
   );
-  const host = new ComponentHost(allowedOptions());
+  const host = new ComponentHost(allowedOptions(fixture));
   await host.handle(prepareCommand(fixture));
   await host.handle(
     command("import", "import-01", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-01", { artifactDigest: digest }));
@@ -1037,7 +1031,7 @@ test("secret access requires manifest request and deployment grant and never lea
   };
   const logs: unknown[] = [];
   const host = new ComponentHost(
-    allowedOptions({
+    allowedOptions(fixture, {
       logger: {
         debug: (...values: unknown[]) => logs.push(values),
         error: (...values: unknown[]) => logs.push(values),
@@ -1074,7 +1068,6 @@ test("secret access requires manifest request and deployment grant and never lea
   await host.handle(
     command("import", "import-01", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   await host.handle(command("start", "start-01", { artifactDigest: digest }));
@@ -1105,30 +1098,30 @@ test("secret access requires manifest request and deployment grant and never lea
     permissions: [],
   });
   const deniedHost = new ComponentHost(
-    allowedOptions({
-      secretProvider: provider,
-      permissionBoundary: {
-        authorize: () => ({ allowed: true, diagnostics: [] }),
-        validateGrant: () => ({
-          allowed: false,
-          diagnostics: [
-            {
-              code: "PERMISSION_GRANT_EXCEEDS_REQUEST",
-              message: "Grant exceeds request",
-              path: "$/permissionGrants",
-            },
-          ],
-        }),
+    allowedOptions(
+      { ...fixture, manifest: unrequestedManifest },
+      {
+        secretProvider: provider,
+        permissionBoundary: {
+          authorize: () => ({ allowed: true, diagnostics: [] }),
+          validateGrant: () => ({
+            allowed: false,
+            diagnostics: [
+              {
+                code: "PERMISSION_GRANT_EXCEEDS_REQUEST",
+                message: "Grant exceeds request",
+                path: "$/permissionGrants",
+              },
+            ],
+          }),
+        },
       },
-    }),
+    ),
   );
   const deniedPrepare = await deniedHost.handle(
     prepareCommand(
       { ...fixture, manifest: unrequestedManifest },
-      {
-        manifest: unrequestedManifest,
-        permissionGrants: [{ kind: "secret", names: ["API_TOKEN"] }],
-      },
+      { permissionGrants: [{ kind: "secret", names: ["API_TOKEN"] }] },
     ),
   );
   assert.equal(deniedPrepare.ok, false);
@@ -1147,12 +1140,11 @@ test("thrown Error and non-Error values become redacted RuntimeDiagnostic result
       });
     `,
   );
-  const host = new ComponentHost(allowedOptions());
+  const host = new ComponentHost(allowedOptions(fixture));
   await host.handle(prepareCommand(fixture));
   await host.handle(
     command("import", "import-01", {
       artifactDigest: digest,
-      entrypoint: "components/component.js",
     }),
   );
   const result = await host.handle(command("start", "start-01", { artifactDigest: digest }));

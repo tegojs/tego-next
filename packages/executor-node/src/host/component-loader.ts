@@ -6,8 +6,11 @@ import {
   runtimeDiagnostic,
   type ArtifactDigest,
   type JsonObject,
+  type JsonValue,
 } from "@tegojs/contracts";
 import { cloneComponentHostValue } from "./protocol.js";
+
+const ROOT_DIGEST_BINDINGS = new Map<string, ArtifactDigest>();
 
 export interface LoadedComponentDefinition {
   readonly protocol: "tego.component/1.0";
@@ -30,6 +33,7 @@ export interface LoadPreparedComponentInput {
 function loaderError(
   code:
     | "ARTIFACT_ENTRY_OUTSIDE_ROOT"
+    | "ARTIFACT_DIGEST_ROOT_CONFLICT"
     | "ARTIFACT_MODULE_FORMAT_INVALID"
     | "EXECUTOR_COMPONENT_DEFINITION_INVALID",
   message: string,
@@ -51,6 +55,32 @@ function confined(root: string, path: string): boolean {
     !pathFromRoot.startsWith(`..${sep}`) &&
     !resolve(pathFromRoot).startsWith(`${sep}..${sep}`)
   );
+}
+
+export async function bindPreparedArtifactRoot(
+  artifactDigest: ArtifactDigest,
+  artifactRoot: string,
+): Promise<string> {
+  const root = await realpath(artifactRoot);
+  const boundDigest = ROOT_DIGEST_BINDINGS.get(root);
+  if (boundDigest !== undefined && boundDigest !== artifactDigest) {
+    throw loaderError(
+      "ARTIFACT_DIGEST_ROOT_CONFLICT",
+      "Prepared artifact root is already bound to another immutable digest",
+    );
+  }
+  ROOT_DIGEST_BINDINGS.set(root, artifactDigest);
+  return root;
+}
+
+function freezeJson<T extends JsonValue>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const item of Array.isArray(value) ? value : Object.values(value)) {
+    if (typeof item === "object" && item !== null && !Object.isFrozen(item)) {
+      freezeJson(item);
+    }
+  }
+  return Object.freeze(value);
 }
 
 function validateDefinition(
@@ -111,17 +141,39 @@ function validateDefinition(
       );
     }
   }
-  const metadata = fields.get("metadata");
-  if (metadata !== undefined) {
-    const parsed = cloneComponentHostValue(metadata);
+  const metadataValue = fields.get("metadata");
+  let metadata: JsonObject | undefined;
+  if (metadataValue !== undefined) {
+    const parsed = cloneComponentHostValue(metadataValue);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw loaderError(
         "EXECUTOR_COMPONENT_DEFINITION_INVALID",
         "Component definition metadata must be a JSON object",
       );
     }
+    metadata = freezeJson(parsed) as JsonObject;
   }
-  return value as LoadedComponentDefinition;
+  const definition: LoadedComponentDefinition = {
+    protocol: "tego.component/1.0",
+    kind: expectedKind,
+    ...(metadata === undefined ? {} : { metadata }),
+    ...(fields.get("start") === undefined
+      ? {}
+      : { start: fields.get("start") as NonNullable<LoadedComponentDefinition["start"]> }),
+    ...(fields.get("health") === undefined
+      ? {}
+      : { health: fields.get("health") as NonNullable<LoadedComponentDefinition["health"]> }),
+    ...(fields.get("run") === undefined
+      ? {}
+      : { run: fields.get("run") as NonNullable<LoadedComponentDefinition["run"]> }),
+    ...(fields.get("drain") === undefined
+      ? {}
+      : { drain: fields.get("drain") as NonNullable<LoadedComponentDefinition["drain"]> }),
+    ...(fields.get("stop") === undefined
+      ? {}
+      : { stop: fields.get("stop") as NonNullable<LoadedComponentDefinition["stop"]> }),
+  };
+  return Object.freeze(definition);
 }
 
 export async function loadPreparedComponent(
@@ -133,7 +185,7 @@ export async function loadPreparedComponent(
       "Component entrypoint must be JavaScript ESM",
     );
   }
-  const root = await realpath(input.artifactRoot);
+  const root = await bindPreparedArtifactRoot(input.artifactDigest, input.artifactRoot);
   const candidate = resolve(root, input.entrypoint);
   if (!confined(root, candidate)) {
     throw loaderError(
@@ -148,9 +200,7 @@ export async function loadPreparedComponent(
       "Component entrypoint resolves outside the prepared artifact root",
     );
   }
-  const url = pathToFileURL(entrypoint);
-  url.searchParams.set("tego-artifact", input.artifactDigest);
-  const namespace = (await import(url.href)) as Record<string, unknown>;
+  const namespace = (await import(pathToFileURL(entrypoint).href)) as Record<string, unknown>;
   const descriptor = Object.getOwnPropertyDescriptor(namespace, "default");
   if (descriptor === undefined || !("value" in descriptor)) {
     throw loaderError(

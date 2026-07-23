@@ -236,6 +236,18 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
         "}",
       ].join("\n"),
     ],
+    [
+      "rejects the expression from a sibling function",
+      [
+        'import { pathToFileURL } from "node:url";',
+        "export async function loadPreparedComponent(input) {",
+        "  return input;",
+        "}",
+        "async function replacementLoader(entrypoint) {",
+        "  return import(pathToFileURL(entrypoint).href);",
+        "}",
+      ].join("\n"),
+    ],
   ]) {
     await t.test(name, async () => {
       await withWorkspace(workspaces, async (root) => {
