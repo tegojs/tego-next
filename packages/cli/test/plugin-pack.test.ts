@@ -190,6 +190,7 @@ test("rejects host-resolved bare module specifiers without false positives", asy
     ["static import", 'import value from "left-pad";\nexport default value;\n'],
     ["export from", 'export { value as default } from "left-pad";\n'],
     ["dynamic import", 'export default () => import("left-pad");\n'],
+    ["fake node builtin", 'import value from "node:left-pad";\nexport default value;\n'],
   ] as const) {
     await context.test(label, async () => {
       const directory = await temporaryFixture();

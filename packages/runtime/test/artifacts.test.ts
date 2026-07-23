@@ -469,6 +469,7 @@ test("compatibility ranges never match empty or incomplete alternatives", async 
     [">=27 ||", false],
     ["|| >=26", false],
     [">=26 nonsense", false],
+    ["nonsense || >=26", false],
     [">", false],
   ] as const) {
     await context.test(range, async () => {
