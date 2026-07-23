@@ -4,6 +4,15 @@ import type { ExecutionRequest, ExecutionResult, Executor, JsonValue } from "@te
 
 export type ExecutorFactory = () => Executor | Promise<Executor>;
 
+export interface ExecutorCleanupRaceFixture {
+  readonly executor: Executor;
+  readonly request: ExecutionRequest;
+  readonly cleanupStarted: Promise<void>;
+  readonly expectedOutput: JsonValue;
+  trigger(): Promise<void>;
+  releaseCleanup(): void;
+}
+
 export interface ExecutorConformanceFixture {
   request(input: JsonValue, suffix: string): ExecutionRequest;
   readonly echoInput: JsonValue;
@@ -18,6 +27,9 @@ export interface ExecutorConformanceFixture {
   spawnFailureFactory(): Executor | Promise<Executor>;
   shutdownHostTwice(): Promise<void>;
   advanceClock(milliseconds: number): Promise<void> | void;
+  cleanupRaceFactory(
+    trigger: "cancel" | "deadline",
+  ): ExecutorCleanupRaceFixture | Promise<ExecutorCleanupRaceFixture>;
 }
 
 async function terminal(executor: Executor, request: ExecutionRequest): Promise<ExecutionResult> {
@@ -208,5 +220,53 @@ export function executorConformance(
       assert.equal(health.active, 0);
       assert.equal(health.accepting, false);
     });
+
+    for (const trigger of ["cancel", "deadline"] as const) {
+      test(`@spec:executor-runtime/cleanup-settlement/${trigger}-cannot-rewrite-frozen-decision`, async () => {
+        const cleanup = await fixture.cleanupRaceFactory(trigger);
+        const handle = await cleanup.executor.submit(cleanup.request);
+        await cleanup.cleanupStarted;
+        let resultSettled = false;
+        let drainSettled = false;
+        void handle.result.then(() => {
+          resultSettled = true;
+        });
+        const draining = cleanup.executor.drain({}).then(() => {
+          drainSettled = true;
+        });
+        try {
+          assert.deepEqual(
+            await cleanup.executor.observe(cleanup.request.taskId, cleanup.request.attemptId),
+            { state: "running" },
+          );
+          assert.equal(resultSettled, false);
+          assert.equal(drainSettled, false);
+          assert.equal((await cleanup.executor.probe()).availableCapacity, 0);
+
+          await cleanup.trigger();
+          await Promise.resolve();
+          assert.deepEqual(
+            await cleanup.executor.observe(cleanup.request.taskId, cleanup.request.attemptId),
+            { state: "running" },
+          );
+          assert.equal(resultSettled, false);
+          assert.equal(drainSettled, false);
+
+          cleanup.releaseCleanup();
+          const result = await handle.result;
+          await draining;
+          assert.equal(result.status, "succeeded");
+          assert.deepEqual(result.output, cleanup.expectedOutput);
+          assert.deepEqual(
+            await cleanup.executor.observe(cleanup.request.taskId, cleanup.request.attemptId),
+            { state: "terminal", result },
+          );
+          assert.equal((await cleanup.executor.health()).active, 0);
+        } finally {
+          cleanup.releaseCleanup();
+          await cleanup.executor.drain({});
+        }
+      });
+    }
   });
 }

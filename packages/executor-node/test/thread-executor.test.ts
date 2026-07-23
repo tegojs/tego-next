@@ -419,6 +419,37 @@ const conformanceFixture: ExecutorConformanceFixture = {
     await Promise.resolve();
     await Promise.resolve();
   },
+  async cleanupRaceFactory(trigger) {
+    const factory = new GatedTerminationFactory();
+    const executor = new ThreadExecutor(
+      await options(factory, {
+        cleanupGraceMs: 1_000,
+        maxConcurrency: 1,
+      }),
+    );
+    const execution = {
+      ...request({ mode: "echo", value: "cleanup-stable" }, `cleanup-${trigger}`),
+      ...(trigger === "deadline"
+        ? { deadline: new Date(clock.now().getTime() + 100).toISOString() }
+        : {}),
+    };
+    return {
+      executor,
+      request: execution,
+      cleanupStarted: factory.terminationStarted.promise,
+      expectedOutput: "cleanup-stable",
+      async trigger() {
+        if (trigger === "cancel") {
+          await executor.cancel(execution.taskId, execution.attemptId);
+        } else {
+          clock.advanceBy(100);
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+      },
+      releaseCleanup: () => factory.gate.resolve(),
+    };
+  },
 };
 
 executorConformance(async () => {
