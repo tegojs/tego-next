@@ -13,10 +13,7 @@ import {
 import { ComponentHost, type ComponentHostClock } from "../host/component-host.js";
 import { authenticateProcessMessage, signProcessMessage } from "./authentication.js";
 import { ProcessFrameDecoder, encodeProcessFrame } from "./framing.js";
-import {
-  ProcessOutboundWriter,
-  type ProcessOutboundPriority,
-} from "./outbound-writer.js";
+import { ProcessOutboundWriter, type ProcessOutboundPriority } from "./outbound-writer.js";
 
 interface BootstrapMessage {
   readonly kind: "bootstrap";
