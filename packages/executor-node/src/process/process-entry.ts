@@ -2,6 +2,7 @@ import {
   compileSchemaValidator,
   parseArtifactDigest,
   parsePluginManifest,
+  validatePermissionGrant,
   type CapabilityDefinition,
   type ComponentCapabilityBoundary,
   type ComponentCapabilityIdentity,
@@ -164,31 +165,8 @@ function rpc(type: "capability" | "secret", payload: JsonValue): Promise<JsonVal
 }
 
 function permissionBoundary(): ComponentPermissionBoundary {
-  const canonical = (value: unknown): string =>
-    JSON.stringify(value, (_key, item: unknown) => {
-      if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
-      return Object.fromEntries(
-        Object.entries(item as Record<string, unknown>).sort(([left], [right]) =>
-          left < right ? -1 : left > right ? 1 : 0,
-        ),
-      );
-    });
   return {
-    validateGrant(requested, granted) {
-      const envelope = new Set(requested.map((permission) => canonical(permission)));
-      const allowed = granted.every((permission) => envelope.has(canonical(permission)));
-      return allowed
-        ? { allowed: true, diagnostics: [], granted }
-        : {
-            allowed: false,
-            diagnostics: [
-              {
-                code: "PERMISSION_GRANT_EXCEEDS_REQUEST",
-                message: "Permission grant exceeds the manifest request",
-              },
-            ],
-          };
-    },
+    validateGrant: (requested, granted) => validatePermissionGrant(requested, granted),
     authorize(granted, attempt) {
       const allowed = granted.some((permission) => {
         if (permission.kind !== attempt.kind) return false;
