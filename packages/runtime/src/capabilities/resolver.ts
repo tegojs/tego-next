@@ -22,6 +22,7 @@ export interface CapabilityResolutionInput {
 
 export type CapabilityResolutionDiagnosticCode =
   | "CAPABILITY_AMBIGUOUS"
+  | "CAPABILITY_BINDING_MAP_INVALID"
   | "CAPABILITY_BINDING_UNKNOWN"
   | "CAPABILITY_DUPLICATE_DEPLOYMENT"
   | "CAPABILITY_DUPLICATE_PROVIDER"
@@ -29,6 +30,7 @@ export type CapabilityResolutionDiagnosticCode =
   | "CAPABILITY_EXPLICIT_PROVIDER_INCOMPATIBLE"
   | "CAPABILITY_EXPLICIT_PROVIDER_MISSING"
   | "CAPABILITY_EXPLICIT_PROVIDER_UNREADY"
+  | "CAPABILITY_INPUT_INVALID"
   | "CAPABILITY_PROTOCOL_RANGE_INVALID"
   | "CAPABILITY_PROTOCOL_VERSION_INVALID"
   | "CAPABILITY_REQUIRED_CYCLE"
@@ -69,6 +71,101 @@ export interface ResolutionResult extends JsonObject {
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+class ResolutionInputError extends Error {
+  readonly path: string;
+
+  constructor(path: string, message: string) {
+    super(message);
+    this.path = path;
+  }
+}
+
+function cloneResolutionBoundary(
+  value: unknown,
+  path = "$",
+  ancestors = new Set<object>(),
+): unknown {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return value;
+  }
+  if (typeof value !== "object" || ancestors.has(value)) {
+    throw new ResolutionInputError(path, "Capability resolution input must be finite JSON data");
+  }
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new ResolutionInputError(path, "Capability resolution arrays must be ordinary");
+      }
+      const result: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+          throw new ResolutionInputError(
+            `${path}/${index}`,
+            "Array element must be a data property",
+          );
+        }
+        result.push(cloneResolutionBoundary(descriptor.value, `${path}/${index}`, ancestors));
+      }
+      if (
+        Reflect.ownKeys(value).some(
+          (key) =>
+            key !== "length" &&
+            !(
+              typeof key === "string" &&
+              /^(?:0|[1-9]\d*)$/u.test(key) &&
+              Number(key) < value.length
+            ),
+        )
+      ) {
+        throw new ResolutionInputError(path, "Extended arrays are not supported");
+      }
+      return result;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new ResolutionInputError(path, "Capability resolution objects must be plain");
+    }
+    const result: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(value).sort((left, right) =>
+      compareText(String(left), String(right)),
+    )) {
+      if (typeof key !== "string") {
+        throw new ResolutionInputError(path, "Symbol properties are not supported");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+        throw new ResolutionInputError(`${path}/${key}`, "Object field must be a data property");
+      }
+      Object.defineProperty(result, key, {
+        configurable: true,
+        enumerable: true,
+        value: cloneResolutionBoundary(descriptor.value, `${path}/${key}`, ancestors),
+        writable: true,
+      });
+    }
+    return result;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function ownBinding(
+  bindings: Readonly<Record<string, PluginDeploymentIdentity>>,
+  name: string,
+): PluginDeploymentIdentity | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(bindings, name);
+  return descriptor !== undefined && descriptor.enumerable && "value" in descriptor
+    ? descriptor.value
+    : undefined;
 }
 
 function identityKey(identity: PluginDeploymentIdentity): string {
@@ -146,7 +243,7 @@ function inputDiagnostics(
 
     const providers = new Set<string>();
     for (const provider of deployment.provides) {
-      const providerKey = provider.name;
+      const providerKey = `${provider.name}@${provider.protocolVersion}`;
       if (providers.has(providerKey)) {
         diagnostics.push(
           diagnostic(
@@ -211,7 +308,26 @@ function inputDiagnostics(
 }
 
 export function resolveCapabilities(input: CapabilityResolutionInput): ResolutionResult {
-  const deployments = [...input.deployments].sort((left, right) =>
+  let stableInput: CapabilityResolutionInput;
+  try {
+    stableInput = cloneResolutionBoundary(input) as CapabilityResolutionInput;
+  } catch (error) {
+    const invalid =
+      error instanceof ResolutionInputError
+        ? error
+        : new ResolutionInputError("$", "Capability resolution input is invalid");
+    const bindingFailure = invalid.path.includes("/bindings");
+    return {
+      ok: false,
+      diagnostics: [
+        diagnostic(
+          bindingFailure ? "CAPABILITY_BINDING_MAP_INVALID" : "CAPABILITY_INPUT_INVALID",
+          invalid.message,
+        ),
+      ],
+    };
+  }
+  const deployments = [...stableInput.deployments].sort((left, right) =>
     compareIdentity(left.identity, right.identity),
   );
   const diagnostics = inputDiagnostics(deployments);
@@ -231,7 +347,7 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
       compareText(left.name, right.name),
     )) {
       const requirement = normalizeRequirement(sourceRequirement);
-      const explicit = consumer.bindings[requirement.name];
+      const explicit = ownBinding(consumer.bindings, requirement.name);
       let candidates: CapabilityResolutionDeployment[] = [];
 
       if (explicit !== undefined) {

@@ -236,7 +236,9 @@ export function gatePermission(
     case "worker":
       if (
         permission.kind === "worker" &&
-        JSON.stringify(permission.labels) === JSON.stringify(attempt.labels) &&
+        Object.entries(permission.labels).every(
+          ([name, value]) => attempt.labels[name] === value,
+        ) &&
         attempt.resources.cpuMillis <= permission.resources.cpuMillis &&
         attempt.resources.memoryBytes <= permission.resources.memoryBytes &&
         attempt.resources.storageBytes <= permission.resources.storageBytes

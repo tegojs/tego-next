@@ -216,7 +216,15 @@ function canonicalRoot(value: unknown, path: string): string {
     throw new PermissionInputError(path, "filesystem root must be an absolute POSIX logical path");
   }
   const segments = source.split("/").slice(1);
-  if (segments.some((segment) => segment === "." || segment === ".." || segment.length === 0)) {
+  if (
+    segments.some(
+      (segment) =>
+        segment === "." ||
+        segment === ".." ||
+        segment.length === 0 ||
+        !/^[A-Za-z0-9._-]+$/u.test(segment),
+    )
+  ) {
     if (source !== "/") {
       throw new PermissionInputError(path, "filesystem root contains an invalid path segment");
     }
@@ -444,7 +452,7 @@ function categorySubset(requested: Permission, granted: Permission): boolean {
     case "worker": {
       const maximum = requested as WorkerPermission;
       return (
-        JSON.stringify(maximum.labels) === JSON.stringify(granted.labels) &&
+        Object.entries(maximum.labels).every(([name, value]) => granted.labels[name] === value) &&
         granted.resources.cpuMillis <= maximum.resources.cpuMillis &&
         granted.resources.memoryBytes <= maximum.resources.memoryBytes &&
         granted.resources.storageBytes <= maximum.resources.storageBytes
