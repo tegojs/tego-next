@@ -236,7 +236,7 @@ test("rejects host-resolved bare module specifiers without false positives", asy
     ["dynamic import", 'export default () => import("left-pad");\n'],
     [
       "dynamic import in template expression",
-      'const load = () => `value: ${import("left-pad")}`;\nexport default load;\n',
+      "const load = () => `value: $" + '{import("left-pad")}`;\nexport default load;\n',
     ],
     ["fake node builtin", 'import value from "node:left-pad";\nexport default value;\n'],
   ] as const) {
@@ -291,7 +291,7 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
   for (const [label, source] of [
     [
       "template interpolation",
-      "const value = 42;\nconst text = `value: ${value}`;\nexport default text;\n",
+      "const value = 42;\nconst text = `value: $" + "{value}`;\nexport default text;\n",
     ],
     [
       "regex contents",
@@ -318,7 +318,7 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
     ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
     [
       "plugin SDK import in template expression",
-      'const load = () => `sdk: ${import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
+      "const load = () => `sdk: $" + '{import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
     ],
   ] as const) {
     await context.test(label, async () => {

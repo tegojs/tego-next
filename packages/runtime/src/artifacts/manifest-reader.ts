@@ -359,7 +359,7 @@ export async function readPluginArtifact(
   let manifestBytes: Uint8Array | undefined;
   let filesBytes: Uint8Array | undefined;
   let zeroBlocks = 0;
-  let failed = false;
+  let result: ReadPluginArtifact;
 
   try {
     while (zeroBlocks < 2) {
@@ -476,15 +476,13 @@ export async function readPluginArtifact(
         );
       }
     }
-    return { archiveDigest: reader.digest(), files, manifest };
+    result = { archiveDigest: reader.digest(), files, manifest };
   } catch (error) {
-    failed = true;
-    throw error;
-  } finally {
     try {
       await reader.close();
-    } catch (error) {
-      if (!failed) throw error;
-    }
+    } catch {}
+    throw error;
   }
+  await reader.close();
+  return result;
 }
