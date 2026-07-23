@@ -326,6 +326,48 @@ test("component host rejects oversized aggregate attachments before plugin execu
   assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
 });
 
+test("component host measures attachment internal slots instead of spoofed byteLength", async (t) => {
+  class SpoofedArrayBuffer extends ArrayBuffer {
+    override get byteLength(): number {
+      return 0;
+    }
+  }
+  const attachment = new SpoofedArrayBuffer(2 * 1024 * 1024);
+  const { result, runCalls } = await attachmentLimitResult(t, [attachment]);
+
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
+test("component host rejects attachments whose native byte length cannot be read", async (t) => {
+  const attachment = new Proxy(new ArrayBuffer(0), {});
+  const { result, runCalls } = await attachmentLimitResult(t, [attachment]);
+
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
+test("component host rejects excessive attachment count before inspecting elements", async (t) => {
+  let reads = 0;
+  const attachments = new Array<ArrayBuffer>(65);
+  Object.defineProperty(attachments, "64", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error("attachment element must not be inspected");
+    },
+  });
+  const { result, runCalls } = await attachmentLimitResult(t, attachments);
+
+  assert.equal(reads, 0);
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
 test("prepare and import commands cannot nominate replaceable artifact locations", () => {
   const prepare = {
     protocol: "1.0",
