@@ -1,0 +1,26 @@
+{
+  "name": "@tegojs/root",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": ">=26.5.0 <27"
+  },
+  "workspaces": ["packages/*", "examples/*"],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test:unit": "npm run test:unit --workspaces --if-present",
+    "test:integration": "npm run test:integration --workspaces --if-present",
+    "test:e2e": "node --test tests/e2e/*.test.mjs",
+    "test": "npm run test:unit && node --test tests/architecture/*.test.mjs",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run test:integration && npm run build && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.5",
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2"
+  }
+}
