@@ -164,13 +164,27 @@ class TegoRuntime implements Runtime {
       if (this.#stopRequested) return;
 
       this.#setLifecycle("electing");
-      this.#leadership = structuredClone(
-        parseLeadership(
-          await this.#drivers.coordination.campaign({
-            resource: `runtime:${this.#configuration.runtimeId}`,
-          }),
-        ),
+      const expectedResource = `runtime:${this.#configuration.runtimeId}`;
+      const leadership = parseLeadership(
+        await this.#drivers.coordination.campaign({
+          resource: expectedResource,
+        }),
       );
+      if (leadership.resource !== expectedResource) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: "COORDINATION_LEADERSHIP_RESOURCE_MISMATCH",
+            message: "Coordination leadership does not match the campaign resource",
+            source: { kind: "coordination", id: "leadership" },
+            details: {
+              expectedResource,
+              actualResource: leadership.resource,
+            },
+            observedAt: this.#drivers.clock.now().toISOString(),
+          }),
+        );
+      }
+      this.#leadership = structuredClone(leadership);
       if (this.#stopRequested) return;
 
       this.#setLifecycle("running");
