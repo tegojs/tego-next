@@ -35,13 +35,26 @@ export interface StateWriteOptions {
   readonly expectedRevision?: ExpectedRevision;
 }
 
-export interface StateTransactionOptions {
-  readonly idempotencyKey?: string;
+interface StateTransactionBaseOptions {
   readonly fencing?: {
     readonly resource: string;
     readonly epoch: FencingEpoch;
   };
 }
+
+export interface NonIdempotentStateTransactionOptions extends StateTransactionBaseOptions {
+  readonly idempotencyKey?: undefined;
+  readonly idempotencyFingerprint?: undefined;
+}
+
+export interface IdempotentStateTransactionOptions extends StateTransactionBaseOptions {
+  readonly idempotencyKey: string;
+  readonly idempotencyFingerprint: string;
+}
+
+export type StateTransactionOptions =
+  | IdempotentStateTransactionOptions
+  | NonIdempotentStateTransactionOptions;
 
 export interface OperationJournalEntry {
   readonly operationId: OperationId;

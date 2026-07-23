@@ -58,8 +58,13 @@ interface StagedTransaction {
 }
 
 interface IdempotencyRecord {
-  readonly signature: string;
+  readonly fingerprint: string;
   readonly result: JsonValue;
+}
+
+interface IdempotencyIdentity {
+  readonly key: string;
+  readonly fingerprint: string;
 }
 
 export interface MemoryStateStoreOptions {
@@ -84,10 +89,14 @@ function serializedKey(key: StateKey<JsonValue>): string {
 
 function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): number {
   return (
-    left.namespace.localeCompare(right.namespace) ||
-    left.collection.localeCompare(right.collection) ||
-    left.id.localeCompare(right.id)
+    compareCodeUnits(left.namespace, right.namespace) ||
+    compareCodeUnits(left.collection, right.collection) ||
+    compareCodeUnits(left.id, right.id)
   );
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function stateError(
@@ -111,8 +120,32 @@ function stateError(
   );
 }
 
-function idempotencySignature(options: StateTransactionOptions): string {
-  return JSON.stringify(options.fencing ?? null);
+function idempotencyIdentity(
+  options: StateTransactionOptions,
+  clock: Clock,
+): IdempotencyIdentity | undefined {
+  const key = options.idempotencyKey;
+  const fingerprint = options.idempotencyFingerprint;
+  if (key === undefined && fingerprint === undefined) {
+    return undefined;
+  }
+  if (
+    typeof key !== "string" ||
+    key.length === 0 ||
+    typeof fingerprint !== "string" ||
+    fingerprint.length === 0
+  ) {
+    throw stateError(
+      "STATE_IDEMPOTENCY_CONFLICT",
+      "Idempotent transactions require a non-empty key and fingerprint",
+      {
+        idempotencyKey: typeof key === "string" ? key : null,
+        idempotencyFingerprint: typeof fingerprint === "string" ? fingerprint : null,
+      },
+      clock,
+    );
+  }
+  return { key, fingerprint };
 }
 
 function matchesExpectedRevision(
@@ -200,7 +233,7 @@ class MemoryTransaction implements StateTransaction {
           record.key.collection === query.collection &&
           (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
       )
-      .sort((left, right) => left.key.id.localeCompare(right.key.id));
+      .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
     for (const record of matching) {
       yield scannedRecord<T>(record);
     }
@@ -336,7 +369,7 @@ export class MemoryStateStore implements StateStore {
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #inFlightIdempotency = new Map<
     string,
-    { readonly signature: string; readonly result: Promise<JsonValue> }
+    { readonly fingerprint: string; readonly result: Promise<JsonValue> }
   >();
   #revision = 0n;
   #commitTail: Promise<void> = Promise.resolve();
@@ -358,34 +391,33 @@ export class MemoryStateStore implements StateStore {
     work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
     this.#assertOpen();
-    const idempotencyKey = options.idempotencyKey;
-    const signature = idempotencySignature(options);
-    if (idempotencyKey !== undefined) {
-      const replay = this.#idempotency.get(idempotencyKey);
+    const identity = idempotencyIdentity(options, this.#clock);
+    if (identity !== undefined) {
+      const replay = this.#idempotency.get(identity.key);
       if (replay !== undefined) {
-        this.#assertIdempotencySignature(idempotencyKey, signature, replay.signature);
+        this.#assertIdempotencyFingerprint(identity, replay.fingerprint);
         return cloneJson(replay.result) as T;
       }
-      const inFlight = this.#inFlightIdempotency.get(idempotencyKey);
+      const inFlight = this.#inFlightIdempotency.get(identity.key);
       if (inFlight !== undefined) {
-        this.#assertIdempotencySignature(idempotencyKey, signature, inFlight.signature);
+        this.#assertIdempotencyFingerprint(identity, inFlight.fingerprint);
         return cloneJson(await inFlight.result) as T;
       }
     }
 
-    const execution = this.#executeTransaction(options, work);
-    if (idempotencyKey === undefined) {
+    const execution = this.#executeTransaction(options, identity, work);
+    if (identity === undefined) {
       return execution;
     }
 
-    this.#inFlightIdempotency.set(idempotencyKey, {
-      signature,
+    this.#inFlightIdempotency.set(identity.key, {
+      fingerprint: identity.fingerprint,
       result: execution as Promise<JsonValue>,
     });
     try {
       return await execution;
     } finally {
-      this.#inFlightIdempotency.delete(idempotencyKey);
+      this.#inFlightIdempotency.delete(identity.key);
     }
   }
 
@@ -406,7 +438,7 @@ export class MemoryStateStore implements StateStore {
           record.key.collection === query.collection &&
           (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
       )
-      .sort((left, right) => left.key.id.localeCompare(right.key.id));
+      .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
     for (const record of matching) {
       this.#assertOpen();
       yield scannedRecord<T>(record);
@@ -446,6 +478,7 @@ export class MemoryStateStore implements StateStore {
 
   async #executeTransaction<T extends JsonValue>(
     options: StateTransactionOptions,
+    identity: IdempotencyIdentity | undefined,
     work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
     const transaction = new MemoryTransaction(new Map(this.#records), this.#clock);
@@ -457,7 +490,7 @@ export class MemoryStateStore implements StateStore {
       throw error;
     }
     const staged = transaction.finish();
-    return this.#enqueueCommit(() => this.#commit(options, staged, result));
+    return this.#enqueueCommit(() => this.#commit(options, identity, staged, result));
   }
 
   #enqueueCommit<T>(commit: () => T): Promise<T> {
@@ -471,6 +504,7 @@ export class MemoryStateStore implements StateStore {
 
   #commit<T extends JsonValue>(
     options: StateTransactionOptions,
+    identity: IdempotencyIdentity | undefined,
     staged: StagedTransaction,
     result: T,
   ): T {
@@ -581,21 +615,25 @@ export class MemoryStateStore implements StateStore {
       }
     }
 
-    if (options.idempotencyKey !== undefined) {
-      this.#idempotency.set(options.idempotencyKey, {
-        signature: idempotencySignature(options),
+    if (identity !== undefined) {
+      this.#idempotency.set(identity.key, {
+        fingerprint: identity.fingerprint,
         result: cloneJson(result),
       });
     }
     return cloneJson(result);
   }
 
-  #assertIdempotencySignature(idempotencyKey: string, requested: string, committed: string): void {
-    if (requested !== committed) {
+  #assertIdempotencyFingerprint(identity: IdempotencyIdentity, committed: string): void {
+    if (identity.fingerprint !== committed) {
       throw stateError(
         "STATE_IDEMPOTENCY_CONFLICT",
         "Idempotency key was already used for a different transaction",
-        { idempotencyKey },
+        {
+          idempotencyKey: identity.key,
+          requestedFingerprint: identity.fingerprint,
+          committedFingerprint: committed,
+        },
         this.#clock,
       );
     }
