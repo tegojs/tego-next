@@ -4,9 +4,15 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { parseArtifactDigest } from "@tegojs/contracts";
 import { loadPreparedComponent } from "../src/index.js";
+import * as publicApi from "../src/index.js";
 
 const digestA = parseArtifactDigest(`sha256:${"1".repeat(64)}`);
 const digestB = parseArtifactDigest(`sha256:${"2".repeat(64)}`);
+
+test("raw artifact binding and loading helpers are not public package API", () => {
+  assert.equal("bindPreparedArtifactRoot" in publicApi, false);
+  assert.equal("loadPreparedComponent" in publicApi, false);
+});
 
 async function artifactRoot(
   t: TestContext,

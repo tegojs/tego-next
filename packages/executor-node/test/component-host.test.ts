@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
@@ -319,6 +319,38 @@ test("prepare has no module side effects and import is confined to the prepared 
   );
   assert.equal(imported.ok, true, JSON.stringify(imported));
   assert.equal(Reflect.get(globalThis, marker), 1);
+});
+
+test("import rejects a prepared root replaced by a symlink without evaluating replacement code", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    'export default { protocol: "tego.component/1.0", kind: "task" };',
+  );
+  const marker = `__tegoArtifactReplacement_${Date.now().toString(36)}`;
+  const replacement = await mkdtemp(join(process.cwd(), ".tego-component-replacement-"));
+  const original = `${fixture.directory}-original`;
+  t.after(() => rm(replacement, { force: true, recursive: true }));
+  t.after(() => rm(original, { force: true, recursive: true }));
+  await mkdir(join(replacement, "components"), { recursive: true });
+  await writeFile(
+    join(replacement, "components/component.js"),
+    `
+      globalThis.${marker} = (globalThis.${marker} ?? 0) + 1;
+      export default { protocol: "tego.component/1.0", kind: "task" };
+    `,
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+  assert.equal((await host.handle(prepareCommand(fixture))).ok, true);
+
+  await rename(fixture.directory, original);
+  await symlink(replacement, fixture.directory, "dir");
+  const imported = await host.handle(
+    command("import", "import-replaced-root", { artifactDigest: digest }),
+  );
+
+  assert.equal(imported.ok, false);
+  assert.equal(imported.diagnostics[0]?.code, "ARTIFACT_ROOT_IDENTITY_MISMATCH");
+  assert.equal(Reflect.get(globalThis, marker), undefined);
 });
 
 test("loader rejects path escape, symlink escape, and CommonJS before import side effects", async (t) => {
