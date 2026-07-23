@@ -687,8 +687,7 @@ test("failed start and stop retries persist a legal pre-state before external ef
   for (const target of ["start", "stop"]) {
     await t.test(target, async (targetTest) => {
       await withRealStateStores(targetTest, async (state, clock) => {
-        const desired =
-          target === "start" ? deployment() : { ...deployment(), state: "disabled" };
+        const desired = target === "start" ? deployment() : { ...deployment(), state: "disabled" };
         if (target === "stop") {
           const identity = planReconcile({
             deployment: deployment(),
@@ -753,10 +752,7 @@ test("failed start and stop retries persist a legal pre-state before external ef
         const callCountAfterSuccess = effects.calls.length;
         await reconciler.wake();
 
-        assert.equal(
-          effects.calls.filter((effect) => effect.kind === target).length,
-          2,
-        );
+        assert.equal(effects.calls.filter((effect) => effect.kind === target).length, 2);
         assert.equal(effects.calls.length, callCountAfterSuccess);
         assert.equal(
           (await readOnlyInstance(state, failedEffect.instanceId))?.value.lifecycle,
