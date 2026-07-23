@@ -1096,7 +1096,7 @@ export class ThreadExecutor implements Executor {
         candidate = {
           taskId: entry.request.taskId,
           attemptId: entry.request.attemptId,
-          status: entry.cancellation ?? "failed",
+          status: error instanceof DiagnosticError ? "failed" : (entry.cancellation ?? "failed"),
           diagnostic:
             error instanceof DiagnosticError
               ? error.diagnostic
@@ -1109,6 +1109,7 @@ export class ThreadExecutor implements Executor {
           startedAt,
           completedAt: this.#clock.now().toISOString(),
         };
+        this.#decide(entry, candidate);
       }
     } finally {
       if (entry.forced === undefined) await Promise.all(admissionSettlements);

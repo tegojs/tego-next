@@ -933,45 +933,35 @@ export class ProcessExecutor implements Executor {
       await this.#shutdownChild(channel, process_, component.artifactDigest, controlDeadline);
     } catch (error) {
       if (entry.decision === undefined) {
-        const termination =
-          process_ === undefined
-            ? undefined
-            : channel === undefined
-              ? await terminateBeforeChannel(process_)
-              : await this.#terminate(process_);
         const code =
-          termination?.diagnostic !== undefined
-            ? termination.diagnostic.code
-            : error instanceof DiagnosticError
-              ? error.diagnostic.code
-              : process_ === undefined
-                ? "EXECUTOR_PROCESS_SPAWN_FAILED"
-                : "EXECUTOR_PROCESS_EXIT";
+          error instanceof DiagnosticError
+            ? error.diagnostic.code
+            : process_ === undefined
+              ? "EXECUTOR_PROCESS_SPAWN_FAILED"
+              : "EXECUTOR_PROCESS_EXIT";
         const message =
-          termination?.diagnostic?.message ??
-          (error instanceof Error ? error.message : "Process executor attempt failed unexpectedly");
+          error instanceof Error ? error.message : "Process executor attempt failed unexpectedly";
         this.#decide(entry, {
           taskId: entry.request.taskId,
           attemptId: entry.request.attemptId,
-          status:
-            termination?.diagnostic === undefined ? (entry.cancellation ?? "failed") : "failed",
+          status: error instanceof DiagnosticError ? "failed" : (entry.cancellation ?? "failed"),
           diagnostic:
-            termination?.diagnostic ??
-            (error instanceof DiagnosticError
+            error instanceof DiagnosticError
               ? error.diagnostic
               : diagnostic(code, message, this.#clock.now(), {
-                  ...(termination?.exit?.code === undefined
-                    ? {}
-                    : { exitCode: termination.exit.code }),
-                  ...(termination?.exit?.signal === undefined
-                    ? {}
-                    : { signal: termination.exit.signal }),
                   ...(channel?.stderr.length === 0 ? {} : { stderr: channel?.stderr ?? "" }),
-                })),
+                }),
           executor: this.#executorMetadata(process_, channel),
           startedAt,
           completedAt: this.#clock.now().toISOString(),
         });
+      }
+      if (process_ !== undefined) {
+        if (channel === undefined) {
+          await terminateBeforeChannel(process_);
+        } else {
+          await this.#terminate(process_);
+        }
       }
     } finally {
       await admissionSettlement;
