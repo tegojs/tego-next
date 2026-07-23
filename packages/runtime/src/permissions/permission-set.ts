@@ -59,7 +59,11 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function safeJsonClone(value: unknown, path = "$", ancestors = new Set<object>()): unknown {
+export function clonePermissionBoundaryValue(
+  value: unknown,
+  path = "$",
+  ancestors = new Set<object>(),
+): unknown {
   if (
     value === null ||
     typeof value === "string" ||
@@ -80,7 +84,7 @@ function safeJsonClone(value: unknown, path = "$", ancestors = new Set<object>()
         if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
           throw new PermissionInputError(`${path}/${index}`, "array must contain data properties");
         }
-        result.push(safeJsonClone(descriptor.value, `${path}/${index}`, ancestors));
+        result.push(clonePermissionBoundaryValue(descriptor.value, `${path}/${index}`, ancestors));
       }
       if (
         Reflect.ownKeys(value).some(
@@ -115,7 +119,7 @@ function safeJsonClone(value: unknown, path = "$", ancestors = new Set<object>()
       Object.defineProperty(result, key, {
         configurable: true,
         enumerable: true,
-        value: safeJsonClone(descriptor.value, `${path}/${key}`, ancestors),
+        value: clonePermissionBoundaryValue(descriptor.value, `${path}/${key}`, ancestors),
         writable: true,
       });
     }
@@ -354,7 +358,7 @@ function canonicalWorker(value: Record<string, unknown>, path: string): WorkerPe
 }
 
 export function canonicalizePermissionSet(input: unknown): readonly Permission[] {
-  const stable = safeJsonClone(input);
+  const stable = clonePermissionBoundaryValue(input);
   const entries = arrayAt(stable, "$");
   const seen = new Set<string>();
   return entries

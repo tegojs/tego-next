@@ -11,6 +11,7 @@ import {
 } from "@tegojs/contracts";
 import {
   canonicalizePermissionSet,
+  clonePermissionBoundaryValue,
   containsLogicalPath,
   type PermissionDecisionDiagnostic,
 } from "./permission-set.js";
@@ -91,35 +92,59 @@ function invalidPermission(error: unknown): PermissionGateDecision {
   };
 }
 
-function normalizeCall(input: PermissionCallAttempt): PermissionCallAttempt {
+function normalizeCall(input: unknown): PermissionCallAttempt {
+  const stable = clonePermissionBoundaryValue(input);
+  if (typeof stable !== "object" || stable === null || Array.isArray(stable)) {
+    throw new Error("Permission call must be an object");
+  }
+  const call = stable as Record<string, unknown>;
+  if (typeof call.kind !== "string") throw new Error("Permission call kind is invalid");
+  const expectedFields: Readonly<Record<string, readonly string[]>> = {
+    capability: ["kind", "method", "name"],
+    environment: ["kind", "name"],
+    executor: ["executor", "kind"],
+    filesystem: ["access", "kind", "path"],
+    network: ["host", "kind", "method", "port"],
+    secret: ["kind", "name"],
+    worker: ["kind", "labels", "resources"],
+  };
+  const expected = expectedFields[call.kind];
+  const actual = Object.keys(call).sort();
+  if (
+    expected === undefined ||
+    actual.length !== expected.length ||
+    actual.some((field, index) => field !== [...expected].sort()[index])
+  ) {
+    throw new Error("Permission call fields are invalid");
+  }
   const holder =
-    input.kind === "network"
+    call.kind === "network"
       ? canonicalizePermissionSet([
           {
             kind: "network",
-            hosts: [input.host],
-            ports: [input.port],
-            methods: [input.method],
+            hosts: [call.host],
+            ports: [call.port],
+            methods: [call.method],
           },
         ])[0]
-      : input.kind === "filesystem"
+      : call.kind === "filesystem"
         ? canonicalizePermissionSet([
-            { kind: "filesystem", roots: [{ path: input.path, access: [input.access] }] },
+            { kind: "filesystem", roots: [{ path: call.path, access: [call.access] }] },
           ])[0]
-        : input.kind === "worker"
+        : call.kind === "worker"
           ? canonicalizePermissionSet([
-              { kind: "worker", labels: input.labels, resources: input.resources },
+              { kind: "worker", labels: call.labels, resources: call.resources },
             ])[0]
-          : input.kind === "capability"
+          : call.kind === "capability"
             ? canonicalizePermissionSet([
                 {
                   kind: "capability",
-                  capabilities: [{ name: input.name, methods: [input.method] }],
+                  capabilities: [{ name: call.name, methods: [call.method] }],
                 },
               ])[0]
-            : input.kind === "executor"
-              ? canonicalizePermissionSet([{ kind: "executor", executors: [input.executor] }])[0]
-              : canonicalizePermissionSet([{ kind: input.kind, names: [input.name] }])[0];
+            : call.kind === "executor"
+              ? canonicalizePermissionSet([{ kind: "executor", executors: [call.executor] }])[0]
+              : canonicalizePermissionSet([{ kind: call.kind, names: [call.name] }])[0];
 
   if (holder === undefined) throw new Error("Permission call could not be normalized");
   switch (holder.kind) {
@@ -152,7 +177,7 @@ function normalizeCall(input: PermissionCallAttempt): PermissionCallAttempt {
 
 export function gatePermission(
   grantedInput: unknown,
-  attemptInput: PermissionCallAttempt,
+  attemptInput: unknown,
 ): PermissionGateDecision {
   let granted: readonly Permission[];
   let attempt: PermissionCallAttempt;

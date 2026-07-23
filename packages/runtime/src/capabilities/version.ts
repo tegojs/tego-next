@@ -2,6 +2,7 @@ interface Version {
   readonly major: number;
   readonly minor: number;
   readonly patch: number;
+  readonly prerelease: readonly string[];
 }
 
 interface RangeVersion {
@@ -11,7 +12,7 @@ interface RangeVersion {
 }
 
 const VERSION_PATTERN =
-  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/u;
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 
 function parseVersion(value: string): Version | undefined {
   const match = VERSION_PATTERN.exec(value);
@@ -20,7 +21,17 @@ function parseVersion(value: string): Version | undefined {
   const minor = Number(match[2]);
   const patch = Number(match[3]);
   if (![major, minor, patch].every(Number.isSafeInteger)) return undefined;
-  return { major, minor, patch };
+  const prerelease = match[4]?.split(".") ?? [];
+  if (
+    prerelease.some(
+      (identifier) =>
+        identifier.length === 0 ||
+        (/^\d+$/u.test(identifier) && !/^(?:0|[1-9]\d*)$/u.test(identifier)),
+    )
+  ) {
+    return undefined;
+  }
+  return { major, minor, patch, prerelease };
 }
 
 function parseRangeVersion(value: string): RangeVersion | undefined {
@@ -53,23 +64,43 @@ function parseRangeVersion(value: string): RangeVersion | undefined {
       major: numbers[0] ?? 0,
       minor: numbers[1] ?? 0,
       patch: numbers[2] ?? 0,
+      prerelease: [],
     },
     wildcard,
   };
 }
 
 function compareVersion(left: Version, right: Version): number {
-  return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+  const core = left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+  if (core !== 0) return core;
+  if (left.prerelease.length === 0) return right.prerelease.length === 0 ? 0 : 1;
+  if (right.prerelease.length === 0) return -1;
+  const length = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = left.prerelease[index];
+    const rightIdentifier = right.prerelease[index];
+    if (leftIdentifier === undefined) return -1;
+    if (rightIdentifier === undefined) return 1;
+    if (leftIdentifier === rightIdentifier) continue;
+    const leftNumeric = /^\d+$/u.test(leftIdentifier);
+    const rightNumeric = /^\d+$/u.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) return Number(leftIdentifier) - Number(rightIdentifier);
+    if (leftNumeric) return -1;
+    if (rightNumeric) return 1;
+    return leftIdentifier < rightIdentifier ? -1 : 1;
+  }
+  return 0;
 }
 
 function upperBound(target: RangeVersion): Version {
   if (target.precision === 1) {
-    return { major: target.version.major + 1, minor: 0, patch: 0 };
+    return { major: target.version.major + 1, minor: 0, patch: 0, prerelease: [] };
   }
   return {
     major: target.version.major,
     minor: target.version.minor + 1,
     patch: 0,
+    prerelease: [],
   };
 }
 
@@ -81,10 +112,10 @@ function satisfiesComparator(version: Version, comparator: string): boolean {
     const minimum = target.version;
     const maximum =
       minimum.major > 0
-        ? { major: minimum.major + 1, minor: 0, patch: 0 }
+        ? { major: minimum.major + 1, minor: 0, patch: 0, prerelease: [] }
         : minimum.minor > 0
-          ? { major: 0, minor: minimum.minor + 1, patch: 0 }
-          : { major: 0, minor: 0, patch: minimum.patch + 1 };
+          ? { major: 0, minor: minimum.minor + 1, patch: 0, prerelease: [] }
+          : { major: 0, minor: 0, patch: minimum.patch + 1, prerelease: [] };
     return compareVersion(version, minimum) >= 0 && compareVersion(version, maximum) < 0;
   }
   if (comparator.startsWith("~")) {

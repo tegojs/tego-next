@@ -150,7 +150,7 @@ function inputDiagnostics(
 
     const providers = new Set<string>();
     for (const provider of deployment.provides) {
-      const providerKey = `${provider.name}@${provider.protocolVersion}`;
+      const providerKey = provider.name;
       if (providers.has(providerKey)) {
         diagnostics.push(
           diagnostic(
