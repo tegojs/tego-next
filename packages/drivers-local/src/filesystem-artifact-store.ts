@@ -227,8 +227,9 @@ export class FilesystemArtifactStore implements ArtifactStore {
             { valueType: typeof chunk },
           );
         }
-        hash.update(chunk);
-        await writeChunk(handle, chunk);
+        const stableChunk = Buffer.from(chunk);
+        hash.update(stableChunk);
+        await writeChunk(handle, stableChunk);
       }
       await handle.sync();
       await handle.close();
