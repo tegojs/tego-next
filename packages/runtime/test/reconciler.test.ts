@@ -742,8 +742,8 @@ test("Reconciler gates artifact, capabilities, permissions, placement, and execu
 });
 
 test("an unready capability consumer does not block its provider from bootstrapping", async () => {
-  const providerId = parsePluginId("a-provider");
-  const consumerId = parsePluginId("z-consumer");
+  const providerId = parsePluginId("z-provider");
+  const consumerId = parsePluginId("a-consumer");
   const capability = parseCapabilityName("org.example.echo");
   const providerDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
   const consumerDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
@@ -816,6 +816,80 @@ test("an unready capability consumer does not block its provider from bootstrapp
     [providerId],
   );
   assert.equal(reconciler.diagnostics()[0]?.code, "CAPABILITY_REQUIRED_UNAVAILABLE");
+  await reconciler.stop();
+});
+
+test("optional capability edges still enqueue providers before lexical-first consumers", async () => {
+  const providerId = parsePluginId("z-optional-provider");
+  const consumerId = parsePluginId("a-optional-consumer");
+  const capability = parseCapabilityName("org.example.optional");
+  const providerDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"d".repeat(64)}`);
+  const component = (id: string) => ({
+    componentId: parseComponentId(id),
+    kind: "service" as const,
+    entrypoint: `components/${id}.js`,
+    executors: ["process" as const],
+  });
+  const providerManifest: PluginManifest = {
+    ...manifest("1.0.0", providerDigest),
+    pluginId: providerId,
+    components: [component("optional-provider")],
+    capabilities: {
+      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      requires: [],
+    },
+  };
+  const consumerManifest: PluginManifest = {
+    ...manifest("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    components: [component("optional-consumer")],
+    capabilities: {
+      provides: [],
+      requires: [{ name: capability, protocolRange: "^1.0.0", optional: true }],
+    },
+  };
+  const deployments = [
+    deployment("1", { pluginId: consumerId, artifactDigest: consumerDigest }),
+    deployment("1", { pluginId: providerId, artifactDigest: providerDigest }),
+  ];
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerDigest),
+      pluginId: providerId,
+      manifest: providerManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map([
+    [providerDigest, { ...gate().artifact, digest: providerDigest, manifest: providerManifest }],
+    [consumerDigest, { ...gate().artifact, digest: consumerDigest, manifest: consumerManifest }],
+  ]);
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate(request) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => installations,
+  });
+
+  await reconciler.start();
+
+  assert.equal(effects.performed[0]?.pluginId, providerId);
   await reconciler.stop();
 });
 
