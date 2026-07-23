@@ -195,7 +195,11 @@ async function within<T>(promise: Promise<T>, milliseconds = 100): Promise<T> {
 async function attachmentLimitResult(
   t: TestContext,
   attachments: readonly ArrayBuffer[],
-): Promise<{ readonly result: ComponentHostResult; readonly runCalls: number }> {
+): Promise<{
+  readonly observedAttachmentLength: number | undefined;
+  readonly result: ComponentHostResult;
+  readonly runCalls: number;
+}> {
   const fixture = await artifactFixture(
     t,
     `
@@ -203,18 +207,22 @@ async function attachmentLimitResult(
       export default defineComponent({
         kind: "task",
         run: async (context) => {
-          await context.events.emit("run.called", null);
+          await context.events.emit("run.called", context.attachments.length);
           return "ran";
         }
       });
     `,
   );
+  let observedAttachmentLength: number | undefined;
   let runCalls = 0;
   const host = new ComponentHost(
     allowedOptions(fixture, {
       events: {
-        emit: async (type) => {
-          if (type === "run.called") runCalls += 1;
+        emit: async (type, payload) => {
+          if (type === "run.called") {
+            runCalls += 1;
+            observedAttachmentLength = payload as number;
+          }
         },
       },
     }),
@@ -256,7 +264,7 @@ async function attachmentLimitResult(
     }),
     attachments,
   );
-  return { result, runCalls };
+  return { observedAttachmentLength, result, runCalls };
 }
 
 test("host command protocol is versioned, strict, JSON-safe, and bounded", () => {
@@ -366,6 +374,28 @@ test("component host rejects excessive attachment count before inspecting elemen
   assert.equal(runCalls, 0);
   assert.equal(result.ok, false);
   assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
+test("component host freezes attachment count before inspecting elements", async (t) => {
+  const attachment = new ArrayBuffer(0);
+  const attachments = [attachment];
+  Object.defineProperty(attachments, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      attachments.push(...Array.from({ length: 64 }, () => new ArrayBuffer(0)));
+      return attachment;
+    },
+  });
+  const { observedAttachmentLength, result, runCalls } = await attachmentLimitResult(
+    t,
+    attachments,
+  );
+
+  assert.equal(attachments.length, 65);
+  assert.equal(runCalls, 1);
+  assert.equal(result.ok, true);
+  assert.equal(observedAttachmentLength, 1);
 });
 
 test("prepare and import commands cannot nominate replaceable artifact locations", () => {
