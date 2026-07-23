@@ -23,9 +23,9 @@ const temporaryDirectories: string[] = [];
 
 after(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -37,14 +37,6 @@ async function temporaryDirectory(name: string): Promise<string> {
 
 function digest(bytes: Uint8Array): ArtifactDigest {
   return parseArtifactDigest(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
-}
-
-async function collect(source: AsyncIterable<Uint8Array>): Promise<Buffer> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of source) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
 }
 
 async function* bytesSource(...chunks: readonly Uint8Array[]): AsyncIterable<Uint8Array> {
@@ -117,7 +109,10 @@ test("artifact publish is invisible until the complete file is durable", async (
   release.resolve();
   await publishing;
 
-  assert.deepEqual(await readFile(store.pathFor(expected)), Buffer.concat([firstChunk, secondChunk]));
+  assert.deepEqual(
+    await readFile(store.pathFor(expected)),
+    Buffer.concat([firstChunk, secondChunk]),
+  );
   await store.close();
 });
 
@@ -215,4 +210,18 @@ test("createLocalDrivers composes durable state, local authority, and filesystem
   await drivers.artifacts.close();
   await drivers.coordination.close();
   await drivers.state.close();
+});
+
+test("close racing with open cannot resurrect filesystem artifact access", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-open-close-race");
+  const store = new FilesystemArtifactStore({ rootDirectory });
+
+  const opening = store.open();
+  const closing = store.close();
+  await Promise.allSettled([opening, closing]);
+
+  await assert.rejects(
+    store.health(),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_CLOSED",
+  );
 });

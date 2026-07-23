@@ -25,9 +25,9 @@ const temporaryDirectories: string[] = [];
 
 after(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -49,9 +49,13 @@ async function openStore(databasePath: string): Promise<SqliteStateStore> {
 
 function runChild(script: string, arguments_: readonly string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--input-type=module", "--eval", script, ...arguments_], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "--eval", script, ...arguments_],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     const stderr: Buffer[] = [];
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.once("error", reject);
@@ -168,10 +172,9 @@ test("idempotency results and fingerprints survive restart", async () => {
     idempotencyFingerprint: "request-v1",
   } as const;
   const first = await openStore(databasePath);
-  assert.deepEqual(
-    await first.transact(options, async () => ({ outcome: "committed" })),
-    { outcome: "committed" },
-  );
+  assert.deepEqual(await first.transact(options, async () => ({ outcome: "committed" })), {
+    outcome: "committed",
+  });
   await first.close();
 
   const second = await openStore(databasePath);
@@ -281,4 +284,18 @@ test("close releases the database file and remains idempotent", async () => {
 
   await rename(databasePath, movedPath);
   await rename(movedPath, databasePath);
+});
+
+test("close racing with open cannot resurrect the SQLite connection", async () => {
+  const databasePath = await temporaryDatabase("open-close-race");
+  const store = new SqliteStateStore({ databasePath });
+
+  const opening = store.open();
+  const closing = store.close();
+  await Promise.allSettled([opening, closing]);
+
+  await assert.rejects(
+    store.health(),
+    (error: unknown) => diagnosticCode(error) === "STATE_CLOSED",
+  );
 });
