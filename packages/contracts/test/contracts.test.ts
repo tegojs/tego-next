@@ -3,24 +3,45 @@ import test from "node:test";
 
 import {
   DiagnosticError,
+  type CapabilityBinding,
+  type CapabilityDefinition,
+  type CapabilityIdentity,
   diagnosticCode,
   type ExecutionRequest,
+  type ExecutionResult,
+  type JsonValue,
   type JsonSchema,
+  parseArtifactDigest,
   type PluginManifest,
   parseApplicationId,
   parseAttemptId,
+  parseCapabilityBinding,
+  parseCapabilityDefinition,
+  parseCapabilityIdentity,
+  parseCapabilityName,
   parseComponentId,
   parseExecutionRequest,
+  parseExecutionResult,
+  parseGeneration,
   parseMessageId,
+  parseNodeId,
   parsePluginId,
+  parsePluginDeployment,
+  parsePluginInstallation,
   parsePluginManifest,
   parseRuntimeId,
+  parseRuntimeConfiguration,
+  parseRuntimeDiagnostic,
   parseSchema,
   parseSequence,
   parseSessionId,
   parseTaskId,
   parseWorkerEnvelope,
   serializeWireValue,
+  type PluginDeployment,
+  type PluginInstallation,
+  type RuntimeConfiguration,
+  type RuntimeDiagnostic,
   type WorkerEnvelope,
 } from "../src/index.js";
 
@@ -66,6 +87,97 @@ const validWorkerEnvelope = {
   sentAt: "2026-07-23T11:59:00.000Z",
   payload: validExecutionRequest,
 } satisfies WorkerEnvelope<ExecutionRequest>;
+
+const validRuntimeConfiguration = {
+  mode: "single-main",
+  runtimeId: parseRuntimeId("medical-device-01"),
+  applicationId: parseApplicationId("detector"),
+  nodeId: parseNodeId("main-01"),
+} satisfies RuntimeConfiguration;
+
+const validInstallation = {
+  pluginId: validManifest.pluginId,
+  version: validManifest.version,
+  digest: parseArtifactDigest(
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  ),
+  manifest: validManifest,
+  installedAt: "2026-07-23T11:00:00.000Z",
+  signature: {
+    algorithm: "Ed25519",
+    keyId: "release-key-01",
+    verified: true,
+  },
+} satisfies PluginInstallation;
+
+const validDeployment = {
+  applicationId: validExecutionRequest.applicationId,
+  pluginId: validManifest.pluginId,
+  version: validManifest.version,
+  artifactDigest: validInstallation.digest,
+  generation: parseGeneration("4"),
+  state: "active",
+  essential: true,
+  configuration: { threshold: 0.75 },
+  permissionGrants: [],
+  capabilityBindings: { "org.example.echo": validManifest.pluginId },
+} satisfies PluginDeployment;
+
+const validCapabilityIdentity = {
+  name: parseCapabilityName("org.example.echo"),
+  protocolVersion: "1.0",
+} satisfies CapabilityIdentity;
+
+const validCapabilityDefinition = {
+  identity: validCapabilityIdentity,
+  requestSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["message"],
+    properties: { message: { type: "string" } },
+  },
+  responseSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["echo"],
+    properties: { echo: { type: "string" } },
+  },
+} satisfies CapabilityDefinition;
+
+const validCapabilityBinding = {
+  capability: validCapabilityIdentity,
+  providerPluginId: validManifest.pluginId,
+} satisfies CapabilityBinding;
+
+const validDiagnostic = {
+  code: "STATE_REVISION_CONFLICT",
+  severity: "error",
+  message: "Revision does not match",
+  source: { kind: "state", id: "deployment-01" },
+  retryable: true,
+  details: { expected: "3", actual: "4" },
+  cause: { name: "ConflictError", message: "stale revision", code: "SQLITE_BUSY" },
+  observedAt: "2026-07-23T12:00:01.000Z",
+} satisfies RuntimeDiagnostic;
+
+const validExecutionResult = {
+  taskId: validExecutionRequest.taskId,
+  attemptId: validExecutionRequest.attemptId,
+  status: "succeeded",
+  output: { message: "hello" },
+  executor: {
+    kind: "thread",
+    metadata: { threadId: 7 },
+  },
+  startedAt: "2026-07-23T12:00:00.000Z",
+  completedAt: "2026-07-23T12:00:01.000Z",
+} satisfies ExecutionResult;
+
+function roundTrip<T>(value: unknown, parse: (input: unknown) => T): T {
+  const wireValue = serializeWireValue(value);
+  const decoded = JSON.parse(JSON.stringify(wireValue)) as JsonValue;
+  return parse(decoded);
+}
 
 test("branded identities are constructed only after validation", () => {
   assert.equal(parseRuntimeId("medical-device-01"), "medical-device-01");
@@ -215,4 +327,77 @@ test("serializeWireValue converts supported runtime values into JSON data", () =
     () => serializeWireValue({ invalid: undefined }),
     (error: unknown) => diagnosticCode(error) === "PROTOCOL_WIRE_VALUE_INVALID",
   );
+});
+
+test("every exported public wire contract survives serialization and validating reconstruction", () => {
+  assert.deepEqual(
+    roundTrip(validRuntimeConfiguration, parseRuntimeConfiguration),
+    validRuntimeConfiguration,
+  );
+  assert.deepEqual(roundTrip(validManifest, parsePluginManifest), validManifest);
+  assert.deepEqual(roundTrip(validInstallation, parsePluginInstallation), validInstallation);
+  assert.deepEqual(roundTrip(validDeployment, parsePluginDeployment), validDeployment);
+  assert.deepEqual(
+    roundTrip(validCapabilityIdentity, parseCapabilityIdentity),
+    validCapabilityIdentity,
+  );
+  assert.deepEqual(
+    roundTrip(validCapabilityDefinition, parseCapabilityDefinition),
+    validCapabilityDefinition,
+  );
+  assert.deepEqual(
+    roundTrip(validCapabilityBinding, parseCapabilityBinding),
+    validCapabilityBinding,
+  );
+  assert.deepEqual(
+    roundTrip(validExecutionRequest, parseExecutionRequest),
+    validExecutionRequest,
+  );
+  assert.deepEqual(roundTrip(validExecutionResult, parseExecutionResult), validExecutionResult);
+  assert.deepEqual(roundTrip(validWorkerEnvelope, parseWorkerEnvelope), validWorkerEnvelope);
+  assert.deepEqual(roundTrip(validDiagnostic, parseRuntimeDiagnostic), validDiagnostic);
+});
+
+test("JSON-bearing contract fields reject non-JSON values recursively", () => {
+  assert.throws(
+    () => parsePluginManifest({ ...validManifest, metadata: { nested: { revision: 1n } } }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        input: { nested: [{ revision: 1n }] },
+      }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_INVALID",
+  );
+  assert.throws(
+    () => parseWorkerEnvelope({ ...validWorkerEnvelope, payload: { revision: 1n } }),
+    (error: unknown) => diagnosticCode(error) === "WORKER_ENVELOPE_INVALID",
+  );
+});
+
+test("WorkerEnvelope payloads are statically constrained to JsonValue", () => {
+  // @ts-expect-error bigint is not a valid wire payload
+  const invalidEnvelope: WorkerEnvelope<{ revision: bigint }> = validWorkerEnvelope;
+  assert.ok(invalidEnvelope);
+});
+
+test("serializeWireValue preserves an own __proto__ property without prototype pollution", () => {
+  const input: Record<string, unknown> = {};
+  Object.defineProperty(input, "__proto__", {
+    configurable: true,
+    enumerable: true,
+    value: { polluted: true },
+    writable: true,
+  });
+
+  const serialized = serializeWireValue(input);
+
+  assert.equal(Object.getPrototypeOf(serialized), Object.prototype);
+  assert.equal(Object.hasOwn(serialized as object, "__proto__"), true);
+  assert.equal((Object.prototype as { polluted?: boolean }).polluted, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(serialized)), {
+    ["__proto__"]: { polluted: true },
+  });
 });
