@@ -801,6 +801,48 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
     }),
     (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
   );
+  for (const mismatch of [
+    {
+      pluginId: parsePluginId("wrong-provider"),
+      version: "1.0.0",
+    },
+    {
+      pluginId: parsePluginId("provider"),
+      version: "2.0.0",
+    },
+  ]) {
+    state.records.delete(`tego/installations/provider@9.9.9@${providerDigest}`);
+    state.records.set(`tego/installations/provider@1.0.0@${providerDigest}`, {
+      value: parsePluginInstallation({
+        ...installation,
+        pluginId: parsePluginId("provider"),
+        digest: providerDigest,
+        manifest: {
+          ...installation.manifest,
+          pluginId: mismatch.pluginId,
+          version: mismatch.version,
+          capabilities: {
+            provides: [{ name: "records", protocolVersion: "1.0.0" }],
+            requires: [],
+          },
+        },
+      }),
+      revision: 94,
+    });
+    await assert.rejects(
+      operations.deployPlugin({
+        ...deploymentRequest,
+        configuration: { mismatch },
+        capabilityBindings: {
+          records: {
+            applicationId: request.applicationId,
+            pluginId: parsePluginId("provider"),
+          },
+        },
+      }),
+      (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
+    );
+  }
   state.records.delete(`tego/installations/provider@1.0.0@${providerDigest}`);
   state.records.set(`tego/installations/provider@9.9.9@${providerDigest}`, {
     value: parsePluginInstallation({
@@ -1181,6 +1223,57 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/stale-completion-keeps-ne
     completedAt: now.toISOString(),
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
+  const cancellation = service.cancel(identity.taskId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(newExecutor.cancelled.length, 1);
+  await service.close();
+  await assert.rejects(cancellation);
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-newer-registration", async () => {
+  const oldExecutor = new ControlledExecutor("remote", "executor-01");
+  const newExecutor = new ControlledExecutor("remote", "executor-01");
+  const observationGate = Promise.withResolvers<void>();
+  oldExecutor.observeGate = observationGate.promise;
+  oldExecutor.observed = {
+    state: "terminal",
+    result: {
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      executor: { kind: "remote" },
+      status: "succeeded",
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  };
+  let selected = oldExecutor;
+  const state = new TransactionalState();
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "running",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: oldExecutor.id, type: oldExecutor.type },
+      authority,
+    }),
+    revision: 1,
+  });
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => selected,
+    createIdentity: () => identity,
+  });
+  await service.recover();
+  const oldActivation = service.setAuthority(authority);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  selected = newExecutor;
+  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  observationGate.resolve();
+  await oldActivation;
   const cancellation = service.cancel(identity.taskId);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(newExecutor.cancelled.length, 1);
