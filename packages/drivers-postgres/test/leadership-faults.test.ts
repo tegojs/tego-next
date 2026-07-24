@@ -92,6 +92,21 @@ async function waitForAdvisoryWaiterCount(
   }
 }
 
+async function coordinationBackendCount(sharedNamespace: string): Promise<number> {
+  const admin = new Pool({ connectionString });
+  try {
+    const result = await admin.query<{ connections: string }>(
+      `SELECT count(*)::text AS connections
+         FROM pg_stat_activity AS activity
+        WHERE activity.application_name = $1`,
+      [`tego:${sharedNamespace}:coordination`.slice(0, 63)],
+    );
+    return Number(result.rows[0]?.connections ?? "-1");
+  } finally {
+    await admin.end();
+  }
+}
+
 test("a stale leader is fenced immediately after takeover before the new leader writes state", async () => {
   const sharedNamespace = namespace("takeover");
   const firstCoordination = new PostgresCoordinationProvider({
@@ -227,6 +242,45 @@ test("@spec:coordination-provider/fenced-leadership/close-during-acquisition", a
   } finally {
     await within(first.release(), "Timed out releasing the held leadership");
     await Promise.all([providerA.close(), providerB.close()]);
+  }
+});
+
+test("@spec:coordination-provider/fenced-leadership/close-while-campaign-waits-for-pool", async () => {
+  const sharedNamespace = namespace("close_pool_waiter");
+  const providerA = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const providerB = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  await Promise.all([providerA.open(), providerB.open()]);
+  const held = await providerA.campaign({ resource: "contended" });
+  await Promise.all(
+    Array.from({ length: 19 }, (_, index) =>
+      providerB.campaign({ resource: `pool-filler:${index}` }),
+    ),
+  );
+  assert.equal(await coordinationBackendCount(sharedNamespace), 22);
+
+  const pending = providerB.campaign({ resource: "contended" });
+  const pendingOutcome = pending.then(
+    () => {
+      throw new Error("Pool-blocked campaign unexpectedly acquired leadership");
+    },
+    (error: unknown) => error,
+  );
+  await waitForAdvisoryWaiterCount(sharedNamespace, 0);
+  const closePromise = providerB.close();
+  try {
+    await within(closePromise, "Timed out closing a provider with a pool-blocked campaign", 500);
+    const error = await within(pendingOutcome, "Timed out settling the pool-blocked campaign");
+    assert.equal(diagnosticCode(error), "COORDINATION_CLOSED");
+    await waitForAdvisoryWaiterCount(sharedNamespace, 0);
+  } finally {
+    await within(held.release(), "Timed out releasing the contended leadership");
+    await Promise.all([closePromise, providerA.close(), providerB.close()]);
   }
 });
 
