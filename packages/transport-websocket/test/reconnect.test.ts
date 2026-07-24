@@ -1573,6 +1573,232 @@ test("a non-settling terminal commit cannot block orphan settlement", async () =
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("a live Main terminal commit timeout fails closed and degrades health", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let terminalCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "live-main-terminal-timeout",
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
+        if (record.state === "terminal") {
+          terminalCalls += 1;
+          return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await reconnect(remote, runtime, "1");
+  const handle = await remote.submit(
+    executionRequest({ mode: "echo", value: "main-timeout" }, "live-main-terminal-timeout"),
+  );
+  await eventually(() => assert.equal(terminalCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+  await flush();
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  await flush();
+
+  assert.equal(settled, true);
+  assert.equal((await handle.result).status, "failed");
+  assert.match((await handle.result).diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.health()).active, 0);
+  assert.equal((await remote.probe()).available, false);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("a live Worker terminal commit timeout fails closed and retains evidence", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let terminalCalls = 0;
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "live-worker-terminal-timeout",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
+        if (record.state === "terminal") {
+          terminalCalls += 1;
+          return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const handle = await remote.submit(
+    executionRequest({ mode: "echo", value: "worker-timeout" }, "live-worker-terminal-timeout"),
+  );
+  await eventually(() => assert.equal(terminalCalls, 1), { advance: flush });
+  clock.advanceBy(1_001);
+  await flush();
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  await flush();
+
+  assert.equal(settled, true);
+  assert.equal((await handle.result).status, "failed");
+  assert.match((await handle.result).diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(local.executions, 1);
+  assert.equal(runtime.bufferedResultCount, 1);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("Main attach bounds a non-settling attempt-store list", async () => {
+  const clock = new FakeClock(new Date(0));
+  let listCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "main-list-timeout",
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: () => Promise.resolve(),
+      commit: () => Promise.resolve(undefined),
+      load: () => Promise.resolve(undefined),
+      list: () => {
+        listCalls += 1;
+        return new Promise<readonly RemoteAttemptRecord[]>(() => undefined);
+      },
+    },
+  });
+  const [main] = memorySessionPair("1");
+  let rejection: unknown;
+  void remote.attach(main).catch((error: unknown) => {
+    rejection = error;
+  });
+  await eventually(() => assert.equal(listCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+  await flush();
+
+  assert.ok(rejection instanceof Error);
+  assert.match(rejection.message, /STATE_UNAVAILABLE|persistence/iu);
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.probe()).available, false);
+  await remote.close();
+});
+
+test("Main submit bounds a non-settling attempt-store load", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let loadCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "main-load-timeout",
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => backing.commit(record, condition),
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: () => {
+        loadCalls += 1;
+        return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+      },
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await reconnect(remote, runtime, "1");
+  let rejection: unknown;
+  void remote
+    .submit(executionRequest({ mode: "echo" }, "main-load-timeout"))
+    .catch((error: unknown) => {
+      rejection = error;
+    });
+  await eventually(() => assert.equal(loadCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+  await flush();
+
+  assert.ok(rejection instanceof Error);
+  assert.match(rejection.message, /STATE_UNAVAILABLE|persistence/iu);
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.health()).active, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("Main submit bounds a non-settling attempt-store create", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let createCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "main-create-timeout",
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: (record, condition) => {
+        if (condition.expectedRevision === null) {
+          createCalls += 1;
+          return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await reconnect(remote, runtime, "1");
+  let rejection: unknown;
+  void remote
+    .submit(executionRequest({ mode: "echo" }, "main-create-timeout"))
+    .catch((error: unknown) => {
+      rejection = error;
+    });
+  await eventually(() => assert.equal(createCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+  await flush();
+
+  assert.ok(rejection instanceof Error);
+  assert.match(rejection.message, /STATE_UNAVAILABLE|persistence/iu);
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.health()).active, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("aggregate byte reservation prevents a second valid result from wedging both attempts", async () => {
   const clock = new FakeClock(new Date(0));
   const remote = new RemoteExecutor({
