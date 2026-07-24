@@ -56,6 +56,13 @@ export interface WorkerSessionRequestOptions {
 type SocketListener = (...arguments_: unknown[]) => void;
 const websocketTextDecoder = new TextDecoder("utf-8", { fatal: true });
 const MAXIMUM_UNSIGNED_64 = 18_446_744_073_709_551_615n;
+const RESERVED_SESSION_MESSAGE_TYPES = new Set([
+  "authenticate",
+  "heartbeat",
+  "hello",
+  "session.ready",
+  "worker.register",
+]);
 
 interface WebSocketTransport {
   readonly readyState: number;
@@ -206,6 +213,15 @@ function normalizeCredential(value: string): string {
     throw new TypeError("credential must be a non-empty bounded string");
   }
   return value;
+}
+
+function rejectReservedMessageType(type: string): void {
+  if (RESERVED_SESSION_MESSAGE_TYPES.has(type)) {
+    throw diagnosticError(
+      "PROTOCOL_MESSAGE_TYPE_RESERVED",
+      "Worker handshake message type is reserved for the session state machine",
+    );
+  }
 }
 
 function normalizeRegistration(value: WorkerRegistration): WorkerRegistration {
@@ -465,6 +481,7 @@ export class WorkerSession {
     payload: JsonValue,
     options: WorkerSessionSendOptions = {},
   ): Promise<string> {
+    rejectReservedMessageType(type);
     if (this.#state !== "ready" || !this.#available) {
       throw diagnosticError(
         "WORKER_SESSION_NOT_AVAILABLE",
@@ -479,6 +496,7 @@ export class WorkerSession {
     payload: JsonValue,
     options: WorkerSessionRequestOptions = {},
   ): Promise<WorkerSessionMessage> {
+    rejectReservedMessageType(type);
     if (this.#pendingRequests.size >= this.#codec.limits.maxInflightMessages) {
       throw diagnosticError(
         "PROTOCOL_INFLIGHT_LIMIT_EXCEEDED",
@@ -836,6 +854,7 @@ export class WorkerSession {
   #receiveRegistration(envelope: WorkerControlEnvelope): void {
     if (
       this.#role !== "main" ||
+      this.#state !== "authenticating" ||
       !this.#peerAuthenticated ||
       this.#remoteRole !== "worker" ||
       this.#onRegister === undefined ||
@@ -867,6 +886,7 @@ export class WorkerSession {
   #receiveReady(envelope: WorkerControlEnvelope): void {
     if (
       this.#role !== "worker" ||
+      this.#state !== "authenticating" ||
       !this.#peerAuthenticated ||
       envelope.sessionId !== this.#sessionId
     ) {

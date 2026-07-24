@@ -356,7 +356,10 @@ export function workerSessionConformance(
         assert.notEqual(firstMain.sessionId, secondMain.sessionId);
         assert.equal(firstMain.available, false);
         assert.equal(firstMain.acceptingAssignments, false);
-        await assert.rejects(firstMain.send("heartbeat", {}), /closed|replaced|available/iu);
+        await assert.rejects(
+          firstMain.send("session.reconcile", {}),
+          /closed|replaced|available/iu,
+        );
       } finally {
         await Promise.all([main.close(), firstWorker.close(), secondWorker.close()]);
       }
@@ -374,7 +377,7 @@ export function workerSessionConformance(
       const [mainSession] = await connect(main, worker, "worker-initiated");
       await Promise.all([mainSession.close(), mainSession.close()]);
       assert.equal(mainSession.state, "closed");
-      await assert.rejects(mainSession.send("heartbeat", {}), /closed/iu);
+      await assert.rejects(mainSession.send("session.reconcile", {}), /closed/iu);
       await Promise.all([main.close(), worker.close()]);
     });
   });
