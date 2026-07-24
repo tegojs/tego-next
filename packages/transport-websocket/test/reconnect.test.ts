@@ -677,3 +677,218 @@ test("duplicate terminal result cannot acknowledge Worker evidence before Main p
   await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
   await Promise.all([remote.close(), runtime.close()]);
 });
+
+test("cancel is latched while the Worker is still selecting a local Executor", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const selected = Promise.withResolvers<void>();
+  const selectorGate = Promise.withResolvers<void>();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: async () => {
+      selected.resolve();
+      await selectorGate.promise;
+      return local;
+    },
+  });
+  await reconnect(remote, runtime, "1");
+  const request = executionRequest({ mode: "wait" }, "cancel-selecting");
+  const handle = await remote.submit(request);
+  await selected.promise;
+  await remote.cancel(request.taskId, request.attemptId);
+  selectorGate.resolve();
+
+  assert.equal((await handle.result).status, "cancelled");
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("a restarted Worker recovers acknowledged finish-and-buffer work", async () => {
+  const clock = new FakeClock(new Date(0));
+  const request = executionRequest(
+    { mode: "echo", value: "recovered" },
+    "worker-restart",
+    "finish-and-buffer",
+  );
+  const workerStore = new MemoryRemoteAttemptStore();
+  await workerStore.save({
+    workerId,
+    request,
+    fingerprint: "persisted-fingerprint",
+    state: "running",
+    epoch: "4",
+    updatedAt: clock.now().toISOString(),
+  });
+  const local = new TestLocalExecutor();
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: workerStore,
+    selectExecutor: () => local,
+  });
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+
+  await reconnect(remote, runtime, "5");
+  await eventually(() => assert.equal(local.executions, 1));
+  const recovered = await workerStore.load(request.taskId, request.attemptId);
+  assert.equal(recovered?.state, "terminal");
+  assert.equal(recovered?.result?.output, "recovered");
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("expired terminal attempts remain deduplicated and cannot execute again", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const store = new MemoryRemoteAttemptStore();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: store,
+    retentionMs: 100,
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    retentionMs: 100,
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const request = executionRequest({ mode: "echo", value: "once" }, "expired-identity");
+  assert.equal((await (await remote.submit(request)).result).output, "once");
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
+  clock.advanceBy(101);
+
+  await assert.rejects(remote.submit(request), /expired|retention/iu);
+  assert.equal(local.executions, 1);
+  assert.equal((await store.load(request.taskId, request.attemptId))?.state, "expired");
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("persisted attempt epochs fence stale sessions after Main restart", async () => {
+  const clock = new FakeClock(new Date(0));
+  const request = executionRequest({ mode: "wait" }, "persisted-epoch");
+  const store = new MemoryRemoteAttemptStore();
+  await store.save({
+    workerId,
+    request,
+    fingerprint: "persisted-fingerprint",
+    state: "assigned",
+    epoch: "7",
+    updatedAt: clock.now().toISOString(),
+  });
+  const remote = new RemoteExecutor({ id: "remote", workerId, clock, attemptStore: store });
+  const [stale] = memorySessionPair("6");
+
+  await assert.rejects(remote.attach(stale), /epoch|stale/iu);
+});
+
+test("a correlated assignment result must match the assigned attempt identity", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  const [main, worker] = memorySessionPair("1");
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const originalRequest = main.request.bind(main);
+  const assigned = executionRequest({ mode: "wait" }, "identity-a");
+  const forged = executionRequest({ mode: "wait" }, "identity-b");
+  main.request = async (type, payload) => {
+    if (type !== "task.assign") return originalRequest(type, payload);
+    const now = clock.now().toISOString();
+    return {
+      messageId: "forged-result",
+      correlationId: "assignment",
+      type: "task.acknowledge",
+      payload: {
+        accepted: false,
+        result: {
+          taskId: forged.taskId,
+          attemptId: forged.attemptId,
+          status: "rejected",
+          executor: { kind: "remote", workerId },
+          startedAt: now,
+          completedAt: now,
+        },
+      },
+    };
+  };
+
+  const handle = await remote.submit(assigned);
+  await flush();
+  assert.equal(await remote.observe(assigned.taskId, assigned.attemptId), undefined);
+  await assert.rejects(handle.result, /identity|result/iu);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("drain observes a submit whose durable assignment save is still in progress", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const backing = new MemoryRemoteAttemptStore();
+  const saveStarted = Promise.withResolvers<void>();
+  const saveGate = Promise.withResolvers<void>();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => {
+        if (record.state === "assigned") {
+          saveStarted.resolve();
+          await saveGate.promise;
+        }
+        await backing.save(record);
+      },
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const request = executionRequest({ mode: "wait" }, "drain-submit-race");
+  const submitted = remote.submit(request);
+  await saveStarted.promise;
+  let drained = false;
+  const draining = remote
+    .drain({ deadline: new Date(clock.now().getTime() + 100).toISOString() })
+    .then(() => {
+      drained = true;
+    });
+  saveGate.resolve();
+  await submitted;
+  assert.equal(drained, false);
+  clock.advanceBy(101);
+  await draining;
+  assert.equal(local.active, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});

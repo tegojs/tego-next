@@ -261,3 +261,17 @@ test("Worker attempt-store failure rejects before local execution instead of lea
   assert.equal(local.executions, 0);
   await Promise.all([remote.close(), runtime.close()]);
 });
+
+test("default remote assignment and result limits fit the Worker protocol frame", async () => {
+  const { remote, local } = await connected();
+  await assert.rejects(
+    remote.submit(executionRequest({ value: "x".repeat(70_000) }, "frame-safe-input")),
+    /admission|capacity|large/iu,
+  );
+  const result = await (
+    await remote.submit(executionRequest({ mode: "large-output" }, "frame-safe-output"))
+  ).result;
+  assert.equal(result.status, "failed");
+  assert.match(result.diagnostic?.code ?? "", /RESULT_TOO_LARGE/iu);
+  assert.equal(local.executions, 1);
+});

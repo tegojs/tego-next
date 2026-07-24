@@ -244,6 +244,7 @@ async function directConnection(options?: {
   readonly maxFrameBytes?: number;
   readonly maxPendingCorrelations?: number;
   readonly maxInflightMessages?: number;
+  readonly requestTimeoutMs?: number;
 }): Promise<DirectConnection> {
   const clock = new FakeClock();
   const limits = {
@@ -260,11 +261,17 @@ async function directConnection(options?: {
     credential: "shared-secret",
     workerId: "direct-worker" as WorkerId,
     limits,
+    ...(options?.requestTimeoutMs === undefined
+      ? {}
+      : { requestTimeoutMs: options.requestTimeoutMs }),
   });
   const worker = createWorkerEndpoint({
     clock,
     credential: "shared-secret",
     limits,
+    ...(options?.requestTimeoutMs === undefined
+      ? {}
+      : { requestTimeoutMs: options.requestTimeoutMs }),
     workerId: "direct-worker" as WorkerId,
     registration: {
       labels: {},
@@ -315,6 +322,25 @@ test("request correlation is installed before a synchronous transport can respon
       ),
     ]);
     assert.deepEqual(response.payload, { accepted: true });
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("application requests expire when the peer never sends a correlated response", async () => {
+  const connection = await directConnection({ requestTimeoutMs: 100 });
+  try {
+    const pending = connection.mainSession.request("session.reconcile", { running: [] });
+    connection.clock.advanceBy(101);
+    await assert.rejects(
+      pending,
+      (error: unknown) =>
+        error instanceof Error &&
+        "diagnostic" in error &&
+        (error as { diagnostic: { code: string } }).diagnostic.code ===
+          "WORKER_REQUEST_TIMEOUT",
+    );
+    assert.equal(connection.mainSession.state, "ready");
   } finally {
     await cleanup(connection);
   }
