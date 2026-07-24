@@ -781,7 +781,7 @@ Commit: `git add packages/testkit packages/transport-websocket && git commit -m 
 - Produces: `RemoteExecutor` implementing `Executor`.
 - Produces: Worker runtime backed by local process/thread executors.
 
-- [ ] **Step 1: Write and commit failing remote conformance and reconnect tests**
+- [x] **Step 1: Write and commit failing remote conformance and reconnect tests**
 
 Invoke the complete executor suite. Add disconnect during assignment,
 disconnect while running, duplicate assignment, `cancel`,
@@ -794,18 +794,18 @@ Expected: FAIL because `RemoteExecutor` is absent.
 
 Commit: `git add packages/transport-websocket/test && git commit -m "test: define remote execution recovery"`
 
-- [ ] **Step 2: Implement assignment, progress, cancellation, and result flow**
+- [x] **Step 2: Implement assignment, progress, cancellation, and result flow**
 
 Persist Main assignment state before send and Worker acknowledgement before
 execution. Cache terminal results until correlated acknowledgement.
 
-- [ ] **Step 3: Implement orphan policies and reconnect reconciliation**
+- [x] **Step 3: Implement orphan policies and reconnect reconciliation**
 
 Worker reports running, acknowledged, terminal-unacknowledged, and prepared
 artifact identities. Main resolves the existing attempt before any retry creates
 a new attempt ID.
 
-- [ ] **Step 4: Run all three executor suites and commit**
+- [x] **Step 4: Run all three executor suites and commit**
 
 Run:
 
