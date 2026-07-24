@@ -1576,6 +1576,7 @@ test("a non-settling terminal commit cannot block orphan settlement", async () =
 test("a live Main terminal commit timeout fails closed and degrades health", async () => {
   const clock = new FakeClock(new Date(0));
   const backing = new MemoryRemoteAttemptStore();
+  const terminalGate = Promise.withResolvers<void>();
   let terminalCalls = 0;
   const remote = new RemoteExecutor({
     id: "live-main-terminal-timeout",
@@ -1587,7 +1588,7 @@ test("a live Main terminal commit timeout fails closed and degrades health", asy
       commit: async (record, condition) => {
         if (record.state === "terminal") {
           terminalCalls += 1;
-          return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+          await terminalGate.promise;
         }
         return backing.commit(record, condition);
       },
@@ -1616,11 +1617,23 @@ test("a live Main terminal commit timeout fails closed and degrades health", asy
   await flush();
 
   assert.equal(settled, true);
-  assert.equal((await handle.result).status, "failed");
-  assert.match((await handle.result).diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  const result = await handle.result;
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(result.diagnostic?.retryable, false);
   assert.equal((await remote.health()).status, "degraded");
   assert.equal((await remote.health()).active, 0);
   assert.equal((await remote.probe()).available, false);
+  terminalGate.resolve();
+  await eventually(async () =>
+    assert.equal(
+      (await backing.load(handle.taskId, handle.attemptId))?.result?.status,
+      "succeeded",
+    ),
+  );
+  const observed = await remote.observe(handle.taskId, handle.attemptId);
+  assert.equal(observed?.state, "terminal");
+  assert.equal(observed?.state === "terminal" ? observed.result.status : undefined, "indeterminate");
   await Promise.all([remote.close(), runtime.close()]);
 });
 
@@ -1669,6 +1682,9 @@ test("a live Worker terminal commit timeout fails closed and retains evidence", 
   assert.match((await handle.result).diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
   assert.equal(local.executions, 1);
   assert.equal(runtime.bufferedResultCount, 1);
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.health()).accepting, false);
+  assert.equal((await remote.probe()).available, false);
   await Promise.all([remote.close(), runtime.close()]);
 });
 
