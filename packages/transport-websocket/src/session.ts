@@ -54,6 +54,7 @@ export interface WorkerSessionRequestOptions {
 }
 
 type SocketListener = (...arguments_: unknown[]) => void;
+const websocketTextDecoder = new TextDecoder("utf-8", { fatal: true });
 
 interface WebSocketTransport {
   readonly readyState: number;
@@ -220,20 +221,56 @@ function normalizeRegistration(value: WorkerRegistration): WorkerRegistration {
   };
 }
 
-function socketMessage(arguments_: readonly unknown[]): string | Uint8Array {
+function socketMessage(arguments_: readonly unknown[], maxFrameBytes: number): string | Uint8Array {
   const first = arguments_[0];
   const candidate =
     typeof first === "object" && first !== null && "data" in first && Object.hasOwn(first, "data")
       ? (first as { data: unknown }).data
       : first;
   if (typeof candidate === "string") {
+    if (Buffer.byteLength(candidate, "utf8") > maxFrameBytes) {
+      throw diagnosticError(
+        "PROTOCOL_FRAME_TOO_LARGE",
+        "Worker text frame exceeds the configured byte limit",
+      );
+    }
     return candidate;
   }
-  if (candidate instanceof Uint8Array) {
-    return candidate;
-  }
-  if (candidate instanceof ArrayBuffer) {
-    return new Uint8Array(candidate);
+  const parts =
+    candidate instanceof Uint8Array
+      ? [candidate]
+      : candidate instanceof ArrayBuffer
+        ? [new Uint8Array(candidate)]
+        : Array.isArray(candidate) &&
+            candidate.every((part): part is Uint8Array => part instanceof Uint8Array)
+          ? candidate
+          : undefined;
+  if (parts !== undefined) {
+    let totalBytes = 0;
+    for (const part of parts) {
+      totalBytes += part.byteLength;
+      if (totalBytes > maxFrameBytes) {
+        throw diagnosticError(
+          "PROTOCOL_FRAME_TOO_LARGE",
+          "Worker frame exceeds the configured byte limit",
+        );
+      }
+    }
+    const bytes =
+      parts.length === 1
+        ? (parts[0] as Uint8Array)
+        : Buffer.concat(
+            parts.map((part) => Buffer.from(part)),
+            totalBytes,
+          );
+    if (arguments_[1] === false) {
+      try {
+        return websocketTextDecoder.decode(bytes);
+      } catch {
+        throw diagnosticError("PROTOCOL_JSON_INVALID", "Worker text frame is not valid UTF-8");
+      }
+    }
+    return bytes;
   }
   throw diagnosticError(
     "PROTOCOL_FRAME_INVALID",
@@ -482,7 +519,7 @@ export class WorkerSession {
       return;
     }
     try {
-      const frame = socketMessage(arguments_);
+      const frame = socketMessage(arguments_, this.#codec.limits.maxFrameBytes);
       if (typeof frame === "string") {
         this.#receiveControl(this.#codec.decodeControl(frame));
       } else {
