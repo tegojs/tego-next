@@ -6,6 +6,7 @@ import {
   createMainEndpoint,
   createWorkerCodec,
   createWorkerEndpoint,
+  systemWorkerClock,
   type MainEndpoint,
   type WorkerControlEnvelope,
   type WorkerEndpoint,
@@ -446,4 +447,13 @@ test("an incomplete authentication handshake expires without retaining the socke
   assert.equal(main.activeSessionCount, 0);
   assert.equal(mainSocket.listenerCount(), 0);
   await main.close();
+});
+
+test("the default Worker clock removes abort listeners after completed sleeps", async () => {
+  const { getEventListeners } = await import("node:events");
+  const controller = new AbortController();
+  for (let index = 0; index < 16; index += 1) {
+    await systemWorkerClock.sleep(1, controller.signal);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  }
 });
