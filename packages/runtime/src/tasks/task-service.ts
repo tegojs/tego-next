@@ -500,7 +500,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     return persisted.record;
   }
 
-  async #settleUncertain(record: TaskRecord, error: unknown): Promise<void> {
+  async #settleUncertain(record: TaskRecord, _error: unknown): Promise<void> {
     if (this.#ephemeralTerminal.has(record.taskId)) return;
     const timestamp = this.#clock.now().toISOString();
     const indeterminate = parseTaskRecord({
@@ -514,9 +514,7 @@ export class TaskService implements RuntimeTaskLifecycle {
         status: "indeterminate",
         diagnostic: indeterminateTaskDiagnostic(
           record.taskId,
-          `The authoritative task result cannot be proven: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          "The execution or persistence boundary cannot prove an authoritative task result",
           timestamp,
         ),
         startedAt: record.createdAt,
