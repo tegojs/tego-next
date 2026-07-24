@@ -22,7 +22,6 @@ function deferred() {
 function settleWithin(promise, timeoutMs) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(false), timeoutMs);
-    timer.unref();
     promise.then(() => {
       clearTimeout(timer);
       resolve(true);
@@ -41,7 +40,7 @@ function isProcessAlive(pid) {
 }
 
 function endStream(stream) {
-  if (stream.closed) return Promise.resolve();
+  if (stream.closed || stream.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
     stream.once("close", resolve);
     stream.end();
@@ -71,10 +70,14 @@ export async function spawnManagedProcess({ artifacts, command, args, env = {}, 
 export class ManagedProcess {
   #artifacts;
   #child;
+  #cleanupAbortController = new AbortController();
+  #cleanupError;
   #events = [];
   #exit = deferred();
   #finalized = deferred();
+  #finalizationStarted = false;
   #name;
+  #processingErrors = [];
   #readyListeners = new Set();
   #stopActions = [];
   #streamErrors = [];
@@ -101,11 +104,8 @@ export class ManagedProcess {
 
     this.#captureStream(child.stdout, "stdout");
     this.#captureStream(child.stderr, "stderr");
-    child.once("close", (code, signal) => {
-      const exit = { code, signal };
-      this.#exit.resolve(exit);
-      void this.#finalize(exit);
-    });
+    child.once("exit", (code, signal) => this.#exit.resolve({ code, signal }));
+    child.once("close", (code, signal) => void this.#finalize({ code, signal }));
   }
 
   get pid() {
@@ -114,7 +114,12 @@ export class ManagedProcess {
 
   async ready(predicate, { timeoutMs }) {
     for (const event of this.#events) {
-      if (predicate(event)) return event;
+      try {
+        if (predicate(event)) return event;
+      } catch (error) {
+        this.#recordProcessingError(error);
+        throw error;
+      }
     }
 
     return new Promise((resolve, reject) => {
@@ -127,6 +132,7 @@ export class ManagedProcess {
         } catch (error) {
           clearTimeout(timer);
           this.#readyListeners.delete(listener);
+          this.#recordProcessingError(error);
           reject(error);
         }
       };
@@ -145,7 +151,7 @@ export class ManagedProcess {
 
   async stop({ timeoutMs }) {
     if (this.#exit.settled) {
-      await this.#finalized.promise;
+      await this.#waitForFinalization(timeoutMs);
       return;
     }
 
@@ -160,11 +166,12 @@ export class ManagedProcess {
         throw new Error(`PROCESS_STOP_TIMEOUT:${this.#name}:${this.pid}`);
       }
     }
-    await this.#finalized.promise;
+    await this.#waitForFinalization(timeoutMs);
   }
 
   async assertClean() {
     const exit = await this.#exit.promise;
+    if (this.#cleanupError !== undefined) throw this.#cleanupError;
     await this.#finalized.promise;
     if (exit.code !== 0 && exit.signal === null) {
       throw processExitDiagnostic(exit, this.#name, this.#artifacts.stderr(this.#name));
@@ -172,6 +179,9 @@ export class ManagedProcess {
     if (this.#streamErrors.length > 0) {
       const first = this.#streamErrors[0];
       throw new Error(`PROCESS_STREAM_ERROR:${first.stream}:${first.error.message}`);
+    }
+    if (this.#processingErrors.length > 0) {
+      throw new Error(`PROCESS_EVENT_PROCESSING_ERROR:${this.#processingErrors[0].message}`);
     }
     if (this.pid !== undefined && isProcessAlive(this.pid)) {
       throw new Error(`PROCESS_LEAK:${this.pid}`);
@@ -196,7 +206,7 @@ export class ManagedProcess {
     const decoder = new StringDecoder("utf8");
     let pending = "";
     input.on("data", (chunk) => {
-      this.#streams[streamName].write(chunk);
+      this.#writeArtifact(streamName, chunk);
       pending += decoder.write(chunk);
       const lines = pending.split("\n");
       pending = lines.pop();
@@ -209,6 +219,8 @@ export class ManagedProcess {
   }
 
   async #finalize(exit) {
+    if (this.#finalizationStarted) return;
+    this.#finalizationStarted = true;
     try {
       await Promise.all(Object.values(this.#streams).map(endStream));
       await writeFile(
@@ -221,7 +233,9 @@ export class ManagedProcess {
             stream,
             message: error.message,
           })),
+          processingErrors: this.#processingErrors.map((error) => error.message),
         })}\n`,
+        { signal: this.#cleanupAbortController.signal },
       );
     } catch (error) {
       this.#recordStreamError("cleanup", error);
@@ -231,21 +245,63 @@ export class ManagedProcess {
   }
 
   #recordLine(streamName, line) {
-    this.#streams.transcript.write(
+    this.#writeArtifact(
+      "transcript",
       `${JSON.stringify({ timestamp: new Date().toISOString(), stream: streamName, line })}\n`,
     );
     if (streamName !== "stdout") return;
+    let event;
     try {
-      const event = JSON.parse(line);
-      this.#events.push(event);
-      this.#streams.events.write(`${JSON.stringify(event)}\n`);
-      for (const listener of this.#readyListeners) listener(event);
+      event = JSON.parse(line);
     } catch {
       // Non-JSON stdout remains available in stdout.log and transcript.ndjson.
+      return;
+    }
+    this.#events.push(event);
+    this.#writeArtifact("events", `${JSON.stringify(event)}\n`);
+    for (const listener of this.#readyListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        this.#recordProcessingError(error);
+      }
     }
   }
 
   #recordStreamError(stream, error) {
     this.#streamErrors.push({ stream, error });
+  }
+
+  #recordProcessingError(error) {
+    this.#processingErrors.push(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  #writeArtifact(stream, value) {
+    try {
+      this.#streams[stream].write(value);
+    } catch (error) {
+      this.#recordProcessingError(
+        new Error(`${stream}:${error instanceof Error ? error.message : String(error)}`),
+      );
+    }
+  }
+
+  #forceCloseResources() {
+    this.#cleanupAbortController.abort();
+    this.#child.stdin.destroy();
+    this.#child.stdout.destroy();
+    this.#child.stderr.destroy();
+    for (const stream of Object.values(this.#streams)) stream.destroy();
+  }
+
+  async #waitForFinalization(timeoutMs) {
+    if (await settleWithin(this.#finalized.promise, timeoutMs)) return;
+    this.#cleanupError = new Error(
+      `PROCESS_CLEANUP_TIMEOUT:${this.#name}:${this.pid}:${timeoutMs}ms`,
+    );
+    this.#forceCloseResources();
+    void this.#finalize(await this.#exit.promise);
+    await settleWithin(this.#finalized.promise, timeoutMs);
+    throw this.#cleanupError;
   }
 }
