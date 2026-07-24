@@ -4,6 +4,7 @@ import {
   parseArtifactDigest,
   parsePluginManifest,
   runtimeDiagnostic,
+  serializeCause,
   type ArtifactDigest,
   type JsonObject,
   type PluginManifest,
@@ -281,7 +282,12 @@ async function readEntry(
   } catch (error) {
     try {
       await writer?.abort?.(error);
-    } catch {}
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Artifact entry read failed and its writer could not be aborted",
+      );
+    }
     throw error;
   }
   const padding = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
@@ -508,7 +514,21 @@ export async function readPluginArtifact(
   } catch (error) {
     try {
       await reader.close();
-    } catch {}
+    } catch (cleanupError) {
+      throw artifactError(
+        "ARTIFACT_READER_CLEANUP_FAILED",
+        "Artifact parsing failed and its source iterator could not be closed",
+        {
+          causes: [
+            {
+              ...serializeCause(error),
+              ...(error instanceof DiagnosticError ? { code: error.diagnostic.code } : {}),
+            },
+            serializeCause(cleanupError),
+          ],
+        },
+      );
+    }
     throw error;
   }
   await reader.close();
