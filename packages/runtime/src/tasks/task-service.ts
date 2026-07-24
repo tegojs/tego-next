@@ -166,6 +166,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     const fingerprint = canonical(request);
     const replay = await this.#findReplay(request, fingerprint);
     if (replay !== undefined) {
+      if (replay.state === "terminal") return structuredClone(replay);
       const active = this.#dispatches.get(replay.taskId);
       if (active !== undefined) return structuredClone(await active);
       await this.#recoverRecord(replay);
@@ -420,7 +421,13 @@ export class TaskService implements RuntimeTaskLifecycle {
     } catch (error) {
       const rejection = this.#classifyDefiniteAdmissionRejection(error);
       if (rejection !== undefined) {
-        return this.#rejectAdmission(record, error, authority, rejection.retryable);
+        try {
+          return await this.#rejectAdmission(record, error, authority, rejection.retryable);
+        } finally {
+          if (this.#executors.get(record.taskId) === registration) {
+            this.#executors.delete(record.taskId);
+          }
+        }
       }
       const outcome = await this.#observeBounded(executor, record.taskId, record.attemptId).catch(
         () => undefined,
