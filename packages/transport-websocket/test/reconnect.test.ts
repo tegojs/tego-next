@@ -467,6 +467,34 @@ test("oversized reconnect inventory rejects attach instead of leaving a pending 
   await runtime.close();
 });
 
+test("inventory provider failure rejects attach instead of leaving a pending correlation", async () => {
+  const clock = new FakeClock(new Date(0));
+  const [main, worker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    preparedArtifacts: () => {
+      throw new Error("artifact inventory unavailable");
+    },
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await runtime.attach(worker);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  let rejected = false;
+  void remote.attach(main).catch(() => {
+    rejected = true;
+  });
+  for (let index = 0; index < 10; index += 1) await flush();
+  assert.equal(rejected, true);
+  await runtime.close();
+});
+
 test("acknowledged terminal attempts expire under the configured retention bound", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
@@ -579,11 +607,11 @@ test("late rejection from a stale assignment cannot roll back the reconciled epo
   await Promise.all([remote.close(), runtime.close()]);
 });
 
-test("retention delete failure keeps terminal identity in memory", async () => {
+test("retention tombstone failure keeps terminal identity in memory", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
   const backing = new MemoryRemoteAttemptStore();
-  let deletes = 0;
+  let tombstones = 0;
   const remote = new RemoteExecutor({
     id: "remote",
     workerId,
@@ -591,10 +619,14 @@ test("retention delete failure keeps terminal identity in memory", async () => {
     maxAssignments: 1,
     retentionMs: 100,
     attemptStore: {
-      save: async (record) => backing.save(record),
-      delete: async (taskId, attemptId) => {
-        deletes += 1;
-        throw new Error(`delete unavailable for ${taskId}/${attemptId}`);
+      save: async (record) => {
+        if (record.state === "expired") {
+          tombstones += 1;
+          throw new Error(
+            `tombstone unavailable for ${record.request.taskId}/${record.request.attemptId}`,
+          );
+        }
+        await backing.save(record);
       },
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
       list: async (id) => backing.list(id),
@@ -615,9 +647,9 @@ test("retention delete failure keeps terminal identity in memory", async () => {
 
   await assert.rejects(
     remote.submit(executionRequest({ mode: "echo", value: "second" }, "delete-retention-next")),
-    /delete unavailable/iu,
+    /tombstone unavailable/iu,
   );
-  assert.equal(deletes, 1);
+  assert.equal(tombstones, 1);
   assert.equal(
     (await remote.observe(firstRequest.taskId, firstRequest.attemptId))?.state,
     "terminal",
@@ -840,9 +872,9 @@ test("a correlated assignment result must match the assigned attempt identity", 
   };
 
   const handle = await remote.submit(assigned);
-  await flush();
-  assert.equal(await remote.observe(assigned.taskId, assigned.attemptId), undefined);
-  await assert.rejects(handle.result, /identity|result/iu);
+  const result = await handle.result;
+  assert.equal(result.status, "failed");
+  assert.match(result.diagnostic?.code ?? "", /IDENTITY/iu);
   await Promise.all([remote.close(), runtime.close()]);
 });
 
