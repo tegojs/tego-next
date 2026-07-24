@@ -193,8 +193,8 @@ TEGO_POSTGRES_URL=postgresql://tego_dev:tego_dev@127.0.0.1:5432/tego_next_test \
 ```
 
 The workflow YAML will also be syntax-checked locally when a compatible
-validator is available. The first pushed branch run provides GitHub's
-authoritative workflow execution result.
+validator is available. The first pull request or `main` push provides
+GitHub's authoritative workflow execution result.
 
 ## Failure Behavior
 
