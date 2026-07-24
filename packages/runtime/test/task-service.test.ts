@@ -8,6 +8,7 @@ import {
   parseDeployPluginRequest,
   parseFencingEpoch,
   parsePluginId,
+  parsePluginDeployment,
   parseRevision,
   parseTaskId,
   parseRunTaskRequest,
@@ -90,9 +91,26 @@ class TransactionalState implements StateStore {
                 revision: parseRevision(String(record.revision)),
               };
         },
-        scan: <V extends JsonValue>(_query: StateQuery<V>) => ({
-          async *[Symbol.asyncIterator]() {},
-        }),
+        scan: <V extends JsonValue>(query: StateQuery<V>) => {
+          const matches = [...this.records.entries()].filter(([key]) =>
+            key.startsWith(`${query.namespace}/${query.collection}/`),
+          );
+          return {
+            async *[Symbol.asyncIterator]() {
+              for (const [key, record] of matches) {
+                yield {
+                  key: {
+                    namespace: query.namespace,
+                    collection: query.collection,
+                    id: key.split("/").at(-1) ?? "",
+                  },
+                  value: clone(record.value) as V,
+                  revision: parseRevision(String(record.revision)),
+                };
+              }
+            },
+          };
+        },
         put: async <V extends JsonValue>(
           key: StateKey<V>,
           value: V,
@@ -723,6 +741,68 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
 
   currentAuthority = authority;
   revokeOnWake = false;
+  const requiringInstallation = parsePluginInstallation({
+    ...installation,
+    manifest: {
+      ...installation.manifest,
+      capabilities: {
+        provides: [],
+        requires: [{ name: "records", protocolRange: "^1.0.0" }],
+      },
+    },
+  });
+  state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
+    value: requiringInstallation,
+    revision: 90,
+  });
+  const providerDigest = parseArtifactDigest(
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  );
+  state.records.set(`tego/installations/provider@1.0.0@${providerDigest}`, {
+    value: parsePluginInstallation({
+      ...installation,
+      pluginId: parsePluginId("provider"),
+      digest: providerDigest,
+      manifest: {
+        ...installation.manifest,
+        pluginId: parsePluginId("provider"),
+        capabilities: { provides: [], requires: [] },
+      },
+    }),
+    revision: 91,
+  });
+  state.records.set(`tego/deployments/${request.applicationId}/provider`, {
+    value: parsePluginDeployment({
+      applicationId: request.applicationId,
+      pluginId: parsePluginId("provider"),
+      version: "1.0.0",
+      artifactDigest: providerDigest,
+      generation: "1",
+      state: "active",
+      essential: true,
+      configuration: {},
+      permissionGrants: [],
+      capabilityBindings: {},
+    }),
+    revision: 92,
+  });
+  await assert.rejects(
+    operations.deployPlugin({
+      ...deploymentRequest,
+      configuration: { greeting: "invalid-provider" },
+      capabilityBindings: {
+        records: {
+          applicationId: request.applicationId,
+          pluginId: parsePluginId("provider"),
+        },
+      },
+    }),
+    (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
+  );
+  state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
+    value: installation,
+    revision: 99,
+  });
   state.beforeTransaction = () => {
     state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
       value: { ...installation, pluginId: parsePluginId("other") },
