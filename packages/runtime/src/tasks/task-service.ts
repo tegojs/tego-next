@@ -1,24 +1,24 @@
 import { randomUUID } from "node:crypto";
 import {
+  type AttemptId,
+  type Clock,
   DiagnosticError,
   diagnosticCode,
+  type ExecutionHandle,
+  type ExecutionResult,
+  type Executor,
   indeterminateTaskDiagnostic,
+  type JsonValue,
   parseAttemptId,
   parseExecutionResult,
   parseRunTaskRequest,
   parseTaskId,
   parseTaskRecord,
-  runtimeDiagnostic,
-  type AttemptId,
-  type Clock,
-  type ExecutionHandle,
-  type ExecutionResult,
-  type Executor,
-  type JsonValue,
   type Revision,
   type RunTaskRequest,
   type RuntimeAuthority,
   type RuntimeTaskLifecycle,
+  runtimeDiagnostic,
   type StateFencing,
   type StateKey,
   type StateStore,
@@ -64,6 +64,13 @@ interface ExecutorRegistration {
 type ObservationOutcome =
   | { readonly kind: "observed"; readonly value: Awaited<ReturnType<Executor["observe"]>> }
   | { readonly kind: "timeout" };
+
+const definiteAdmissionRejections = {
+  EXECUTOR_ATTEMPT_CAPACITY_EXCEEDED: { retryable: true },
+  EXECUTOR_DRAINING: { retryable: true },
+  EXECUTOR_INPUT_LIMIT_EXCEEDED: { retryable: false },
+  EXECUTOR_QUEUE_CAPACITY_EXCEEDED: { retryable: true },
+} as const;
 
 interface DeferredWaiter {
   readonly resolve: (record: TaskRecord) => void;
@@ -259,7 +266,8 @@ export class TaskService implements RuntimeTaskLifecycle {
       const dispatch = this.#dispatches.get(taskId);
       if (dispatch !== undefined) await dispatch.catch(() => undefined);
     }
-    const active = this.#executors.get(taskId)?.executor;
+    const activeRegistration = this.#executors.get(taskId);
+    const active = activeRegistration?.executor;
     if (active !== undefined) {
       this.#assertAuthority(authority);
       await this.#boundedEffect(active.cancel(intended.taskId, intended.attemptId));
@@ -271,7 +279,7 @@ export class TaskService implements RuntimeTaskLifecycle {
         : await this.#observeBounded(active, intended.taskId, intended.attemptId);
     this.#assertAuthority(authority);
     if (observed?.kind === "observed" && observed.value?.state === "terminal") {
-      await this.#complete(intended, observed.value.result, authority);
+      await this.#complete(intended, observed.value.result, authority, activeRegistration);
     }
     const completed = await this.#waitBounded(taskId);
     if (completed !== undefined) return completed;
@@ -410,8 +418,9 @@ export class TaskService implements RuntimeTaskLifecycle {
     try {
       handle = await executor.submit(request);
     } catch (error) {
-      if (this.#isDefiniteAdmissionRejection(error)) {
-        return this.#rejectAdmission(record, error, authority);
+      const rejection = this.#classifyDefiniteAdmissionRejection(error);
+      if (rejection !== undefined) {
+        return this.#rejectAdmission(record, error, authority, rejection.retryable);
       }
       const outcome = await this.#observeBounded(executor, record.taskId, record.attemptId).catch(
         () => undefined,
@@ -553,7 +562,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     }
     this.#assertAuthority(authority);
     if (observed?.state === "terminal") {
-      await this.#complete(record, observed.result, authority);
+      await this.#complete(record, observed.result, authority, registration);
     } else if (observed?.state === "running" && record.state === "accepted") {
       await this.#transition(record.taskId, authority, (current) => ({
         ...current,
@@ -747,18 +756,20 @@ export class TaskService implements RuntimeTaskLifecycle {
     }));
   }
 
-  #isDefiniteAdmissionRejection(error: unknown): boolean {
-    return new Set([
-      "EXECUTOR_DRAINING",
-      "EXECUTOR_ATTEMPT_CAPACITY_EXCEEDED",
-      "EXECUTOR_QUEUE_CAPACITY_EXCEEDED",
-    ]).has(diagnosticCode(error) ?? "");
+  #classifyDefiniteAdmissionRejection(
+    error: unknown,
+  ): (typeof definiteAdmissionRejections)[keyof typeof definiteAdmissionRejections] | undefined {
+    const code = diagnosticCode(error);
+    return code === undefined || !Object.hasOwn(definiteAdmissionRejections, code)
+      ? undefined
+      : definiteAdmissionRejections[code as keyof typeof definiteAdmissionRejections];
   }
 
   async #rejectAdmission(
     record: TaskRecord,
     error: unknown,
     authority: RuntimeAuthority,
+    retryable: boolean,
   ): Promise<TaskRecord> {
     const timestamp = this.#clock.now().toISOString();
     const code = diagnosticCode(error) ?? "EXECUTOR_SUBMISSION_REJECTED";
@@ -776,7 +787,7 @@ export class TaskService implements RuntimeTaskLifecycle {
           code,
           message: "Executor rejected the task before creating an attempt",
           source: { kind: "executor", id: record.taskId },
-          retryable: true,
+          retryable,
           observedAt: timestamp,
         }),
         startedAt: record.createdAt,

@@ -1,6 +1,14 @@
 import {
+  type Clock,
+  type DeployPluginRequest,
   DiagnosticError,
   diagnosticCode,
+  type InstallPluginRequest,
+  type PersistedOperationJournalEntry,
+  type PluginDeployment,
+  type PluginDeploymentIdentity,
+  type PluginDeploymentStatus,
+  type PluginInstallation,
   parseDeployPluginRequest,
   parseInstallPluginRequest,
   parsePluginDeployment,
@@ -10,18 +18,10 @@ import {
   parseRunTaskRequest,
   parseTaskId,
   parseTaskRecord,
-  runtimeDiagnostic,
-  type Clock,
-  type DeployPluginRequest,
-  type InstallPluginRequest,
-  type PersistedOperationJournalEntry,
-  type PluginDeployment,
-  type PluginDeploymentIdentity,
-  type PluginDeploymentStatus,
-  type PluginInstallation,
   type RunTaskRequest,
   type RuntimeAuthority,
   type RuntimeOperations,
+  runtimeDiagnostic,
   type StateFencing,
   type StateKey,
   type StateStore,
@@ -416,7 +416,9 @@ export class RuntimeOperationController implements RuntimeOperations {
       if (
         stored.key.id !==
           `${installation.pluginId}@${installation.version}@${installation.digest}` ||
-        provider.version !== installation.version
+        provider.version !== installation.version ||
+        installation.manifest.pluginId !== installation.pluginId ||
+        installation.manifest.version !== installation.version
       ) {
         break;
       }
