@@ -92,6 +92,7 @@ export interface WorkerSessionOptions {
   readonly limits?: WorkerProtocolLimitOverrides;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
+  readonly handshakeTimeoutMs?: number;
   readonly worker?: WorkerRegistration;
   readonly onRegister?: (session: WorkerSession, registration: WorkerRegistration) => string;
   readonly onUnavailable?: (session: WorkerSession) => void;
@@ -320,12 +321,14 @@ export class WorkerSession {
   readonly #role: WorkerSessionRole;
   readonly #heartbeatIntervalMs: number;
   readonly #heartbeatTimeoutMs: number;
+  readonly #handshakeTimeoutMs: number;
   readonly #worker: WorkerRegistration | undefined;
   readonly #onRegister: WorkerSessionOptions["onRegister"] | undefined;
   readonly #onUnavailable: WorkerSessionOptions["onUnavailable"] | undefined;
   readonly #onClosed: WorkerSessionOptions["onClosed"] | undefined;
   readonly #nonce = createAuthenticationNonce();
   readonly #abort = new AbortController();
+  readonly #handshakeAbort = new AbortController();
   readonly #listeners = new Set<(message: WorkerSessionMessage) => void>();
   readonly #receivedIds = new Set<string>();
   readonly #receivedIdOrder: string[] = [];
@@ -377,6 +380,11 @@ export class WorkerSession {
       15_000,
       "heartbeatTimeoutMs",
     );
+    this.#handshakeTimeoutMs = positiveDuration(
+      options.handshakeTimeoutMs,
+      10_000,
+      "handshakeTimeoutMs",
+    );
     this.#worker = options.worker === undefined ? undefined : normalizeRegistration(options.worker);
     this.#onRegister = options.onRegister;
     this.#onUnavailable = options.onUnavailable;
@@ -388,6 +396,7 @@ export class WorkerSession {
     this.#socket.on("message", this.#messageListener);
     this.#socket.on("close", this.#closeListener);
     this.#socket.on("error", this.#errorListener);
+    void this.#watchHandshake();
     queueMicrotask(() => {
       if (this.#state === "authenticating") {
         try {
@@ -490,6 +499,7 @@ export class WorkerSession {
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#abort.abort(diagnosticError("WORKER_SESSION_CLOSED", "Worker session is closed"));
+    this.#handshakeAbort.abort();
     this.#readyDeferred.reject(
       diagnosticError("WORKER_SESSION_CLOSED", "Worker session closed before becoming ready"),
     );
@@ -508,6 +518,7 @@ export class WorkerSession {
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#abort.abort(diagnosticError("WORKER_SESSION_REPLACED", "Worker session was replaced"));
+    this.#handshakeAbort.abort();
     this.#rejectPending(diagnosticError("WORKER_SESSION_REPLACED", "Worker session was replaced"));
     this.#onUnavailable?.(this);
     this.#socket.close(1000, "WORKER_SESSION_REPLACED");
@@ -813,6 +824,7 @@ export class WorkerSession {
     this.#available = true;
     this.#acceptingAssignments = true;
     this.#lastHeartbeatAt = this.#clock.now().getTime();
+    this.#handshakeAbort.abort();
     this.#sendInternal("session.ready", { epoch: this.#epoch });
     this.#readyDeferred.resolve();
     void this.#watchHeartbeat();
@@ -838,6 +850,7 @@ export class WorkerSession {
     this.#state = "ready";
     this.#available = true;
     this.#acceptingAssignments = true;
+    this.#handshakeAbort.abort();
     this.#readyDeferred.resolve();
     void this.#sendHeartbeats();
   }
@@ -850,6 +863,22 @@ export class WorkerSession {
       }
     } catch {
       // Closing or replacing the session aborts its sole heartbeat sleeper.
+    }
+  }
+
+  async #watchHandshake(): Promise<void> {
+    try {
+      await this.#clock.sleep(this.#handshakeTimeoutMs, this.#handshakeAbort.signal);
+      if (this.#state === "authenticating") {
+        this.#fail(
+          diagnosticError(
+            "PROTOCOL_HANDSHAKE_TIMEOUT",
+            "Worker authentication handshake timed out",
+          ),
+        );
+      }
+    } catch {
+      // A completed or closed session aborts its sole handshake sleeper.
     }
   }
 
@@ -889,6 +918,7 @@ export class WorkerSession {
     this.#abort.abort(
       diagnosticError("WORKER_HEARTBEAT_EXPIRED", "Worker heartbeat deadline expired"),
     );
+    this.#handshakeAbort.abort();
     this.#rejectPending(
       diagnosticError("WORKER_HEARTBEAT_EXPIRED", "Worker heartbeat deadline expired"),
     );
@@ -993,6 +1023,7 @@ export class WorkerSession {
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#abort.abort(error);
+    this.#handshakeAbort.abort();
     this.#readyDeferred.reject(error);
     this.#rejectPending(error);
     this.#socket.close(closeCode(error.diagnostic), error.diagnostic.code);
@@ -1010,6 +1041,7 @@ export class WorkerSession {
       reason: details.reason.slice(0, 128),
     });
     this.#abort.abort(error);
+    this.#handshakeAbort.abort();
     this.#readyDeferred.reject(error);
     this.#rejectPending(error);
     this.#detach();

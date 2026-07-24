@@ -40,6 +40,7 @@ export interface WorkerEndpointOptions {
   readonly limits?: WorkerProtocolLimitOverrides;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
+  readonly handshakeTimeoutMs?: number;
   readonly workerId?: WorkerId;
   readonly registration?: WorkerRegistrationInput;
 }
@@ -77,6 +78,9 @@ export class MainEndpoint {
       ...(this.#options.heartbeatTimeoutMs === undefined
         ? {}
         : { heartbeatTimeoutMs: this.#options.heartbeatTimeoutMs }),
+      ...(this.#options.handshakeTimeoutMs === undefined
+        ? {}
+        : { handshakeTimeoutMs: this.#options.handshakeTimeoutMs }),
       onRegister: (registeredSession, registration) =>
         this.#register(registeredSession, registration),
       onClosed: (closedSession) => {

@@ -78,6 +78,9 @@ export class WorkerEndpoint {
       ...(this.#options.heartbeatTimeoutMs === undefined
         ? {}
         : { heartbeatTimeoutMs: this.#options.heartbeatTimeoutMs }),
+      ...(this.#options.handshakeTimeoutMs === undefined
+        ? {}
+        : { handshakeTimeoutMs: this.#options.handshakeTimeoutMs }),
       worker: this.#registration,
       onClosed: (closedSession) => {
         this.#sessions.delete(closedSession);
