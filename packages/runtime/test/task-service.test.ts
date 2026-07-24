@@ -1346,6 +1346,7 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
     }),
     revision: 100,
   });
+  await service.recover();
   await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
   assert.equal(selections, selectionsAfterHandover);
   await service.close();
