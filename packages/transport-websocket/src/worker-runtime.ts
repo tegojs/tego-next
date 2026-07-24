@@ -582,8 +582,8 @@ export class WorkerRuntime {
         attempt.acknowledgedAt !== undefined &&
         attempt.acknowledgedAt <= cutoff
       ) {
-        this.#attempts.delete(key);
         await this.#attemptStore.delete?.(attempt.request.taskId, attempt.request.attemptId);
+        this.#attempts.delete(key);
       }
     }
   }

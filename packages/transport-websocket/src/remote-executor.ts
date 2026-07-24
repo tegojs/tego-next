@@ -93,6 +93,7 @@ export class RemoteExecutor implements Executor {
   #closed = false;
   #hydrated = false;
   #attachChain = Promise.resolve();
+  #submitChain = Promise.resolve();
   #drainPromise: Promise<void> | undefined;
 
   constructor(options: RemoteExecutorOptions) {
@@ -150,7 +151,16 @@ export class RemoteExecutor implements Executor {
     };
   }
 
-  async submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
+  submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
+    const submitted = this.#submitChain.then(async () => this.#submit(requestValue));
+    this.#submitChain = submitted.then(
+      () => undefined,
+      () => undefined,
+    );
+    return submitted;
+  }
+
+  async #submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
     await this.#pruneTerminals();
     const request = parseRemoteRequest(requestValue);
     const fingerprint = requestFingerprint(request);
@@ -217,7 +227,6 @@ export class RemoteExecutor implements Executor {
   }
 
   async observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {
-    await this.#pruneTerminals();
     const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
     if (attempt === undefined) return undefined;
     if (attempt.terminal !== undefined) {
@@ -242,7 +251,7 @@ export class RemoteExecutor implements Executor {
     try {
       await session.request(REMOTE_CANCEL, { request: attempt.request });
     } catch {
-      if (attempt.terminal === undefined) {
+      if (this.#session === session && attempt.terminal === undefined) {
         attempt.state = "unknown";
         await this.#save(attempt);
       }
@@ -417,7 +426,7 @@ export class RemoteExecutor implements Executor {
         await this.#save(attempt);
       }
     } catch {
-      if (attempt.terminal === undefined) {
+      if (this.#session === session && attempt.terminal === undefined) {
         attempt.state = "unknown";
         attempt.epoch = session.epoch;
         await this.#save(attempt);
@@ -636,8 +645,8 @@ export class RemoteExecutor implements Executor {
         attempt.terminalAt !== undefined &&
         attempt.terminalAt <= cutoff
       ) {
-        this.#attempts.delete(key);
         await this.#attemptStore.delete?.(attempt.request.taskId, attempt.request.attemptId);
+        this.#attempts.delete(key);
       }
     }
   }

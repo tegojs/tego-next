@@ -538,7 +538,7 @@ test("concurrent duplicate submit waits for one persisted assignment and returns
   try {
     assert.strictEqual(second, first);
     assert.equal(assignedSaves, 1);
-    assert.equal(local.executions, 1);
+    await eventually(() => assert.equal(local.executions, 1));
   } finally {
     await remote.cancel(request.taskId, request.attemptId);
     await second.result;
