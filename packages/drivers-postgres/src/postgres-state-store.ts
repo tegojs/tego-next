@@ -909,15 +909,10 @@ export class PostgresStateStore implements StateStore {
     const locks =
       request.fencing === undefined ? [] : [fenceLock(this.#namespace, request.fencing.resource)];
     return this.#trackExecution(
-      withPostgresTransaction(
-        this.#pool,
-        "READ COMMITTED",
-        locks,
-        this.#transactionControl(),
-        async (client) => {
-          const advancesFence = await verifyFence(client, this.#namespace, request.fencing);
-          const result = await client.query(
-            `
+      this.#withTransaction("READ COMMITTED", locks, async (client) => {
+        const advancesFence = await verifyFence(client, this.#namespace, request.fencing);
+        const result = await client.query(
+          `
           SELECT message_id, operation_id, topic, payload_json, created_at, available_at, attempt,
             clock_timestamp() AS claimed_at
           FROM tego_outbox
@@ -930,49 +925,47 @@ export class PostgresStateStore implements StateStore {
           FOR UPDATE SKIP LOCKED
           LIMIT $3
         `,
-            [this.#namespace, request.topic ?? null, limit],
-          );
-          if (result.rows.length === 0 && !advancesFence) return [];
-          const revision = await allocateRevision(client, this.#namespace);
-          if (advancesFence) await advanceFence(client, this.#namespace, request.fencing);
-          const claims: OutboxClaim[] = [];
-          for (const row of result.rows) {
-            const storedAttempt = Number(row.attempt);
-            if (
-              !Number.isSafeInteger(storedAttempt) ||
-              storedAttempt < 0 ||
-              storedAttempt >= Number.MAX_SAFE_INTEGER
-            ) {
-              throw postgresError(
-                "STATE_DATA_INVALID",
-                "PostgreSQL outbox contains an invalid delivery attempt",
-                "state",
-                { messageId: String(row.message_id) },
-              );
-            }
-            const attempt = storedAttempt + 1;
-            const claimedAt = isoTimestamp(row.claimed_at, "claimed_at");
-            const expiresAt = new Date(
-              Date.parse(claimedAt) + request.leaseDurationMs,
-            ).toISOString();
-            const claim: OutboxClaim = {
-              message: {
-                messageId: parseMessageId(String(row.message_id)),
-                operationId: parseOperationId(String(row.operation_id)),
-                topic: String(row.topic),
-                payload: jsonValue(row, "payload_json"),
-                createdAt: isoTimestamp(row.created_at, "created_at"),
-                availableAt: isoTimestamp(row.available_at, "available_at"),
-              },
-              owner: request.owner,
-              claimEpoch: parseFencingEpoch(String(attempt)),
-              attempt,
-              claimedAt,
-              expiresAt,
-            };
-            claims.push(claim);
-            await client.query(
-              `
+          [this.#namespace, request.topic ?? null, limit],
+        );
+        if (result.rows.length === 0 && !advancesFence) return [];
+        const revision = await allocateRevision(client, this.#namespace);
+        if (advancesFence) await advanceFence(client, this.#namespace, request.fencing);
+        const claims: OutboxClaim[] = [];
+        for (const row of result.rows) {
+          const storedAttempt = Number(row.attempt);
+          if (
+            !Number.isSafeInteger(storedAttempt) ||
+            storedAttempt < 0 ||
+            storedAttempt >= Number.MAX_SAFE_INTEGER
+          ) {
+            throw postgresError(
+              "STATE_DATA_INVALID",
+              "PostgreSQL outbox contains an invalid delivery attempt",
+              "state",
+              { messageId: String(row.message_id) },
+            );
+          }
+          const attempt = storedAttempt + 1;
+          const claimedAt = isoTimestamp(row.claimed_at, "claimed_at");
+          const expiresAt = new Date(Date.parse(claimedAt) + request.leaseDurationMs).toISOString();
+          const claim: OutboxClaim = {
+            message: {
+              messageId: parseMessageId(String(row.message_id)),
+              operationId: parseOperationId(String(row.operation_id)),
+              topic: String(row.topic),
+              payload: jsonValue(row, "payload_json"),
+              createdAt: isoTimestamp(row.created_at, "created_at"),
+              availableAt: isoTimestamp(row.available_at, "available_at"),
+            },
+            owner: request.owner,
+            claimEpoch: parseFencingEpoch(String(attempt)),
+            attempt,
+            claimedAt,
+            expiresAt,
+          };
+          claims.push(claim);
+          await client.query(
+            `
             UPDATE tego_outbox SET
               attempt = $3, claim_owner = $4, claim_epoch = $5,
               claimed_at = $6, claim_expires_at = $7,
@@ -981,21 +974,20 @@ export class PostgresStateStore implements StateStore {
               acknowledged_at = NULL, revision = $8
             WHERE driver_namespace = $1 AND message_id = $2
           `,
-              [
-                this.#namespace,
-                claim.message.messageId,
-                claim.attempt,
-                claim.owner,
-                claim.claimEpoch,
-                claim.claimedAt,
-                claim.expiresAt,
-                revision,
-              ],
-            );
-          }
-          return claims;
-        },
-      ),
+            [
+              this.#namespace,
+              claim.message.messageId,
+              claim.attempt,
+              claim.owner,
+              claim.claimEpoch,
+              claim.claimedAt,
+              claim.expiresAt,
+              revision,
+            ],
+          );
+        }
+        return claims;
+      }),
     );
   }
 
@@ -1016,15 +1008,10 @@ export class PostgresStateStore implements StateStore {
     const locks =
       request.fencing === undefined ? [] : [fenceLock(this.#namespace, request.fencing.resource)];
     return this.#trackExecution(
-      withPostgresTransaction(
-        this.#pool,
-        "READ COMMITTED",
-        locks,
-        this.#transactionControl(),
-        async (client) => {
-          const advancesFence = await verifyFence(client, this.#namespace, request.fencing);
-          const result = await client.query(
-            `
+      this.#withTransaction("READ COMMITTED", locks, async (client) => {
+        const advancesFence = await verifyFence(client, this.#namespace, request.fencing);
+        const result = await client.query(
+          `
           SELECT attempt, claim_owner, claim_epoch::text, acknowledgement_outcome,
             acknowledgement_owner, acknowledgement_claim_epoch::text,
             acknowledgement_retry_at, acknowledged_at
@@ -1032,62 +1019,62 @@ export class PostgresStateStore implements StateStore {
           WHERE driver_namespace = $1 AND message_id = $2
           FOR UPDATE
         `,
-            [this.#namespace, request.messageId],
-          );
-          const row = result.rows[0];
-          if (row === undefined) {
-            throw postgresError("STATE_QUERY_INVALID", "Outbox message does not exist", "state", {
-              messageId: request.messageId,
-            });
-          }
-          const sameAcknowledgedClaim =
-            (row.acknowledgement_outcome === "completed" ||
-              row.acknowledgement_outcome === "retry") &&
-            row.acknowledgement_owner === request.owner &&
-            row.acknowledgement_claim_epoch === request.claimEpoch;
-          if (sameAcknowledgedClaim) {
-            const retryAt =
-              row.acknowledgement_retry_at === null
-                ? undefined
-                : isoTimestamp(row.acknowledgement_retry_at, "retry_at");
-            if (row.acknowledgement_outcome !== request.outcome || retryAt !== request.retryAt) {
-              throw postgresError(
-                "STATE_IDEMPOTENCY_CONFLICT",
-                "Outbox claim was acknowledged with a different outcome",
-                "state",
-                { claimEpoch: request.claimEpoch, messageId: request.messageId },
-              );
-            }
-            if (advancesFence) {
-              await allocateRevision(client, this.#namespace);
-              await advanceFence(client, this.#namespace, request.fencing);
-            }
-            return {
-              messageId: request.messageId,
-              outcome: request.outcome,
-              attempt: this.#outboxAttempt(row.attempt, request.messageId),
-              acknowledgedAt: isoTimestamp(row.acknowledged_at, "acknowledged_at"),
-              duplicate: true,
-              ...(retryAt === undefined ? {} : { retryAt }),
-            };
-          }
-          if (row.claim_owner !== request.owner || row.claim_epoch !== request.claimEpoch) {
+          [this.#namespace, request.messageId],
+        );
+        const row = result.rows[0];
+        if (row === undefined) {
+          throw postgresError("STATE_QUERY_INVALID", "Outbox message does not exist", "state", {
+            messageId: request.messageId,
+          });
+        }
+        const sameAcknowledgedClaim =
+          (row.acknowledgement_outcome === "completed" ||
+            row.acknowledgement_outcome === "retry") &&
+          row.acknowledgement_owner === request.owner &&
+          row.acknowledgement_claim_epoch === request.claimEpoch;
+        if (sameAcknowledgedClaim) {
+          const retryAt =
+            row.acknowledgement_retry_at === null
+              ? undefined
+              : isoTimestamp(row.acknowledgement_retry_at, "retry_at");
+          if (row.acknowledgement_outcome !== request.outcome || retryAt !== request.retryAt) {
             throw postgresError(
-              "STATE_FENCE_STALE",
-              "Outbox acknowledgement claim fence is stale",
+              "STATE_IDEMPOTENCY_CONFLICT",
+              "Outbox claim was acknowledged with a different outcome",
               "state",
-              {
-                actualClaimEpoch: typeof row.claim_epoch === "string" ? row.claim_epoch : null,
-                messageId: request.messageId,
-                requestedClaimEpoch: request.claimEpoch,
-              },
+              { claimEpoch: request.claimEpoch, messageId: request.messageId },
             );
           }
-          const attempt = this.#outboxAttempt(row.attempt, request.messageId);
-          const revision = await allocateRevision(client, this.#namespace);
-          if (advancesFence) await advanceFence(client, this.#namespace, request.fencing);
-          const updated = await client.query<{ acknowledged_at: Date }>(
-            `
+          if (advancesFence) {
+            await allocateRevision(client, this.#namespace);
+            await advanceFence(client, this.#namespace, request.fencing);
+          }
+          return {
+            messageId: request.messageId,
+            outcome: request.outcome,
+            attempt: this.#outboxAttempt(row.attempt, request.messageId),
+            acknowledgedAt: isoTimestamp(row.acknowledged_at, "acknowledged_at"),
+            duplicate: true,
+            ...(retryAt === undefined ? {} : { retryAt }),
+          };
+        }
+        if (row.claim_owner !== request.owner || row.claim_epoch !== request.claimEpoch) {
+          throw postgresError(
+            "STATE_FENCE_STALE",
+            "Outbox acknowledgement claim fence is stale",
+            "state",
+            {
+              actualClaimEpoch: typeof row.claim_epoch === "string" ? row.claim_epoch : null,
+              messageId: request.messageId,
+              requestedClaimEpoch: request.claimEpoch,
+            },
+          );
+        }
+        const attempt = this.#outboxAttempt(row.attempt, request.messageId);
+        const revision = await allocateRevision(client, this.#namespace);
+        if (advancesFence) await advanceFence(client, this.#namespace, request.fencing);
+        const updated = await client.query<{ acknowledged_at: Date }>(
+          `
           UPDATE tego_outbox SET
             acknowledgement_outcome = $3,
             acknowledgement_owner = $4,
@@ -1103,26 +1090,25 @@ export class PostgresStateStore implements StateStore {
           WHERE driver_namespace = $1 AND message_id = $2
           RETURNING acknowledged_at
         `,
-            [
-              this.#namespace,
-              request.messageId,
-              request.outcome,
-              request.owner,
-              request.claimEpoch,
-              request.retryAt ?? null,
-              revision,
-            ],
-          );
-          return {
-            messageId: request.messageId,
-            outcome: request.outcome,
-            attempt,
-            acknowledgedAt: isoTimestamp(updated.rows[0]?.acknowledged_at, "acknowledged_at"),
-            duplicate: false,
-            ...(request.retryAt === undefined ? {} : { retryAt: request.retryAt }),
-          };
-        },
-      ),
+          [
+            this.#namespace,
+            request.messageId,
+            request.outcome,
+            request.owner,
+            request.claimEpoch,
+            request.retryAt ?? null,
+            revision,
+          ],
+        );
+        return {
+          messageId: request.messageId,
+          outcome: request.outcome,
+          attempt,
+          acknowledgedAt: isoTimestamp(updated.rows[0]?.acknowledged_at, "acknowledged_at"),
+          duplicate: false,
+          ...(request.retryAt === undefined ? {} : { retryAt: request.retryAt }),
+        };
+      }),
     );
   }
 
@@ -1164,61 +1150,69 @@ export class PostgresStateStore implements StateStore {
         ? []
         : [fenceLock(this.#namespace, options.fencing.resource)]),
     ];
-    return withPostgresTransaction(
-      this.#pool,
-      "REPEATABLE READ",
-      sessionLocks,
-      this.#transactionControl(),
-      async (client) => {
-        if (identity !== undefined) {
-          const replay = await client.query<{ fingerprint: string; result_json: JsonValue }>(
-            `
+    return this.#withTransaction("REPEATABLE READ", sessionLocks, async (client) => {
+      if (identity !== undefined) {
+        const replay = await client.query<{ fingerprint: string; result_json: JsonValue }>(
+          `
             SELECT fingerprint, result_json
             FROM tego_idempotency
             WHERE driver_namespace = $1 AND idempotency_key = $2
             FOR UPDATE
           `,
-            [this.#namespace, identity.key],
-          );
-          const row = replay.rows[0];
-          if (row !== undefined) {
-            assertSameFingerprint(identity, row.fingerprint);
-            return cloneJson(row.result_json as T);
-          }
+          [this.#namespace, identity.key],
+        );
+        const row = replay.rows[0];
+        if (row !== undefined) {
+          assertSameFingerprint(identity, row.fingerprint);
+          return cloneJson(row.result_json as T);
         }
-        const advancesFence = await verifyFence(client, this.#namespace, options.fencing);
-        const transaction = new PostgresTransaction(client, this.#namespace);
-        let result: T;
-        try {
-          result = cloneJson(await work(transaction));
-        } catch (error) {
-          transaction.abort();
-          throw error;
-        }
-        const revision = transaction.finish();
-        if (advancesFence) {
-          if (revision === undefined) await allocateRevision(client, this.#namespace);
-          await advanceFence(client, this.#namespace, options.fencing);
-        }
-        if (identity !== undefined) {
-          await client.query(
-            `
+      }
+      const advancesFence = await verifyFence(client, this.#namespace, options.fencing);
+      const transaction = new PostgresTransaction(client, this.#namespace);
+      let result: T;
+      try {
+        result = cloneJson(await work(transaction));
+      } catch (error) {
+        transaction.abort();
+        throw error;
+      }
+      const revision = transaction.finish();
+      if (advancesFence) {
+        if (revision === undefined) await allocateRevision(client, this.#namespace);
+        await advanceFence(client, this.#namespace, options.fencing);
+      }
+      if (identity !== undefined) {
+        await client.query(
+          `
             INSERT INTO tego_idempotency(
               driver_namespace, idempotency_key, fingerprint, result_json
             ) VALUES ($1, $2, $3, $4::jsonb)
           `,
-            [this.#namespace, identity.key, identity.fingerprint, canonicalJson(result)],
-          );
-        }
-        if (revision !== undefined) {
-          await client.query("SELECT pg_notify('tego_state_changes', $1)", [this.#namespace]);
-        }
-        return cloneJson(result);
-      },
-    ).then((result) => {
+          [this.#namespace, identity.key, identity.fingerprint, canonicalJson(result)],
+        );
+      }
+      if (revision !== undefined) {
+        await client.query("SELECT pg_notify('tego_state_changes', $1)", [this.#namespace]);
+      }
+      return cloneJson(result);
+    }).then((result) => {
       for (const watcher of this.#watchers) watcher.wake();
       return result;
     });
+  }
+
+  #withTransaction<T>(
+    isolation: "READ COMMITTED" | "REPEATABLE READ",
+    sessionLocks: readonly string[],
+    work: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    return withPostgresTransaction(
+      this.#pool,
+      isolation,
+      sessionLocks,
+      this.#transactionControl(),
+      work,
+    );
   }
 
   #transactionControl(): TransactionControl {
