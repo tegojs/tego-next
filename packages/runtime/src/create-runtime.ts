@@ -1,13 +1,12 @@
 import {
   DiagnosticError,
-  parseLeadership,
   parseRuntimeConfiguration,
   parseRuntimeEvent,
   parseRuntimeStatus,
   runtimeDiagnostic,
   serializeCause,
-  type Leadership,
   type Runtime,
+  type RuntimeAuthority,
   type RuntimeConfiguration,
   type RuntimeEvent,
   type RuntimeLifecycleState,
@@ -16,10 +15,13 @@ import {
   type StopOptions,
 } from "@tegojs/contracts";
 import { DriverSupervisor } from "./driver-supervisor.js";
+import { LeadershipController } from "./leadership-controller.js";
 import { isRuntimeReady } from "./readiness.js";
+import type { Reconciler } from "./reconcile/reconciler.js";
 import { recoverRuntimeState, type RuntimeRecoverySnapshot } from "./recovery.js";
 import { RuntimeOperationController } from "./runtime-operations.js";
 import { transitionRuntimeState } from "./runtime-state.js";
+import type { RuntimeHostServices } from "./runtime-host.js";
 
 class RuntimeEventIterator implements AsyncIterable<RuntimeEvent>, AsyncIterator<RuntimeEvent> {
   readonly #onClose: () => void;
@@ -102,6 +104,7 @@ class TegoRuntime implements Runtime {
   readonly events: AsyncIterable<RuntimeEvent>;
   readonly #configuration: RuntimeConfiguration;
   readonly #drivers: RuntimeDrivers;
+  readonly #services: RuntimeHostServices | undefined;
   readonly #supervisor: DriverSupervisor;
   readonly #eventStream = new RuntimeEventStream();
   #lifecycle: RuntimeLifecycleState = "created";
@@ -112,15 +115,23 @@ class TegoRuntime implements Runtime {
     taskCount: 0,
     operations: [],
   };
-  #leadership: Leadership | undefined;
+  #leadership: RuntimeAuthority | undefined;
+  #leadershipController: LeadershipController | undefined;
+  #reconciler: Reconciler | undefined;
   #driverHealth: RuntimeStatus["drivers"] = [];
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
   #stopRequested = false;
+  #servicesClosed = false;
 
-  constructor(configuration: RuntimeConfiguration, drivers: RuntimeDrivers) {
+  constructor(
+    configuration: RuntimeConfiguration,
+    drivers: RuntimeDrivers,
+    services?: RuntimeHostServices,
+  ) {
     this.#configuration = parseRuntimeConfiguration(configuration);
     this.#drivers = drivers;
+    this.#services = services;
     this.#supervisor = new DriverSupervisor(drivers);
     this.operations = new RuntimeOperationController(drivers.clock);
     this.events = this.#eventStream;
@@ -160,38 +171,42 @@ class TegoRuntime implements Runtime {
         this.#drivers.state,
         this.#configuration.applicationId,
       );
+      await this.#services?.tasks.recover();
       this.operations.setRecovered(this.#recovery.operations);
       if (this.#stopRequested) return;
 
+      this.#driverHealth = await this.#supervisor.health(this.#drivers.clock.now().toISOString());
+      if (this.#stopRequested) return;
+      this.operations.openReadOnly();
+
       this.#setLifecycle("electing");
       const expectedResource = `runtime:${this.#configuration.runtimeId}`;
-      const leadershipHandle = await this.#drivers.coordination.campaign({
+      const leadershipController = new LeadershipController({
+        coordination: this.#drivers.coordination,
+        clock: this.#drivers.clock,
         resource: expectedResource,
+        onAcquired: (leadership) => this.#activateAuthority(leadership),
+        onLost: (leadership) => this.#deactivateAuthority(leadership),
+        ...(this.#services?.onDiagnostic === undefined
+          ? {}
+          : {
+              onDiagnostic: (diagnostic) => this.#services?.onDiagnostic?.(diagnostic),
+            }),
       });
-      const leadership = parseLeadership(leadershipHandle.leadership);
-      if (leadership.resource !== expectedResource) {
-        throw new DiagnosticError(
-          runtimeDiagnostic({
-            code: "COORDINATION_LEADERSHIP_RESOURCE_MISMATCH",
-            message: "Coordination leadership does not match the campaign resource",
-            source: { kind: "coordination", id: "leadership" },
-            details: {
-              expectedResource,
-              actualResource: leadership.resource,
-            },
-            observedAt: this.#drivers.clock.now().toISOString(),
-          }),
-        );
+      this.#leadershipController = leadershipController;
+      await leadershipController.start();
+      if (this.#configuration.mode === "single-main") {
+        await leadershipController.waitForAuthority();
       }
-      this.#leadership = structuredClone(leadership);
       if (this.#stopRequested) return;
 
       this.#setLifecycle("running");
-      this.#driverHealth = await this.#supervisor.health(this.#drivers.clock.now().toISOString());
-      if (this.#stopRequested) return;
-      this.operations.open();
+      if (this.#leadership !== undefined) this.operations.openMutations();
     } catch (error) {
       this.operations.close();
+      await this.#leadershipController?.stop().catch(() => undefined);
+      await this.#stopReconciler().catch(() => undefined);
+      await this.#closeServices();
       await this.#supervisor.close();
       if (
         this.#lifecycle !== "failed" &&
@@ -205,20 +220,31 @@ class TegoRuntime implements Runtime {
   }
 
   async #stop(): Promise<void> {
+    const errors: unknown[] = [];
+    try {
+      await this.#leadershipController?.stop();
+    } catch (error) {
+      errors.push(error);
+    }
     await this.#startPromise?.catch(() => undefined);
     if (this.#lifecycle === "stopped") return;
     this.operations.close();
     if (this.#lifecycle === "running") this.#setLifecycle("draining");
     if (this.#lifecycle !== "stopping") this.#setLifecycle("stopping");
-    const errors = await this.#supervisor.close();
-    this.#setLifecycle("stopped");
+    try {
+      await this.#stopReconciler();
+    } catch (error) {
+      errors.push(error);
+    }
+    errors.push(...(await this.#closeServices()), ...(await this.#supervisor.close()));
+    this.#setLifecycle(errors.length === 0 ? "stopped" : "failed");
     this.#eventStream.close();
     if (errors.length > 0) {
       throw new DiagnosticError(
         runtimeDiagnostic({
           code: "BOOTSTRAP_STOP_FAILED",
-          message: "One or more runtime drivers failed to close",
-          source: { kind: "runtime", id: "driver-supervisor" },
+          message: "One or more runtime resources failed to close",
+          source: { kind: "runtime", id: "shutdown" },
           details: {
             causes: errors.map((error) => serializeCause(error)),
           },
@@ -253,8 +279,8 @@ class TegoRuntime implements Runtime {
         deployments: this.#recovery.deploymentCount,
         installations: this.#recovery.installationCount,
         recoverableOperations: this.#recovery.operations.length,
-        tasks: this.#recovery.taskCount,
-        workers: 0,
+        tasks: this.#services?.tasks.count() ?? this.#recovery.taskCount,
+        workers: this.#services?.workers.count() ?? 0,
       },
       ...(this.#leadership === undefined
         ? {}
@@ -314,6 +340,86 @@ class TegoRuntime implements Runtime {
     }
   }
 
+  async #activateAuthority(authority: RuntimeAuthority): Promise<void> {
+    if (this.#stopRequested) return;
+    if (this.#services === undefined) {
+      this.#leadership = structuredClone(authority);
+      if (this.#lifecycle === "running" && !this.#stopRequested) {
+        this.operations.openMutations();
+      }
+      return;
+    }
+
+    await this.#services.tasks.setAuthority(authority);
+    const reconciler = this.#services.createReconciler(authority);
+    this.#reconciler = reconciler;
+    await reconciler.start();
+    this.#leadership = structuredClone(authority);
+    if (this.#lifecycle === "running" && !this.#stopRequested) {
+      this.operations.openMutations();
+    }
+  }
+
+  async #deactivateAuthority(authority: RuntimeAuthority): Promise<void> {
+    if (
+      this.#leadership !== undefined &&
+      (this.#leadership.resource !== authority.resource ||
+        this.#leadership.epoch !== authority.epoch)
+    ) {
+      return;
+    }
+    this.operations.closeMutations();
+    this.#leadership = undefined;
+    if (this.#services === undefined) return;
+
+    const errors: unknown[] = [];
+    try {
+      await this.#services.tasks.setAuthority(undefined);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await this.#stopReconciler();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length > 0) {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "COORDINATION_LEADERSHIP_CALLBACK_FAILED",
+          message: "Leader-owned runtime services failed to deactivate",
+          source: { kind: "runtime", id: this.#configuration.runtimeId },
+          details: { causes: errors.map((error) => serializeCause(error)) },
+          observedAt: this.#drivers.clock.now().toISOString(),
+        }),
+      );
+    }
+  }
+
+  async #stopReconciler(): Promise<void> {
+    const reconciler = this.#reconciler;
+    if (reconciler === undefined) return;
+    await reconciler.stop();
+    if (this.#reconciler === reconciler) this.#reconciler = undefined;
+  }
+
+  async #closeServices(): Promise<readonly unknown[]> {
+    if (this.#services === undefined || this.#servicesClosed) return [];
+    this.#servicesClosed = true;
+    const errors: unknown[] = [];
+    for (const close of [
+      () => this.#services?.tasks.close(),
+      () => this.#services?.workers.close(),
+    ]) {
+      try {
+        await close();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    return errors;
+  }
+
   #setLifecycle(next: RuntimeLifecycleState): void {
     const previous = this.#lifecycle;
     this.#lifecycle = transitionRuntimeState(
@@ -349,4 +455,12 @@ export function createRuntime(
   drivers: RuntimeDrivers,
 ): Runtime {
   return new TegoRuntime(configuration, drivers);
+}
+
+export function createManagedRuntime(
+  configuration: RuntimeConfiguration,
+  drivers: RuntimeDrivers,
+  services: RuntimeHostServices,
+): Runtime {
+  return new TegoRuntime(configuration, drivers, services);
 }

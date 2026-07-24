@@ -8,7 +8,8 @@ import {
 
 export class RuntimeOperationController implements RuntimeOperations {
   readonly #clock: Clock;
-  #accepting = false;
+  #available = false;
+  #acceptingMutations = false;
   #recovered: readonly PersistedOperationJournalEntry[] = [];
 
   constructor(clock: Clock) {
@@ -16,7 +17,7 @@ export class RuntimeOperationController implements RuntimeOperations {
   }
 
   get accepting(): boolean {
-    return this.#accepting;
+    return this.#acceptingMutations;
   }
 
   setRecovered(entries: readonly PersistedOperationJournalEntry[]): void {
@@ -24,15 +25,29 @@ export class RuntimeOperationController implements RuntimeOperations {
   }
 
   open(): void {
-    this.#accepting = true;
+    this.openReadOnly();
+    this.openMutations();
+  }
+
+  openReadOnly(): void {
+    this.#available = true;
+  }
+
+  openMutations(): void {
+    this.#acceptingMutations = true;
+  }
+
+  closeMutations(): void {
+    this.#acceptingMutations = false;
   }
 
   close(): void {
-    this.#accepting = false;
+    this.#available = false;
+    this.#acceptingMutations = false;
   }
 
   async recoveredOperations(): Promise<readonly PersistedOperationJournalEntry[]> {
-    if (!this.#accepting) {
+    if (!this.#available) {
       throw new DiagnosticError(
         runtimeDiagnostic({
           code: "BOOTSTRAP_NOT_READY",

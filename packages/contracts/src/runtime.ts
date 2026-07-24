@@ -1,5 +1,6 @@
 import type { ApplicationId, FencingEpoch, NodeId, RuntimeId } from "./identity.js";
 import type { JsonObject } from "./json.js";
+import type { WorkerResourceCeilings } from "./permission.js";
 import type { DriverHealth, PersistedOperationJournalEntry } from "./state.js";
 
 export type RuntimeMode = "multi-main" | "single-main";
@@ -46,6 +47,25 @@ export interface RuntimeCounts extends JsonObject {
 export interface RuntimeAuthority extends JsonObject {
   readonly resource: string;
   readonly epoch: FencingEpoch;
+}
+
+export interface RuntimePlacementWorker extends JsonObject {
+  readonly workerId: string;
+  readonly labels: Readonly<Record<string, string>>;
+  readonly resources: WorkerResourceCeilings;
+}
+
+export interface RuntimeTaskLifecycle {
+  recover(): Promise<void>;
+  setAuthority(authority: RuntimeAuthority | undefined): Promise<void>;
+  count(): number;
+  close(): Promise<void>;
+}
+
+export interface RuntimeWorkerDirectory {
+  count(): number;
+  placements(): readonly RuntimePlacementWorker[];
+  close(): Promise<void>;
 }
 
 export interface RuntimeStatus extends JsonObject {

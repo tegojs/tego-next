@@ -37,6 +37,15 @@ export {
 } from "./capabilities/version.js";
 export { createRuntime } from "./create-runtime.js";
 export {
+  LeadershipController,
+  type LeadershipControllerOptions,
+} from "./leadership-controller.js";
+export {
+  createRuntimeHost,
+  type RuntimeHost,
+  type RuntimeHostServices,
+} from "./runtime-host.js";
+export {
   CapabilitySchemaGate,
   CapabilitySchemaRegistry,
   gateCapabilityRequest,
