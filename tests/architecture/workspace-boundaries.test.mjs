@@ -391,6 +391,43 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-rel
   );
 });
 
+test("first-layer cache boundaries distinguish internal filenames from external packages", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: {
+          "@tegojs/contracts": "0.0.0",
+          "@vendor/cache": "1.0.0",
+          "@tegojs/cache-driver": "0.0.0",
+        },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/runtime/dist/src/artifacts/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.js", outputDirectory),
+        [
+          'export { PreparedArtifactCache } from "./prepared-artifact-cache.js";',
+          'import "@vendor/cache";',
+          'import "@tegojs/cache-driver";',
+        ].join("\n"),
+      );
+      await writeFile(
+        new URL("prepared-artifact-cache.js", outputDirectory),
+        "export class PreparedArtifactCache {}",
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/runtime -> @tegojs/cache-driver",
+        "@tegojs/runtime -> @vendor/cache",
+      ]);
+    },
+  );
+});
+
 test("@spec:runtime-operations/layer-one-dependency-boundary/allows-testkit-conformance-edges", async () => {
   await withWorkspace(
     {
