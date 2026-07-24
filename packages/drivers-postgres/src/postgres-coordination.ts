@@ -495,6 +495,10 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
 
   async #acquireLeadership(resource: string): Promise<LeadershipHandle> {
     const client = await this.#pool.connect();
+    if (this.#isClosed()) {
+      this.#releaseClient(client, true);
+      throw this.#closedError();
+    }
     let session: LeadershipSession | undefined;
     const onError = (error: Error) => {
       this.#acquiringClients.delete(client);
