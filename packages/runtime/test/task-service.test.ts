@@ -5,6 +5,7 @@ import {
   parseApplicationId,
   parseAttemptId,
   parseComponentId,
+  parseDeployPluginRequest,
   parseFencingEpoch,
   parsePluginId,
   parseRevision,
@@ -897,6 +898,42 @@ test("@spec:runtime-operations/task-operations/complete-operation-payloads-have-
     () => parseRunTaskRequest({ ...request, input: oversized }),
     (error: unknown) => diagnosticCode(error) === "PROTOCOL_OPERATION_INVALID",
   );
+  assert.throws(
+    () =>
+      parseDeployPluginRequest({
+        applicationId: request.applicationId,
+        pluginId: request.pluginId,
+        artifactDigest:
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        essential: true,
+        configuration: oversized,
+        permissionGrants: [],
+        capabilityBindings: {},
+      }),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_OPERATION_INVALID",
+  );
+  assert.throws(
+    () =>
+      parseTaskRecord({
+        taskId: identity.taskId,
+        attemptId: identity.attemptId,
+        request,
+        state: "terminal",
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        executor: { id: "executor-01", type: "process" },
+        result: {
+          taskId: identity.taskId,
+          attemptId: identity.attemptId,
+          executor: { kind: "process" },
+          status: "succeeded",
+          output: oversized,
+          startedAt: now.toISOString(),
+          completedAt: now.toISOString(),
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_OPERATION_INVALID",
+  );
 });
 
 test("@spec:runtime-operations/task-operations/task-record-cross-field-invariants", () => {
@@ -922,4 +959,36 @@ test("@spec:runtime-operations/task-operations/task-record-cross-field-invariant
     () => parseRunTaskRequest({ ...request, deadline: "2026-02-30T00:00:00.000Z" }),
     /canonical UTC timestamp/u,
   );
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/replays-durable-cancellation-intent", async () => {
+  const { executor, service, state } = serviceFixture();
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "running",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: executor.id, type: executor.type },
+      authority,
+      cancellation: { requestedAt: now.toISOString(), authority },
+    }),
+    revision: 1,
+  });
+  await service.recover();
+  await service.setAuthority(authority);
+  assert.deepEqual(executor.cancelled, [`${identity.taskId}/${identity.attemptId}`]);
+});
+
+test("@spec:runtime-operations/task-operations/uncertain-remote-submit-is-redacted-and-recoverable", async () => {
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const { service } = serviceFixture(executor);
+  await service.setAuthority(authority);
+  executor.submitError = new Error("remote-submit-secret");
+  const accepted = await service.run(request);
+  assert.notEqual(accepted.state, "terminal");
+  assert.equal(accepted.diagnostic?.code, "EXECUTOR_SUBMISSION_UNKNOWN");
+  assert.doesNotMatch(JSON.stringify(accepted), /remote-submit-secret/u);
 });
