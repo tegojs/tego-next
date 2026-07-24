@@ -64,6 +64,8 @@ class TransactionalState implements StateStore {
   readonly accepted = Promise.withResolvers<void>();
   rejectTerminalWrites = false;
   beforeTransaction: (() => void) | undefined;
+  terminalPutGate: Promise<void> | undefined;
+  readonly terminalPutEntered = Promise.withResolvers<void>();
   #revision = 0;
   #tail = Promise.resolve();
 
@@ -118,6 +120,10 @@ class TransactionalState implements StateStore {
           value: V,
           options: StateWriteOptions,
         ) => {
+          if ((value as { state?: unknown }).state === "terminal") {
+            this.terminalPutEntered.resolve();
+            await this.terminalPutGate;
+          }
           staged.push({
             key: key as StateKey<JsonValue>,
             value: clone(value),
@@ -1279,6 +1285,66 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
   assert.equal(newExecutor.cancelled.length, 1);
   await service.close();
   await assert.rejects(cancellation);
+});
+
+test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-registration", async () => {
+  const oldExecutor = new ControlledExecutor("remote", "executor-01");
+  const newExecutor = new ControlledExecutor("remote", "executor-01");
+  oldExecutor.observed = {
+    state: "terminal",
+    result: {
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      executor: { kind: "remote" },
+      status: "cancelled",
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  };
+  let selected = oldExecutor;
+  let selections = 0;
+  const state = new TransactionalState();
+  const gate = Promise.withResolvers<void>();
+  state.terminalPutGate = gate.promise;
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      selections += 1;
+      return selected;
+    },
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+  await service.run(request);
+  void service.cancel(identity.taskId);
+  await state.terminalPutEntered.promise;
+  selected = newExecutor;
+  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  const selectionsAfterHandover = selections;
+  gate.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  state.terminalPutGate = undefined;
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "running",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: newExecutor.id, type: newExecutor.type },
+      authority: { ...authority, epoch: parseFencingEpoch("8") },
+      cancellation: {
+        requestedAt: now.toISOString(),
+        authority: { ...authority, epoch: parseFencingEpoch("8") },
+      },
+    }),
+    revision: 100,
+  });
+  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  assert.equal(selections, selectionsAfterHandover);
+  await service.close();
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/authority-loss-during-resolution-has-zero-cancel-effects", async () => {
