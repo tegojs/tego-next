@@ -1320,9 +1320,13 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
   void service.cancel(identity.taskId);
   await state.terminalPutEntered.promise;
   selected = newExecutor;
-  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  const handover = service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  while (newExecutor.cancelled.length === 0) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
   const selectionsAfterHandover = selections;
   gate.resolve();
+  await handover;
   await new Promise<void>((resolve) => setImmediate(resolve));
   state.terminalPutGate = undefined;
   state.records.set(`tego/tasks/${identity.taskId}`, {
