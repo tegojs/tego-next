@@ -398,6 +398,33 @@ test("component host freezes attachment count before inspecting elements", async
   assert.equal(observedAttachmentLength, 1);
 });
 
+test("component host rejects a non-primitive attachment count before inspecting elements", async (t) => {
+  let conversions = 0;
+  let elementReads = 0;
+  const attachments = new Proxy([new ArrayBuffer(0)], {
+    get(target, property, receiver) {
+      if (property === "length") {
+        return {
+          [Symbol.toPrimitive]() {
+            conversions += 1;
+            return conversions === 1 ? 0 : 65;
+          },
+        };
+      }
+      if (property === "0") elementReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  }) as unknown as readonly ArrayBuffer[];
+
+  const { result, runCalls } = await attachmentLimitResult(t, attachments);
+
+  assert.equal(conversions, 0);
+  assert.equal(elementReads, 0);
+  assert.equal(runCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "PROTOCOL_COMPONENT_HOST_COMMAND_INVALID");
+});
+
 test("prepare and import commands cannot nominate replaceable artifact locations", () => {
   const prepare = {
     protocol: "1.0",
