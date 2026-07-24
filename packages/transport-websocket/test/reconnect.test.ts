@@ -460,3 +460,35 @@ test("oversized reconnect inventory rejects attach instead of leaving a pending 
   assert.equal(rejected, true);
   await runtime.close();
 });
+
+test("acknowledged terminal attempts expire under the configured retention bound", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxAssignments: 1,
+    retentionMs: 100,
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxAssignments: 1,
+    retentionMs: 100,
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const firstRequest = executionRequest({ mode: "echo", value: "first" }, "retention-first");
+  assert.equal((await (await remote.submit(firstRequest)).result).output, "first");
+  clock.advanceBy(101);
+  await flush();
+
+  const secondRequest = executionRequest({ mode: "echo", value: "second" }, "retention-second");
+  assert.equal((await (await remote.submit(secondRequest)).result).output, "second");
+  assert.equal(await remote.observe(firstRequest.taskId, firstRequest.attemptId), undefined);
+  assert.equal(local.executions, 2);
+  await Promise.all([remote.close(), runtime.close()]);
+});
