@@ -64,6 +64,27 @@ export function coordinationConformance(
       }
     });
 
+    test("@spec:coordination-provider/provider-conformance-contract/monotonic-namespace-epochs", async () => {
+      const left = await openProvider(factory, "epochs-left");
+      const right = await openProvider(factory, "epochs-right");
+      try {
+        const leftFirst = await left.nextEpoch("runtime");
+        const [leftSecond, rightFirst] = await Promise.all([
+          left.nextEpoch("runtime"),
+          right.nextEpoch("runtime"),
+        ]);
+        const rightSecond = await right.nextEpoch("runtime");
+        assert.match(leftFirst, /^(?:0|[1-9]\d*)$/u);
+        assert.match(leftSecond, /^(?:0|[1-9]\d*)$/u);
+        assert.match(rightFirst, /^(?:0|[1-9]\d*)$/u);
+        assert.match(rightSecond, /^(?:0|[1-9]\d*)$/u);
+        assert.ok(BigInt(leftSecond) > BigInt(leftFirst));
+        assert.ok(BigInt(rightSecond) > BigInt(rightFirst));
+      } finally {
+        await Promise.all([left.close(), right.close()]);
+      }
+    });
+
     test("@spec:coordination-provider/fenced-leadership/exclusive-monotonic-takeover", async () => {
       const leader = await openProvider(factory, "leadership");
       const follower = await openProvider(factory, "leadership");
@@ -120,6 +141,27 @@ export function coordinationConformance(
       }
     });
 
+    test("@spec:coordination-provider/provider-conformance-contract/same-owner-lease-renewal", async () => {
+      const provider = await openProvider(factory, "lease-renewal");
+      try {
+        const first = await provider.acquireLease({
+          resource: "task/renewed",
+          owner: "worker-a",
+          durationMs: 100,
+        });
+        await delay(10);
+        const renewed = await provider.acquireLease({
+          resource: "task/renewed",
+          owner: "worker-a",
+          durationMs: 250,
+        });
+        assert.equal(renewed.epoch, first.epoch);
+        assert.ok(Date.parse(renewed.expiresAt) > Date.parse(first.expiresAt));
+      } finally {
+        await provider.close();
+      }
+    });
+
     test("@spec:coordination-provider/atomic-compare-and-set/concurrent-writers", async () => {
       const left = await openProvider(factory, "cas");
       const right = await openProvider(factory, "cas");
@@ -149,6 +191,40 @@ export function coordinationConformance(
         assert.ok(outcomes.every((outcome) => outcome.revision !== undefined));
       } finally {
         await Promise.all([left.close(), right.close()]);
+      }
+    });
+
+    test("@spec:coordination-provider/provider-conformance-contract/cas-current-revision", async () => {
+      const provider = await openProvider(factory, "cas-replay");
+      try {
+        const first = await provider.compareAndSet({
+          key: "stable",
+          expectedRevision: "absent",
+          value: { version: 1 },
+        });
+        assert.equal(first.applied, true);
+        assert.ok(first.revision);
+
+        const replay = await provider.compareAndSet({
+          key: "stable",
+          expectedRevision: "absent",
+          value: { version: 1 },
+        });
+        assert.deepEqual(replay, {
+          applied: false,
+          revision: first.revision,
+          value: { version: 1 },
+        });
+
+        const updated = await provider.compareAndSet({
+          key: "stable",
+          expectedRevision: first.revision,
+          value: { version: 2 },
+        });
+        assert.equal(updated.applied, true);
+        assert.ok(BigInt(updated.revision ?? "0") > BigInt(first.revision));
+      } finally {
+        await provider.close();
       }
     });
 

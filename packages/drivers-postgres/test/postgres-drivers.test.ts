@@ -27,11 +27,13 @@ stateStoreConformance(
   { name: "PostgreSQL StateStore conformance" },
 );
 
+const coordinationTestNamespace = namespace("coordination");
+
 coordinationConformance(
   (requestedNamespace) =>
     new PostgresCoordinationProvider({
       connectionString,
-      namespace: `coordination_${requestedNamespace ?? "default"}`,
+      namespace: `${coordinationTestNamespace}_${requestedNamespace ?? "default"}`,
     }),
   { name: "PostgreSQL CoordinationProvider conformance" },
 );
