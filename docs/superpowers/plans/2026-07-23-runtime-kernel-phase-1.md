@@ -690,7 +690,7 @@ Commit: `git add packages/testkit packages/executor-node && git commit -m "feat:
 **Interfaces:**
 - Produces: `ThreadExecutor` implementing the same `Executor`.
 
-- [ ] **Step 1: Write and commit the same conformance invocation for threads**
+- [x] **Step 1: Write and commit the same conformance invocation for threads**
 
 Add thread-specific assertions for transferable `ArrayBuffer`, worker exit, and
 documentation metadata declaring `securityIsolation: false`.
@@ -701,17 +701,17 @@ Expected: FAIL because `ThreadExecutor` is not exported.
 
 Commit: `git add packages/executor-node/test/thread-executor.test.ts && git commit -m "test: require thread executor parity"`
 
-- [ ] **Step 2: Implement MessagePort transport and transferable payloads**
+- [x] **Step 2: Implement MessagePort transport and transferable payloads**
 
 Reuse the ComponentHost protocol codec and attempt registry. Transfer owned
 buffers only when the execution request marks them transferable.
 
-- [ ] **Step 3: Implement worker exit replacement and drain**
+- [x] **Step 3: Implement worker exit replacement and drain**
 
 Resolve every inflight attempt before replacing a dead Worker. Drain refuses new
 submissions, waits for terminal attempts, then terminates idle Workers.
 
-- [ ] **Step 4: Run both executor suites and commit**
+- [x] **Step 4: Run both executor suites and commit**
 
 Run: `npm run build -w @tegojs/executor-node && node --test packages/executor-node/dist/test/process-executor.test.js packages/executor-node/dist/test/thread-executor.test.js`
 
