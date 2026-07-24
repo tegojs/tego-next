@@ -1,10 +1,48 @@
-export { buildPlugin, type BuildPluginOptions } from "./plugin/build-plugin.js";
+export { type ControlClientOptions, requestControl } from "./control/client.js";
 export {
-  packPlugin,
+  CONTROL_PROTOCOL_VERSION,
+  type ControlRequest,
+  type ControlResponse,
+  DEFAULT_CONTROL_TIMEOUT_MS,
+  MAX_CONTROL_LINE_BYTES,
+  MAX_CONTROL_OUTSTANDING_REQUESTS,
+  type RuntimeOperationName,
+} from "./control/protocol.js";
+export {
+  type ControlRuntimeOperations,
+  type ControlServer,
+  type ControlServerOptions,
+  type LocalArtifactIngress,
+  startControlServer,
+} from "./control/server.js";
+export {
+  defaultControlEndpoint,
+  defaultDataDirectory,
+  type ParsedCommand,
+  parseCommand,
+  type RuntimeStartCommand,
+  type RuntimeStatusCommand,
+  type RuntimeStopCommand,
+} from "./parse-command.js";
+export { type BuildPluginOptions, buildPlugin } from "./plugin/build-plugin.js";
+export {
   type PackedPluginArtifact,
   type PackPluginOptions,
+  packPlugin,
 } from "./plugin/pack-plugin.js";
 export {
-  signArtifact,
   type SignArtifactOptions,
+  signArtifact,
 } from "./plugin/sign-plugin.js";
+export { type CliRunOptions, runCli } from "./run-cli.js";
+export {
+  type CreateNodeRuntimeHostOptions,
+  createNodeRuntimeHost,
+  type NodeRuntimeHost,
+} from "./runtime/create-node-runtime-host.js";
+export {
+  type MainProcessOptions,
+  type NodeMainProcessOptions,
+  runMainProcess,
+  runNodeMainProcess,
+} from "./runtime/main-process.js";

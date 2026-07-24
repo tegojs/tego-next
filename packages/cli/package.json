@@ -6,6 +6,9 @@
     "dist"
   ],
   "types": "./dist/src/index.d.ts",
+  "bin": {
+    "tego": "./dist/src/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/src/index.d.ts",
@@ -19,7 +22,11 @@
   },
   "dependencies": {
     "@tegojs/contracts": "0.0.0",
+    "@tegojs/drivers-local": "0.0.0",
+    "@tegojs/drivers-postgres": "0.0.0",
+    "@tegojs/executor-node": "0.0.0",
     "@tegojs/runtime": "0.0.0",
+    "@tegojs/transport-websocket": "0.0.0",
     "typescript": "7.0.2"
   }
 }

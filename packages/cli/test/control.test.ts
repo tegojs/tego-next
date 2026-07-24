@@ -5,24 +5,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-  parsePluginInstallation,
   type ArtifactDigest,
   type InstallPluginRequest,
   type JsonValue,
+  parsePluginInstallation,
+  parseRuntimeStatus,
   type RuntimeOperations,
 } from "@tegojs/contracts";
-import {
-  MAX_CONTROL_LINE_BYTES,
-  type ControlResponse,
-} from "../src/control/protocol.js";
 import { requestControl } from "../src/control/client.js";
-import {
-  startControlServer,
-  type ControlRuntimeOperations,
-} from "../src/control/server.js";
+import { type ControlResponse, MAX_CONTROL_LINE_BYTES } from "../src/control/protocol.js";
+import { type ControlRuntimeOperations, startControlServer } from "../src/control/server.js";
 
 function runtimeStatus() {
-  return {
+  return parseRuntimeStatus({
     identity: {
       runtimeId: "runtime-control-test",
       applicationId: "application-control-test",
@@ -41,26 +36,36 @@ function runtimeStatus() {
       tasks: 0,
       workers: 0,
     },
-  };
+  });
 }
 
 function fakeRuntimeOperations(): RuntimeOperations {
   return {
-    installPlugin: async (request) => parsePluginInstallation({
-      pluginId: "plugin-control-test",
-      version: "1.0.0",
-      digest: request.digest,
-      installedAt: "2026-07-25T00:00:00.000Z",
-      manifest: {
-        schemaVersion: "1.0",
+    installPlugin: async (request) =>
+      parsePluginInstallation({
         pluginId: "plugin-control-test",
         version: "1.0.0",
-        engine: { tego: ">=0.0.0" },
-        components: [],
-        capabilities: { provides: [], requires: [] },
-        permissions: [],
-      },
-    }),
+        digest: request.digest,
+        installedAt: "2026-07-25T00:00:00.000Z",
+        manifest: {
+          schemaVersion: "1.0",
+          pluginId: "plugin-control-test",
+          version: "1.0.0",
+          contractRange: "^1.0.0",
+          nodeRange: ">=26.0.0",
+          moduleFormat: "esm",
+          components: [
+            {
+              componentId: "component-control-test",
+              kind: "task",
+              entrypoint: "dist/component.js",
+              executors: ["thread"],
+            },
+          ],
+          capabilities: { provides: [], requires: [] },
+          permissions: [],
+        },
+      }),
     deployPlugin: () => Promise.reject(new Error("not used")),
     pluginStatus: () => Promise.reject(new Error("not used")),
     runTask: () => Promise.reject(new Error("not used")),

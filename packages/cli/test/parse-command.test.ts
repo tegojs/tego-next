@@ -174,21 +174,38 @@ test("@spec:runtime-operations/local-runtime-operations/detached-start-waits-for
 });
 
 test("@spec:runtime-operations/local-runtime-operations/graceful-idempotent-stop", async () => {
-  const stdout = capture();
+  const firstStdout = capture();
+  const secondStdout = capture();
   const stderr = capture();
   const requests: string[] = [];
-  const exitCode = await runCli({
+  let stopped = false;
+  const requestControl = async (request: { readonly operation: string }) => {
+    requests.push(request.operation);
+    if (stopped) {
+      const error = new Error("connect ENOENT") as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+    stopped = true;
+    return response({ stopped: true });
+  };
+  const firstExitCode = await runCli({
     argv: ["runtime", "stop", "--json"],
-    stdout: stdout.stream,
+    stdout: firstStdout.stream,
     stderr: stderr.stream,
-    requestControl: async (request: { readonly operation: string }) => {
-      requests.push(request.operation);
-      return response({ stopped: true });
-    },
+    requestControl,
+  });
+  const secondExitCode = await runCli({
+    argv: ["runtime", "stop", "--json"],
+    stdout: secondStdout.stream,
+    stderr: stderr.stream,
+    requestControl,
   });
 
-  assert.equal(exitCode, 0);
-  assert.deepEqual(requests, ["runtime.stop"]);
-  assert.deepEqual(JSON.parse(stdout.read()), { stopped: true });
+  assert.equal(firstExitCode, 0);
+  assert.equal(secondExitCode, 0);
+  assert.deepEqual(requests, ["runtime.stop", "runtime.stop"]);
+  assert.deepEqual(JSON.parse(firstStdout.read()), { stopped: true });
+  assert.deepEqual(JSON.parse(secondStdout.read()), { alreadyStopped: true, stopped: true });
   assert.equal(stderr.read(), "");
 });
