@@ -37,20 +37,20 @@ The repository will contain:
 
 ```text
 packages/
-  contracts/               @tego-next/contracts
-  kernel/                  @tego-next/kernel
-  coordination-local/      @tego-next/coordination-local
-  coordination-postgres/   @tego-next/coordination-postgres
-  executor-node/           @tego-next/executor-node
-  transport-websocket/     @tego-next/transport-websocket
-  plugin-sdk/              @tego-next/plugin-sdk
-  testkit/                 @tego-next/testkit
-  cli/                     @tego-next/cli
+  contracts/               @tegojs/contracts
+  runtime/                 @tegojs/runtime
+  drivers-local/           @tegojs/drivers-local
+  drivers-postgres/        @tegojs/drivers-postgres
+  executor-node/           @tegojs/executor-node
+  transport-websocket/     @tegojs/transport-websocket
+  plugin-sdk/              @tegojs/plugin-sdk
+  testkit/                 @tegojs/testkit
+  cli/                     @tegojs/cli
 examples/
   echo-plugin/
 ```
 
-`contracts` contains only data contracts, runtime validators, and error codes. `kernel` depends on contracts and driver interfaces but not on concrete drivers. Driver and executor packages depend inward on contracts. The CLI composes packages without becoming a privileged runtime API.
+`contracts` contains only data contracts, runtime validators, and error codes. `runtime` depends on contracts and driver interfaces but not on concrete drivers. Driver and executor packages depend inward on contracts. The CLI composes packages without becoming a privileged runtime API.
 
 Alternatives considered:
 
@@ -71,17 +71,17 @@ This avoids the circular requirement where the plugin system needs a plugin in o
 
 There is no separate “strict one OS process” product mode. Thread and child-process execution are executor choices, not deployment modes.
 
-### 4. Use SQLite for durable single-Main state
+### 4. Use a local driver set for durable single-Main state
 
-The local state driver uses `node:sqlite`. Writes are transactional and records carry a monotonically increasing revision. Runtime restart reconstructs installations, deployments, operation journals, and unfinished tasks before accepting new work.
+`@tegojs/drivers-local` supplies a `node:sqlite` state store, local coordination, a filesystem artifact store, process hosting, system clock, and development secret source. Writes are transactional and records carry a monotonically increasing revision. Runtime restart reconstructs installations, deployments, operation journals, and unfinished tasks before accepting new work.
 
 An in-memory implementation remains available for unit tests. It is not advertised as crash-durable.
 
 JSON files were rejected because multi-record transitions, revisions, and crash recovery would require rebuilding transaction semantics.
 
-### 5. Use PostgreSQL as the first certified multi-Main coordination provider
+### 5. Use PostgreSQL as the first certified multi-Main driver set
 
-The PostgreSQL driver provides:
+`@tegojs/drivers-postgres` provides shared state, artifact bytes, and coordination so a multi-Main deployment never relies on node-local control-plane state. Its coordination implementation provides:
 
 - leadership with a dedicated advisory-lock connection;
 - a transactional, monotonically increasing fencing epoch;
@@ -137,6 +137,15 @@ This phase establishes enforcement points and tests. It does not attempt operati
 
 An execution request contains stable `taskId`, `attemptId`, artifact digest, component ID, input, deadline, cancellation token identity, permission grant, and artifact references. Results contain a terminal status, structured error, output, timing, and the same identities.
 
+`unknown` remains a non-terminal reconciliation state. `indeterminate` is a
+distinct terminal observation used only when execution or a durable state
+transition may have completed but the persistence boundary cannot prove the
+authoritative result. An indeterminate result has no output, requires a
+non-retryable structured diagnostic, and never authorizes automatic retry.
+Task inspection and audit surfaces preserve that distinction. A later restart
+may recover a durable terminal record as explicit recovery evidence, but it
+does not rewrite the historical result already delivered to a caller.
+
 The Node executor package supplies:
 
 - `ThreadExecutor` using `node:worker_threads`;
@@ -152,7 +161,7 @@ Either Worker or Main may initiate the WebSocket connection. After authenticatio
 
 Messages use an envelope with protocol version, message ID, session ID, sequence, correlation ID, type, and payload. Registration and heartbeat advertise Worker labels, resources, executors, and prepared artifact digests.
 
-Task assignment is acknowledged before execution. Duplicate assignments are deduplicated by `(taskId, attemptId)`. On reconnect, the Worker reports running and buffered terminal results. The Main then resumes, cancels, or acknowledges them according to the task’s orphan policy.
+Task assignment is acknowledged before execution. Duplicate assignments are deduplicated by `(taskId, attemptId)`. On reconnect, the Worker reports running and buffered terminal results plus whether its attempt-state persistence boundary is available. The Main then resumes, cancels, or acknowledges them according to the task’s orphan policy. A higher transport epoch alone does not clear persistence unavailability; Main advertises the Worker as healthy again only after reconciliation explicitly proves a recovered persistence boundary.
 
 ### 12. Make observability a kernel contract, not an HTTP dependency
 

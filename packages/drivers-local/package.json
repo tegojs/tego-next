@@ -1,0 +1,25 @@
+{
+  "name": "@tegojs/drivers-local",
+  "version": "0.0.0",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@tegojs/contracts": "0.0.0"
+  },
+  "devDependencies": {
+    "@tegojs/testkit": "0.0.0"
+  }
+}

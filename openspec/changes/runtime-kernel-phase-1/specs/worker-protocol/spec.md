@@ -26,11 +26,19 @@ The Worker SHALL register labels, resources, executors, and prepared artifacts a
 - **THEN** the Main marks it unavailable and stops assigning new tasks
 
 ### Requirement: Reconnect reconciliation
-The protocol SHALL reconcile running attempts and buffered terminal results after a session reconnect.
+The protocol SHALL reconcile running attempts, buffered terminal results, and Worker attempt-persistence availability after a session reconnect. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch.
 
 #### Scenario: Result completes while disconnected
 - **WHEN** a task using `finish-and-buffer` completes after its session disconnects
 - **THEN** the Worker sends the buffered result after reconnect and the Main records it once
+
+#### Scenario: Persistence-latched Worker reconnects
+- **WHEN** the same Worker runtime reconnects at a higher session epoch while its attempt persistence remains unavailable
+- **THEN** Main keeps its remote executor degraded and unavailable for scheduling
+
+#### Scenario: Recovered Worker runtime reconnects
+- **WHEN** a higher-epoch Worker reconciliation explicitly reports attempt persistence available
+- **THEN** Main may clear the prior persistence latch and advertise the remote executor as available
 
 ### Requirement: Orphan policy
 The runtime SHALL apply `cancel`, `finish-and-buffer`, or `finish-and-persist` when a Worker loses its Main session.

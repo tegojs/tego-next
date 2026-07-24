@@ -21,6 +21,17 @@ Every executor SHALL accept cancellation and enforce execution deadlines with a 
 - **WHEN** a caller cancels an acknowledged running task
 - **THEN** the executor requests cooperative cancellation, terminates it after the grace period if necessary, and reports `cancelled`
 
+### Requirement: Indeterminate terminal observation
+An executor SHALL report `indeterminate` when execution or terminal persistence may have completed but the authoritative result cannot be proven. An indeterminate result SHALL contain no output, SHALL include a structured diagnostic with `retryable: false`, and SHALL NOT authorize automatic retry.
+
+#### Scenario: Terminal persistence completes after timeout
+- **WHEN** a remote terminal persistence operation exceeds its timeout and may later become visible
+- **THEN** the caller and `observe` receive one frozen `indeterminate` result without output and a later durable result is treated only as explicit recovery evidence
+
+#### Scenario: Automatic retry considers an indeterminate result
+- **WHEN** retry policy evaluates an `indeterminate` attempt
+- **THEN** it does not create a replacement attempt unless an operator or explicit policy advances to a new attempt ID after accounting for possible prior side effects
+
 ### Requirement: Executor failure containment
 An executor runtime SHALL record task failure and restore executor capacity after a thread exit, child-process crash, or remote-session loss.
 

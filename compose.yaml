@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16.14-alpine
+    environment:
+      POSTGRES_DB: tego_next_test
+      POSTGRES_PASSWORD: tego_test
+      POSTGRES_USER: tego_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tego_test -d tego_next_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "55432:5432"
