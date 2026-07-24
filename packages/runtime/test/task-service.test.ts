@@ -31,6 +31,7 @@ import {
   type StateWriteOptions,
   type Versioned,
 } from "@tegojs/contracts";
+import { FakeClock } from "@tegojs/testkit";
 import { RuntimeOperationController, TaskService, type TaskIdentity } from "../src/index.js";
 
 const now = new Date("2026-07-25T00:00:00.000Z");
@@ -54,6 +55,7 @@ class TransactionalState implements StateStore {
   readonly writes: string[] = [];
   readonly accepted = Promise.withResolvers<void>();
   rejectTerminalWrites = false;
+  beforeTransaction: (() => void) | undefined;
   #revision = 0;
   #tail = Promise.resolve();
 
@@ -66,6 +68,8 @@ class TransactionalState implements StateStore {
     work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
     const execution = this.#tail.then(async () => {
+      this.beforeTransaction?.();
+      this.beforeTransaction = undefined;
       const staged: Array<{
         key: StateKey<JsonValue>;
         value: JsonValue;
@@ -192,6 +196,10 @@ class ControlledExecutor implements Executor {
   submitGate: Promise<void> = Promise.resolve();
   observed: Awaited<ReturnType<Executor["observe"]>> = undefined;
   submitError: Error | undefined;
+  observeGate: Promise<void> = Promise.resolve();
+  observeError: Error | undefined;
+  cancelGate: Promise<void> = Promise.resolve();
+  handleTaskId: ExecutionRequest["taskId"] | undefined;
 
   constructor(type: "process" | "remote" | "thread" = "process", id = "executor-01") {
     this.type = type;
@@ -212,14 +220,20 @@ class ControlledExecutor implements Executor {
     await this.submitGate;
     this.submitted.push(structuredClone(request));
     if (this.submitError !== undefined) throw this.submitError;
-    return { taskId: request.taskId, attemptId: request.attemptId, result: this.result.promise };
+    return {
+      taskId: this.handleTaskId ?? request.taskId,
+      attemptId: request.attemptId,
+      result: this.result.promise,
+    };
   }
-  observe() {
-    return Promise.resolve(this.observed);
+  async observe() {
+    await this.observeGate;
+    if (this.observeError !== undefined) throw this.observeError;
+    return this.observed;
   }
-  cancel(taskId: ExecutionRequest["taskId"], attemptId: ExecutionRequest["attemptId"]) {
+  async cancel(taskId: ExecutionRequest["taskId"], attemptId: ExecutionRequest["attemptId"]) {
     this.cancelled.push(`${taskId}/${attemptId}`);
-    return Promise.resolve();
+    await this.cancelGate;
   }
   drain() {
     return Promise.resolve();
@@ -701,4 +715,184 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
     pluginId: request.pluginId,
   });
   assert.equal(status.desired?.generation, "2");
+});
+
+test("@spec:runtime-operations/task-operations/old-epoch-completion-cannot-use-new-authority", async () => {
+  const { executor, service, state } = serviceFixture();
+  await service.setAuthority(authority);
+  await service.run(request);
+  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  executor.result.resolve({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    executor: { kind: "process" },
+    status: "succeeded",
+    output: { secret: true },
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const durable = await state.read<JsonValue>({
+    namespace: "tego",
+    collection: "tasks",
+    id: identity.taskId,
+  });
+  assert.equal((durable?.value as { state?: unknown }).state, "running");
+});
+
+test("@spec:runtime-operations/task-operations/durable-terminal-replaces-ephemeral-uncertainty", async () => {
+  const { executor, service, state } = serviceFixture();
+  await service.setAuthority(authority);
+  await service.run(request);
+  state.rejectTerminalWrites = true;
+  executor.result.reject(new Error("persistence-secret"));
+  assert.equal((await service.wait(identity.taskId)).result?.status, "indeterminate");
+  state.rejectTerminalWrites = false;
+  const succeeded = parseTaskRecord({
+    ...(await service.status(identity.taskId)),
+    state: "terminal",
+    updatedAt: now.toISOString(),
+    result: {
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      executor: { kind: "process" },
+      status: "succeeded",
+      output: { durable: true },
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: succeeded, revision: 99 });
+  assert.equal((await service.status(identity.taskId))?.result?.status, "succeeded");
+});
+
+test("@spec:runtime-operations/task-operations/cancellation-intent-is-durable-before-effect", async () => {
+  const { executor, service, state } = serviceFixture();
+  await service.setAuthority(authority);
+  await service.run(request);
+  const gate = Promise.withResolvers<void>();
+  executor.cancelGate = gate.promise;
+  const cancellation = service.cancel(identity.taskId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const durable = await state.read<JsonValue>({
+    namespace: "tego",
+    collection: "tasks",
+    id: identity.taskId,
+  });
+  assert.equal(
+    (durable?.value as { cancellation?: { authority?: { epoch?: unknown } } }).cancellation
+      ?.authority?.epoch,
+    authority.epoch,
+  );
+  gate.resolve();
+  executor.result.resolve({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    executor: { kind: "process" },
+    status: "cancelled",
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  });
+  assert.equal((await cancellation).result?.status, "cancelled");
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/remote-observation-failure-stays-nonterminal", async () => {
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const { service, state } = serviceFixture(executor);
+  const running = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "running",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    executor: { id: executor.id, type: executor.type },
+    authority,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
+  executor.observeError = new Error("remote-token-must-not-leak");
+  await service.recover();
+  await service.setAuthority(authority);
+  const recovered = await service.status(identity.taskId);
+  assert.notEqual(recovered?.state, "terminal");
+  assert.doesNotMatch(JSON.stringify(recovered), /remote-token-must-not-leak/u);
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/observation-is-clock-bounded-and-close-settles-recovery", async () => {
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const state = new TransactionalState();
+  const runtimeClock = new FakeClock(now);
+  const service = new TaskService({
+    state,
+    clock: runtimeClock,
+    selectExecutor: async () => executor,
+    createIdentity: () => identity,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "running",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: executor.id, type: executor.type },
+      authority,
+    }),
+    revision: 1,
+  });
+  executor.observeGate = new Promise<void>(() => {});
+  await service.recover();
+  let settled = false;
+  const recovery = service.setAuthority(authority).finally(() => {
+    settled = true;
+  });
+  runtimeClock.advanceBy(5_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, true);
+  await service.close();
+  await recovery;
+});
+
+test("@spec:runtime-operations/task-operations/rejected-handle-is-consumed-and-classified", async () => {
+  const { executor, service } = serviceFixture();
+  await service.setAuthority(authority);
+  executor.handleTaskId = parseTaskId("wrong-task");
+  executor.result.reject(new Error("executor-secret"));
+  const record = await service.run(request);
+  assert.equal(record.result?.status, "indeterminate");
+  assert.doesNotMatch(JSON.stringify(record), /executor-secret/u);
+});
+
+test("@spec:runtime-operations/task-operations/complete-operation-payloads-have-one-mebibyte-limit", () => {
+  const oversized = "x".repeat(1_048_576);
+  assert.throws(
+    () => parseRunTaskRequest({ ...request, input: oversized }),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_OPERATION_INVALID",
+  );
+});
+
+test("@spec:runtime-operations/task-operations/task-record-cross-field-invariants", () => {
+  const base = {
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "terminal",
+    createdAt: "2026-07-25T00:00:01.000Z",
+    updatedAt: "2026-07-25T00:00:00.000Z",
+    executor: { id: "executor-01", type: "process" },
+    result: {
+      taskId: parseTaskId("wrong-task"),
+      attemptId: identity.attemptId,
+      executor: { kind: "remote" },
+      status: "succeeded",
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  };
+  assert.throws(() => parseTaskRecord(base), /updatedAt/u);
+  assert.throws(
+    () => parseRunTaskRequest({ ...request, deadline: "2026-02-30T00:00:00.000Z" }),
+    /canonical UTC timestamp/u,
+  );
 });
