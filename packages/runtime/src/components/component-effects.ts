@@ -7,6 +7,7 @@ import {
   type PluginDeployment,
   type RuntimeAuthority,
 } from "@tegojs/contracts";
+import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { PreparedArtifactCache } from "../artifacts/prepared-artifact-cache.js";
 import type { ComponentEffectExecutor } from "../reconcile/reconciler.js";
 import type { ReconcileEffect } from "../reconcile/plan.js";
@@ -26,15 +27,33 @@ export interface ComponentEffectsOptions {
   readonly artifacts: Pick<PreparedArtifactCache, "prepare" | "release">;
   readonly registry: ComponentRegistry;
   readonly supportedExecutors: readonly ExecutorKind[];
-  readonly resolveDeployment: (effect: ReconcileEffect) => Promise<PluginDeployment | undefined>;
+  readonly resolveDeployment: (
+    effect: ReconcileEffect,
+  ) => Promise<ValidatedComponentDeployment | undefined>;
   readonly host: ComponentLifecycleHost;
   readonly authority?: () => RuntimeAuthority | undefined;
+}
+
+export interface ValidatedComponentDeployment {
+  readonly deployment: PluginDeployment;
+  readonly artifact: Pick<ValidatedPluginArtifact, "digest" | "manifest">;
 }
 
 interface CachedOperation {
   readonly fingerprint: string;
   readonly result: Promise<void>;
+  readonly instanceId: string;
+  readonly authority: RuntimeAuthority | undefined;
+  status: "pending" | "succeeded";
 }
+
+interface OperationFingerprint {
+  readonly fingerprint: string;
+  readonly instanceId: string;
+}
+
+const MAX_STOPPED_OPERATIONS = 256;
+const MAX_FAILED_OPERATIONS = 256;
 
 function effectFingerprint(effect: ReconcileEffect): string {
   return JSON.stringify([
@@ -49,6 +68,13 @@ function effectFingerprint(effect: ReconcileEffect): string {
     effect.workerId ?? null,
     effect.messageId,
   ]);
+}
+
+function sameAuthority(
+  left: RuntimeAuthority | undefined,
+  right: RuntimeAuthority | undefined,
+): boolean {
+  return left?.resource === right?.resource && left?.epoch === right?.epoch;
 }
 
 function effectError(
@@ -80,6 +106,9 @@ export class ComponentEffects implements ComponentEffectExecutor {
   readonly #host: ComponentLifecycleHost;
   readonly #authority: () => RuntimeAuthority | undefined;
   readonly #operations = new Map<string, CachedOperation>();
+  readonly #fingerprints = new Map<string, OperationFingerprint>();
+  readonly #stoppedOperations: string[] = [];
+  readonly #failedOperations: string[] = [];
 
   constructor(options: ComponentEffectsOptions) {
     this.#artifacts = options.artifacts;
@@ -91,26 +120,67 @@ export class ComponentEffects implements ComponentEffectExecutor {
   }
 
   perform(effect: ReconcileEffect): Promise<void> {
+    const authority = this.#authority();
     const fingerprint = effectFingerprint(effect);
+    const known = this.#fingerprints.get(effect.operationId);
+    if (known !== undefined && known.fingerprint !== fingerprint) {
+      return Promise.reject(
+        effectError(
+          "LIFECYCLE_OPERATION_CONFLICT",
+          "Lifecycle operation identity was reused with a different payload",
+          effect,
+        ),
+      );
+    }
     const existing = this.#operations.get(effect.operationId);
     if (existing !== undefined) {
-      if (existing.fingerprint !== fingerprint) {
-        return Promise.reject(
-          effectError(
-            "LIFECYCLE_OPERATION_CONFLICT",
-            "Lifecycle operation identity was reused with a different payload",
-            effect,
-          ),
-        );
+      if (!sameAuthority(existing.authority, authority)) {
+        const completedStop =
+          effect.kind === "stop" &&
+          existing.status === "succeeded" &&
+          this.#registry.get(effect.instanceId) === undefined;
+        const stoppingCleanup =
+          effect.kind === "stop" &&
+          this.#registry.get(effect.instanceId)?.state === "stopping" &&
+          existing.status === "pending";
+        if (!completedStop && !stoppingCleanup) {
+          return Promise.reject(
+            effectError(
+              "LIFECYCLE_AUTHORITY_LOST",
+              "Lifecycle operation cannot replay under another authority",
+              effect,
+            ),
+          );
+        }
       }
       return existing.result;
     }
-    const result = this.#perform(effect);
-    this.#operations.set(effect.operationId, { fingerprint, result });
+    this.#removeFailedOperation(effect.operationId);
+    this.#fingerprints.set(effect.operationId, { fingerprint, instanceId: effect.instanceId });
+    const result = this.#perform(effect, authority);
+    const operation: CachedOperation = {
+      fingerprint,
+      result,
+      instanceId: effect.instanceId,
+      authority,
+      status: "pending",
+    };
+    this.#operations.set(effect.operationId, operation);
+    void result.then(
+      () => {
+        operation.status = "succeeded";
+      },
+      () => {
+        if (this.#operations.get(effect.operationId)?.result === result) {
+          this.#operations.delete(effect.operationId);
+          this.#retainFailedOperation(effect.operationId);
+        }
+      },
+    );
     return result;
   }
 
-  async #perform(effect: ReconcileEffect): Promise<void> {
+  async #perform(effect: ReconcileEffect, authority: RuntimeAuthority | undefined): Promise<void> {
     if (!this.supportedExecutors.includes(effect.executor)) {
       throw effectError(
         "LIFECYCLE_EXECUTOR_UNSUPPORTED",
@@ -118,13 +188,17 @@ export class ComponentEffects implements ComponentEffectExecutor {
         effect,
       );
     }
-    const authority = this.#authority();
+    this.#assertCurrentAuthority(effect, authority);
     if (effect.kind === "prepare") {
       await this.#prepare(effect, authority);
       return;
     }
-    const entry = this.#registry.require(effect.instanceId);
-    this.#registry.assertMatches(effect, entry, authority);
+    let entry = this.#registry.require(effect.instanceId);
+    if (effect.kind === "stop" && entry.state === "stopping") {
+      entry = this.#registry.takeoverStopping(effect, authority);
+    } else {
+      this.#registry.assertMatches(effect, entry, authority);
+    }
     if (effect.kind === "start") {
       if (entry.state !== "prepared") {
         throw effectError(
@@ -134,6 +208,14 @@ export class ComponentEffects implements ComponentEffectExecutor {
         );
       }
       await this.#host.start(entry.binding);
+      if (!this.#authorityMatches(authority)) {
+        await this.#cleanupAfterAuthorityLoss(effect, entry, authority);
+        throw effectError(
+          "LIFECYCLE_AUTHORITY_LOST",
+          "Leadership authority changed while the component was starting",
+          effect,
+        );
+      }
       this.#registry.transition(effect, "prepared", "active", authority);
       return;
     }
@@ -146,6 +228,14 @@ export class ComponentEffects implements ComponentEffectExecutor {
         );
       }
       await this.#host.drain(entry.binding);
+      if (!this.#authorityMatches(authority)) {
+        await this.#cleanupAfterAuthorityLoss(effect, entry, authority);
+        throw effectError(
+          "LIFECYCLE_AUTHORITY_LOST",
+          "Leadership authority changed while the component was draining",
+          effect,
+        );
+      }
       this.#registry.transition(effect, "active", "draining", authority);
       return;
     }
@@ -158,13 +248,15 @@ export class ComponentEffects implements ComponentEffectExecutor {
       this.#registry.assertMatches(effect, current, authority);
       return;
     }
-    const deployment = await this.#resolveDeployment(effect);
+    const resolved = await this.#resolveDeployment(effect);
     if (
-      deployment === undefined ||
-      deployment.applicationId !== effect.applicationId ||
-      deployment.pluginId !== effect.pluginId ||
-      deployment.generation !== effect.deploymentGeneration ||
-      deployment.artifactDigest !== effect.artifactDigest
+      resolved === undefined ||
+      resolved.artifact.digest !== effect.artifactDigest ||
+      resolved.artifact.manifest.pluginId !== effect.pluginId ||
+      resolved.deployment.applicationId !== effect.applicationId ||
+      resolved.deployment.pluginId !== effect.pluginId ||
+      resolved.deployment.generation !== effect.deploymentGeneration ||
+      resolved.deployment.artifactDigest !== effect.artifactDigest
     ) {
       throw effectError(
         "LIFECYCLE_DEPLOYMENT_IDENTITY_MISMATCH",
@@ -172,16 +264,23 @@ export class ComponentEffects implements ComponentEffectExecutor {
         effect,
       );
     }
+    const { deployment } = resolved;
     const artifact = await this.#artifacts.prepare({ digest: effect.artifactDigest });
     try {
-      const component = artifact.manifest.components.find(
+      this.#assertCurrentAuthority(effect, authority);
+      const validatedComponent = resolved.artifact.manifest.components.find(
+        (candidate) => candidate.componentId === effect.componentId,
+      );
+      const preparedComponent = artifact.manifest.components.find(
         (candidate) => candidate.componentId === effect.componentId,
       );
       if (
         artifact.digest !== effect.artifactDigest ||
         artifact.manifest.pluginId !== effect.pluginId ||
-        component === undefined ||
-        !component.executors.includes(effect.executor)
+        validatedComponent === undefined ||
+        preparedComponent === undefined ||
+        JSON.stringify(validatedComponent) !== JSON.stringify(preparedComponent) ||
+        !validatedComponent.executors.includes(effect.executor)
       ) {
         throw effectError(
           "LIFECYCLE_ARTIFACT_IDENTITY_MISMATCH",
@@ -195,10 +294,21 @@ export class ComponentEffects implements ComponentEffectExecutor {
         ...(effect.workerId === undefined ? {} : { workerId: parseWorkerId(effect.workerId) }),
         artifact,
         deployment,
+        component: validatedComponent,
+        ...(authority === undefined ? {} : { authority }),
       };
       this.#registry.register(effect, binding, authority);
     } catch (error) {
-      await this.#artifacts.release(effect.artifactDigest).catch(() => undefined);
+      try {
+        await this.#artifacts.release(effect.artifactDigest);
+      } catch (releaseError) {
+        throw effectError(
+          "LIFECYCLE_PREPARE_ROLLBACK_FAILED",
+          "Prepared artifact rollback failed",
+          effect,
+          { causes: [serializeCause(error), serializeCause(releaseError)] },
+        );
+      }
       throw error;
     }
   }
@@ -208,26 +318,39 @@ export class ComponentEffects implements ComponentEffectExecutor {
     entry: RegisteredComponent,
     authority: RuntimeAuthority | undefined,
   ): Promise<void> {
-    if (entry.state !== "prepared" && entry.state !== "active" && entry.state !== "draining") {
+    if (
+      entry.state !== "prepared" &&
+      entry.state !== "active" &&
+      entry.state !== "draining" &&
+      entry.state !== "stopping"
+    ) {
       throw effectError(
         "LIFECYCLE_TRANSITION_INVALID",
         "Component binding cannot stop from its current state",
         effect,
       );
     }
-    this.#registry.transition(effect, entry.state, "stopping", authority);
+    let progress =
+      entry.state === "stopping"
+        ? entry
+        : this.#registry.transition(effect, entry.state, "stopping", authority);
     const failures: unknown[] = [];
-    try {
-      await this.#host.stop(entry.binding);
-    } catch (error) {
-      failures.push(error);
+    if (!progress.hostStopped) {
+      try {
+        await this.#host.stop(progress.binding);
+        progress = this.#registry.updateStopProgress(effect, { hostStopped: true }, authority);
+      } catch (error) {
+        failures.push(error);
+      }
     }
-    try {
-      await this.#artifacts.release(effect.artifactDigest);
-    } catch (error) {
-      failures.push(error);
+    if (!progress.artifactReleased) {
+      try {
+        await this.#artifacts.release(effect.artifactDigest);
+        progress = this.#registry.updateStopProgress(effect, { artifactReleased: true }, authority);
+      } catch (error) {
+        failures.push(error);
+      }
     }
-    this.#registry.remove(effect, authority);
     if (failures.length > 0) {
       throw effectError(
         "LIFECYCLE_STOP_FAILED",
@@ -236,5 +359,100 @@ export class ComponentEffects implements ComponentEffectExecutor {
         { causes: failures.map((failure) => serializeCause(failure)) },
       );
     }
+    if (!progress.hostStopped || !progress.artifactReleased) {
+      throw effectError(
+        "LIFECYCLE_STOP_INCOMPLETE",
+        "Component stop cleanup is incomplete",
+        effect,
+      );
+    }
+    this.#registry.remove(effect, authority);
+    this.#forgetInstanceOperations(effect.instanceId, effect.operationId);
+  }
+
+  async #cleanupAfterAuthorityLoss(
+    effect: ReconcileEffect,
+    entry: RegisteredComponent,
+    authority: RuntimeAuthority | undefined,
+  ): Promise<void> {
+    const stopping = this.#registry.transition(effect, entry.state, "stopping", authority);
+    const failures: unknown[] = [];
+    let progress = stopping;
+    try {
+      await this.#host.stop(entry.binding);
+      progress = this.#registry.updateStopProgress(effect, { hostStopped: true }, authority);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await this.#artifacts.release(effect.artifactDigest);
+      progress = this.#registry.updateStopProgress(effect, { artifactReleased: true }, authority);
+    } catch (error) {
+      failures.push(error);
+    }
+    if (progress.hostStopped && progress.artifactReleased) {
+      this.#registry.remove(effect, authority);
+      this.#forgetInstanceOperations(effect.instanceId, effect.operationId);
+    }
+    if (failures.length > 0) {
+      throw effectError(
+        "LIFECYCLE_AUTHORITY_CLEANUP_FAILED",
+        "Leadership changed and component cleanup failed",
+        effect,
+        { causes: failures.map((failure) => serializeCause(failure)) },
+      );
+    }
+  }
+
+  #assertCurrentAuthority(effect: ReconcileEffect, expected: RuntimeAuthority | undefined): void {
+    if (!this.#authorityMatches(expected)) {
+      throw effectError(
+        "LIFECYCLE_AUTHORITY_LOST",
+        "Leadership authority changed before the component effect",
+        effect,
+      );
+    }
+  }
+
+  #authorityMatches(expected: RuntimeAuthority | undefined): boolean {
+    const current = this.#authority();
+    return current?.resource === expected?.resource && current?.epoch === expected?.epoch;
+  }
+
+  #forgetInstanceOperations(instanceId: string, retainedOperationId: string): void {
+    for (const [operationId, operation] of this.#operations) {
+      if (operation.instanceId === instanceId && operationId !== retainedOperationId) {
+        this.#operations.delete(operationId);
+        this.#fingerprints.delete(operationId);
+      }
+    }
+    for (const [operationId, operation] of this.#fingerprints) {
+      if (operation.instanceId === instanceId && operationId !== retainedOperationId) {
+        this.#fingerprints.delete(operationId);
+      }
+    }
+    this.#stoppedOperations.push(retainedOperationId);
+    while (this.#stoppedOperations.length > MAX_STOPPED_OPERATIONS) {
+      const expired = this.#stoppedOperations.shift();
+      if (expired !== undefined) {
+        this.#operations.delete(expired);
+        this.#fingerprints.delete(expired);
+      }
+    }
+  }
+
+  #retainFailedOperation(operationId: string): void {
+    this.#failedOperations.push(operationId);
+    while (this.#failedOperations.length > MAX_FAILED_OPERATIONS) {
+      const expired = this.#failedOperations.shift();
+      if (expired !== undefined && !this.#operations.has(expired)) {
+        this.#fingerprints.delete(expired);
+      }
+    }
+  }
+
+  #removeFailedOperation(operationId: string): void {
+    const index = this.#failedOperations.indexOf(operationId);
+    if (index >= 0) this.#failedOperations.splice(index, 1);
   }
 }
