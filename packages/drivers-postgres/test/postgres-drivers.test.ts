@@ -253,7 +253,7 @@ test("opposite-order updates do not leak PostgreSQL deadlocks or partially commi
     });
     await blocker.query("BEGIN");
     await blocker.query(
-      "UPDATE tego_state_revisions SET revision = revision WHERE driver_namespace = $1",
+      "SELECT revision FROM tego_state_revisions WHERE driver_namespace = $1 FOR UPDATE",
       [sharedNamespace],
     );
     blocked = true;
