@@ -18,6 +18,31 @@ export {
   type DeterministicArchiveEntry,
 } from "./artifacts/archive-codec.js";
 export {
+  PreparedArtifactCache,
+  type PreparedArtifact,
+  type PreparedArtifactCacheOptions,
+} from "./artifacts/prepared-artifact-cache.js";
+export {
+  readPluginArtifact,
+  type ArtifactEntryWriter,
+  type ArtifactFileRecord,
+  type ArtifactFilesMetadata,
+  type ArtifactReadLimits,
+  type ArtifactReadObserver,
+  type ReadPluginArtifact,
+} from "./artifacts/manifest-reader.js";
+export {
+  ComponentEffects,
+  type ComponentEffectsOptions,
+  type ComponentLifecycleHost,
+} from "./components/component-effects.js";
+export {
+  ComponentRegistry,
+  type ComponentBinding,
+  type ComponentBindingState,
+  type RegisteredComponent,
+} from "./components/component-registry.js";
+export {
   resolveCapabilities,
   type CapabilityResolutionDeployment,
   type CapabilityResolutionDiagnostic,

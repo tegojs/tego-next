@@ -72,7 +72,7 @@ function effect(kind: ReconcileEffectKind): ReconcileEffect {
   };
 }
 
-class ControlledCache implements PreparedArtifactCache {
+class ControlledCache implements Pick<PreparedArtifactCache, "close" | "prepare" | "release"> {
   readonly prepared: PreparedArtifact = Object.freeze({
     digest: artifactDigest,
     root: "/immutable/artifact",

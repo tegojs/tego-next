@@ -12,10 +12,7 @@ import {
   type ArtifactStore,
   type DriverHealth,
 } from "@tegojs/contracts";
-import {
-  canonicalJsonBytes,
-  createDeterministicArchive,
-} from "../src/artifacts/archive-codec.js";
+import { canonicalJsonBytes, createDeterministicArchive } from "../src/artifacts/archive-codec.js";
 import { PreparedArtifactCache } from "../src/artifacts/prepared-artifact-cache.js";
 
 const encoder = new TextEncoder();
@@ -144,8 +141,7 @@ test("prepared cache rejects changed archive bytes and removes its temporary dir
       typeof error === "object" &&
       error !== null &&
       "diagnostic" in error &&
-      (error as { diagnostic: { code?: unknown } }).diagnostic.code ===
-        "ARTIFACT_DIGEST_MISMATCH",
+      (error as { diagnostic: { code?: unknown } }).diagnostic.code === "ARTIFACT_DIGEST_MISMATCH",
   );
   assert.deepEqual(await readdir(root), []);
 });
@@ -165,6 +161,9 @@ test("prepared cache never trusts or overwrites a changed completed directory", 
     restarted.prepare({ digest: artifactDigest }),
     /prepared artifact|cache|conflict|digest/iu,
   );
-  assert.equal(await readFile(join(prepared.root, "components/component.js"), "utf8"), "tampered\n");
+  assert.equal(
+    await readFile(join(prepared.root, "components/component.js"), "utf8"),
+    "tampered\n",
+  );
   await restarted.close();
 });
