@@ -553,3 +553,29 @@ test("a late lower epoch cannot replace the authoritative Worker session", async
 
   await Promise.all([mainA.close(), mainB.close(), targetWorker.close()]);
 });
+
+test("public send and request cannot re-enter reserved handshake transitions", async () => {
+  const connection = await directConnection();
+  try {
+    const originalEpoch = connection.workerSession.epoch;
+    await assert.rejects(
+      connection.mainSession.send("session.ready", { epoch: "999" }),
+      /handshake|reserved/iu,
+    );
+    await assert.rejects(
+      connection.mainSession.request("worker.register", {
+        workerId: "forged-worker",
+        labels: {},
+        resources: {},
+        executors: [],
+        preparedArtifacts: [],
+      }),
+      /handshake|reserved/iu,
+    );
+    assert.equal(connection.workerSession.epoch, originalEpoch);
+    assert.equal(connection.workerSession.state, "ready");
+    assert.equal(connection.mainSession.state, "ready");
+  } finally {
+    await cleanup(connection);
+  }
+});
