@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   chmod,
   lstat,
@@ -244,6 +246,85 @@ test("@spec:plugin-artifacts/immutable-artifacts/publishes-only-readonly-roots",
   const objects = (await readdir(root)).filter((entry) => entry.startsWith(".object-"));
   const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
   assert.deepEqual(objects, [pointer.split("/")[0]]);
+  await restarted.release(artifactDigest);
+  await restarted.close();
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/pre-pointer-crash-reuses-deterministic-object", async (context) => {
+  const workspace = await mkdtemp(join(tmpdir(), "tego-prepared-pre-pointer-crash-"));
+  const root = join(workspace, "cache");
+  const archivePath = join(workspace, "artifact.tego");
+  const bytes = archive();
+  const artifactDigest = digest(bytes);
+  await writeFile(archivePath, bytes);
+  const moduleUrl = new URL("../src/artifacts/prepared-artifact-cache.js", import.meta.url).href;
+  const childSource = `
+    import { readFile } from "node:fs/promises";
+    const [moduleUrl, root, archivePath, digest] = process.argv.slice(1);
+    const { PreparedArtifactCache } = await import(moduleUrl);
+    const bytes = await readFile(archivePath);
+    const artifacts = {
+      scope: "local",
+      open: async () => {},
+      close: async () => {},
+      health: async () => ({ status: "healthy", checkedAt: new Date(0).toISOString() }),
+      put: async () => {},
+      read: async function* () { yield bytes; },
+    };
+    const cache = new PreparedArtifactCache({
+      artifacts,
+      root,
+      beforePointerPublish: async () => {
+        process.stdout.write("READY\\n");
+        await new Promise(() => {});
+      },
+    });
+    await cache.prepare({ digest });
+  `;
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      childSource,
+      moduleUrl,
+      root,
+      archivePath,
+      artifactDigest,
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  context.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await cleanupRoot(workspace);
+  });
+  let output = "";
+  const ready = new Promise<void>((resolve, reject) => {
+    child.stdout.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+      if (output.includes("READY\n")) resolve();
+    });
+    child.once("exit", (code, signal) => {
+      reject(new Error(`publisher exited before READY: code=${code} signal=${signal}`));
+    });
+  });
+
+  await ready;
+  child.kill("SIGKILL");
+  const [, signal] = await once(child, "exit");
+  assert.equal(signal, "SIGKILL");
+
+  const artifacts = new MemoryArtifacts();
+  artifacts.set(artifactDigest, bytes);
+  const restarted = new PreparedArtifactCache({ artifacts, root });
+  const prepared = await restarted.prepare({ digest: artifactDigest });
+
+  const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
+  assert.equal(pointer, `.objects/${artifactDigest.slice("sha256:".length)}/artifact\n`);
+  assert.deepEqual(await readdir(join(root, ".objects")), [
+    artifactDigest.slice("sha256:".length),
+  ]);
+  assert.equal((await stat(prepared.root)).mode & 0o222, 0);
   await restarted.release(artifactDigest);
   await restarted.close();
 });
