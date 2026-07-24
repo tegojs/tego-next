@@ -450,7 +450,10 @@ function containsForbiddenBoundary(source, specifiers, workspaces, importingFile
   return specifiers.some(
     (specifier) =>
       containsForbiddenFragment(specifier) &&
-      referencedWorkspace(specifier, workspaces, importingFile) !== source,
+      !(
+        specifier.startsWith(".") &&
+        referencedWorkspace(specifier, workspaces, importingFile) === source
+      ),
   );
 }
 
