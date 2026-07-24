@@ -26,10 +26,7 @@ import {
   type DriverHealth,
 } from "@tegojs/contracts";
 import { canonicalJsonBytes, createDeterministicArchive } from "../src/artifacts/archive-codec.js";
-import {
-  PreparedArtifactCache,
-  type PreparedArtifactCacheOptions,
-} from "../src/artifacts/prepared-artifact-cache.js";
+import { PreparedArtifactCache } from "../src/artifacts/prepared-artifact-cache.js";
 
 const encoder = new TextEncoder();
 const source = "export default { value: 'prepared' };\n";
@@ -216,19 +213,15 @@ test("@spec:plugin-artifacts/immutable-artifacts/publishes-only-readonly-roots",
   const artifactDigest = digest(bytes);
   artifacts.set(artifactDigest, bytes);
   let observed = 0;
-  const crashing = new PreparedArtifactCache(
-    {
-      artifacts,
-      root,
-      afterPublish: async (publishedRoot: string) => {
-        observed += 1;
-        assert.equal((await stat(publishedRoot)).mode & 0o222, 0);
-        throw new Error("simulated immediate publisher crash");
-      },
-    } as PreparedArtifactCacheOptions & {
-      readonly afterPublish: (publishedRoot: string) => Promise<void>;
+  const crashing = new PreparedArtifactCache({
+    artifacts,
+    root,
+    afterPublish: async (publishedRoot) => {
+      observed += 1;
+      assert.equal((await stat(publishedRoot)).mode & 0o222, 0);
+      throw new Error("simulated immediate publisher crash");
     },
-  );
+  });
   context.after(async () => {
     await crashing.close();
     await cleanupRoot(root);

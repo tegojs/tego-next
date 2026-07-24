@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,7 +12,7 @@ import {
   rename,
   rm,
 } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   DiagnosticError,
   runtimeDiagnostic,
@@ -38,6 +39,7 @@ export interface PreparedArtifactCacheOptions {
   readonly artifacts: ArtifactStore;
   readonly root: string;
   readonly limits?: ArtifactReadLimits;
+  readonly afterPublish?: (publishedRoot: string) => Promise<void>;
 }
 
 interface FileSnapshot {
@@ -93,6 +95,10 @@ function cleanupError(primary: unknown, cleanup: readonly unknown[]): Diagnostic
 
 function digestPath(digest: ArtifactDigest): string {
   return digest.slice("sha256:".length);
+}
+
+function objectPath(temporary: string): string {
+  return `.object-${basename(temporary).slice(".tmp-".length)}`;
 }
 
 function errorCode(error: unknown): unknown {
@@ -255,6 +261,79 @@ async function snapshotDirectory(
   );
 }
 
+async function readPublishedRoot(canonicalRoot: string, target: string): Promise<string> {
+  const targetIdentity = await lstat(target);
+  if (targetIdentity.isSymbolicLink()) {
+    throw cacheError(
+      "ARTIFACT_CACHE_CONFLICT",
+      "Prepared artifact publication target cannot be a symbolic link",
+    );
+  }
+  if (targetIdentity.isDirectory()) {
+    return target;
+  }
+  if (
+    !targetIdentity.isFile() ||
+    (targetIdentity.mode & 0o222) !== 0 ||
+    targetIdentity.size > 256
+  ) {
+    throw cacheError("ARTIFACT_CACHE_CONFLICT", "Prepared artifact publication pointer is invalid");
+  }
+  const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let value: string;
+  try {
+    const identity = await handle.stat();
+    if (
+      !identity.isFile() ||
+      identity.dev !== targetIdentity.dev ||
+      identity.ino !== targetIdentity.ino
+    ) {
+      throw cacheError(
+        "ARTIFACT_CACHE_CONFLICT",
+        "Prepared artifact publication pointer changed while being read",
+      );
+    }
+    value = await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+  const relative = value.endsWith("\n") ? value.slice(0, -1) : "";
+  if (!/^\.object-[A-Za-z0-9_-]+\/artifact$/u.test(relative)) {
+    throw cacheError(
+      "ARTIFACT_CACHE_CONFLICT",
+      "Prepared artifact publication pointer contains an invalid object path",
+    );
+  }
+  const wrapper = join(canonicalRoot, dirname(relative));
+  const wrapperIdentity = await lstat(wrapper);
+  if (wrapperIdentity.isSymbolicLink() || !wrapperIdentity.isDirectory()) {
+    throw cacheError(
+      "ARTIFACT_CACHE_CONFLICT",
+      "Prepared artifact publication object wrapper is invalid",
+    );
+  }
+  const publishedRoot = join(canonicalRoot, relative);
+  if ((await realpath(publishedRoot)) !== publishedRoot) {
+    throw cacheError(
+      "ARTIFACT_CACHE_CONFLICT",
+      "Prepared artifact publication object escapes the cache root",
+    );
+  }
+  return publishedRoot;
+}
+
+async function writePublicationPointer(path: string, relative: string): Promise<void> {
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.writeFile(`${relative}\n`, "utf8");
+    await handle.sync();
+    await handle.chmod(0o444);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 async function syncNestedDirectories(root: string, snapshot: TreeSnapshot): Promise<void> {
   const directories = snapshot
     .filter((entry): entry is DirectorySnapshot => entry.type === "directory")
@@ -345,6 +424,7 @@ export class PreparedArtifactCache {
   readonly #artifacts: ArtifactStore;
   readonly #root: string;
   readonly #limits: ArtifactReadLimits;
+  readonly #afterPublish: ((publishedRoot: string) => Promise<void>) | undefined;
   readonly #entries = new Map<ArtifactDigest, CacheEntry>();
   readonly #preparing = new Map<ArtifactDigest, Promise<PreparedArtifact>>();
   readonly #acquisitions = new Set<Promise<PreparedArtifact>>();
@@ -355,6 +435,7 @@ export class PreparedArtifactCache {
     this.#artifacts = options.artifacts;
     this.#root = resolve(options.root);
     this.#limits = options.limits ?? {};
+    this.#afterPublish = options.afterPublish;
   }
 
   prepare(request: ValidateArtifactRequest): Promise<PreparedArtifact> {
@@ -463,6 +544,7 @@ export class PreparedArtifactCache {
     const staging = join(temporary, "artifact");
     await mkdir(staging, { mode: 0o700 });
     const target = join(canonicalRoot, digestPath(request.digest));
+    let cleanupRootPath: string | undefined = temporary;
     let primary: unknown;
     let failed = false;
     let result: PreparedArtifact | undefined;
@@ -490,7 +572,15 @@ export class PreparedArtifactCache {
       const writableSnapshot = await snapshotDirectory(staging);
       await syncNestedDirectories(staging, writableSnapshot);
       await makeTreeReadOnly(staging, writableSnapshot);
+      await chmod(staging, 0o555);
       const preparedSnapshot = await snapshotDirectory(staging);
+      if (!isReadOnlySnapshot(preparedSnapshot)) {
+        throw cacheError(
+          "ARTIFACT_CACHE_CONFLICT",
+          "Prepared artifact staging tree is not read-only before publication",
+          { digest: request.digest },
+        );
+      }
       await syncNestedDirectories(staging, preparedSnapshot);
       await syncDirectory(temporary);
 
@@ -502,9 +592,11 @@ export class PreparedArtifactCache {
         targetExists = false;
       }
 
+      let publishedRoot: string;
       let publishedSnapshot: TreeSnapshot;
       if (targetExists) {
-        const existingSnapshot = await snapshotDirectory(target);
+        publishedRoot = await readPublishedRoot(canonicalRoot, target);
+        const existingSnapshot = await snapshotDirectory(publishedRoot);
         if (
           !isReadOnlySnapshot(existingSnapshot) ||
           !compareSnapshot(existingSnapshot, preparedSnapshot, false)
@@ -517,26 +609,37 @@ export class PreparedArtifactCache {
         }
         publishedSnapshot = existingSnapshot;
       } else {
+        const objectRelative = objectPath(temporary);
+        const objectWrapper = join(canonicalRoot, objectRelative);
+        const pointerRelative = `${objectRelative}/artifact`;
+        const pointerSource = join(temporary, "entry");
+        await writePublicationPointer(pointerSource, pointerRelative);
+        await syncDirectory(temporary);
+        await rename(temporary, objectWrapper);
+        cleanupRootPath = objectWrapper;
+        const candidateRoot = join(objectWrapper, "artifact");
+        const candidateSnapshot = await snapshotDirectory(candidateRoot);
+        if (
+          !isReadOnlySnapshot(candidateSnapshot) ||
+          !compareSnapshot(candidateSnapshot, preparedSnapshot, true)
+        ) {
+          throw cacheError(
+            "ARTIFACT_CACHE_CONFLICT",
+            "Prepared artifact changed before atomic publication",
+            { digest: request.digest },
+          );
+        }
         try {
-          await rename(staging, target);
-          await chmod(target, 0o555);
+          await link(join(objectWrapper, "entry"), target);
           await syncDirectory(canonicalRoot);
-          publishedSnapshot = await snapshotDirectory(target);
-          await syncNestedDirectories(target, publishedSnapshot);
+          publishedRoot = candidateRoot;
+          publishedSnapshot = candidateSnapshot;
+          cleanupRootPath = undefined;
+          await this.#afterPublish?.(publishedRoot);
         } catch (error) {
-          if (
-            errorCode(error) !== "EEXIST" &&
-            errorCode(error) !== "ENOTEMPTY" &&
-            errorCode(error) !== "EACCES"
-          ) {
-            throw error;
-          }
-          let existingSnapshot: TreeSnapshot;
-          try {
-            existingSnapshot = await snapshotDirectory(target);
-          } catch {
-            throw error;
-          }
+          if (errorCode(error) !== "EEXIST") throw error;
+          publishedRoot = await readPublishedRoot(canonicalRoot, target);
+          const existingSnapshot = await snapshotDirectory(publishedRoot);
           if (
             !isReadOnlySnapshot(existingSnapshot) ||
             !compareSnapshot(existingSnapshot, preparedSnapshot, false)
@@ -553,7 +656,7 @@ export class PreparedArtifactCache {
 
       const artifact = Object.freeze({
         digest: request.digest,
-        root: target,
+        root: publishedRoot,
         manifest: freezeManifest(parsed.manifest),
       });
       this.#entries.set(request.digest, {
@@ -566,10 +669,12 @@ export class PreparedArtifactCache {
       failed = true;
       primary = error;
     } finally {
-      try {
-        await removeTree(temporary);
-      } catch (error) {
-        cleanupFailures.push(error);
+      if (cleanupRootPath !== undefined) {
+        try {
+          await removeTree(cleanupRootPath);
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
       }
     }
     if (cleanupFailures.length > 0) {
