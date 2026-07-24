@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   type ArtifactDigest,
   diagnosticCode,
@@ -25,6 +26,27 @@ if (connectionString === undefined) {
 
 function namespace(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll("-", "")}`;
+}
+
+async function within<T>(promise: Promise<T>, message: string, timeoutMs = 2_000): Promise<T> {
+  return Promise.race([
+    promise,
+    delay(timeoutMs).then(() => {
+      throw new Error(message);
+    }),
+  ]);
+}
+
+async function waitFor(
+  predicate: () => Promise<boolean>,
+  message: string,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await delay(10);
+  }
 }
 
 stateStoreConformance(
@@ -152,6 +174,191 @@ test("concurrent idempotent transactions commit one durable state and outbox eff
     );
   } finally {
     await Promise.all([left.close(), right.close()]);
+  }
+});
+
+test("concurrent updates of one revision report one stable state conflict", async () => {
+  const sharedNamespace = namespace("state_revision_race");
+  const left = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const right = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const record = { namespace: "runtime", collection: "records", id: "contended" };
+  await Promise.all([left.open(), right.open()]);
+  try {
+    await left.transact({}, async (transaction) => {
+      await transaction.put(record, { contender: "initial" }, { expectedRevision: "absent" });
+      return null;
+    });
+
+    const ready = Promise.withResolvers<void>();
+    let contenders = 0;
+    const run = (store: PostgresStateStore, contender: string) =>
+      store.transact({}, async (transaction) => {
+        contenders += 1;
+        if (contenders === 2) ready.resolve();
+        await ready.promise;
+        await transaction.put(record, { contender }, { expectedRevision: parseRevision("1") });
+        return contender;
+      });
+
+    const results = await within(
+      Promise.allSettled([run(left, "left"), run(right, "right")]),
+      "Timed out waiting for the revision race",
+    );
+    const winners = results.filter((result) => result.status === "fulfilled");
+    const losers = results.filter((result) => result.status === "rejected");
+    assert.equal(winners.length, 1);
+    assert.equal(losers.length, 1);
+    assert.ok(
+      losers[0]?.status === "rejected" &&
+        diagnosticCode(losers[0].reason) === "STATE_REVISION_CONFLICT",
+    );
+    const winner = winners[0];
+    assert.ok(winner?.status === "fulfilled");
+    assert.deepEqual(await left.read(record), {
+      revision: parseRevision("2"),
+      value: { contender: winner.value },
+    });
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
+});
+
+test("opposite-order updates do not leak PostgreSQL deadlocks or partially commit", async () => {
+  const sharedNamespace = namespace("state_deadlock");
+  const left = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const right = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const observer = new Pool({ connectionString });
+  const blocker = await observer.connect();
+  const firstRecord = { namespace: "runtime", collection: "records", id: "first" };
+  const secondRecord = { namespace: "runtime", collection: "records", id: "second" };
+  await Promise.all([left.open(), right.open()]);
+  let blocked = false;
+  try {
+    await left.transact({}, async (transaction) => {
+      await transaction.put(firstRecord, { contender: "initial" }, { expectedRevision: "absent" });
+      await transaction.put(secondRecord, { contender: "initial" }, { expectedRevision: "absent" });
+      return null;
+    });
+    await blocker.query("BEGIN");
+    await blocker.query(
+      "UPDATE tego_state_revisions SET revision = revision WHERE driver_namespace = $1",
+      [sharedNamespace],
+    );
+    blocked = true;
+
+    const run = (
+      store: PostgresStateStore,
+      contender: string,
+      first: typeof firstRecord,
+      second: typeof secondRecord,
+    ) =>
+      store.transact({}, async (transaction) => {
+        await transaction.put(first, { contender }, { expectedRevision: parseRevision("1") });
+        await transaction.put(second, { contender }, { expectedRevision: parseRevision("1") });
+        return contender;
+      });
+    const executions = [
+      run(left, "left", firstRecord, secondRecord),
+      run(right, "right", secondRecord, firstRecord),
+    ];
+
+    await waitFor(async () => {
+      const result = await observer.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+          WHERE application_name = $1
+            AND wait_event_type = 'Lock'`,
+        [`tego:${sharedNamespace}:state`],
+      );
+      return Number(result.rows[0]?.count ?? 0) >= 2;
+    }, "State transactions did not both reach the revision lock");
+    await blocker.query("COMMIT");
+    blocked = false;
+
+    const results = await within(
+      Promise.allSettled(executions),
+      "Timed out waiting for opposite-order state transactions",
+      4_000,
+    );
+    const winners = results.filter((result) => result.status === "fulfilled");
+    const losers = results.filter((result) => result.status === "rejected");
+    assert.equal(winners.length, 1);
+    assert.equal(losers.length, 1);
+    assert.ok(
+      losers[0]?.status === "rejected" &&
+        diagnosticCode(losers[0].reason) === "STATE_REVISION_CONFLICT",
+    );
+    const winner = winners[0];
+    assert.ok(winner?.status === "fulfilled");
+    assert.deepEqual((await left.read(firstRecord))?.value, { contender: winner.value });
+    assert.deepEqual((await left.read(secondRecord))?.value, { contender: winner.value });
+  } finally {
+    if (blocked) await blocker.query("ROLLBACK").catch(() => undefined);
+    blocker.release();
+    await Promise.all([left.close(), right.close(), observer.end()]);
+  }
+});
+
+test("StateStore close cancels a transaction waiting for an advisory lock", async () => {
+  const sharedNamespace = namespace("state_close_lock");
+  const store = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const observer = new Pool({ connectionString });
+  const blocker = await observer.connect();
+  const idempotencyKey = "blocked-close";
+  const lockName = `tego:state:idempotency:${sharedNamespace}:${idempotencyKey}`;
+  await store.open();
+  await blocker.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockName]);
+  const transaction = store.transact(
+    {
+      idempotencyKey,
+      idempotencyFingerprint: "blocked-close-request",
+    },
+    async () => null,
+  );
+  let closePromise: Promise<void> | undefined;
+  try {
+    await waitFor(async () => {
+      const result = await observer.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+          WHERE application_name = $1
+            AND wait_event = 'advisory'`,
+        [`tego:${sharedNamespace}:state`],
+      );
+      return Number(result.rows[0]?.count ?? 0) === 1;
+    }, "State transaction did not wait for the advisory lock");
+
+    closePromise = store.close();
+    await within(closePromise, "StateStore close remained blocked behind an advisory lock");
+    const result = await within(
+      transaction.then(
+        () => "fulfilled" as const,
+        (error: unknown) => diagnosticCode(error),
+      ),
+      "Blocked state transaction did not settle during close",
+    );
+    assert.equal(result, "STATE_CLOSED");
+  } finally {
+    await blocker
+      .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockName])
+      .catch(() => undefined);
+    blocker.release();
+    await Promise.allSettled([transaction, closePromise ?? store.close(), observer.end()]);
   }
 });
 
