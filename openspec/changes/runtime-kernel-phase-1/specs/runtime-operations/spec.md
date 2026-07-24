@@ -39,6 +39,25 @@ The repository SHALL pin Node.js, package-manager, TypeScript, dependency lockfi
 - **WHEN** a contributor uses the pinned toolchain on a clean checkout
 - **THEN** one documented verification command installs from the lockfile, checks formatting and types, runs tests, builds packages, and runs the echo-plugin smoke test
 
+### Requirement: CI-authoritative system acceptance
+GitHub Actions SHALL be the authoritative phase-one acceptance environment and SHALL execute real process-level single-Main and multi-Main system tests.
+
+#### Scenario: Real single-Main executor parity
+- **WHEN** CI starts one Main and an independent Worker process, connects them through a real WebSocket socket, and deploys the echo plugin
+- **THEN** the same plugin component executes successfully through thread, process, and remote executors without executor-specific plugin code
+
+#### Scenario: Durable restart recovery
+- **WHEN** CI stops and restarts Main after deployment and task execution
+- **THEN** Main reconstructs installed artifacts, desired deployments, observed instances, operations, and task results before reporting recovery complete
+
+#### Scenario: Real multi-Main takeover
+- **WHEN** CI starts two Main processes against one PostgreSQL database and terminates the fenced leader during an active topology
+- **THEN** the follower becomes leader, the stale leader cannot commit control-plane state, the Worker reconnects, and the task has exactly one authoritative terminal result
+
+#### Scenario: Actionable system-test failure
+- **WHEN** a system test fails, times out, or leaks a process
+- **THEN** CI fails the job and preserves per-process logs, structured diagnostics, and test results as workflow artifacts
+
 ### Requirement: Layer-one dependency boundary
 The first-layer packages SHALL NOT import Tego 1.x code or define frontend, HTTP routing, authentication, ACL, database-resource, cache, scheduler, workflow, or business-domain APIs.
 

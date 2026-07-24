@@ -187,7 +187,29 @@ tego worker start
 
 Every implementation slice starts from an approved OpenSpec scenario and a failing automated test. The repository uses Node’s test runner for behavior and contract tests, TypeScript for static contracts, and Docker-backed integration tests for PostgreSQL.
 
-CI verifies formatting, linting, type checking, unit tests, package tests, integration tests, a clean package build, artifact reproducibility, and the end-to-end echo-plugin flow.
+CI is the authoritative acceptance environment for phase one. Local commands provide fast feedback, but a change is not complete until the required GitHub Actions jobs pass on a clean checkout.
+
+CI verifies formatting, linting, type checking, unit tests, package tests, integration tests, a clean package build, artifact reproducibility, and the end-to-end echo-plugin flow. It uses the repository-pinned Node.js version and a pinned PostgreSQL 16 service container.
+
+### 14. Prove the kernel with real process-level system tests
+
+The phase-one system tests run Main and Worker as independent Node.js processes. They communicate through real operating-system sockets and a real WebSocket connection; in-memory session pairs and direct method calls remain valid for unit tests but do not satisfy end-to-end acceptance.
+
+The authoritative GitHub Actions topology uses:
+
+- an Ubuntu runner for the test orchestrator and Node.js processes;
+- a PostgreSQL 16 service container with a dynamically mapped host port;
+- bounded readiness probes for database, local control channel, Main, and Worker;
+- separate stdout and stderr logs for every long-running process;
+- unconditional diagnostic artifact collection with bounded upload time;
+- explicit job and step timeouts;
+- deterministic cleanup that fails on leaked child processes, open handles, or occupied ports.
+
+The single-Main flow packs, installs, deploys, and executes the same echo component through thread, process, and remote executors. The remote path uses an independent Worker process and real WebSocket transport. It then restarts Main and verifies durable deployment and task recovery.
+
+The multi-Main flow starts two Main processes against one PostgreSQL database. It proves one fenced leader performs reconciliation and assignment, terminates that leader, observes follower takeover, rejects stale-leader writes, reconnects the Worker, and records exactly one authoritative terminal task result.
+
+Docker Compose and Kubernetes topologies are deferred. They may later reuse the same black-box system scenarios, but phase one does not require containerizing Main or Worker.
 
 ## Failure and Recovery Model
 
@@ -207,10 +229,12 @@ CI verifies formatting, linting, type checking, unit tests, package tests, integ
 - **[Risk] Thread execution may be mistaken for security isolation.** → Document it as a performance isolation mechanism and default ordinary plugin execution to child processes.
 - **[Risk] Plugin packaging can become a build-system project.** → Limit phase one to TypeScript-to-JavaScript ESM, deterministic archives, digest, and Ed25519 signatures; defer arbitrary bundler plugins and SEA.
 - **[Risk] PostgreSQL leadership depends on a live session.** → Use a dedicated connection, database time, fencing epochs, and takeover tests that kill the leader connection.
+- **[Risk] Process-level CI can become timing-dependent.** → Use protocol-level readiness probes, event-driven assertions, bounded deadlines, per-process logs, and deterministic cleanup; fixed sleeps are prohibited.
+- **[Risk] GitHub-hosted runner images change over time.** → Install the exact repository-pinned Node.js version and use pinned service-container versions instead of relying on preinstalled software.
 
 ## Delivery and Rollback
 
-Development occurs on `codex/runtime-kernel-phase-1`. Each capability is committed only after its focused test suite passes. The initial public release is `0.1.0-alpha.1`; no production stability promise is made.
+Development occurs on reviewable `codex/` feature branches. Each capability is committed only after its focused test suite passes. The initial public release is `0.1.0-alpha.1`; no production stability promise is made.
 
 Rollback before the first release is a Git revert to the last passing capability slice. Runtime state schemas use forward-only numbered migrations and keep the previous binary’s compatibility range in release metadata. Plugin deployment rollback changes desired state to a previously installed immutable artifact and increments the deployment generation.
 
