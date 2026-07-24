@@ -25,9 +25,11 @@ import {
   type StateFencing,
   type StateKey,
   type StateStore,
+  type StateTransaction,
   type TaskId,
   type TaskRecord,
 } from "@tegojs/contracts";
+import { satisfiesVersionRange } from "./capabilities/version.js";
 import { validatePermissionGrant } from "./permissions/permission-set.js";
 
 export interface RuntimeArtifactInstaller {
@@ -47,7 +49,7 @@ export interface RuntimeOperationControllerOptions {
   readonly artifactService?: RuntimeArtifactInstaller;
   readonly tasks?: RuntimeTaskOperations;
   readonly authority?: () => RuntimeAuthority | undefined;
-  readonly wake?: () => void | Promise<void>;
+  readonly wake?: (authority: RuntimeAuthority) => void | Promise<void>;
 }
 
 const deploymentKey = (identity: PluginDeploymentIdentity): StateKey<PluginDeployment> => ({
@@ -96,7 +98,7 @@ export class RuntimeOperationController implements RuntimeOperations {
   readonly #artifacts: RuntimeArtifactInstaller | undefined;
   readonly #tasks: RuntimeTaskOperations | undefined;
   readonly #authority: () => RuntimeAuthority | undefined;
-  readonly #wake: () => void | Promise<void>;
+  readonly #wake: (authority: RuntimeAuthority) => void | Promise<void>;
   #available = false;
   #acceptingMutations = false;
   #recovered: readonly PersistedOperationJournalEntry[] = [];
@@ -180,7 +182,21 @@ export class RuntimeOperationController implements RuntimeOperations {
                 request,
               );
             }
-            for (const binding of Object.values(request.capabilityBindings)) {
+            const transactionInstallation = parsePluginInstallation(durableInstallation.value);
+            if (
+              transactionInstallation.pluginId !== request.pluginId ||
+              transactionInstallation.digest !== request.artifactDigest ||
+              transactionInstallation.manifest.pluginId !== request.pluginId ||
+              transactionInstallation.manifest.version !== transactionInstallation.version
+            ) {
+              throw this.#deploymentError(
+                "DEPLOYMENT_ARTIFACT_NOT_INSTALLED",
+                "The selected artifact installation identity changed",
+                request,
+              );
+            }
+            this.#validateDeployment(request, transactionInstallation);
+            for (const [name, binding] of Object.entries(request.capabilityBindings)) {
               const provider = await transaction.get(deploymentKey(binding));
               if (provider === undefined) {
                 throw this.#deploymentError(
@@ -189,6 +205,25 @@ export class RuntimeOperationController implements RuntimeOperations {
                   request,
                 );
               }
+              const parsedProvider = parsePluginDeployment(provider.value);
+              if (
+                parsedProvider.applicationId !== binding.applicationId ||
+                parsedProvider.pluginId !== binding.pluginId ||
+                parsedProvider.state !== "active"
+              ) {
+                throw this.#deploymentError(
+                  "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
+                  "A capability binding refers to an invalid provider deployment",
+                  request,
+                );
+              }
+              await this.#validateProviderBinding(
+                transaction,
+                name,
+                parsedProvider,
+                transactionInstallation,
+                request,
+              );
             }
             const existing = await transaction.get(key);
             if (existing !== undefined) {
@@ -205,7 +240,7 @@ export class RuntimeOperationController implements RuntimeOperations {
             const deployment = parsePluginDeployment({
               applicationId: request.applicationId,
               pluginId: request.pluginId,
-              version: installation.version,
+              version: transactionInstallation.version,
               artifactDigest: request.artifactDigest,
               generation,
               state: "active",
@@ -222,13 +257,18 @@ export class RuntimeOperationController implements RuntimeOperations {
         );
         this.#assertAuthority(authority);
         const existingBefore = await state.read(key);
+        this.#assertAuthority(authority);
         if (existingBefore === undefined) throw this.#unconfigured("deployment persistence");
         const persisted = parsePluginDeployment(existingBefore.value);
         if (
           persisted.generation === result.deployment.generation &&
           sameDesired(persisted, request)
         ) {
-          if (result.changed) await this.#wake();
+          if (result.changed) {
+            this.#assertAuthority(authority);
+            await this.#wake(authority);
+            this.#assertAuthority(authority);
+          }
           return structuredClone(persisted);
         }
       } catch (error) {
@@ -335,6 +375,52 @@ export class RuntimeOperationController implements RuntimeOperations {
         );
       }
     }
+  }
+
+  async #validateProviderBinding(
+    transaction: StateTransaction,
+    name: string,
+    provider: PluginDeployment,
+    consumer: PluginInstallation,
+    request: DeployPluginRequest,
+  ): Promise<void> {
+    const requirement = consumer.manifest.capabilities.requires.find(
+      (candidate) => candidate.name === name,
+    );
+    if (requirement === undefined) {
+      throw this.#deploymentError(
+        "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
+        "Capability binding is not declared by the consumer",
+        request,
+      );
+    }
+    for await (const stored of transaction.scan<PluginInstallation>({
+      namespace: "tego",
+      collection: "installations",
+    })) {
+      const installation = parsePluginInstallation(stored.value);
+      if (
+        installation.pluginId !== provider.pluginId ||
+        installation.digest !== provider.artifactDigest
+      ) {
+        continue;
+      }
+      const provided = installation.manifest.capabilities.provides.find(
+        (candidate) => candidate.name === name,
+      );
+      if (
+        provided !== undefined &&
+        satisfiesVersionRange(provided.protocolVersion, requirement.protocolRange)
+      ) {
+        return;
+      }
+      break;
+    }
+    throw this.#deploymentError(
+      "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
+      "Capability provider does not satisfy the declared protocol range",
+      request,
+    );
   }
 
   #requireAvailable(): void {

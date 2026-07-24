@@ -21,6 +21,7 @@ import {
   parseExecutionResult,
   parsePermissionSet,
   parsePluginDeployment,
+  parseRuntimeDiagnostic,
 } from "./schema.js";
 import type { ExecutionResult, OrphanPolicy } from "./execution.js";
 import type { JsonObject, JsonValue } from "./json.js";
@@ -73,6 +74,14 @@ export interface TaskExecutorReference extends JsonObject {
   readonly type: "process" | "remote" | "thread";
 }
 
+export interface TaskCancellationIntent extends JsonObject {
+  readonly requestedAt: string;
+  readonly authority: {
+    readonly resource: string;
+    readonly epoch: string;
+  };
+}
+
 export interface TaskRecord extends JsonObject {
   readonly taskId: TaskId;
   readonly attemptId: AttemptId;
@@ -85,8 +94,12 @@ export interface TaskRecord extends JsonObject {
     readonly resource: string;
     readonly epoch: string;
   };
+  readonly cancellation?: TaskCancellationIntent;
+  readonly diagnostic?: RuntimeDiagnostic;
   readonly result?: ExecutionResult;
 }
+
+export const runtimeOperationMaxBytes = 1_048_576;
 
 function operationError(message: string): DiagnosticError {
   return new DiagnosticError(
@@ -153,11 +166,18 @@ function timestamp(value: unknown, field: string): string {
   if (
     typeof value !== "string" ||
     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value) ||
-    Number.isNaN(Date.parse(value))
+    Number.isNaN(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
   ) {
     throw operationError(`${field} must be a canonical UTC timestamp`);
   }
   return value;
+}
+
+function assertSerializedLimit(value: JsonValue): void {
+  if (new TextEncoder().encode(JSON.stringify(value)).byteLength > runtimeOperationMaxBytes) {
+    throw operationError("Runtime operation exceeds the serialized size limit");
+  }
 }
 
 function orphanPolicy(value: unknown): OrphanPolicy {
@@ -180,7 +200,11 @@ export function parseInstallPluginRequest(input: unknown): InstallPluginRequest 
   const value = objectValue(input);
   exactKeys(value, ["digest"], ["signature"]);
   const digest = parseArtifactDigest(value.digest);
-  if (value.signature === undefined) return { digest };
+  if (value.signature === undefined) {
+    const parsed = { digest };
+    assertSerializedLimit(parsed);
+    return parsed;
+  }
   const signature = objectValue(value.signature);
   exactKeys(signature, ["algorithm", "digest", "keyId", "signature"]);
   if (
@@ -190,7 +214,7 @@ export function parseInstallPluginRequest(input: unknown): InstallPluginRequest 
   ) {
     throw operationError("Artifact signature envelope is invalid");
   }
-  return {
+  const parsed: InstallPluginRequest = {
     digest,
     signature: {
       algorithm: "Ed25519",
@@ -199,6 +223,8 @@ export function parseInstallPluginRequest(input: unknown): InstallPluginRequest 
       signature: signature.signature,
     },
   };
+  assertSerializedLimit(parsed);
+  return parsed;
 }
 
 export function parseDeployPluginRequest(input: unknown): DeployPluginRequest {
@@ -221,7 +247,7 @@ export function parseDeployPluginRequest(input: unknown): DeployPluginRequest {
     }
     capabilityBindings[key] = deploymentIdentity(bindings[key]);
   }
-  return {
+  const parsed: DeployPluginRequest = {
     applicationId: parseApplicationId(value.applicationId),
     pluginId: parsePluginId(value.pluginId),
     artifactDigest: parseArtifactDigest(value.artifactDigest),
@@ -230,6 +256,8 @@ export function parseDeployPluginRequest(input: unknown): DeployPluginRequest {
     permissionGrants: structuredClone(parsePermissionSet(value.permissionGrants)),
     capabilityBindings,
   };
+  assertSerializedLimit(parsed);
+  return parsed;
 }
 
 export function parseRunTaskRequest(input: unknown): RunTaskRequest {
@@ -239,7 +267,7 @@ export function parseRunTaskRequest(input: unknown): RunTaskRequest {
     ["applicationId", "pluginId", "componentId", "input", "deadline", "orphanPolicy"],
     ["operationId"],
   );
-  return {
+  const parsed: RunTaskRequest = {
     applicationId: parseApplicationId(value.applicationId),
     pluginId: parsePluginId(value.pluginId),
     componentId: parseComponentId(value.componentId),
@@ -250,6 +278,8 @@ export function parseRunTaskRequest(input: unknown): RunTaskRequest {
       ? {}
       : { operationId: parseOperationId(value.operationId) }),
   };
+  assertSerializedLimit(parsed);
+  return parsed;
 }
 
 export function parsePluginDeploymentIdentity(input: unknown): PluginDeploymentIdentity {
@@ -275,7 +305,7 @@ export function parseTaskRecord(input: unknown): TaskRecord {
   exactKeys(
     value,
     ["taskId", "attemptId", "request", "state", "createdAt", "updatedAt"],
-    ["executor", "authority", "result"],
+    ["executor", "authority", "cancellation", "diagnostic", "result"],
   );
   if (value.state !== "accepted" && value.state !== "running" && value.state !== "terminal") {
     throw operationError("Task state is invalid");
@@ -306,22 +336,64 @@ export function parseTaskRecord(input: unknown): TaskRecord {
           if (typeof entry.resource !== "string") throw operationError("Task authority is invalid");
           return { resource: entry.resource, epoch: parseFencingEpoch(entry.epoch) };
         })();
+  const cancellation =
+    value.cancellation === undefined
+      ? undefined
+      : (() => {
+          const entry = objectValue(value.cancellation);
+          exactKeys(entry, ["requestedAt", "authority"]);
+          const cancellationAuthority = objectValue(entry.authority);
+          exactKeys(cancellationAuthority, ["resource", "epoch"]);
+          if (typeof cancellationAuthority.resource !== "string") {
+            throw operationError("Task cancellation authority is invalid");
+          }
+          return {
+            requestedAt: timestamp(entry.requestedAt, "cancellation.requestedAt"),
+            authority: {
+              resource: cancellationAuthority.resource,
+              epoch: parseFencingEpoch(cancellationAuthority.epoch),
+            },
+          };
+        })();
   const result =
     value.result === undefined ? undefined : structuredClone(parseExecutionResult(value.result));
+  const diagnostic =
+    value.diagnostic === undefined
+      ? undefined
+      : structuredClone(parseRuntimeDiagnostic(value.diagnostic));
   if ((value.state === "terminal") !== (result !== undefined)) {
     throw operationError("Terminal task records must contain exactly one result");
   }
-  return {
-    taskId: parseTaskId(value.taskId),
-    attemptId: parseAttemptId(value.attemptId),
+  const taskId = parseTaskId(value.taskId);
+  const attemptId = parseAttemptId(value.attemptId);
+  const createdAt = timestamp(value.createdAt, "createdAt");
+  const updatedAt = timestamp(value.updatedAt, "updatedAt");
+  if (Date.parse(updatedAt) < Date.parse(createdAt)) {
+    throw operationError("updatedAt must not precede createdAt");
+  }
+  if (
+    result !== undefined &&
+    (result.taskId !== taskId ||
+      result.attemptId !== attemptId ||
+      (executor !== undefined && result.executor.kind !== executor.type))
+  ) {
+    throw operationError("Task result identity or executor does not match its record");
+  }
+  const parsed: TaskRecord = {
+    taskId,
+    attemptId,
     request: parseRunTaskRequest(value.request),
-    state: value.state,
-    createdAt: timestamp(value.createdAt, "createdAt"),
-    updatedAt: timestamp(value.updatedAt, "updatedAt"),
+    state: value.state as TaskRecordState,
+    createdAt,
+    updatedAt,
     ...(executor === undefined ? {} : { executor }),
     ...(authority === undefined ? {} : { authority }),
+    ...(cancellation === undefined ? {} : { cancellation }),
+    ...(diagnostic === undefined ? {} : { diagnostic }),
     ...(result === undefined ? {} : { result }),
   };
+  assertSerializedLimit(parsed);
+  return parsed;
 }
 
 export interface RuntimeOperations {

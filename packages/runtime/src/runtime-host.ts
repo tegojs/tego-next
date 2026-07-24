@@ -13,10 +13,9 @@ import type { RuntimeArtifactInstaller, RuntimeTaskOperations } from "./runtime-
 
 export interface RuntimeHostServices {
   readonly createReconciler: (authority: RuntimeAuthority) => Reconciler;
-  readonly tasks: RuntimeTaskLifecycle;
+  readonly tasks: RuntimeTaskLifecycle & RuntimeTaskOperations;
   readonly workers: RuntimeWorkerDirectory;
   readonly artifactService?: RuntimeArtifactInstaller;
-  readonly taskOperations?: RuntimeTaskOperations;
   readonly onDiagnostic?: (diagnostic: RuntimeDiagnostic) => void | Promise<void>;
 }
 

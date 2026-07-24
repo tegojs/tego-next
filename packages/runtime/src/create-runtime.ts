@@ -139,7 +139,7 @@ class TegoRuntime implements Runtime {
       ...(services?.artifactService === undefined
         ? {}
         : { artifactService: services.artifactService }),
-      ...(services?.taskOperations === undefined ? {} : { tasks: services.taskOperations }),
+      ...(services === undefined ? {} : { tasks: services.tasks }),
       authority: () => this.#leadership,
       wake: () => this.#reconciler?.wake(),
     });

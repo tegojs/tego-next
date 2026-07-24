@@ -844,7 +844,7 @@ test("@spec:runtime-operations/task-operations/old-epoch-completion-cannot-use-n
     collection: "tasks",
     id: identity.taskId,
   });
-  assert.equal((durable?.value as { state?: unknown }).state, "running");
+  assert.equal((durable?.value as { state?: unknown } | undefined)?.state, "running");
 });
 
 test("@spec:runtime-operations/task-operations/durable-terminal-replaces-ephemeral-uncertainty", async () => {
@@ -887,8 +887,8 @@ test("@spec:runtime-operations/task-operations/cancellation-intent-is-durable-be
     id: identity.taskId,
   });
   assert.equal(
-    (durable?.value as { cancellation?: { authority?: { epoch?: unknown } } }).cancellation
-      ?.authority?.epoch,
+    (durable?.value as { cancellation?: { authority?: { epoch?: unknown } } } | undefined)
+      ?.cancellation?.authority?.epoch,
     authority.epoch,
   );
   gate.resolve();
@@ -983,8 +983,7 @@ test("@spec:runtime-operations/task-operations/complete-operation-payloads-have-
       parseDeployPluginRequest({
         applicationId: request.applicationId,
         pluginId: request.pluginId,
-        artifactDigest:
-          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        artifactDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         essential: true,
         configuration: oversized,
         permissionGrants: [],
