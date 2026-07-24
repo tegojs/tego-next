@@ -79,6 +79,7 @@ export interface WorkerSessionLike {
 }
 
 export interface MainEndpointLike {
+  readonly activeSessionCount: number;
   attach(socket: WorkerSessionSocket): WorkerSessionLike;
   current(workerId: WorkerId): WorkerSessionLike | undefined;
   registration(workerId: WorkerId): WorkerRegistration | undefined;
@@ -86,6 +87,8 @@ export interface MainEndpointLike {
 }
 
 export interface WorkerEndpointLike {
+  readonly activeSessionCount: number;
+  readonly current: WorkerSessionLike | undefined;
   attach(socket: WorkerSessionSocket): WorkerSessionLike;
   close(): Promise<void>;
 }
@@ -408,6 +411,10 @@ export function workerSessionConformance(
         assert.equal(mainSession.available, false);
         assert.equal(mainSession.acceptingAssignments, false);
         assert.equal(mainSession.state, "unavailable");
+        assert.equal(main.current(WORKER_ID), undefined);
+        assert.equal(worker.current, undefined);
+        assert.equal(main.activeSessionCount, 0);
+        assert.equal(worker.activeSessionCount, 0);
       } finally {
         await Promise.all([main.close(), worker.close()]);
       }
@@ -490,13 +497,19 @@ export function workerSessionConformance(
       const currentWorkerSession = targetWorker.attach(currentWorkerSocket);
       await Promise.all([currentMainSession.ready, currentWorkerSession.ready]);
       assert.equal(currentWorkerSession.epoch, "2");
+      currentWorkerSocket.close(1006, "transport-lost");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(mainB.current(WORKER_ID), undefined);
+      assert.equal(targetWorker.current, undefined);
 
       delayedMainSocket.releaseHeld();
       await delayedWorkerSession.ready;
       await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(delayedWorkerSession.epoch, "1");
       assert.equal(delayedWorkerSession.state, "unavailable");
-      assert.equal(currentWorkerSession.state, "ready");
+      assert.equal(currentWorkerSession.state, "closed");
+      assert.equal(targetWorker.current, undefined);
+      assert.equal(targetWorker.activeSessionCount, 0);
 
       await Promise.all([mainA.close(), mainB.close(), targetWorker.close()]);
     });
