@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { parseArtifactDigest, type ArtifactDigest } from "@tegojs/contracts";
+import {
+  diagnosticCode,
+  parseArtifactDigest,
+  parseMessageId,
+  parseOperationId,
+  parseRevision,
+  type ArtifactDigest,
+} from "@tegojs/contracts";
 import { coordinationConformance, stateStoreConformance } from "@tegojs/testkit";
+import { Pool } from "pg";
 import {
   POSTGRES_ARTIFACT_MAX_BYTES,
   PostgresArtifactStore,
@@ -46,6 +54,189 @@ function digest(bytes: Uint8Array): ArtifactDigest {
 async function* source(...chunks: readonly Uint8Array[]): AsyncIterable<Uint8Array> {
   yield* chunks;
 }
+
+test("PostgreSQL StateStore instances share state and revisions across reopen", async () => {
+  const sharedNamespace = namespace("state_shared");
+  const first = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const second = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const record = { namespace: "runtime", collection: "records", id: "shared" };
+  await Promise.all([first.open(), second.open()]);
+  try {
+    await first.transact({}, async (transaction) => {
+      await transaction.put(record, { version: 1 }, { expectedRevision: "absent" });
+      return null;
+    });
+    assert.deepEqual(await second.read(record), {
+      revision: parseRevision("1"),
+      value: { version: 1 },
+    });
+  } finally {
+    await Promise.all([first.close(), second.close()]);
+  }
+
+  const reopened = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  await reopened.open();
+  try {
+    await reopened.transact({}, async (transaction) => {
+      await transaction.put(record, { version: 2 }, { expectedRevision: parseRevision("1") });
+      return null;
+    });
+    assert.deepEqual(await reopened.read(record), {
+      revision: parseRevision("2"),
+      value: { version: 2 },
+    });
+  } finally {
+    await reopened.close();
+  }
+});
+
+test("concurrent idempotent transactions commit one durable state and outbox effect", async () => {
+  const sharedNamespace = namespace("state_idempotent");
+  const left = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const right = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const record = { namespace: "runtime", collection: "records", id: "idempotent" };
+  const createdAt = new Date().toISOString();
+  const messageId = parseMessageId("postgres-concurrent-idempotent-message");
+  const operationId = parseOperationId("postgres-concurrent-idempotent-operation");
+  await Promise.all([left.open(), right.open()]);
+  try {
+    const run = (store: PostgresStateStore, contender: string) =>
+      store.transact(
+        {
+          idempotencyKey: "postgres-concurrent-idempotency",
+          idempotencyFingerprint: "same-request",
+        },
+        async (transaction) => {
+          await transaction.put(record, { contender }, { expectedRevision: "absent" });
+          await transaction.enqueueOutbox({
+            availableAt: createdAt,
+            createdAt,
+            messageId,
+            operationId,
+            payload: { contender },
+            topic: "component.lifecycle",
+          });
+          return { contender };
+        },
+      );
+
+    const [leftResult, rightResult] = await Promise.all([
+      run(left, "left"),
+      run(right, "right"),
+    ]);
+    assert.deepEqual(rightResult, leftResult);
+    assert.deepEqual(await left.read(record), {
+      revision: parseRevision("1"),
+      value: leftResult,
+    });
+    const claims = await left.claimOutbox({
+      leaseDurationMs: 30_000,
+      limit: 2,
+      owner: "idempotency-verifier",
+    });
+    assert.deepEqual(
+      claims.map((claim) => claim.message.messageId),
+      [messageId],
+    );
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
+});
+
+test("concurrent outbox claims across PostgreSQL StateStore instances have one winner", async () => {
+  const sharedNamespace = namespace("state_claim");
+  const left = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const right = new PostgresStateStore({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const createdAt = new Date().toISOString();
+  await Promise.all([left.open(), right.open()]);
+  try {
+    await left.transact({}, async (transaction) => {
+      await transaction.enqueueOutbox({
+        availableAt: createdAt,
+        createdAt,
+        messageId: parseMessageId("postgres-shared-claim-message"),
+        operationId: parseOperationId("postgres-shared-claim-operation"),
+        payload: { shared: true },
+        topic: "component.lifecycle",
+      });
+      return null;
+    });
+
+    const [leftClaims, rightClaims] = await Promise.all([
+      left.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "left" }),
+      right.claimOutbox({ leaseDurationMs: 30_000, limit: 1, owner: "right" }),
+    ]);
+    assert.equal(leftClaims.length + rightClaims.length, 1);
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
+});
+
+test("concurrent absent PostgreSQL leases use database time and have one winner", async () => {
+  const sharedNamespace = namespace("lease_race");
+  const left = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const right = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const realDateNow = Date.now;
+  await Promise.all([left.open(), right.open()]);
+  try {
+    const earliestDatabaseTime = realDateNow() - 5_000;
+    Date.now = () => Date.UTC(2100, 0, 1);
+    const results = await Promise.allSettled([
+      left.acquireLease({
+        resource: "task/absent-race",
+        owner: "left",
+        durationMs: 30_000,
+      }),
+      right.acquireLease({
+        resource: "task/absent-race",
+        owner: "right",
+        durationMs: 30_000,
+      }),
+    ]);
+    const winners = results.filter((result) => result.status === "fulfilled");
+    const losers = results.filter((result) => result.status === "rejected");
+    assert.equal(winners.length, 1);
+    assert.equal(losers.length, 1);
+    assert.ok(
+      losers[0]?.status === "rejected" &&
+        diagnosticCode(losers[0].reason) === "COORDINATION_LEASE_HELD",
+    );
+    const winner = winners[0];
+    assert.ok(winner?.status === "fulfilled");
+    assert.ok(Date.parse(winner.value.acquiredAt) >= earliestDatabaseTime);
+    assert.ok(Date.parse(winner.value.acquiredAt) <= realDateNow() + 5_000);
+  } finally {
+    Date.now = realDateNow;
+    await Promise.all([left.close(), right.close()]);
+  }
+});
 
 test("PostgreSQL ArtifactStore verifies digest, uniqueness, size, and restart reads", async () => {
   const content = Buffer.from("shared PostgreSQL artifact");
@@ -100,6 +291,37 @@ test("PostgreSQL ArtifactStore rejects digest mismatches and oversized artifacts
     );
   } finally {
     await store.close();
+  }
+});
+
+test("PostgreSQL ArtifactStore rejects at-rest corruption before yielding bytes", async () => {
+  const content = Buffer.from("uncorrupted artifact");
+  const artifactDigest = digest(content);
+  const storeNamespace = namespace("artifact_corruption");
+  const store = new PostgresArtifactStore({
+    connectionString,
+    namespace: storeNamespace,
+  });
+  const pool = new Pool({ connectionString });
+  await store.open();
+  try {
+    await store.put(artifactDigest, source(content));
+    const corrupted = Buffer.from("corrupted artifact");
+    const updated = await pool.query(
+      `UPDATE tego_artifacts
+          SET content = $3, size_bytes = $4
+        WHERE driver_namespace = $1 AND digest = $2`,
+      [storeNamespace, artifactDigest, corrupted, corrupted.byteLength],
+    );
+    assert.equal(updated.rowCount, 1);
+
+    const iterator = store.read(artifactDigest)[Symbol.asyncIterator]();
+    await assert.rejects(
+      iterator.next(),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
+    );
+  } finally {
+    await Promise.all([store.close(), pool.end()]);
   }
 });
 
