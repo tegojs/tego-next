@@ -1,4 +1,5 @@
 import { parseWorkerId, type WorkerId } from "@tegojs/contracts";
+import { systemWorkerClock } from "./clock.js";
 import type { WorkerEndpointOptions, WorkerRegistrationInput } from "./main-endpoint.js";
 import { WorkerSession, type WorkerRegistration } from "./session.js";
 
@@ -52,23 +53,7 @@ export class WorkerEndpoint {
     const session = new WorkerSession({
       role: "worker",
       socket,
-      clock: this.#options.clock ?? {
-        now: () => new Date(),
-        sleep(delayMs, signal): Promise<void> {
-          if (signal?.aborted === true) {
-            return Promise.reject(signal.reason);
-          }
-          return new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(resolve, delayMs);
-            const abort = () => {
-              clearTimeout(timeout);
-              reject(signal?.reason);
-            };
-            signal?.addEventListener("abort", abort, { once: true });
-            timeout.unref();
-          });
-        },
-      },
+      clock: this.#options.clock ?? systemWorkerClock,
       credential: this.#options.credential,
       ...(this.#options.protocol === undefined ? {} : { protocol: this.#options.protocol }),
       ...(this.#options.limits === undefined ? {} : { limits: this.#options.limits }),

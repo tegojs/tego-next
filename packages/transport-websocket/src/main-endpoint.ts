@@ -6,25 +6,8 @@ import {
   type WorkerId,
 } from "@tegojs/contracts";
 import type { WorkerProtocolLimitOverrides } from "./codec.js";
+import { systemWorkerClock } from "./clock.js";
 import { WorkerSession, type WorkerRegistration } from "./session.js";
-
-const systemClock: Clock = {
-  now: () => new Date(),
-  sleep(delayMs, signal): Promise<void> {
-    if (signal?.aborted === true) {
-      return Promise.reject(signal.reason);
-    }
-    return new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(resolve, delayMs);
-      const abort = () => {
-        clearTimeout(timeout);
-        reject(signal?.reason);
-      };
-      signal?.addEventListener("abort", abort, { once: true });
-      timeout.unref();
-    });
-  },
-};
 
 export interface WorkerRegistrationInput {
   readonly labels: JsonObject;
@@ -68,7 +51,7 @@ export class MainEndpoint {
     const session = new WorkerSession({
       role: "main",
       socket,
-      clock: this.#options.clock ?? systemClock,
+      clock: this.#options.clock ?? systemWorkerClock,
       credential: this.#options.credential,
       ...(this.#options.protocol === undefined ? {} : { protocol: this.#options.protocol }),
       ...(this.#options.limits === undefined ? {} : { limits: this.#options.limits }),
