@@ -345,6 +345,7 @@ export class WorkerSession {
   readonly #abort = new AbortController();
   readonly #handshakeAbort = new AbortController();
   readonly #listeners = new Set<(message: WorkerSessionMessage) => void>();
+  readonly #stateListeners = new Set<(state: WorkerSessionState) => void>();
   readonly #receivedIds = new Set<string>();
   readonly #receivedIdOrder: string[] = [];
   readonly #pendingBinary = new Map<string, PendingBinary>();
@@ -472,6 +473,11 @@ export class WorkerSession {
     return () => this.#listeners.delete(listener);
   }
 
+  onStateChange(listener: (state: WorkerSessionState) => void): () => void {
+    this.#stateListeners.add(listener);
+    return () => this.#stateListeners.delete(listener);
+  }
+
   async send(
     type: WorkerMessageType,
     payload: JsonValue,
@@ -526,6 +532,7 @@ export class WorkerSession {
       return;
     }
     this.#state = "closed";
+    this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#abort.abort(diagnosticError("WORKER_SESSION_CLOSED", "Worker session is closed"));
@@ -545,6 +552,7 @@ export class WorkerSession {
       return;
     }
     this.#state = "unavailable";
+    this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#abort.abort(diagnosticError("WORKER_SESSION_REPLACED", "Worker session was replaced"));
@@ -898,6 +906,7 @@ export class WorkerSession {
     }
     this.#epoch = boundedUnsigned64(this.#onRegister(this, registration), "Worker session epoch");
     this.#state = "ready";
+    this.#notifyState();
     this.#available = true;
     this.#acceptingAssignments = true;
     this.#lastHeartbeatAt = this.#clock.now().getTime();
@@ -926,6 +935,7 @@ export class WorkerSession {
     }
     this.#epoch = boundedUnsigned64(payload.epoch, "Worker session epoch");
     this.#state = "ready";
+    this.#notifyState();
     this.#available = true;
     this.#acceptingAssignments = true;
     this.#handshakeAbort.abort();
@@ -986,6 +996,7 @@ export class WorkerSession {
       return;
     }
     this.#state = "unavailable";
+    this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#diagnostic = runtimeDiagnostic({
@@ -1100,6 +1111,7 @@ export class WorkerSession {
     }
     this.#diagnostic = error.diagnostic;
     this.#state = "closed";
+    this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
     this.#abort.abort(error);
@@ -1116,6 +1128,7 @@ export class WorkerSession {
       return;
     }
     this.#state = "closed";
+    this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
     const error = diagnosticError("WORKER_SESSION_CLOSED", "Worker WebSocket session closed", {
@@ -1147,9 +1160,20 @@ export class WorkerSession {
     this.#socket.off("close", this.#closeListener);
     this.#socket.off("error", this.#errorListener);
     this.#listeners.clear();
+    this.#stateListeners.clear();
     if (!this.#closedNotified) {
       this.#closedNotified = true;
       this.#onClosed?.(this);
+    }
+  }
+
+  #notifyState(): void {
+    for (const listener of this.#stateListeners) {
+      try {
+        listener(this.#state);
+      } catch {
+        // Consumer state observers do not participate in protocol liveness.
+      }
     }
   }
 }

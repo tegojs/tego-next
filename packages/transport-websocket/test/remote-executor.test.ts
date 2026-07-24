@@ -3,6 +3,7 @@ import { afterEach, test } from "node:test";
 import { parseWorkerId, type JsonValue } from "@tegojs/contracts";
 import {
   executorConformance,
+  eventually,
   FakeClock,
   type ExecutorCleanupRaceFixture,
   type ExecutorConformanceFixture,
@@ -56,25 +57,32 @@ afterEach(async () => {
   await Promise.all(cleanups.splice(0).map(async (cleanup) => cleanup()));
 });
 
-function cleanupFixture(trigger: "cancel" | "deadline"): Promise<ExecutorCleanupRaceFixture> {
+function cleanupFixture(
+  trigger: "cancel" | "deadline",
+  failed = false,
+): Promise<ExecutorCleanupRaceFixture> {
   const cleanupStarted = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const local = new TestLocalExecutor();
   const originalSubmit = local.submit.bind(local);
   local.submit = async (request) => {
-    const handle = await originalSubmit({
-      ...request,
-      input: { mode: "wait" },
-    });
+    const handle = await originalSubmit({ ...request, input: { mode: "wait" } });
+    const attempt = local.attempts.get(
+      `${request.taskId.length}:${request.taskId}${request.attemptId}`,
+    );
     queueMicrotask(() => cleanupStarted.resolve());
-    void release.promise.then(async () => {
-      const attempt = local.attempts.get(`${request.taskId.length}:${request.taskId}${request.attemptId}`);
+    void release.promise.then(() => {
       if (attempt !== undefined) {
-        await local.cancel(request.taskId, request.attemptId);
+        local.complete(
+          attempt,
+          failed ? "failed" : "succeeded",
+          failed ? undefined : "cleanup-stable",
+        );
       }
     });
     return handle;
   };
+  local.cancel = async () => undefined;
   return connected({}, local).then(({ remote }) => {
     const request = executionRequest(
       { mode: "wait" },
@@ -85,7 +93,7 @@ function cleanupFixture(trigger: "cancel" | "deadline"): Promise<ExecutorCleanup
       executor: remote,
       request,
       cleanupStarted: cleanupStarted.promise,
-      expectedOutput: null,
+      expectedOutput: "cleanup-stable",
       async trigger() {
         if (trigger === "cancel") {
           await remote.cancel(request.taskId, request.attemptId);
@@ -123,8 +131,8 @@ const fixture: ExecutorConformanceFixture = {
     clock.advanceBy(milliseconds);
     await flush();
   },
-  cleanupRaceFactory: cleanupFixture,
-  failedCleanupRaceFactory: cleanupFixture,
+  cleanupRaceFactory: (trigger) => cleanupFixture(trigger),
+  failedCleanupRaceFactory: (trigger) => cleanupFixture(trigger, true),
 };
 
 executorConformance(async () => {
@@ -162,15 +170,22 @@ test("assignment is recorded before the Worker receives it", async () => {
 
   const result = await (await remote.submit(executionRequest({ mode: "echo", value: 1 }, "order"))).result;
   assert.equal(result.status, "succeeded");
-  assert.ok(events.indexOf("store:assigned") < events.indexOf("send:execution.assign"));
+  assert.ok(events.indexOf("store:assigned") < events.indexOf("send:task.assign"));
 });
 
 test("same attempt with a different fingerprint is rejected before remote execution", async () => {
   const { remote, local } = await connected();
   const request = executionRequest({ mode: "wait" }, "fingerprint");
-  await remote.submit(request);
-  await assert.rejects(remote.submit({ ...request, input: { changed: true } }), /fingerprint|identity/iu);
-  assert.equal(local.executions, 1);
+  try {
+    await remote.submit(request);
+    await assert.rejects(
+      remote.submit({ ...request, input: { changed: true } }),
+      /fingerprint|identity/iu,
+    );
+    await eventually(() => assert.equal(local.executions, 1));
+  } finally {
+    await remote.cancel(request.taskId, request.attemptId);
+  }
 });
 
 test("remote probe reports Worker identity and isolated execution", async () => {

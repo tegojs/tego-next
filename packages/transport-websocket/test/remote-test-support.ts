@@ -16,6 +16,7 @@ import {
   type ExecutorHealth,
   type JsonValue,
   type TaskId,
+  type WorkerMessageType,
 } from "@tegojs/contracts";
 import type {
   RemoteSession,
@@ -70,7 +71,7 @@ export class MemoryRemoteSession implements RemoteSession {
   }
 
   async send(
-    type: string,
+    type: WorkerMessageType,
     payload: JsonValue,
     options: { readonly correlationId?: string } = {},
   ): Promise<string> {
@@ -86,7 +87,7 @@ export class MemoryRemoteSession implements RemoteSession {
     return messageId;
   }
 
-  async request(type: string, payload: JsonValue): Promise<RemoteSessionMessage> {
+  async request(type: WorkerMessageType, payload: JsonValue): Promise<RemoteSessionMessage> {
     if (this.#state !== "ready") {
       throw new Error("session is closed");
     }
@@ -230,11 +231,11 @@ export class TestLocalExecutor implements Executor {
         : {};
     const mode = "mode" in input ? input.mode : undefined;
     if (mode === "echo") {
-      queueMicrotask(() => this.#complete(attempt, "succeeded", input.value));
+      queueMicrotask(() => this.complete(attempt, "succeeded", input.value));
     } else if (mode === "crash") {
-      queueMicrotask(() => this.#complete(attempt, "failed"));
+      queueMicrotask(() => this.complete(attempt, "failed"));
     } else if (mode === "large-output") {
-      queueMicrotask(() => this.#complete(attempt, "succeeded", "x".repeat(2_000_000)));
+      queueMicrotask(() => this.complete(attempt, "succeeded", "x".repeat(2_000_000)));
     }
     return Promise.resolve(handle);
   }
@@ -251,7 +252,7 @@ export class TestLocalExecutor implements Executor {
   cancel(taskId: TaskId, attemptId: AttemptId): Promise<void> {
     const attempt = this.attempts.get(attemptKey(taskId, attemptId));
     if (attempt !== undefined && attempt.terminal === undefined) {
-      this.#complete(attempt, "cancelled");
+      this.complete(attempt, "cancelled");
     }
     return Promise.resolve();
   }
@@ -278,7 +279,7 @@ export class TestLocalExecutor implements Executor {
     return this.drain({});
   }
 
-  #complete(
+  complete(
     attempt: LocalAttempt,
     status: ExecutionResult["status"],
     output?: JsonValue,

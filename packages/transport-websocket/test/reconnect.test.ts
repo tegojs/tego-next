@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseWorkerId } from "@tegojs/contracts";
-import { FakeClock } from "@tegojs/testkit";
+import { eventually, FakeClock } from "@tegojs/testkit";
 import {
   MemoryRemoteAttemptStore,
   MemoryRemoteResultStore,
@@ -42,8 +42,7 @@ test("duplicate assignment after reconnect reuses one local attempt", async () =
   await reconnect(remote, runtime, "1");
   const request = executionRequest({ mode: "wait" }, "duplicate");
   const handle = await remote.submit(request);
-  await flush();
-  assert.equal(local.executions, 1);
+  await eventually(() => assert.equal(local.executions, 1));
 
   await reconnect(remote, runtime, "2");
   const duplicate = await remote.submit(request);
@@ -74,7 +73,9 @@ test("cancel orphan policy cancels locally and preserves terminal evidence for r
   await remote.attach(main);
   const request = executionRequest({ mode: "wait" }, "cancel-orphan", "cancel");
   const handle = await remote.submit(request);
-  await flush();
+  await eventually(() =>
+    assert.equal(local.attempts.has(`${request.taskId.length}:${request.taskId}${request.attemptId}`), true),
+  );
   main.close();
   await flush();
   assert.equal((await local.observe(request.taskId, request.attemptId))?.state, "terminal");
@@ -111,8 +112,7 @@ test("finish-and-buffer completes offline and releases only after Main acknowled
   const handle = await remote.submit(request);
   await flush();
   main.close();
-  await flush();
-  assert.equal(runtime.bufferedResultCount, 1);
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 1));
 
   await reconnect(remote, runtime, "2");
   assert.equal((await handle.result).output, "buffered");
@@ -176,8 +176,7 @@ test("finish-and-persist recovers terminal result from an injected durable store
   const handle = await remote.submit(request);
   await flush();
   main.close();
-  await flush();
-  assert.equal((await results.list()).length, 1);
+  await eventually(async () => assert.equal((await results.list()).length, 1));
 
   await reconnect(remote, runtime, "2");
   assert.equal((await handle.result).output, "persisted");
