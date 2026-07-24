@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { parseArtifactDigest, type ArtifactDigest } from "@tegojs/contracts";
 import { coordinationConformance, stateStoreConformance } from "@tegojs/testkit";
 import {
+  POSTGRES_ARTIFACT_MAX_BYTES,
   PostgresArtifactStore,
   PostgresCoordinationProvider,
   PostgresStateStore,
@@ -70,6 +71,36 @@ test("PostgreSQL ArtifactStore verifies digest, uniqueness, size, and restart re
   for await (const chunk of reopened.read(artifactDigest)) chunks.push(chunk);
   assert.deepEqual(Buffer.concat(chunks), content);
   await reopened.close();
+});
+
+test("PostgreSQL ArtifactStore rejects digest mismatches and oversized artifacts", async () => {
+  const store = new PostgresArtifactStore({
+    connectionString,
+    namespace: namespace("artifact_bounds"),
+  });
+  await store.open();
+  try {
+    await assert.rejects(
+      store.put(digest(Buffer.from("expected")), source(Buffer.from("different"))),
+      (error: unknown) =>
+        error instanceof Error &&
+        "diagnostic" in error &&
+        (error as { diagnostic?: { code?: string } }).diagnostic?.code ===
+          "ARTIFACT_DIGEST_MISMATCH",
+    );
+    await assert.rejects(
+      store.put(
+        digest(Buffer.alloc(POSTGRES_ARTIFACT_MAX_BYTES + 1)),
+        source(Buffer.alloc(POSTGRES_ARTIFACT_MAX_BYTES + 1)),
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        "diagnostic" in error &&
+        (error as { diagnostic?: { code?: string } }).diagnostic?.code === "ARTIFACT_SIZE_EXCEEDED",
+    );
+  } finally {
+    await store.close();
+  }
 });
 
 test("createPostgresDrivers creates one shared driver namespace", async () => {
