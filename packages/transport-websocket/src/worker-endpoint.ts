@@ -27,6 +27,7 @@ export class WorkerEndpoint {
   readonly #registration: WorkerRegistration;
   readonly #sessions = new Set<WorkerSession>();
   #current: WorkerSession | undefined;
+  #highestAcceptedEpoch = "0";
   #closed = false;
 
   constructor(options: WorkerEndpointOptions) {
@@ -71,6 +72,9 @@ export class WorkerEndpoint {
       worker: this.#registration,
       onClosed: (closedSession) => {
         this.#sessions.delete(closedSession);
+        if (this.#current === closedSession) {
+          this.#current = undefined;
+        }
       },
     });
     this.#sessions.add(session);
@@ -80,7 +84,8 @@ export class WorkerEndpoint {
           return;
         }
         const predecessor = this.#current;
-        if (predecessor === undefined || compareWorkerEpoch(session.epoch, predecessor.epoch) > 0) {
+        if (compareWorkerEpoch(session.epoch, this.#highestAcceptedEpoch) > 0) {
+          this.#highestAcceptedEpoch = session.epoch;
           this.#current = session;
           if (predecessor !== session) {
             predecessor?.replace();

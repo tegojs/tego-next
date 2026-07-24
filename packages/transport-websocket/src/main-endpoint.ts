@@ -93,7 +93,7 @@ export class MainEndpoint {
       onRegister: (registeredSession, registration) =>
         this.#register(registeredSession, registration),
       onClosed: (closedSession) => {
-        this.#sessions.delete(closedSession);
+        this.#release(closedSession);
       },
     });
     this.#sessions.add(session);
@@ -131,6 +131,16 @@ export class MainEndpoint {
     this.#registrations.set(workerId, registration);
     predecessor?.replace();
     return parseSequence(nextEpoch.toString());
+  }
+
+  #release(session: WorkerSession): void {
+    this.#sessions.delete(session);
+    for (const [workerId, current] of this.#current) {
+      if (current === session) {
+        this.#current.delete(workerId);
+        this.#registrations.delete(workerId);
+      }
+    }
   }
 }
 
