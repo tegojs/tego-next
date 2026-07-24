@@ -501,6 +501,15 @@ export class RemoteExecutor implements Executor {
     if (payload.epoch !== session.epoch) {
       throw new Error("Remote inventory epoch does not match the authoritative session");
     }
+    if (payload.error !== undefined) {
+      const error = asObject(payload.error, "remote inventory error");
+      throw remoteError(
+        "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
+        typeof error.message === "string" ? error.message : "Remote inventory was rejected",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     if (
       payload.acknowledged === undefined ||
       payload.running === undefined ||

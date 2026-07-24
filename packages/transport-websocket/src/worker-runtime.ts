@@ -81,6 +81,7 @@ export class WorkerRuntime {
   #hydrated = false;
   #closed = false;
   #reservedResults = 0;
+  #persistenceAvailable = true;
 
   constructor(options: WorkerRuntimeOptions) {
     this.#workerId = options.workerId;
@@ -266,7 +267,10 @@ export class WorkerRuntime {
       );
       return;
     }
-    if (request.orphanPolicy === "finish-and-persist" && this.#resultStore?.durable !== true) {
+    if (
+      request.orphanPolicy === "finish-and-persist" &&
+      (this.#resultStore?.durable !== true || !this.#persistenceAvailable)
+    ) {
       await this.#sendRejected(
         session,
         message.messageId,
@@ -367,7 +371,17 @@ export class WorkerRuntime {
     if (attempt.state === "terminal") return;
     let result = parseExecutionResult(candidate);
     if (attempt.request.orphanPolicy === "finish-and-persist") {
-      await this.#resultStore?.put(result);
+      try {
+        await this.#resultStore?.put(result);
+      } catch {
+        this.#persistenceAvailable = false;
+        result = this.#result(
+          attempt.request,
+          "failed",
+          "EXECUTOR_REMOTE_PERSISTENCE_FAILED",
+          "Worker durable result persistence failed",
+        );
+      }
     }
     try {
       this.#results.put(result);
@@ -420,11 +434,21 @@ export class WorkerRuntime {
     const attempts = [...this.#attempts.values()];
     const buffered = this.#results.list();
     if (attempts.length + buffered.length > this.#maxInventoryItems) {
-      throw new Error("Worker reconnect inventory exceeds maxInventoryItems");
+      await this.#inventoryError(
+        session,
+        message.messageId,
+        "Worker reconnect inventory exceeds maxInventoryItems",
+      );
+      return;
     }
     const artifacts = [...((await this.#preparedArtifacts?.()) ?? [])];
     if (artifacts.length > this.#maxInventoryItems) {
-      throw new Error("Worker prepared artifact inventory exceeds maxInventoryItems");
+      await this.#inventoryError(
+        session,
+        message.messageId,
+        "Worker prepared artifact inventory exceeds maxInventoryItems",
+      );
+      return;
     }
     await session.send(
       REMOTE_INVENTORY_RESULT,
@@ -447,11 +471,33 @@ export class WorkerRuntime {
     const payload = asObject(payloadValue, REMOTE_RESULT_ACK);
     const request = identityFrom(payload);
     const retained = this.#results.get(request.taskId, request.attemptId);
-    this.#results.acknowledge(request.taskId, request.attemptId);
     await this.#resultStore?.delete(request.taskId, request.attemptId);
+    this.#results.acknowledge(request.taskId, request.attemptId);
     if (retained !== undefined) {
       this.#reservedResults = Math.max(0, this.#reservedResults - 1);
     }
+  }
+
+  async #inventoryError(
+    session: RemoteSession,
+    correlationId: string,
+    message: string,
+  ): Promise<void> {
+    await session.send(
+      REMOTE_INVENTORY_RESULT,
+      {
+        epoch: session.epoch,
+        error: {
+          code: "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
+          message,
+        },
+        acknowledged: [],
+        running: [],
+        terminalUnacknowledged: [],
+        preparedArtifacts: [],
+      },
+      { correlationId },
+    );
   }
 
   #sessionLost(session: RemoteSession): void {
