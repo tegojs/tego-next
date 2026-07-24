@@ -391,7 +391,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-rel
   );
 });
 
-test("first-layer cache boundaries distinguish internal filenames from external packages", async () => {
+test("@spec:runtime-operations/layer-one-dependency-boundary/cache-specifier-resolution", async () => {
   await withWorkspace(
     {
       "packages/contracts": { name: "@tegojs/contracts" },
@@ -411,6 +411,7 @@ test("first-layer cache boundaries distinguish internal filenames from external 
         new URL("index.js", outputDirectory),
         [
           'export { PreparedArtifactCache } from "./prepared-artifact-cache.js";',
+          'import "@tegojs/runtime/cache";',
           'import "@vendor/cache";',
           'import "@tegojs/cache-driver";',
         ].join("\n"),
@@ -422,6 +423,7 @@ test("first-layer cache boundaries distinguish internal filenames from external 
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
         "@tegojs/runtime -> @tegojs/cache-driver",
+        "@tegojs/runtime -> @tegojs/runtime/cache",
         "@tegojs/runtime -> @vendor/cache",
       ]);
     },
