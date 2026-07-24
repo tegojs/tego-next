@@ -43,6 +43,7 @@ import {
 } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import { createRuntimeHost, type Reconciler, type RuntimeHostServices } from "../src/index.js";
+import { wakeReconcilerForAuthority } from "../src/create-runtime.js";
 
 const now = new Date("2026-07-24T00:00:00.000Z");
 const clock: Clock = {
@@ -479,6 +480,25 @@ test("@spec:runtime-operations/task-operations/runtime-host-uses-one-canonical-t
   assert.equal(await runtime.operations.taskStatus(parseTaskId("task-missing")), undefined);
   assert.equal(value.log.includes("tasks.status"), true);
   await runtime.stop();
+});
+
+test("@spec:runtime-operations/plugin-operations/runtime-host-rejects-stale-reconciler-wake", async () => {
+  let wakes = 0;
+  const expected = {
+    resource: "runtime:runtime-01",
+    epoch: parseFencingEpoch("7"),
+  };
+  await assert.rejects(
+    wakeReconcilerForAuthority(
+      expected,
+      { ...expected, epoch: parseFencingEpoch("8") },
+      expected,
+      { wake: async () => void (wakes += 1) },
+      clock,
+    ),
+    (error: unknown) => diagnosticCode(error) === "COORDINATION_FENCE_REJECTED",
+  );
+  assert.equal(wakes, 0);
 });
 
 test("@spec:runtime-bootstrap/recovery/leadership-reacquisition", async () => {

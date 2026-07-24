@@ -837,6 +837,27 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
   });
   state.beforeTransaction = () => {
     state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
+      value: parsePluginInstallation({
+        ...installation,
+        version: "2.0.0",
+        manifest: { ...installation.manifest, version: "2.0.0" },
+      }),
+      revision: 100,
+    });
+  };
+  await assert.rejects(
+    operations.deployPlugin({
+      ...deploymentRequest,
+      configuration: { greeting: "stale-consumer-key" },
+    }),
+    (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_ARTIFACT_NOT_INSTALLED",
+  );
+  state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
+    value: installation,
+    revision: 101,
+  });
+  state.beforeTransaction = () => {
+    state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
       value: { ...installation, pluginId: parsePluginId("other") },
       revision: 100,
     });
@@ -1163,15 +1184,8 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/stale-completion-keeps-ne
   const cancellation = service.cancel(identity.taskId);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(newExecutor.cancelled.length, 1);
-  newExecutor.result.resolve({
-    taskId: identity.taskId,
-    attemptId: identity.attemptId,
-    executor: { kind: "remote" },
-    status: "cancelled",
-    startedAt: now.toISOString(),
-    completedAt: now.toISOString(),
-  });
-  await cancellation;
+  await service.close();
+  await assert.rejects(cancellation);
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/authority-loss-during-resolution-has-zero-cancel-effects", async () => {
