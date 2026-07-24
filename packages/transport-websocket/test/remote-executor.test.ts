@@ -202,3 +202,62 @@ test("remote result output stays JSON-compatible", async () => {
   const result = await (await remote.submit(executionRequest({ mode: "echo", value }, "json"))).result;
   assert.deepEqual(result.output, value);
 });
+
+test("future drain deadline cancels active remote attempts with the fake clock", async () => {
+  const { remote } = await connected();
+  const request = executionRequest({ mode: "wait" }, "drain-deadline");
+  const handle = await remote.submit(request);
+  await eventually(async () =>
+    assert.deepEqual(await remote.observe(request.taskId, request.attemptId), {
+      state: "running",
+    }),
+  );
+  let drained = false;
+  const draining = remote
+    .drain({ deadline: new Date(clock.now().getTime() + 100).toISOString() })
+    .then(() => {
+      drained = true;
+    });
+  try {
+    clock.advanceBy(101);
+    await flush();
+    assert.equal(drained, true);
+    assert.equal((await handle.result).status, "cancelled");
+  } finally {
+    await remote.cancel(request.taskId, request.attemptId);
+    await draining;
+  }
+});
+
+test("Worker attempt-store failure rejects before local execution instead of leaving an ambiguous ack", async () => {
+  const local = new TestLocalExecutor();
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: {
+      save: async () => {
+        throw new Error("attempt store unavailable");
+      },
+      load: async () => undefined,
+      list: async () => [],
+    },
+    selectExecutor: () => local,
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote-store-failure",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await remote.attach(mainSession);
+  const request = executionRequest({ mode: "echo", value: "never" }, "worker-store-failure");
+  const handle = await remote.submit(request);
+  for (let index = 0; index < 10; index += 1) await flush();
+  const observed = await remote.observe(request.taskId, request.attemptId);
+  assert.equal(observed?.state, "terminal");
+  assert.equal((await handle.result).status, "rejected");
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
