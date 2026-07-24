@@ -84,7 +84,9 @@ class DirectSocket {
   automaticDelivery = true;
   synchronousDelivery = false;
   wsRawDelivery = false;
+  holdControlType?: string;
   readonly sent: (string | Uint8Array)[] = [];
+  readonly held: (string | Uint8Array)[] = [];
   readonly closeReasons: string[] = [];
   readonly #listeners = new Map<SocketEvent, Set<SocketListener>>([
     ["close", new Set()],
@@ -98,6 +100,14 @@ class DirectSocket {
     }
     const copy = typeof data === "string" ? data : Uint8Array.from(data);
     this.sent.push(copy);
+    if (
+      typeof copy === "string" &&
+      this.holdControlType !== undefined &&
+      (JSON.parse(copy) as { type?: unknown }).type === this.holdControlType
+    ) {
+      this.held.push(copy);
+      return;
+    }
     if (this.automaticDelivery) {
       const peer = this.peer;
       const deliver = () => {
@@ -163,6 +173,16 @@ class DirectSocket {
 
   clearSent(): void {
     this.sent.length = 0;
+  }
+
+  releaseHeld(): void {
+    const peer = this.peer;
+    if (peer === undefined) {
+      throw new Error("socket has no peer");
+    }
+    for (const frame of this.held.splice(0)) {
+      peer.#emit("message", { data: frame });
+    }
   }
 
   listenerCount(): number {
@@ -486,4 +506,50 @@ test("a peer hello arriving first cannot move authenticate before the local hell
   assert.deepEqual(sentTypes.slice(0, 2), ["hello", "authenticate"]);
   await main.close();
   await assert.rejects(session.ready);
+});
+
+test("a late lower epoch cannot replace the authoritative Worker session", async () => {
+  const clock = new FakeClock();
+  const workerId = "epoch-worker" as WorkerId;
+  const mainA = createMainEndpoint({ clock, credential: "shared-secret" });
+  const mainB = createMainEndpoint({ clock, credential: "shared-secret" });
+
+  const seedWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+  });
+  const seedSockets = directSocketPair();
+  const seedMainSession = mainB.attach(seedSockets[0]);
+  const seedWorkerSession = seedWorker.attach(seedSockets[1]);
+  await Promise.all([seedMainSession.ready, seedWorkerSession.ready]);
+  await seedWorker.close();
+
+  const targetWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+  });
+  const delayedSockets = directSocketPair();
+  delayedSockets[0].holdControlType = "session.ready";
+  const delayedMainSession = mainA.attach(delayedSockets[0]);
+  const delayedWorkerSession = targetWorker.attach(delayedSockets[1]);
+  await delayedMainSession.ready;
+
+  const currentSockets = directSocketPair();
+  const currentMainSession = mainB.attach(currentSockets[0]);
+  const currentWorkerSession = targetWorker.attach(currentSockets[1]);
+  await Promise.all([currentMainSession.ready, currentWorkerSession.ready]);
+  assert.equal(currentWorkerSession.epoch, "2");
+  assert.equal(targetWorker.current, currentWorkerSession);
+
+  delayedSockets[0].releaseHeld();
+  await delayedWorkerSession.ready;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(delayedWorkerSession.epoch, "1");
+  assert.equal(targetWorker.current, currentWorkerSession);
+  assert.equal(delayedWorkerSession.state, "unavailable");
+  assert.equal(currentWorkerSession.state, "ready");
+
+  await Promise.all([mainA.close(), mainB.close(), targetWorker.close()]);
 });
