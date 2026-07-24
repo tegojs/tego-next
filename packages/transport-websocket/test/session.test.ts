@@ -27,8 +27,7 @@ test("codec rejects oversized control frames before JSON parsing", () => {
     (error: unknown) =>
       error instanceof Error &&
       "diagnostic" in error &&
-      (error as { diagnostic: { code: string } }).diagnostic.code ===
-        "PROTOCOL_FRAME_TOO_LARGE",
+      (error as { diagnostic: { code: string } }).diagnostic.code === "PROTOCOL_FRAME_TOO_LARGE",
   );
 });
 
@@ -68,9 +67,5 @@ test("binary codec rejects partial, oversized, and inconsistent frames", () => {
     payload: Uint8Array.of(1, 2, 3),
   });
   assert.throws(() => codec.decodeBinary(frame.subarray(0, frame.length - 1)));
-  assert.throws(() =>
-    codec.decodeBinary(
-      new Uint8Array(129),
-    ),
-  );
+  assert.throws(() => codec.decodeBinary(new Uint8Array(129)));
 });

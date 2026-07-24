@@ -41,6 +41,13 @@ export interface WorkerRegistration extends JsonObject {
   readonly preparedArtifacts: readonly string[];
 }
 
+export interface WorkerRegistrationInput {
+  readonly labels: JsonObject;
+  readonly resources: JsonObject;
+  readonly executors: readonly string[];
+  readonly preparedArtifacts: readonly string[];
+}
+
 export interface WorkerSessionMessage {
   readonly messageId: string;
   readonly correlationId?: string;
@@ -56,7 +63,7 @@ export interface WorkerSessionLike {
   readonly state: "authenticating" | "closed" | "ready" | "unavailable";
   readonly available: boolean;
   readonly acceptingAssignments: boolean;
-  readonly diagnostic?: RuntimeDiagnostic;
+  readonly diagnostic: RuntimeDiagnostic | undefined;
   send(
     type: string,
     payload: JsonValue,
@@ -88,7 +95,7 @@ export interface WorkerEndpointFactoryOptions {
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
   readonly workerId?: WorkerId;
-  readonly registration?: Omit<WorkerRegistration, "workerId">;
+  readonly registration?: WorkerRegistrationInput;
 }
 
 export type MainEndpointFactory = (
@@ -143,17 +150,25 @@ class MemorySocket implements WorkerSessionSocket {
     });
   }
 
-  on(event: "message" | "close" | "error", listener: MessageListener | CloseListener | ErrorListener): this {
+  on(
+    event: "message" | "close" | "error",
+    listener: MessageListener | CloseListener | ErrorListener,
+  ): this {
     this.#listeners(event).add(listener as never);
     return this;
   }
 
-  off(event: "message" | "close" | "error", listener: MessageListener | CloseListener | ErrorListener): this {
+  off(
+    event: "message" | "close" | "error",
+    listener: MessageListener | CloseListener | ErrorListener,
+  ): this {
     this.#listeners(event).delete(listener as never);
     return this;
   }
 
-  #listeners(event: "message" | "close" | "error"): Set<MessageListener> | Set<CloseListener> | Set<ErrorListener> {
+  #listeners(
+    event: "message" | "close" | "error",
+  ): Set<MessageListener> | Set<CloseListener> | Set<ErrorListener> {
     if (event === "message") {
       return this.#messages;
     }
@@ -189,7 +204,7 @@ async function connect(
 }
 
 const WORKER_ID = "worker-1" as WorkerId;
-const REGISTRATION: Omit<WorkerRegistration, "workerId"> = {
+const REGISTRATION: WorkerRegistrationInput = {
   labels: { region: "test" },
   resources: { cpu: 2 },
   executors: ["process"],
@@ -238,7 +253,10 @@ export function workerSessionConformance(
       const [mainSocket, workerSocket] = socketPair();
       const mainSession = main.attach(mainSocket);
       const workerSession = worker.attach(workerSocket);
-      await assert.rejects(Promise.all([mainSession.ready, workerSession.ready]), /auth|credential/iu);
+      await assert.rejects(
+        Promise.all([mainSession.ready, workerSession.ready]),
+        /auth|credential/iu,
+      );
       assert.equal(main.current(WORKER_ID), undefined);
       assert.equal(mainSession.state, "closed");
       await Promise.all([main.close(), worker.close()]);
@@ -257,7 +275,10 @@ export function workerSessionConformance(
       const [mainSocket, workerSocket] = socketPair();
       const mainSession = main.attach(mainSocket);
       const workerSession = worker.attach(workerSocket);
-      await assert.rejects(Promise.all([mainSession.ready, workerSession.ready]), /protocol|version/iu);
+      await assert.rejects(
+        Promise.all([mainSession.ready, workerSession.ready]),
+        /protocol|version/iu,
+      );
       assert.equal(mainSession.diagnostic?.code, "PROTOCOL_VERSION_UNSUPPORTED");
       await Promise.all([main.close(), worker.close()]);
     });
@@ -276,11 +297,7 @@ export function workerSessionConformance(
         const received: WorkerSessionMessage[] = [];
         const unsubscribe = workerSession.onMessage((message) => received.push(message));
         const messageId = await mainSession.send("session.reconcile", { running: [] });
-        await mainSession.send(
-          "session.reconcile",
-          { running: [] },
-          { correlationId: messageId },
-        );
+        await mainSession.send("session.reconcile", { running: [] }, { correlationId: messageId });
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(received.length, 2);
         assert.equal(received[1]?.correlationId, messageId);
