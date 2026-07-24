@@ -1045,9 +1045,7 @@ export class WorkerSession {
     ) {
       throw diagnosticError("WORKER_SESSION_CLOSED", "Worker session is closed");
     }
-    const messageId = parseMessageId(
-      suppliedMessageId ?? `message-${randomUUID()}`,
-    );
+    const messageId = parseMessageId(suppliedMessageId ?? `message-${randomUUID()}`);
     const binary = options.binary;
     const maxChunkPayload = Math.max(1, this.#codec.limits.maxFrameBytes - 160);
     const binaryChunks =
