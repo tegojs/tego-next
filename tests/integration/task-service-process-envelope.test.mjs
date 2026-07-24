@@ -53,10 +53,35 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
       high = middle;
     }
   }
+  let realRejection;
+  await assert.rejects(
+    executor.submit({
+      taskId: parseTaskId("task-real-process-envelope"),
+      attemptId: parseAttemptId("attempt-real-process-envelope"),
+      ...parseRunTaskRequest({ ...base, input: "x".repeat(low) }),
+    }),
+    (error) => {
+      realRejection = error;
+      return error?.diagnostic?.code === "EXECUTOR_INPUT_LIMIT_EXCEEDED";
+    },
+  );
+  const rejectingExecutor = {
+    id: executor.id,
+    type: executor.type,
+    probe: () => executor.probe(),
+    submit: async () => {
+      throw realRejection;
+    },
+    observe: async () => undefined,
+    cancel: async () => {},
+    drain: async () => {},
+    health: () => executor.health(),
+    close: async () => {},
+  };
   const service = new TaskService({
     state,
     clock,
-    selectExecutor: async () => executor,
+    selectExecutor: async () => rejectingExecutor,
     createIdentity: () => ({
       taskId: parseTaskId("task-process-envelope"),
       attemptId: parseAttemptId("attempt-process-envelope"),
@@ -66,7 +91,7 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
     resource: "runtime:runtime-01",
     epoch: parseFencingEpoch("1"),
   });
-  const terminal = await service.run({ ...base, input: "x".repeat(low) });
+  const terminal = await service.run({ ...base, input: "small" });
   assert.equal(terminal.state, "terminal");
   assert.equal(terminal.result?.status, "rejected");
   assert.equal(terminal.result?.diagnostic?.code, "EXECUTOR_INPUT_LIMIT_EXCEEDED");
