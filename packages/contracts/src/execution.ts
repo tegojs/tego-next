@@ -26,6 +26,7 @@ export interface ExecutionRequest extends JsonObject {
 export type ExecutionTerminalStatus =
   | "cancelled"
   | "failed"
+  | "indeterminate"
   | "rejected"
   | "succeeded"
   | "timed-out";

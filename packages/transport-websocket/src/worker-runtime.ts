@@ -705,7 +705,7 @@ export class WorkerRuntime {
         attempt,
         this.#result(
           attempt.request,
-          "failed",
+          "indeterminate",
           "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
           isRemoteAttemptRevisionError(error)
             ? "Worker attempt persistence returned an invalid revision"
@@ -717,6 +717,7 @@ export class WorkerRuntime {
   }
 
   #terminalVolatile(attempt: WorkerAttempt, result: ExecutionResult): void {
+    if (attempt.state === "terminal") return;
     const terminal = cloneJson(result);
     attempt.result = terminal;
     attempt.state = "terminal";
@@ -1137,7 +1138,7 @@ export class WorkerRuntime {
     if (attempt.state === "terminal") return;
     const failure = this.#result(
       attempt.request,
-      "failed",
+      "indeterminate",
       "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
       message,
     );

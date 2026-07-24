@@ -502,6 +502,20 @@ test("every exported public wire contract survives serialization and validating 
   assert.deepEqual(roundTrip(validDiagnostic, parseRuntimeDiagnostic), validDiagnostic);
 });
 
+test("indeterminate execution is a non-retryable terminal observation", () => {
+  const { output: _output, ...base } = validExecutionResult;
+  const indeterminate = {
+    ...base,
+    status: "indeterminate",
+    diagnostic: {
+      ...validDiagnostic,
+      retryable: false,
+    },
+  };
+
+  assert.deepEqual(roundTrip(indeterminate, parseExecutionResult), indeterminate);
+});
+
 test("runtime boundary validators reject malformed health, authority, status, and events", () => {
   for (const [value, parse, code] of [
     [{ status: "unknown", checkedAt: 1n }, parseDriverHealth, "PROTOCOL_DRIVER_HEALTH_INVALID"],

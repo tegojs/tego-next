@@ -118,6 +118,7 @@ export class RemoteExecutor implements Executor {
   #drainPromise: Promise<void> | undefined;
   #orphanRecovery = new AbortController();
   #persistenceDegraded = false;
+  #workerUnavailableEpoch: string | undefined;
 
   constructor(options: RemoteExecutorOptions) {
     if (options.id.length === 0) throw new TypeError("RemoteExecutor id must not be empty");
@@ -175,7 +176,8 @@ export class RemoteExecutor implements Executor {
       !this.#draining &&
       this.#session?.state === "ready" &&
       this.#session.acceptingAssignments &&
-      !this.#persistenceDegraded;
+      !this.#persistenceDegraded &&
+      this.#workerUnavailableEpoch === undefined;
     return {
       id: this.id,
       type: this.type,
@@ -362,7 +364,8 @@ export class RemoteExecutor implements Executor {
       !this.#persistenceDegraded &&
       !this.#closed &&
       !this.#draining &&
-      this.#session?.state === "ready";
+      this.#session?.state === "ready" &&
+      this.#workerUnavailableEpoch === undefined;
     return {
       id: this.id,
       type: this.type,
@@ -426,7 +429,16 @@ export class RemoteExecutor implements Executor {
     try {
       await this.#reconcile(session);
       if (this.#session === session && session.state === "ready") {
-        this.#accepting = !this.#draining && !this.#persistenceDegraded;
+        if (
+          this.#workerUnavailableEpoch !== undefined &&
+          epoch > BigInt(this.#workerUnavailableEpoch)
+        ) {
+          this.#workerUnavailableEpoch = undefined;
+        }
+        this.#accepting =
+          !this.#draining &&
+          !this.#persistenceDegraded &&
+          this.#workerUnavailableEpoch === undefined;
       }
     } catch (error) {
       if (this.#session === session) await this.#sessionLost(session);
@@ -510,14 +522,18 @@ export class RemoteExecutor implements Executor {
             ),
           );
         } else {
-          await this.#publish(attempt, parseExecutionResult(payload.result));
+          const result = parseExecutionResult(payload.result);
+          this.#latchWorkerUnavailable(session, result);
+          await this.#publish(attempt, result);
         }
         return;
       }
       if (payload.accepted !== true)
         throw new Error("Remote assignment acknowledgement is invalid");
       if (payload.result !== undefined) {
-        await this.#publish(attempt, parseExecutionResult(payload.result), false);
+        const result = parseExecutionResult(payload.result);
+        this.#latchWorkerUnavailable(session, result);
+        await this.#publish(attempt, result, false);
         if (this.#session === session && session.state === "ready") {
           await session.send(REMOTE_RESULT_ACK, {
             kind: "result",
@@ -585,6 +601,7 @@ export class RemoteExecutor implements Executor {
       const result = parseExecutionResult(payload.result);
       const attempt = this.#attempts.get(attemptKey(result.taskId, result.attemptId));
       if (attempt === undefined || attempt.epoch !== session.epoch) return;
+      this.#latchWorkerUnavailable(session, result);
       await this.#publish(attempt, result, false);
       if (this.#session === session && session.state === "ready") {
         await session.send(
@@ -1141,8 +1158,21 @@ export class RemoteExecutor implements Executor {
     attempt.persistenceFailed = true;
     this.#publishVolatile(
       attempt,
-      this.#failure(attempt.request, "failed", "EXECUTOR_REMOTE_STATE_UNAVAILABLE", message),
+      this.#failure(attempt.request, "indeterminate", "EXECUTOR_REMOTE_STATE_UNAVAILABLE", message),
     );
+  }
+
+  #latchWorkerUnavailable(session: RemoteSession, result: ExecutionResult): void {
+    if (
+      this.#session !== session ||
+      result.diagnostic?.code !== "EXECUTOR_REMOTE_STATE_UNAVAILABLE" ||
+      result.diagnostic.source.kind !== "executor" ||
+      result.diagnostic.source.id !== "worker-runtime"
+    ) {
+      return;
+    }
+    this.#workerUnavailableEpoch = session.epoch;
+    this.#accepting = false;
   }
 
   #assertPersistenceAvailable(): void {
@@ -1219,7 +1249,9 @@ export class RemoteExecutor implements Executor {
         throw new Error("Remote cancellation acknowledgement is invalid");
       }
       if (payload.result !== undefined) {
-        await this.#publish(attempt, parseExecutionResult(payload.result), false);
+        const result = parseExecutionResult(payload.result);
+        this.#latchWorkerUnavailable(session, result);
+        await this.#publish(attempt, result, false);
         if (this.#session === session && session.state === "ready") {
           await session.send(REMOTE_RESULT_ACK, {
             kind: "result",

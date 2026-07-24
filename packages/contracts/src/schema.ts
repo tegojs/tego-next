@@ -681,7 +681,7 @@ const executionResultSchema = {
     taskId: { type: "string", pattern: IDENTITY_PATTERN },
     attemptId: { type: "string", pattern: IDENTITY_PATTERN },
     status: {
-      enum: ["cancelled", "failed", "rejected", "succeeded", "timed-out"],
+      enum: ["cancelled", "failed", "indeterminate", "rejected", "succeeded", "timed-out"],
     },
     output: { $ref: JSON_VALUE_SCHEMA_ID },
     diagnostic: { $ref: DIAGNOSTIC_SCHEMA_ID },

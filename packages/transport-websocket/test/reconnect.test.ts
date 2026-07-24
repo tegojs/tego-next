@@ -1633,7 +1633,10 @@ test("a live Main terminal commit timeout fails closed and degrades health", asy
   );
   const observed = await remote.observe(handle.taskId, handle.attemptId);
   assert.equal(observed?.state, "terminal");
-  assert.equal(observed?.state === "terminal" ? observed.result.status : undefined, "indeterminate");
+  assert.equal(
+    observed?.state === "terminal" ? observed.result.status : undefined,
+    "indeterminate",
+  );
   await Promise.all([remote.close(), runtime.close()]);
 });
 
@@ -1678,14 +1681,32 @@ test("a live Worker terminal commit timeout fails closed and retains evidence", 
   });
   await eventually(() => assert.equal(settled, true), { advance: flush });
 
-  assert.equal((await handle.result).status, "failed");
+  assert.equal((await handle.result).status, "indeterminate");
   assert.match((await handle.result).diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
   assert.equal(local.executions, 1);
   assert.equal(runtime.bufferedResultCount, 1);
   assert.equal((await remote.health()).status, "degraded");
   assert.equal((await remote.health()).accepting, false);
   assert.equal((await remote.probe()).available, false);
-  await Promise.all([remote.close(), runtime.close()]);
+  const recoveredLocal = new TestLocalExecutor();
+  const recoveredRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => recoveredLocal,
+  });
+  await reconnect(remote, recoveredRuntime, "2");
+  assert.equal((await remote.health()).status, "healthy");
+  assert.equal((await remote.probe()).available, true);
+  const recovered = await (
+    await remote.submit(
+      executionRequest({ mode: "echo", value: "recovered" }, "worker-timeout-recovered"),
+    )
+  ).result;
+  assert.equal(recovered.status, "succeeded");
+  assert.equal(recovered.output, "recovered");
+  assert.equal(recoveredLocal.executions, 1);
+  await Promise.all([remote.close(), runtime.close(), recoveredRuntime.close()]);
 });
 
 test("Main attach bounds a non-settling attempt-store list", async () => {
@@ -1885,11 +1906,11 @@ test("Worker assignment bounds a non-settling attempt-store load", async () => {
   const result = await handle.result;
   assert.equal(result.status, "rejected");
   assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
-  const latched = await (
-    await remote.submit(executionRequest({ mode: "echo" }, "worker-load-timeout-latched"))
-  ).result;
-  assert.equal(latched.status, "rejected");
-  assert.match(latched.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  await assert.rejects(
+    remote.submit(executionRequest({ mode: "echo" }, "worker-load-timeout-latched")),
+    /not accepting assignments/iu,
+  );
+  assert.equal((await remote.probe()).available, false);
   assert.equal(loadCalls, 1);
   assert.equal(local.executions, 0);
   await Promise.all([remote.close(), runtime.close()]);
@@ -1975,7 +1996,7 @@ test("a live Worker running commit timeout fails closed", async () => {
   clock.advanceBy(51);
 
   const result = await handle.result;
-  assert.equal(result.status, "failed");
+  assert.equal(result.status, "indeterminate");
   assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
   assert.equal(local.executions, 1);
   await Promise.all([remote.close(), runtime.close()]);
@@ -2293,7 +2314,7 @@ test("WorkerRuntime does not retry a malformed external revision forever", async
   await flush();
 
   assert.equal(settled, true);
-  assert.equal((await handle.result).status, "failed");
+  assert.equal((await handle.result).status, "indeterminate");
   assert.match(
     (await handle.result).diagnostic?.code ?? "",
     /STATE_UNAVAILABLE|PERSISTENCE_FAILED/iu,
