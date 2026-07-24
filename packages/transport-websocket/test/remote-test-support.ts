@@ -18,11 +18,7 @@ import {
   type TaskId,
   type WorkerMessageType,
 } from "@tegojs/contracts";
-import type {
-  RemoteSession,
-  RemoteSessionMessage,
-  RemoteSessionState,
-} from "../src/index.js";
+import type { RemoteSession, RemoteSessionMessage, RemoteSessionState } from "../src/index.js";
 
 interface PendingRequest {
   readonly resolve: (message: RemoteSessionMessage) => void;
@@ -80,9 +76,7 @@ export class MemoryRemoteSession implements RemoteSession {
       messageId,
       type,
       payload,
-      ...(options.correlationId === undefined
-        ? {}
-        : { correlationId: options.correlationId }),
+      ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
     });
     return messageId;
   }
@@ -166,10 +160,9 @@ export class MemoryRemoteSession implements RemoteSession {
   }
 }
 
-export function memorySessionPair(epoch: string): readonly [
-  MemoryRemoteSession,
-  MemoryRemoteSession,
-] {
+export function memorySessionPair(
+  epoch: string,
+): readonly [MemoryRemoteSession, MemoryRemoteSession] {
   const main = new MemoryRemoteSession(epoch);
   const worker = new MemoryRemoteSession(epoch);
   main.link(worker);
@@ -279,11 +272,7 @@ export class TestLocalExecutor implements Executor {
     return this.drain({});
   }
 
-  complete(
-    attempt: LocalAttempt,
-    status: ExecutionResult["status"],
-    output?: JsonValue,
-  ): void {
+  complete(attempt: LocalAttempt, status: ExecutionResult["status"], output?: JsonValue): void {
     if (attempt.terminal !== undefined) return;
     const result: ExecutionResult = {
       taskId: attempt.request.taskId,

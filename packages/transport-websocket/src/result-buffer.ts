@@ -1,11 +1,5 @@
 import type { ExecutionResult } from "@tegojs/contracts";
-import {
-  attemptKey,
-  cloneJson,
-  jsonBytes,
-  positiveLimit,
-  remoteError,
-} from "./remote-protocol.js";
+import { attemptKey, cloneJson, jsonBytes, positiveLimit, remoteError } from "./remote-protocol.js";
 
 export interface ResultBufferOptions {
   readonly maxCount?: number;

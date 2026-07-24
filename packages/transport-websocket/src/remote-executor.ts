@@ -225,9 +225,7 @@ export class RemoteExecutor implements Executor {
     }
     return {
       state:
-        attempt.state === "assigned" || attempt.state === "acknowledged"
-          ? "accepted"
-          : "running",
+        attempt.state === "assigned" || attempt.state === "acknowledged" ? "accepted" : "running",
     };
   }
 
@@ -252,8 +250,7 @@ export class RemoteExecutor implements Executor {
   }
 
   drain(options: DrainOptions): Promise<void> {
-    const deadline =
-      options.deadline === undefined ? undefined : Date.parse(options.deadline);
+    const deadline = options.deadline === undefined ? undefined : Date.parse(options.deadline);
     if (deadline !== undefined && Number.isNaN(deadline)) {
       return Promise.reject(new TypeError("drain deadline must be an ISO date"));
     }
@@ -261,9 +258,7 @@ export class RemoteExecutor implements Executor {
     this.#accepting = false;
     this.#drainPromise ??= (async () => {
       const controller = new AbortController();
-      const active = [...this.#attempts.values()].filter(
-        (attempt) => attempt.state !== "terminal",
-      );
+      const active = [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal");
       if (deadline !== undefined) {
         void this.#waitUntil(deadline, controller.signal)
           .then(async () =>
@@ -287,10 +282,7 @@ export class RemoteExecutor implements Executor {
   async health(): Promise<ExecutorHealth> {
     const active = this.#activeCount();
     const accepting =
-      this.#accepting &&
-      !this.#closed &&
-      !this.#draining &&
-      this.#session?.state === "ready";
+      this.#accepting && !this.#closed && !this.#draining && this.#session?.state === "ready";
     return {
       id: this.id,
       type: this.type,
@@ -406,7 +398,8 @@ export class RemoteExecutor implements Executor {
         await this.#publish(attempt, parseExecutionResult(payload.result));
         return;
       }
-      if (payload.accepted !== true) throw new Error("Remote assignment acknowledgement is invalid");
+      if (payload.accepted !== true)
+        throw new Error("Remote assignment acknowledgement is invalid");
       attempt.state = "acknowledged";
       attempt.epoch = session.epoch;
       await this.#save(attempt);
@@ -467,10 +460,7 @@ export class RemoteExecutor implements Executor {
       return;
     }
     let result = parseExecutionResult(candidate);
-    if (
-      attempt.cancellation === "timed-out" &&
-      result.status === "cancelled"
-    ) {
+    if (attempt.cancellation === "timed-out" && result.status === "cancelled") {
       result = {
         ...result,
         status: "timed-out",
@@ -602,10 +592,7 @@ export class RemoteExecutor implements Executor {
           await this.cancel(attempt.request.taskId, attempt.request.attemptId);
           return;
         }
-        await this.#clock.sleep(
-          Math.min(remaining, MAX_CLOCK_SLEEP_MS),
-          attempt.deadline.signal,
-        );
+        await this.#clock.sleep(Math.min(remaining, MAX_CLOCK_SLEEP_MS), attempt.deadline.signal);
       }
     } catch {
       // Terminal publication aborts the deadline sleeper.
@@ -650,10 +637,7 @@ export class RemoteExecutor implements Executor {
         attempt.terminalAt <= cutoff
       ) {
         this.#attempts.delete(key);
-        await this.#attemptStore.delete?.(
-          attempt.request.taskId,
-          attempt.request.attemptId,
-        );
+        await this.#attemptStore.delete?.(attempt.request.taskId, attempt.request.attemptId);
       }
     }
   }

@@ -84,11 +84,7 @@ function cleanupFixture(
   };
   local.cancel = async () => undefined;
   return connected({}, local).then(({ remote }) => {
-    const request = executionRequest(
-      { mode: "wait" },
-      `cleanup-${trigger}`,
-      "finish-and-buffer",
-    );
+    const request = executionRequest({ mode: "wait" }, `cleanup-${trigger}`, "finish-and-buffer");
     return {
       executor: remote,
       request,
@@ -168,7 +164,8 @@ test("assignment is recorded before the Worker receives it", async () => {
   await remote.attach(mainSession);
   cleanups.push(async () => Promise.all([remote.close(), runtime.close()]).then(() => undefined));
 
-  const result = await (await remote.submit(executionRequest({ mode: "echo", value: 1 }, "order"))).result;
+  const result = await (await remote.submit(executionRequest({ mode: "echo", value: 1 }, "order")))
+    .result;
   assert.equal(result.status, "succeeded");
   assert.ok(events.indexOf("store:assigned") < events.indexOf("send:task.assign"));
 });
@@ -199,13 +196,17 @@ test("remote probe reports Worker identity and isolated execution", async () => 
 test("remote result output stays JSON-compatible", async () => {
   const { remote } = await connected();
   const value: JsonValue = { nested: [true, null, 1, "value"] };
-  const result = await (await remote.submit(executionRequest({ mode: "echo", value }, "json"))).result;
+  const result = await (await remote.submit(executionRequest({ mode: "echo", value }, "json")))
+    .result;
   assert.deepEqual(result.output, value);
 });
 
 test("future drain deadline cancels active remote attempts with the fake clock", async () => {
   const { remote } = await connected();
-  const request = executionRequest({ mode: "wait" }, "drain-deadline");
+  const request = {
+    ...executionRequest({ mode: "wait" }, "drain-deadline"),
+    deadline: new Date(clock.now().getTime() + 1_000_000).toISOString(),
+  };
   const handle = await remote.submit(request);
   await eventually(async () =>
     assert.deepEqual(await remote.observe(request.taskId, request.attemptId), {

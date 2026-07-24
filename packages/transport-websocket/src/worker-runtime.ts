@@ -108,11 +108,7 @@ export class WorkerRuntime {
       DEFAULT_MAX_INVENTORY,
       "maxInventoryItems",
     );
-    this.#maxBufferedResults = positiveLimit(
-      options.resultBuffer?.maxCount,
-      256,
-      "maxResultCount",
-    );
+    this.#maxBufferedResults = positiveLimit(options.resultBuffer?.maxCount, 256, "maxResultCount");
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
     this.#results = new ResultBuffer(options.resultBuffer);
   }
@@ -587,10 +583,7 @@ export class WorkerRuntime {
         attempt.acknowledgedAt <= cutoff
       ) {
         this.#attempts.delete(key);
-        await this.#attemptStore.delete?.(
-          attempt.request.taskId,
-          attempt.request.attemptId,
-        );
+        await this.#attemptStore.delete?.(attempt.request.taskId, attempt.request.attemptId);
       }
     }
   }

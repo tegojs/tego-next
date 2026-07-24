@@ -74,7 +74,10 @@ test("cancel orphan policy cancels locally and preserves terminal evidence for r
   const request = executionRequest({ mode: "wait" }, "cancel-orphan", "cancel");
   const handle = await remote.submit(request);
   await eventually(() =>
-    assert.equal(local.attempts.has(`${request.taskId.length}:${request.taskId}${request.attemptId}`), true),
+    assert.equal(
+      local.attempts.has(`${request.taskId.length}:${request.taskId}${request.attemptId}`),
+      true,
+    ),
   );
   main.close();
   await flush();
@@ -232,9 +235,8 @@ test("Worker records acknowledgement before delegating to the local Executor", a
     attemptStore: new MemoryRemoteAttemptStore(),
   });
   await reconnect(remote, runtime, "1");
-  await (
-    await remote.submit(executionRequest({ mode: "echo", value: "ordered" }, "worker-order"))
-  ).result;
+  await (await remote.submit(executionRequest({ mode: "echo", value: "ordered" }, "worker-order")))
+    .result;
   assert.ok(events.indexOf("store:acknowledged") < events.indexOf("execute"));
   await Promise.all([remote.close(), runtime.close()]);
 });
@@ -381,7 +383,11 @@ test("durable result write failure becomes a structured terminal failure", async
   await reconnect(remote, runtime, "1");
   const result = await (
     await remote.submit(
-      executionRequest({ mode: "echo", value: "lost" }, "persist-write-failure", "finish-and-persist"),
+      executionRequest(
+        { mode: "echo", value: "lost" },
+        "persist-write-failure",
+        "finish-and-persist",
+      ),
     )
   ).result;
   assert.equal(result.status, "failed");

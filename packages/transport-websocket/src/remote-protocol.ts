@@ -57,12 +57,7 @@ export interface RemoteAttemptIdentity extends JsonObject {
   readonly attemptId: ExecutionRequest["attemptId"];
 }
 
-export type RemoteAttemptState =
-  | "acknowledged"
-  | "assigned"
-  | "running"
-  | "terminal"
-  | "unknown";
+export type RemoteAttemptState = "acknowledged" | "assigned" | "running" | "terminal" | "unknown";
 
 export interface RemoteAttemptRecord extends JsonObject {
   readonly workerId: WorkerId;
@@ -110,9 +105,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     attemptId: ExecutionRequest["attemptId"],
   ): Promise<RemoteAttemptRecord | undefined> {
     const record = this.#records.get(attemptKey(taskId, attemptId));
-    return record === undefined
-      ? undefined
-      : (cloneJson(record) as unknown as RemoteAttemptRecord);
+    return record === undefined ? undefined : (cloneJson(record) as unknown as RemoteAttemptRecord);
   }
 
   async delete(
@@ -132,7 +125,10 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
 export interface RemoteResultStore {
   readonly durable: boolean;
   put(result: ExecutionResult): Promise<void>;
-  delete(taskId: ExecutionRequest["taskId"], attemptId: ExecutionRequest["attemptId"]): Promise<void>;
+  delete(
+    taskId: ExecutionRequest["taskId"],
+    attemptId: ExecutionRequest["attemptId"],
+  ): Promise<void>;
   list(): Promise<readonly ExecutionResult[]>;
 }
 
