@@ -19,10 +19,9 @@ import {
   PostgresStateStore,
 } from "../src/index.js";
 
-const connectionString = process.env.TEGO_POSTGRES_URL;
-if (connectionString === undefined) {
-  throw new Error("TEGO_POSTGRES_URL is required");
-}
+const connectionString =
+  process.env.TEGO_POSTGRES_URL ??
+  "postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test";
 
 function namespace(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll("-", "")}`;

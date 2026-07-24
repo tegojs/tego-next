@@ -1133,7 +1133,7 @@ export class PostgresStateStore implements StateStore {
     );
     return {
       status: "healthy",
-      checkedAt: (result.rows[0]?.checked_at ?? new Date()).toISOString(),
+      checkedAt: isoTimestamp(result.rows[0]?.checked_at, "health timestamp"),
     };
   }
 

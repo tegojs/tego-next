@@ -22,7 +22,7 @@ The external provider SHALL issue a monotonically increasing fencing epoch to ea
 - **THEN** the write from A is rejected and B remains authoritative
 
 ### Requirement: Expiring exclusive leases
-The external provider SHALL use provider time to grant, renew, release, and expire exclusive leases.
+The external provider SHALL use provider time to grant, renew, and expire exclusive leases.
 
 #### Scenario: Lease owner disappears
 - **WHEN** an owner stops renewing a lease

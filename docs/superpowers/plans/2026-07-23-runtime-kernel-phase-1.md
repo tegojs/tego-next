@@ -845,6 +845,10 @@ leader-connection death, notification pause, stale fenced write, and cleanup.
 
 Run: `docker compose up -d postgres && npm run test:integration -w @tegojs/drivers-postgres`
 
+The PostgreSQL integration tests default to the Compose endpoint
+`postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test`. Set
+`TEGO_POSTGRES_URL` to run them against another disposable PostgreSQL database.
+
 Expected: FAIL because PostgreSQL driver exports are absent.
 
 Commit: `git add compose.yaml packages/testkit packages/drivers-postgres && git commit -m "test: define PostgreSQL runtime drivers"`
