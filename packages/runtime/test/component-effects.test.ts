@@ -361,6 +361,63 @@ test("@spec:coordination-provider/fenced-leadership/component-stop-takeover-retr
   assert.equal(registry.get(instanceId), undefined);
 });
 
+test("@spec:coordination-provider/fenced-leadership/stop-takeover-requires-strictly-newer-decimal-epoch", async (context) => {
+  async function stoppingEntry(epoch: string) {
+    const authority = {
+      resource: "runtime:app",
+      epoch: parseFencingEpoch(epoch),
+    };
+    const { effects, registry } = harness({ authority });
+    await effects.perform(effect("prepare"));
+    return { authority, registry, stopping: registry.transition(effect("stop"), "prepared", "stopping", authority) };
+  }
+
+  await context.test("rejects epoch rollback", async () => {
+    const { registry } = await stoppingEntry("2");
+    assert.throws(
+      () =>
+        registry.takeoverStopping(effect("stop"), {
+          resource: "runtime:app",
+          epoch: parseFencingEpoch("1"),
+        }),
+      /authority|epoch|fenc|newer/iu,
+    );
+  });
+
+  await context.test("rejects equal epoch", async () => {
+    const { registry } = await stoppingEntry("2");
+    assert.throws(
+      () =>
+        registry.takeoverStopping(effect("stop"), {
+          resource: "runtime:app",
+          epoch: parseFencingEpoch("2"),
+        }),
+      /authority|epoch|fenc|newer/iu,
+    );
+  });
+
+  await context.test("rejects another resource", async () => {
+    const { registry } = await stoppingEntry("2");
+    assert.throws(
+      () =>
+        registry.takeoverStopping(effect("stop"), {
+          resource: "runtime:other",
+          epoch: parseFencingEpoch("3"),
+        }),
+      /authority|resource|identity/iu,
+    );
+  });
+
+  await context.test("compares epochs beyond Number.MAX_SAFE_INTEGER exactly", async () => {
+    const { registry } = await stoppingEntry("9007199254740992");
+    const taken = registry.takeoverStopping(effect("stop"), {
+      resource: "runtime:app",
+      epoch: parseFencingEpoch("9007199254740993"),
+    });
+    assert.equal(taken.binding.authority?.epoch, "9007199254740993");
+  });
+});
+
 test("@spec:plugin-deployment/idempotent-reconciliation/bounds-failed-operation-history", async () => {
   const { effects } = harness();
   for (let index = 0; index < 300; index += 1) {
