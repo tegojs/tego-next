@@ -1434,8 +1434,10 @@ test("session-loss persistence failure cannot suppress the orphan recovery timer
     settled = true;
   });
   assert.equal(settled, false);
-  clock.advanceBy(26);
+  clock.advanceBy(25);
   for (let index = 0; index < 20; index += 1) await flush();
+  clock.advanceBy(1);
+  await flush();
 
   assert.deepEqual(
     {

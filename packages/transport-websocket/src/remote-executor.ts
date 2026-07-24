@@ -27,6 +27,7 @@ import {
   cloneJson,
   jsonFingerprint,
   jsonBytes,
+  parseAttemptRevision,
   parseRemoteRequest,
   positiveLimit,
   remoteError,
@@ -44,6 +45,8 @@ const DEFAULT_MAX_RESULT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
 const DEFAULT_MAX_INFLIGHT = 64;
 const DEFAULT_MAX_INVENTORY = 512;
 const MAX_CLOCK_SLEEP_MS = 2_147_483_647;
+const MAX_PERSISTENCE_ATTEMPTS = 8;
+const PERSISTENCE_SETTLEMENT_GRACE_MS = 26;
 
 export interface RemoteExecutorOptions {
   readonly id: string;
@@ -110,6 +113,7 @@ export class RemoteExecutor implements Executor {
   #submitChain = Promise.resolve();
   #drainPromise: Promise<void> | undefined;
   #orphanRecovery = new AbortController();
+  #persistenceDegraded = false;
 
   constructor(options: RemoteExecutorOptions) {
     if (options.id.length === 0) throw new TypeError("RemoteExecutor id must not be empty");
@@ -161,7 +165,8 @@ export class RemoteExecutor implements Executor {
       !this.#closed &&
       !this.#draining &&
       this.#session?.state === "ready" &&
-      this.#session.acceptingAssignments;
+      this.#session.acceptingAssignments &&
+      !this.#persistenceDegraded;
     return {
       id: this.id,
       type: this.type,
@@ -207,6 +212,7 @@ export class RemoteExecutor implements Executor {
       return existing.handle;
     }
     const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
+    if (persisted !== undefined) parseAttemptRevision(persisted.revision);
     if (persisted?.state === "expired") {
       if (persisted.fingerprint !== fingerprint) {
         throw remoteError(
@@ -339,7 +345,11 @@ export class RemoteExecutor implements Executor {
   async health(): Promise<ExecutorHealth> {
     const active = this.#activeCount();
     const accepting =
-      this.#accepting && !this.#closed && !this.#draining && this.#session?.state === "ready";
+      this.#accepting &&
+      !this.#persistenceDegraded &&
+      !this.#closed &&
+      !this.#draining &&
+      this.#session?.state === "ready";
     return {
       id: this.id,
       type: this.type,
@@ -395,7 +405,7 @@ export class RemoteExecutor implements Executor {
     try {
       await this.#reconcile(session);
       if (this.#session === session && session.state === "ready") {
-        this.#accepting = !this.#draining;
+        this.#accepting = !this.#draining && !this.#persistenceDegraded;
       }
     } catch (error) {
       if (this.#session === session) await this.#sessionLost(session);
@@ -406,6 +416,7 @@ export class RemoteExecutor implements Executor {
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
     const records = await this.#attemptStore.list(this.#workerId);
+    for (const record of records) parseAttemptRevision(record.revision);
     const activeRecords = records.filter((record) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
       throw remoteError(
@@ -431,7 +442,7 @@ export class RemoteExecutor implements Executor {
         handle,
         result,
         deadline: new AbortController(),
-        revision: record.revision,
+        revision: parseAttemptRevision(record.revision),
         transition: Promise.resolve(),
         state: record.state,
         epoch: record.epoch,
@@ -783,8 +794,11 @@ export class RemoteExecutor implements Executor {
     this.#accepting = false;
     this.#detachSession(true);
     const recovery = this.#orphanRecovery;
+    const orphaned = [...this.#attempts.values()].filter(
+      (attempt) => attempt.state !== "terminal" && attempt.epoch === session.epoch,
+    );
     const persisted = Promise.allSettled(
-      [...this.#attempts.values()].map(async (attempt) =>
+      orphaned.map(async (attempt) =>
         this.#transition(attempt, async () => {
           if (attempt.state !== "terminal" && attempt.epoch === session.epoch) {
             await this.#commit(attempt, "unknown");
@@ -792,13 +806,24 @@ export class RemoteExecutor implements Executor {
         }),
       ),
     );
+    const persistence = {
+      promise: persisted,
+      settled: false,
+    };
+    void persisted.then(() => {
+      persistence.settled = true;
+    });
     this.#background(persisted);
-    this.#background(this.#expireOrphans(recovery, persisted));
+    this.#background(this.#expireOrphans(recovery, orphaned, persistence));
   }
 
   async #expireOrphans(
     recovery: AbortController,
-    persisted: Promise<readonly PromiseSettledResult<void>[]>,
+    orphaned: readonly RemoteAttempt[],
+    persistence: {
+      readonly promise: Promise<readonly PromiseSettledResult<void>[]>;
+      settled: boolean;
+    },
   ): Promise<void> {
     const expiresAt = this.#clock.now().getTime() + this.#orphanTimeoutMs;
     try {
@@ -806,19 +831,36 @@ export class RemoteExecutor implements Executor {
     } catch {
       return;
     }
-    await persisted;
     if (this.#session !== undefined || recovery !== this.#orphanRecovery) return;
-    for (const attempt of this.#attempts.values()) {
-      if (attempt.state !== "unknown" || attempt.terminal !== undefined) continue;
-      await this.#publish(
-        attempt,
-        this.#failure(
-          attempt.request,
-          "failed",
-          "EXECUTOR_REMOTE_ORPHAN_UNAVAILABLE",
-          "Remote Worker did not reconnect within the orphan recovery window",
-        ),
+    if (!persistence.settled) {
+      try {
+        await Promise.race([
+          persistence.promise,
+          this.#clock.sleep(PERSISTENCE_SETTLEMENT_GRACE_MS, recovery.signal),
+        ]);
+      } catch {
+        return;
+      }
+      if (this.#session !== undefined || recovery !== this.#orphanRecovery) return;
+    }
+    if (persistence.settled) await persistence.promise;
+    for (const attempt of orphaned) {
+      if (attempt.terminal !== undefined) continue;
+      const result = this.#failure(
+        attempt.request,
+        "failed",
+        "EXECUTOR_REMOTE_ORPHAN_UNAVAILABLE",
+        "Remote Worker did not reconnect within the orphan recovery window",
       );
+      if (!persistence.settled) {
+        this.#publishVolatile(attempt, result);
+        continue;
+      }
+      try {
+        await this.#publish(attempt, result);
+      } catch {
+        this.#publishVolatile(attempt, result);
+      }
     }
   }
 
@@ -885,7 +927,7 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    attempt.revision = committed.revision;
+    attempt.revision = parseAttemptRevision(committed.revision);
   }
 
   async #commit(
@@ -905,7 +947,9 @@ export class RemoteExecutor implements Executor {
           },
         );
         if (committed !== undefined) {
-          attempt.revision = committed.revision;
+          const revision = parseAttemptRevision(committed.revision);
+          if (attempt.terminal !== undefined && state !== "terminal") return;
+          attempt.revision = revision;
           attempt.state = state;
           attempt.epoch = epoch;
           if (result !== undefined) attempt.terminal = result;
@@ -918,7 +962,7 @@ export class RemoteExecutor implements Executor {
         if (latest === undefined) {
           throw new Error("Remote attempt state disappeared during a conditional commit");
         }
-        attempt.revision = latest.revision;
+        attempt.revision = parseAttemptRevision(latest.revision);
         attempt.epoch = latest.epoch;
         attempt.state = latest.state === "expired" ? "terminal" : latest.state;
         if (latest.cancellation === undefined) {
@@ -946,6 +990,16 @@ export class RemoteExecutor implements Executor {
             "EXECUTOR_REMOTE_STALE_EPOCH"
         ) {
           throw error;
+        }
+        if (isRevisionBoundaryError(error)) throw error;
+        if (immediateRetries >= MAX_PERSISTENCE_ATTEMPTS) {
+          this.#degradePersistence();
+          throw remoteError(
+            "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+            "Remote attempt persistence remained unavailable after bounded retries",
+            this.id,
+            this.#clock.now().toISOString(),
+          );
         }
         if (immediateRetries >= 3) {
           await this.#clock.sleep(25);
@@ -987,6 +1041,22 @@ export class RemoteExecutor implements Executor {
     if (attempt.settled || attempt.terminal === undefined) return;
     attempt.settled = true;
     attempt.result.resolve(attempt.terminal);
+  }
+
+  #publishVolatile(attempt: RemoteAttempt, result: ExecutionResult): void {
+    this.#degradePersistence();
+    if (attempt.terminal === undefined) {
+      attempt.terminal = cloneJson(result);
+      attempt.state = "terminal";
+      attempt.terminalAt = this.#clock.now().getTime();
+      attempt.deadline.abort();
+    }
+    this.#settle(attempt);
+  }
+
+  #degradePersistence(): void {
+    this.#persistenceDegraded = true;
+    this.#accepting = false;
   }
 
   async #requestCancel(attempt: RemoteAttempt, session: RemoteSession): Promise<void> {
@@ -1092,6 +1162,7 @@ export class RemoteExecutor implements Executor {
           if (committed === undefined) {
             throw new Error("Remote terminal tombstone lost conditional authority");
           }
+          parseAttemptRevision(committed.revision);
           this.#attempts.delete(key);
         });
       }
@@ -1129,4 +1200,11 @@ function parseTerminal(value: JsonValue, limit: number): readonly ExecutionResul
     const record = asObject(item, "terminal result");
     return parseExecutionResult(record.result);
   });
+}
+
+function isRevisionBoundaryError(error: unknown): boolean {
+  return (
+    (error instanceof RangeError || error instanceof TypeError) &&
+    /revision|unsigned 64-bit/iu.test(error.message)
+  );
 }

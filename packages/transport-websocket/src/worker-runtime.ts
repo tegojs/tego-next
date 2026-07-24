@@ -23,6 +23,7 @@ import {
   attemptKey,
   cloneJson,
   jsonBytes,
+  parseAttemptRevision,
   parseRemoteRequest,
   positiveLimit,
   remoteDiagnostic,
@@ -231,6 +232,7 @@ export class WorkerRuntime {
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
     const records = await this.#attemptStore.list(this.#workerId);
+    for (const record of records) parseAttemptRevision(record.revision);
     const activeRecords = records.filter((record) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
       throw new Error("Worker attempt inventory exceeds maxInventoryItems");
@@ -257,7 +259,7 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: record.revision,
+          revision: parseAttemptRevision(record.revision),
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
@@ -278,7 +280,7 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: record.revision,
+          revision: parseAttemptRevision(record.revision),
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
@@ -295,7 +297,7 @@ export class WorkerRuntime {
         this.#attempts.set(key, {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: record.revision,
+          revision: parseAttemptRevision(record.revision),
           transition: Promise.resolve(),
           state: "acknowledged",
           epoch: record.epoch,
@@ -441,6 +443,7 @@ export class WorkerRuntime {
       return;
     }
     const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
+    if (persisted !== undefined) parseAttemptRevision(persisted.revision);
     if (persisted?.state === "expired") {
       await this.#sendRejected(
         session,
@@ -888,7 +891,7 @@ export class WorkerRuntime {
     if (committed === undefined) {
       throw new Error("Remote attempt was concurrently admitted by another Worker session");
     }
-    attempt.revision = committed.revision;
+    attempt.revision = parseAttemptRevision(committed.revision);
   }
 
   async #commit(
@@ -904,7 +907,7 @@ export class WorkerRuntime {
           expectedEpoch: attempt.epoch,
         });
         if (committed !== undefined) {
-          attempt.revision = committed.revision;
+          attempt.revision = parseAttemptRevision(committed.revision);
           attempt.state = state;
           if (result !== undefined) attempt.result = result;
           return;
@@ -916,7 +919,7 @@ export class WorkerRuntime {
         if (latest === undefined) {
           throw new Error("Worker attempt disappeared during a conditional commit");
         }
-        attempt.revision = latest.revision;
+        attempt.revision = parseAttemptRevision(latest.revision);
         attempt.epoch = latest.epoch;
         if (latest.cancellation === undefined) {
           delete attempt.cancellation;
@@ -930,6 +933,7 @@ export class WorkerRuntime {
         }
         throw new Error("Worker attempt transition lost epoch or revision authority");
       } catch (error) {
+        if (isRevisionBoundaryError(error)) throw error;
         if (
           error instanceof Error &&
           /lost epoch or revision authority|disappeared/iu.test(error.message)
@@ -984,6 +988,7 @@ export class WorkerRuntime {
           },
         );
         if (expired === undefined) continue;
+        parseAttemptRevision(expired.revision);
         this.#attempts.delete(key);
       }
     }
@@ -1098,4 +1103,11 @@ function identityFrom(payload: Record<string, JsonValue>): {
     orphanPolicy: "cancel",
   });
   return identity(request);
+}
+
+function isRevisionBoundaryError(error: unknown): boolean {
+  return (
+    (error instanceof RangeError || error instanceof TypeError) &&
+    /revision|unsigned 64-bit/iu.test(error.message)
+  );
 }

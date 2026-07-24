@@ -119,7 +119,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     const key = attemptKey(record.request.taskId, record.request.attemptId);
     const snapshot = cloneJson({
       ...record,
-      revision: boundedRevision(record.revision),
+      revision: parseAttemptRevision(record.revision),
     }) as unknown as RemoteAttemptRecord;
     this.#records.set(key, snapshot);
     this.#onSave?.(snapshot);
@@ -129,6 +129,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     record: RemoteAttemptRecord,
     condition: RemoteAttemptCommitCondition,
   ): Promise<RemoteAttemptRecord | undefined> {
+    parseAttemptRevision(record.revision);
     const key = attemptKey(record.request.taskId, record.request.attemptId);
     const current = this.#records.get(key);
     const currentRevision = current?.revision;
@@ -136,7 +137,8 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       (condition.expectedRevision === null && current !== undefined) ||
       (condition.expectedRevision !== null &&
         (currentRevision === undefined ||
-          boundedRevision(currentRevision) !== boundedRevision(condition.expectedRevision))) ||
+          parseAttemptRevision(currentRevision) !==
+            parseAttemptRevision(condition.expectedRevision))) ||
       (condition.expectedEpoch !== undefined &&
         current !== undefined &&
         current.epoch !== condition.expectedEpoch)
@@ -175,14 +177,17 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
 }
 
 function incrementRevision(revision: string): string {
-  const current = BigInt(boundedRevision(revision));
+  const current = BigInt(parseAttemptRevision(revision));
   if (current === MAXIMUM_UNSIGNED_64) {
     throw new RangeError("Remote attempt revision exceeds the unsigned 64-bit limit");
   }
   return (current + 1n).toString();
 }
 
-function boundedRevision(revision: string): string {
+export function parseAttemptRevision(revision: unknown): string {
+  if (typeof revision !== "string") {
+    throw new TypeError("Remote attempt revision must be an unsigned 64-bit decimal string");
+  }
   const parsed = parseSequence(revision);
   if (BigInt(parsed) > MAXIMUM_UNSIGNED_64) {
     throw new RangeError("Remote attempt revision exceeds the unsigned 64-bit limit");
