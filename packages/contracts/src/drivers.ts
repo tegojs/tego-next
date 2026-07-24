@@ -1,4 +1,5 @@
 import type { Clock } from "./clock.js";
+import type { LeadershipHandle } from "./coordination.js";
 import type { ArtifactDigest, FencingEpoch, Revision } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { DriverHealth, StateStore, StorageScope } from "./state.js";
@@ -58,7 +59,7 @@ export interface CoordinationChange {
 
 export interface CoordinationProvider extends ManagedDriver {
   readonly scope: "distributed" | "local";
-  campaign(request: CampaignRequest): Promise<Leadership>;
+  campaign(request: CampaignRequest): Promise<LeadershipHandle>;
   acquireLease(request: LeaseRequest): Promise<Lease>;
   nextEpoch(resource: string): Promise<FencingEpoch>;
   compareAndSet<T extends JsonValue>(request: CompareAndSetRequest<T>): Promise<CasResult<T>>;

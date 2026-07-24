@@ -165,11 +165,10 @@ class TegoRuntime implements Runtime {
 
       this.#setLifecycle("electing");
       const expectedResource = `runtime:${this.#configuration.runtimeId}`;
-      const leadership = parseLeadership(
-        await this.#drivers.coordination.campaign({
-          resource: expectedResource,
-        }),
-      );
+      const leadershipHandle = await this.#drivers.coordination.campaign({
+        resource: expectedResource,
+      });
+      const leadership = parseLeadership(leadershipHandle.leadership);
       if (leadership.resource !== expectedResource) {
         throw new DiagnosticError(
           runtimeDiagnostic({

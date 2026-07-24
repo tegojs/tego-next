@@ -1,6 +1,7 @@
 export * from "./capability.js";
 export * from "./clock.js";
 export * from "./component-boundary.js";
+export * from "./coordination.js";
 export * from "./diagnostic.js";
 export * from "./drivers.js";
 export * from "./execution.js";

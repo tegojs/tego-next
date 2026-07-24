@@ -21,6 +21,7 @@ import {
   type DriverHealth,
   type JsonValue,
   type Leadership,
+  type LeadershipHandle,
   type OperationJournalQuery,
   type PersistedOperationJournalEntry,
   type HostedProcess,
@@ -180,12 +181,17 @@ class ControlledCoordination implements CoordinationProvider {
     if (this.failOpen) throw new Error("coordination open failed");
   }
 
-  async campaign(request: { readonly resource: string }): Promise<Leadership> {
+  async campaign(request: { readonly resource: string }): Promise<LeadershipHandle> {
     this.log.push("coordination.campaign");
-    return (this.campaignResult ?? {
+    const leadership = (this.campaignResult ?? {
       resource: request.resource,
       epoch: parseFencingEpoch("1"),
     }) as Leadership;
+    return {
+      leadership,
+      lost: new Promise(() => undefined),
+      release: () => Promise.resolve(),
+    };
   }
 
   async acquireLease(): Promise<never> {

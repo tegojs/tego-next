@@ -16,9 +16,11 @@ import {
   type FencingEpoch,
   type JsonValue,
   type Leadership,
+  type LeadershipHandle,
   type Lease,
   type LeaseRequest,
   type Revision,
+  type RuntimeDiagnostic,
 } from "@tegojs/contracts";
 
 const localEpoch = parseFencingEpoch("1");
@@ -114,6 +116,7 @@ export class LocalCoordinationProvider implements CoordinationProvider {
   readonly scope = "local" as const;
   readonly #clock: Clock;
   readonly #records = new Map<string, CoordinationRecord>();
+  readonly #leadership = new Map<string, LeadershipHandle>();
   readonly #changes: CoordinationChange[] = [];
   readonly #watchers = new Set<CoordinationWatchIterator>();
   #revision = 0n;
@@ -130,13 +133,37 @@ export class LocalCoordinationProvider implements CoordinationProvider {
     this.#lifecycle = "open";
   }
 
-  async campaign(request: CampaignRequest): Promise<Leadership> {
+  async campaign(request: CampaignRequest): Promise<LeadershipHandle> {
     this.#assertOpen();
     this.#assertResource(request.resource);
-    return {
+    const existing = this.#leadership.get(request.resource);
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const leadership: Leadership = {
       resource: request.resource,
       epoch: localEpoch,
     };
+    let resolveLost!: (diagnostic: RuntimeDiagnostic) => void;
+    const lost = new Promise<RuntimeDiagnostic>((resolve) => {
+      resolveLost = resolve;
+    });
+    let released = false;
+    const handle: LeadershipHandle = {
+      leadership,
+      lost,
+      release: async () => {
+        if (released) return;
+        released = true;
+        if (this.#leadership.get(request.resource) === handle) {
+          this.#leadership.delete(request.resource);
+        }
+        resolveLost(this.#leadershipLost(request.resource));
+      },
+    };
+    this.#leadership.set(request.resource, handle);
+    return handle;
   }
 
   async acquireLease(request: LeaseRequest): Promise<Lease> {
@@ -234,9 +261,21 @@ export class LocalCoordinationProvider implements CoordinationProvider {
       return;
     }
     this.#lifecycle = "closed";
+    await Promise.all([...this.#leadership.values()].map((handle) => handle.release()));
     for (const watcher of [...this.#watchers]) {
       watcher.close();
     }
+  }
+
+  #leadershipLost(resource: string): RuntimeDiagnostic {
+    return runtimeDiagnostic({
+      code: "COORDINATION_LEADERSHIP_LOST",
+      message: "Local coordination leadership was released",
+      source: { kind: "coordination", id: "local-coordination" },
+      retryable: true,
+      details: { resource },
+      observedAt: this.#clock.now().toISOString(),
+    });
   }
 
   #assertOpen(): void {
