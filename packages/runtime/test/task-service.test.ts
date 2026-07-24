@@ -222,6 +222,7 @@ class ControlledExecutor implements Executor {
   readonly id: string;
   readonly type: "process" | "remote" | "thread";
   readonly submitted: ExecutionRequest[] = [];
+  readonly observations: string[] = [];
   readonly cancelled: string[] = [];
   readonly result = Promise.withResolvers<ExecutionResult>();
   submitGate: Promise<void> = Promise.resolve();
@@ -257,7 +258,8 @@ class ControlledExecutor implements Executor {
       result: this.result.promise,
     };
   }
-  async observe() {
+  async observe(taskId: ExecutionRequest["taskId"], attemptId: ExecutionRequest["attemptId"]) {
+    this.observations.push(`${taskId}/${attemptId}`);
     await this.observeGate;
     if (this.observeError !== undefined) throw this.observeError;
     return this.observed;
@@ -1426,4 +1428,98 @@ test("@spec:runtime-operations/task-operations/definite-submit-rejection-is-auth
   assert.equal(terminal.result?.status, "rejected");
   assert.equal(terminal.result?.diagnostic?.code, "EXECUTOR_DRAINING");
   assert.doesNotMatch(JSON.stringify(terminal), /secret admission detail/u);
+});
+
+test("@spec:runtime-operations/task-operations/keyed-rejected-replay-is-terminal-without-executor-work", async () => {
+  const executor = new ControlledExecutor();
+  let selections = 0;
+  const state = new TransactionalState();
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      selections += 1;
+      return executor;
+    },
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+  executor.submitError = new DiagnosticError(
+    runtimeDiagnostic({
+      code: "EXECUTOR_DRAINING",
+      message: "secret admission detail",
+      source: { kind: "executor", id: executor.id },
+      retryable: true,
+      observedAt: now.toISOString(),
+    }),
+  );
+  const keyed = { ...request, operationId: parseOperationId("rejected-replay") };
+  const first = await service.run(keyed);
+  const replay = await service.run(keyed);
+  assert.deepEqual(replay, first);
+  assert.equal(selections, 1);
+  assert.equal(executor.submitted.length, 1);
+  assert.equal(executor.observations.length, 0);
+  await service.close();
+});
+
+test("@spec:runtime-operations/task-operations/unique-rejections-release-executor-registrations", async () => {
+  const executor = new ControlledExecutor();
+  let selections = 0;
+  let identities = 0;
+  const state = new TransactionalState();
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      selections += 1;
+      return executor;
+    },
+    createIdentity: () => {
+      identities += 1;
+      return {
+        taskId: parseTaskId(`rejected-task-${identities}`),
+        attemptId: parseAttemptId(`rejected-attempt-${identities}`),
+      };
+    },
+  });
+  await service.setAuthority(authority);
+  executor.submitError = new DiagnosticError(
+    runtimeDiagnostic({
+      code: "EXECUTOR_DRAINING",
+      message: "secret admission detail",
+      source: { kind: "executor", id: executor.id },
+      retryable: true,
+      observedAt: now.toISOString(),
+    }),
+  );
+  const rejected = await Promise.all(
+    Array.from({ length: 3 }, (_, index) =>
+      service.run({ ...request, input: { value: `rejected-${index}` } }),
+    ),
+  );
+  assert.equal(selections, rejected.length);
+  assert.equal(executor.submitted.length, rejected.length);
+  assert.equal(executor.observations.length, 0);
+  for (const [index, record] of rejected.entries()) {
+    state.records.set(`tego/tasks/${record.taskId}`, {
+      value: parseTaskRecord({
+        taskId: record.taskId,
+        attemptId: record.attemptId,
+        request: record.request,
+        state: "running",
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        executor: record.executor,
+        authority,
+      }),
+      revision: 100 + index,
+    });
+  }
+  await service.recover();
+  await service.setAuthority(authority);
+  assert.equal(selections, rejected.length * 2);
+  assert.equal(executor.submitted.length, rejected.length);
+  assert.equal(executor.observations.length, rejected.length);
+  await service.close();
 });
