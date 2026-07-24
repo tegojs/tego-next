@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+const root = fileURLToPath(new URL("../../", import.meta.url));
 const scriptUrl = new URL("../../scripts/commitlint-ci.mjs", import.meta.url);
 const workflowUrl = new URL("../../.github/workflows/ci.yml", import.meta.url);
 
@@ -25,6 +28,43 @@ test("commitlint CI selects explicit ranges and safe fallbacks", async () => {
     ["--last", "--verbose"],
   );
   assert.deepEqual(commitlintArguments({}), ["--last", "--verbose"]);
+});
+
+test("TypeScript workspaces reference every internal build dependency", async () => {
+  const packagesDirectory = join(root, "packages");
+  const directories = await readdir(packagesDirectory, { withFileTypes: true });
+  const workspaces = new Map();
+
+  for (const directory of directories) {
+    if (!directory.isDirectory()) continue;
+    const manifest = JSON.parse(
+      await readFile(join(packagesDirectory, directory.name, "package.json"), "utf8"),
+    );
+    workspaces.set(manifest.name, directory.name);
+  }
+
+  for (const [workspaceName, directoryName] of workspaces) {
+    const workspaceDirectory = join(packagesDirectory, directoryName);
+    const manifest = JSON.parse(await readFile(join(workspaceDirectory, "package.json"), "utf8"));
+    const tsconfig = JSON.parse(await readFile(join(workspaceDirectory, "tsconfig.json"), "utf8"));
+    const references = new Set(
+      (tsconfig.references ?? []).map((reference) => basename(reference.path)),
+    );
+    const dependencies = {
+      ...manifest.dependencies,
+      ...manifest.devDependencies,
+    };
+
+    for (const dependencyName of Object.keys(dependencies)) {
+      const dependencyDirectory = workspaces.get(dependencyName);
+      if (!dependencyDirectory) continue;
+      assert.equal(
+        references.has(dependencyDirectory),
+        true,
+        `${workspaceName} must reference ${dependencyName}`,
+      );
+    }
+  }
 });
 
 test("GitHub CI declares quality and PostgreSQL integration gates", async () => {

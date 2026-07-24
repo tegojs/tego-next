@@ -231,10 +231,15 @@ Expected: the commit succeeds through the new `commit-msg` hook.
 - Create: `scripts/commitlint-ci.mjs`
 - Create: `.github/workflows/ci.yml`
 - Modify: `package.json`
+- Modify: internal `packages/*/tsconfig.json` files that are missing project
+  references for declared workspace dependencies
 
 **Interfaces:**
 - Consumes: `npm run commitlint`, `.node-version`, root quality and integration scripts, and `TEGO_POSTGRES_URL`.
-- Produces: `commitlintArguments(environment): string[]`, `runCommitlint(environment): number`, `npm run commitlint:ci`, GitHub `quality`, and GitHub `postgres-integration` jobs.
+- Produces: `commitlintArguments(environment): string[]`,
+  `runCommitlint(environment): number`, `npm run commitlint:ci`, a complete
+  TypeScript workspace reference graph, GitHub `quality`, and GitHub
+  `postgres-integration` jobs.
 
 - [ ] **Step 1: Write the failing CI contract test**
 

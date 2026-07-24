@@ -30,6 +30,8 @@ protection settings.
 5. The checked-in lockfile remains the dependency source of truth.
 6. The project does not add a general-purpose release abstraction before a
    release target exists.
+7. TypeScript project references mirror internal workspace dependencies so a
+   clean checkout can build packages in dependency order.
 
 ## README
 
@@ -128,6 +130,11 @@ The `quality` job runs on Ubuntu and performs:
 
 These commands remain separate workflow steps so GitHub identifies the failing
 gate directly.
+
+Every TypeScript workspace must reference each internal package listed in its
+runtime or development dependencies. An architecture test enforces this
+relationship because local generated declarations can otherwise hide a broken
+clean build.
 
 ### PostgreSQL Integration Job
 
