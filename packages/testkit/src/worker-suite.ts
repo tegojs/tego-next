@@ -117,12 +117,14 @@ class MemorySocket implements WorkerSessionSocket {
   readonly #messages = new Set<MessageListener>();
   readonly #closes = new Set<CloseListener>();
   readonly #errors = new Set<ErrorListener>();
+  readonly #sent: (string | Uint8Array)[] = [];
 
   send(data: string | Uint8Array): void {
     if (this.readyState !== 1 || this.peer?.readyState !== 1) {
       throw new Error("socket is not open");
     }
     const copy = typeof data === "string" ? data : Uint8Array.from(data);
+    this.#sent.push(copy);
     queueMicrotask(() => {
       const peer = this.peer;
       for (const listener of peer === undefined ? [] : peer.#messages) {
@@ -167,6 +169,23 @@ class MemorySocket implements WorkerSessionSocket {
     return this;
   }
 
+  lastControlFrame(): string {
+    const frame = this.#sent.findLast(
+      (candidate): candidate is string => typeof candidate === "string",
+    );
+    if (frame === undefined) {
+      throw new Error("socket has not sent a control frame");
+    }
+    return frame;
+  }
+
+  inject(data: string | Uint8Array): void {
+    const copy = typeof data === "string" ? data : Uint8Array.from(data);
+    for (const listener of this.#messages) {
+      listener({ data: copy });
+    }
+  }
+
   #listeners(
     event: "message" | "close" | "error",
   ): Set<MessageListener> | Set<CloseListener> | Set<ErrorListener> {
@@ -192,9 +211,7 @@ async function connect(
   main: MainEndpointLike,
   worker: WorkerEndpointLike,
   direction: WorkerConnectionDirection,
-): Promise<
-  readonly [WorkerSessionLike, WorkerSessionLike, MemorySocket, MemorySocket]
-> {
+): Promise<readonly [WorkerSessionLike, WorkerSessionLike, MemorySocket, MemorySocket]> {
   const [mainSocket, workerSocket] = socketPair();
   const first =
     direction === "main-initiated" ? worker.attach(workerSocket) : main.attach(mainSocket);
