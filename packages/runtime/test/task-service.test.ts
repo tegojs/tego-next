@@ -1,30 +1,30 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type Clock,
   DiagnosticError,
   diagnosticCode,
-  parseApplicationId,
-  parseAttemptId,
-  parseComponentId,
-  parseDeployPluginRequest,
-  parseFencingEpoch,
-  parsePluginId,
-  parsePluginDeployment,
-  parseRevision,
-  parseTaskId,
-  parseRunTaskRequest,
-  parseArtifactDigest,
-  parsePluginInstallation,
-  parseOperationId,
-  parseTaskRecord,
-  runtimeDiagnostic,
-  type Clock,
   type ExecutionHandle,
   type ExecutionRequest,
   type ExecutionResult,
   type Executor,
   type JsonValue,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseAttemptId,
+  parseComponentId,
+  parseDeployPluginRequest,
+  parseFencingEpoch,
+  parseOperationId,
+  parsePluginDeployment,
+  parsePluginId,
+  parsePluginInstallation,
+  parseRevision,
+  parseRunTaskRequest,
+  parseTaskId,
+  parseTaskRecord,
   type RuntimeAuthority,
+  runtimeDiagnostic,
   type ScannedState,
   type StateChange,
   type StateKey,
@@ -36,7 +36,7 @@ import {
   type Versioned,
 } from "@tegojs/contracts";
 import { FakeClock } from "@tegojs/testkit";
-import { RuntimeOperationController, TaskService, type TaskIdentity } from "../src/index.js";
+import { RuntimeOperationController, type TaskIdentity, TaskService } from "../src/index.js";
 
 const now = new Date("2026-07-25T00:00:00.000Z");
 const clock: Clock = {
@@ -1239,8 +1239,6 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/stale-completion-keeps-ne
 test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-newer-registration", async () => {
   const oldExecutor = new ControlledExecutor("remote", "executor-01");
   const newExecutor = new ControlledExecutor("remote", "executor-01");
-  const observationGate = Promise.withResolvers<void>();
-  oldExecutor.observeGate = observationGate.promise;
   oldExecutor.observed = {
     state: "terminal",
     result: {
@@ -1253,7 +1251,10 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
     },
   };
   let selected = oldExecutor;
+  let selections = 0;
   const state = new TransactionalState();
+  const gate = Promise.withResolvers<void>();
+  state.terminalPutGate = gate.promise;
   state.records.set(`tego/tasks/${identity.taskId}`, {
     value: parseTaskRecord({
       taskId: identity.taskId,
@@ -1270,21 +1271,42 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
   const service = new TaskService({
     state,
     clock,
-    selectExecutor: async () => selected,
+    selectExecutor: async () => {
+      selections += 1;
+      return selected;
+    },
     createIdentity: () => identity,
   });
   await service.recover();
   const oldActivation = service.setAuthority(authority);
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await state.terminalPutEntered.promise;
   selected = newExecutor;
-  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
-  observationGate.resolve();
-  await oldActivation;
-  const cancellation = service.cancel(identity.taskId);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(newExecutor.cancelled.length, 1);
+  const newerAuthority = { ...authority, epoch: parseFencingEpoch("8") };
+  const handover = service.setAuthority(newerAuthority);
+  while (selections < 2) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  const selectionsAfterHandover = selections;
+  gate.resolve();
+  await Promise.all([oldActivation, handover]);
+  state.terminalPutGate = undefined;
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "running",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: newExecutor.id, type: newExecutor.type },
+      authority: newerAuthority,
+    }),
+    revision: 100,
+  });
+  await service.recover();
+  await service.setAuthority(newerAuthority);
+  assert.equal(selections, selectionsAfterHandover);
   await service.close();
-  await assert.rejects(cancellation);
 });
 
 test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-registration", async () => {
