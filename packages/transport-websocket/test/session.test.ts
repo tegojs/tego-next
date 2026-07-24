@@ -579,3 +579,26 @@ test("public send and request cannot re-enter reserved handshake transitions", a
     await cleanup(connection);
   }
 });
+
+test("a credential is bound to its authenticated Worker principal", async () => {
+  const clock = new FakeClock();
+  const main = createMainEndpoint({
+    clock,
+    credentials: {
+      "bound-worker": "bound-secret",
+      "other-worker": "other-secret",
+    },
+  });
+  const impersonator = createWorkerEndpoint({
+    clock,
+    credential: "bound-secret",
+    workerId: "other-worker" as WorkerId,
+  });
+  const [mainSocket, workerSocket] = directSocketPair();
+  const mainSession = main.attach(mainSocket);
+  const workerSession = impersonator.attach(workerSocket);
+  await assert.rejects(Promise.all([mainSession.ready, workerSession.ready]), /auth/iu);
+  assert.equal(main.current("bound-worker" as WorkerId), undefined);
+  assert.equal(main.current("other-worker" as WorkerId), undefined);
+  await Promise.all([main.close(), impersonator.close()]);
+});
