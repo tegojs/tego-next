@@ -37,7 +37,10 @@ test("managed process reports deadline and preserves logs", async () => {
     ],
     name: "silent-child",
   });
-  await assert.rejects(child.ready(() => true, { timeoutMs: 50 }), /PROCESS_READY_TIMEOUT/u);
+  await assert.rejects(
+    child.ready(() => true, { timeoutMs: 50 }),
+    /PROCESS_READY_TIMEOUT/u,
+  );
   await child.stop({ timeoutMs: 2_000 });
   assert.equal(await child.artifactsExist(), true);
 });
