@@ -21,6 +21,10 @@ The CLI SHALL run, inspect, wait for, and cancel tasks while preserving structur
 - **WHEN** an operator runs the installed echo component with JSON input
 - **THEN** the CLI waits for a terminal result and prints the echoed output
 
+#### Scenario: Inspect an indeterminate task
+- **WHEN** an operator inspects a task whose persistence boundary could not prove its authoritative outcome
+- **THEN** the CLI/API and audit output report `indeterminate`, omit task output, preserve the non-retryable diagnostic, and do not present it as an ordinary failure
+
 ### Requirement: Reusable conformance test kits
 The repository SHALL expose test kits for manifests, plugin lifecycle, executors, Workers, state stores, and coordination providers.
 

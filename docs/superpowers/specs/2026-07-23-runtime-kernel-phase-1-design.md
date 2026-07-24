@@ -285,13 +285,30 @@ return outcomes; they do not set states.
 ```text
 created → assigned → acknowledged → running → succeeded
        │          │              ├──────────→ failed
+       │          │              ├──────────→ indeterminate
        │          │              ├──────────→ cancelled
        │          │              ├──────────→ timed-out
        │          │              └──────────→ unknown
        └──────────┴─────────────────────────→ rejected
 ```
 
-`unknown` is non-terminal. Reconnect or orphan-policy timeout resolves it.
+`unknown` is non-terminal: the remote execution state has not yet been
+reconciled, so reconnect or orphan-policy timeout must resolve it.
+
+`indeterminate` is terminal for the caller and means that an external effect or
+durable state transition may have completed, but the executor could not prove
+which result became authoritative before its persistence boundary timed out.
+It carries no output and requires a structured diagnostic with
+`retryable: false`. The scheduler MUST NOT automatically create a replacement
+attempt from this result. An operator or policy may explicitly advance to a new
+attempt ID only after accounting for the possible prior side effect.
+
+`observe`, CLI/API task inspection, audit events, and stored diagnostics expose
+`indeterminate` verbatim; they MUST NOT render it as ordinary `failed`.
+Historical handles remain frozen. On restart, explicit durable recovery may
+discover a later authoritative terminal record for the same identity, but that
+recovery evidence does not rewrite the result already delivered to an earlier
+caller.
 
 State-machine transition tables are pure data and are exhaustively tested.
 
@@ -520,10 +537,18 @@ memory/disk buffers for `finish-and-buffer`. Reconnect reports:
 - running attempts;
 - acknowledged but not started attempts;
 - terminal results awaiting Main acknowledgement;
-- prepared artifact digests.
+- prepared artifact digests;
+- whether the Worker attempt-state persistence boundary is currently available.
 
 The Main never creates a replacement attempt until the current attempt is
 resolved or retry policy explicitly advances to a new attempt ID.
+
+A transport epoch alone is not proof that a failed Worker persistence boundary
+recovered. Main keeps that Worker unavailable until a higher-epoch
+reconciliation explicitly reports attempt persistence available. A
+`STATE_UNAVAILABLE` result from `worker-runtime` latches the current Worker
+epoch unavailable. Reconnecting the same persistence-latched Worker therefore
+does not briefly re-advertise healthy capacity.
 
 ## 15. Multi-Main PostgreSQL Semantics
 

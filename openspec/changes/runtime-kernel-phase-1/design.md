@@ -137,6 +137,15 @@ This phase establishes enforcement points and tests. It does not attempt operati
 
 An execution request contains stable `taskId`, `attemptId`, artifact digest, component ID, input, deadline, cancellation token identity, permission grant, and artifact references. Results contain a terminal status, structured error, output, timing, and the same identities.
 
+`unknown` remains a non-terminal reconciliation state. `indeterminate` is a
+distinct terminal observation used only when execution or a durable state
+transition may have completed but the persistence boundary cannot prove the
+authoritative result. An indeterminate result has no output, requires a
+non-retryable structured diagnostic, and never authorizes automatic retry.
+Task inspection and audit surfaces preserve that distinction. A later restart
+may recover a durable terminal record as explicit recovery evidence, but it
+does not rewrite the historical result already delivered to a caller.
+
 The Node executor package supplies:
 
 - `ThreadExecutor` using `node:worker_threads`;
@@ -152,7 +161,7 @@ Either Worker or Main may initiate the WebSocket connection. After authenticatio
 
 Messages use an envelope with protocol version, message ID, session ID, sequence, correlation ID, type, and payload. Registration and heartbeat advertise Worker labels, resources, executors, and prepared artifact digests.
 
-Task assignment is acknowledged before execution. Duplicate assignments are deduplicated by `(taskId, attemptId)`. On reconnect, the Worker reports running and buffered terminal results. The Main then resumes, cancels, or acknowledges them according to the task’s orphan policy.
+Task assignment is acknowledged before execution. Duplicate assignments are deduplicated by `(taskId, attemptId)`. On reconnect, the Worker reports running and buffered terminal results plus whether its attempt-state persistence boundary is available. The Main then resumes, cancels, or acknowledges them according to the task’s orphan policy. A higher transport epoch alone does not clear persistence unavailability; Main advertises the Worker as healthy again only after reconciliation explicitly proves a recovered persistence boundary.
 
 ### 12. Make observability a kernel contract, not an HTTP dependency
 
