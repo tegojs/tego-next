@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DiagnosticError,
   diagnosticCode,
   parseApplicationId,
   parseAttemptId,
@@ -16,6 +17,7 @@ import {
   parsePluginInstallation,
   parseOperationId,
   parseTaskRecord,
+  runtimeDiagnostic,
   type Clock,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -799,6 +801,36 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
     }),
     (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
   );
+  state.records.delete(`tego/installations/provider@1.0.0@${providerDigest}`);
+  state.records.set(`tego/installations/provider@9.9.9@${providerDigest}`, {
+    value: parsePluginInstallation({
+      ...installation,
+      pluginId: parsePluginId("provider"),
+      digest: providerDigest,
+      manifest: {
+        ...installation.manifest,
+        pluginId: parsePluginId("provider"),
+        capabilities: {
+          provides: [{ name: "records", protocolVersion: "1.0.0" }],
+          requires: [],
+        },
+      },
+    }),
+    revision: 93,
+  });
+  await assert.rejects(
+    operations.deployPlugin({
+      ...deploymentRequest,
+      configuration: { greeting: "stale-provider-key" },
+      capabilityBindings: {
+        records: {
+          applicationId: request.applicationId,
+          pluginId: parsePluginId("provider"),
+        },
+      },
+    }),
+    (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_CAPABILITY_BINDING_INVALID",
+  );
   state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
     value: installation,
     revision: 99,
@@ -1070,4 +1102,128 @@ test("@spec:runtime-operations/task-operations/uncertain-remote-submit-is-redact
   assert.notEqual(accepted.state, "terminal");
   assert.equal(accepted.diagnostic?.code, "EXECUTOR_SUBMISSION_UNKNOWN");
   assert.doesNotMatch(JSON.stringify(accepted), /remote-submit-secret/u);
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/local-observation-timeout-never-redispatches", async () => {
+  const executor = new ControlledExecutor();
+  const state = new TransactionalState();
+  const runtimeClock = new FakeClock(now);
+  const service = new TaskService({
+    state,
+    clock: runtimeClock,
+    selectExecutor: async () => executor,
+    createIdentity: () => identity,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "accepted",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: executor.id, type: executor.type },
+      authority,
+    }),
+    revision: 1,
+  });
+  executor.observeGate = new Promise<void>(() => {});
+  await service.recover();
+  const recovery = service.setAuthority(authority);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  runtimeClock.advanceBy(5_000);
+  await recovery;
+  assert.equal(executor.submitted.length, 0);
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/stale-completion-keeps-newer-executor-registration", async () => {
+  const oldExecutor = new ControlledExecutor("remote", "executor-01");
+  const newExecutor = new ControlledExecutor("remote", "executor-01");
+  let selected = oldExecutor;
+  const state = new TransactionalState();
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => selected,
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+  await service.run(request);
+  selected = newExecutor;
+  await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
+  oldExecutor.result.resolve({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    executor: { kind: "remote" },
+    status: "succeeded",
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const cancellation = service.cancel(identity.taskId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(newExecutor.cancelled.length, 1);
+  newExecutor.result.resolve({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    executor: { kind: "remote" },
+    status: "cancelled",
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  });
+  await cancellation;
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/authority-loss-during-resolution-has-zero-cancel-effects", async () => {
+  const executor = new ControlledExecutor();
+  const gate = Promise.withResolvers<void>();
+  const { service, state } = serviceFixture(executor);
+  const cancelling = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "running",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    executor: { id: executor.id, type: executor.type },
+    authority,
+    cancellation: { requestedAt: now.toISOString(), authority },
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: cancelling, revision: 1 });
+  const delayed = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      await gate.promise;
+      return executor;
+    },
+    createIdentity: () => identity,
+  });
+  await delayed.recover();
+  const activation = delayed.setAuthority(authority);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await delayed.setAuthority(undefined);
+  gate.resolve();
+  await activation;
+  assert.equal(executor.cancelled.length, 0);
+  await service.close();
+});
+
+test("@spec:runtime-operations/task-operations/definite-submit-rejection-is-authoritative", async () => {
+  const { executor, service } = serviceFixture();
+  await service.setAuthority(authority);
+  executor.submitError = new DiagnosticError(
+    runtimeDiagnostic({
+      code: "EXECUTOR_DRAINING",
+      message: "secret admission detail",
+      source: { kind: "executor", id: executor.id },
+      retryable: true,
+      observedAt: now.toISOString(),
+    }),
+  );
+  const terminal = await service.run(request);
+  assert.equal(terminal.state, "terminal");
+  assert.equal(terminal.result?.status, "rejected");
+  assert.equal(terminal.result?.diagnostic?.code, "EXECUTOR_DRAINING");
+  assert.doesNotMatch(JSON.stringify(terminal), /secret admission detail/u);
 });
