@@ -13,6 +13,7 @@ import {
   type RuntimeDiagnostic,
   type SessionId,
   type WorkerMessageType,
+  type WorkerProtocolVersion,
   type WorkerId,
 } from "@tegojs/contracts";
 import {
@@ -99,7 +100,7 @@ export interface WorkerSessionOptions {
   readonly clock: Clock;
   readonly credential?: string;
   readonly resolveCredential?: (workerId: WorkerId) => string | undefined;
-  readonly protocol?: string;
+  readonly protocol?: WorkerProtocolVersion;
   readonly limits?: WorkerProtocolLimitOverrides;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
@@ -354,7 +355,7 @@ export class WorkerSession {
   readonly #clock: Clock;
   #credential: string;
   readonly #resolveCredential: WorkerSessionOptions["resolveCredential"] | undefined;
-  readonly #protocol: string;
+  readonly #protocol: WorkerProtocolVersion;
   readonly #codec: WorkerCodec;
   readonly #role: WorkerSessionRole;
   readonly #heartbeatIntervalMs: number;

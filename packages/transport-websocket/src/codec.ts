@@ -1,32 +1,16 @@
 import {
   DiagnosticError,
   parseMessageId,
-  parseSequence,
-  parseSessionId,
   parseWorkerEnvelope,
   runtimeDiagnostic,
-  serializeWireValue,
   type JsonValue,
   type WorkerEnvelope,
-  type WorkerMessageType,
+  type WorkerProtocolVersion,
 } from "@tegojs/contracts";
 
-const CONTROL_FIELDS = new Set([
-  "protocol",
-  "messageId",
-  "sessionId",
-  "sequence",
-  "correlationId",
-  "type",
-  "sentAt",
-  "payload",
-  "binaryBytes",
-  "binaryChunks",
-]);
 const BINARY_HEADER_BYTES = 16;
 const BINARY_MAGIC = 0x54;
 const BINARY_VERSION = 1;
-const MESSAGE_TYPE_PATTERN = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)*$/u;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -52,20 +36,7 @@ export const DEFAULT_WORKER_PROTOCOL_LIMITS: WorkerProtocolLimits = {
 
 export type WorkerProtocolLimitOverrides = Partial<WorkerProtocolLimits>;
 
-export type WorkerControlEnvelope = Pick<
-  WorkerEnvelope,
-  | "binaryBytes"
-  | "binaryChunks"
-  | "correlationId"
-  | "messageId"
-  | "payload"
-  | "sentAt"
-  | "sequence"
-  | "sessionId"
-  | "type"
-> & {
-  readonly protocol: string;
-};
+export type WorkerControlEnvelope = WorkerEnvelope;
 
 export interface WorkerBinaryChunk {
   readonly correlationId: string;
@@ -136,28 +107,6 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function exactFields(record: Record<string, unknown>): void {
-  for (const field of Object.keys(record)) {
-    if (!CONTROL_FIELDS.has(field)) {
-      throw protocolError(
-        "PROTOCOL_ENVELOPE_INVALID",
-        "Worker envelope contains an unsupported field",
-        { field },
-      );
-    }
-  }
-}
-
-function finiteNonNegativeInteger(value: unknown, name: string): number | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
-    throw protocolError("PROTOCOL_ENVELOPE_INVALID", `${name} must be a non-negative integer`);
-  }
-  return value as number;
-}
-
 export interface WorkerCodec {
   readonly limits: WorkerProtocolLimits;
   encodeControl(envelope: WorkerControlEnvelope): string;
@@ -166,103 +115,50 @@ export interface WorkerCodec {
   decodeBinary(frame: Uint8Array): WorkerBinaryChunk;
 }
 
+export function assertWorkerProtocolVersion(
+  value: unknown,
+): asserts value is WorkerProtocolVersion {
+  if (value !== "1.0") {
+    throw protocolError(
+      "PROTOCOL_VERSION_UNSUPPORTED",
+      "Worker protocol version is not implemented",
+      { received: typeof value === "string" ? value : typeof value, supported: "1.0" },
+    );
+  }
+}
+
 export function createWorkerCodec(
   overrides: WorkerProtocolLimitOverrides = {},
-  supportedProtocol = "1.0",
+  supportedProtocol: WorkerProtocolVersion = "1.0",
 ): WorkerCodec {
+  assertWorkerProtocolVersion(supportedProtocol);
   const limits = normalizeLimits(overrides);
 
   function validateControl(value: unknown): WorkerControlEnvelope {
     const record = asRecord(value);
-    if (record.protocol !== supportedProtocol) {
+    if (record.protocol !== "1.0") {
       throw protocolError(
         "PROTOCOL_VERSION_UNSUPPORTED",
         "Worker protocol version is not supported",
         {
           received: typeof record.protocol === "string" ? record.protocol : typeof record.protocol,
-          supported: supportedProtocol,
+          supported: "1.0",
         },
       );
     }
-    if (record.protocol === "1.0") {
-      const envelope = parseWorkerEnvelope(record);
-      if (
-        envelope.binaryBytes !== undefined &&
-        (envelope.binaryBytes > limits.maxBinaryBytes ||
-          envelope.binaryChunks === undefined ||
-          envelope.binaryChunks > limits.maxBinaryChunks)
-      ) {
-        throw protocolError(
-          "PROTOCOL_BINARY_LIMIT_EXCEEDED",
-          "Worker binary payload exceeds configured limits",
-        );
-      }
-      return envelope;
-    }
-
-    // A non-current local version is accepted only so a peer can reject it during negotiation.
-    exactFields(record);
-    if (typeof record.messageId !== "string") {
-      throw protocolError("PROTOCOL_ENVELOPE_INVALID", "messageId must be a string");
-    }
-    if (typeof record.sessionId !== "string") {
-      throw protocolError("PROTOCOL_ENVELOPE_INVALID", "sessionId must be a string");
-    }
-    if (typeof record.sequence !== "string") {
-      throw protocolError("PROTOCOL_ENVELOPE_INVALID", "sequence must be a decimal string");
-    }
+    const envelope = parseWorkerEnvelope(record);
     if (
-      typeof record.type !== "string" ||
-      record.type.length > 128 ||
-      !MESSAGE_TYPE_PATTERN.test(record.type)
-    ) {
-      throw protocolError("PROTOCOL_ENVELOPE_INVALID", "type must be a protocol message type");
-    }
-    if (
-      typeof record.sentAt !== "string" ||
-      !Number.isFinite(Date.parse(record.sentAt)) ||
-      new Date(record.sentAt).toISOString() !== record.sentAt
-    ) {
-      throw protocolError("PROTOCOL_ENVELOPE_INVALID", "sentAt must be an ISO timestamp");
-    }
-    const messageId = parseMessageId(record.messageId);
-    const sessionId = parseSessionId(record.sessionId);
-    const sequence = parseSequence(record.sequence);
-    const correlationId =
-      record.correlationId === undefined ? undefined : parseMessageId(record.correlationId);
-    const payload = serializeWireValue(record.payload);
-    const binaryBytes = finiteNonNegativeInteger(record.binaryBytes, "binaryBytes");
-    const binaryChunks = finiteNonNegativeInteger(record.binaryChunks, "binaryChunks");
-    if ((binaryBytes === undefined) !== (binaryChunks === undefined)) {
-      throw protocolError(
-        "PROTOCOL_ENVELOPE_INVALID",
-        "binaryBytes and binaryChunks must be provided together",
-      );
-    }
-    if (
-      binaryBytes !== undefined &&
-      (binaryBytes > limits.maxBinaryBytes ||
-        binaryChunks === undefined ||
-        binaryChunks === 0 ||
-        binaryChunks > limits.maxBinaryChunks)
+      envelope.binaryBytes !== undefined &&
+      (envelope.binaryBytes > limits.maxBinaryBytes ||
+        envelope.binaryChunks === undefined ||
+        envelope.binaryChunks > limits.maxBinaryChunks)
     ) {
       throw protocolError(
         "PROTOCOL_BINARY_LIMIT_EXCEEDED",
         "Worker binary payload exceeds configured limits",
       );
     }
-    return {
-      protocol: record.protocol,
-      messageId,
-      sessionId,
-      sequence,
-      ...(correlationId === undefined ? {} : { correlationId }),
-      type: record.type as WorkerMessageType,
-      sentAt: record.sentAt,
-      payload,
-      ...(binaryBytes === undefined ? {} : { binaryBytes }),
-      ...(binaryChunks === undefined ? {} : { binaryChunks }),
-    };
+    return envelope;
   }
 
   return {

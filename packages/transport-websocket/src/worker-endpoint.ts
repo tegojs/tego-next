@@ -1,5 +1,6 @@
 import { parseWorkerId, type WorkerId } from "@tegojs/contracts";
 import { systemWorkerClock } from "./clock.js";
+import { assertWorkerProtocolVersion } from "./codec.js";
 import type { WorkerEndpointOptions, WorkerRegistrationInput } from "./main-endpoint.js";
 import { compareWorkerEpoch, WorkerSession, type WorkerRegistration } from "./session.js";
 
@@ -29,6 +30,7 @@ export class WorkerEndpoint {
   #closed = false;
 
   constructor(options: WorkerEndpointOptions) {
+    assertWorkerProtocolVersion(options.protocol ?? "1.0");
     this.#options = options;
     this.#workerId = parseWorkerId(options.workerId);
     this.#registration = registrationFrom(options);

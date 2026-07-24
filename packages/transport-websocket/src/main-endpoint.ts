@@ -4,8 +4,9 @@ import {
   type Clock,
   type JsonObject,
   type WorkerId,
+  type WorkerProtocolVersion,
 } from "@tegojs/contracts";
-import type { WorkerProtocolLimitOverrides } from "./codec.js";
+import { assertWorkerProtocolVersion, type WorkerProtocolLimitOverrides } from "./codec.js";
 import { systemWorkerClock } from "./clock.js";
 import { WorkerSession, type WorkerRegistration } from "./session.js";
 
@@ -18,7 +19,7 @@ export interface WorkerRegistrationInput {
 
 export interface WorkerSessionEndpointOptions {
   readonly clock?: Clock;
-  readonly protocol?: string;
+  readonly protocol?: WorkerProtocolVersion;
   readonly limits?: WorkerProtocolLimitOverrides;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
@@ -47,6 +48,7 @@ export class MainEndpoint {
   #closed = false;
 
   constructor(options: MainEndpointOptions) {
+    assertWorkerProtocolVersion(options.protocol ?? "1.0");
     this.#options = options;
     const credentials = new Map<WorkerId, string>();
     for (const [workerId, credential] of Object.entries(options.credentials ?? {})) {
