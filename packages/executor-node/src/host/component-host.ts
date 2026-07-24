@@ -786,21 +786,14 @@ export class ComponentHost {
     });
   }
 
-  #attachments(
-    input: readonly ArrayBuffer[],
-    allowAttachments = true,
-  ): RunAttachmentLease {
+  #attachments(input: readonly ArrayBuffer[], allowAttachments = true): RunAttachmentLease {
     let rawCount: unknown;
     try {
       rawCount = Reflect.get(input, "length");
     } catch {
       throw this.#protocolError("Component host attachment count is invalid");
     }
-    if (
-      typeof rawCount !== "number" ||
-      !Number.isSafeInteger(rawCount) ||
-      rawCount < 0
-    ) {
+    if (typeof rawCount !== "number" || !Number.isSafeInteger(rawCount) || rawCount < 0) {
       throw this.#protocolError("Component host attachment count is invalid");
     }
     const count = rawCount;
