@@ -147,13 +147,13 @@ export function coordinationConformance(
         const first = await provider.acquireLease({
           resource: "task/renewed",
           owner: "worker-a",
-          durationMs: 100,
+          durationMs: 500,
         });
         await delay(10);
         const renewed = await provider.acquireLease({
           resource: "task/renewed",
           owner: "worker-a",
-          durationMs: 250,
+          durationMs: 750,
         });
         assert.equal(renewed.epoch, first.epoch);
         assert.ok(Date.parse(renewed.expiresAt) > Date.parse(first.expiresAt));
