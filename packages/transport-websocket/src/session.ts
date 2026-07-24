@@ -317,30 +317,6 @@ function socketMessage(arguments_: readonly unknown[], maxFrameBytes: number): s
   );
 }
 
-function closeDetails(arguments_: readonly unknown[]): {
-  readonly code: number;
-  readonly reason: string;
-} {
-  const first = arguments_[0];
-  if (typeof first === "object" && first !== null && "code" in first) {
-    const event = first as { code?: unknown; reason?: unknown };
-    return {
-      code: typeof event.code === "number" ? event.code : 1006,
-      reason: typeof event.reason === "string" ? event.reason : "",
-    };
-  }
-  const second = arguments_[1];
-  return {
-    code: typeof first === "number" ? first : 1006,
-    reason:
-      typeof second === "string"
-        ? second
-        : second instanceof Uint8Array
-          ? Buffer.from(second).toString("utf8")
-          : "",
-  };
-}
-
 function closeCode(diagnostic: RuntimeDiagnostic): number {
   if (diagnostic.code === "PROTOCOL_FRAME_TOO_LARGE") {
     return 1009;
@@ -398,8 +374,8 @@ export class WorkerSession {
   readonly #messageListener: SocketListener = (...arguments_) => {
     this.#receive(arguments_);
   };
-  readonly #closeListener: SocketListener = (...arguments_) => {
-    this.#transportClosed(closeDetails(arguments_));
+  readonly #closeListener: SocketListener = () => {
+    this.#transportClosed();
   };
   readonly #errorListener: SocketListener = () => {
     this.#fail(diagnosticError("WORKER_TRANSPORT_ERROR", "Worker WebSocket transport failed"));
@@ -1134,16 +1110,18 @@ export class WorkerSession {
     this.#detach();
   }
 
-  #transportClosed(details: { readonly code: number; readonly reason: string }): void {
-    if (this.#state !== "unavailable") {
-      this.#state = "closed";
+  #transportClosed(): void {
+    if (this.#state === "closed" || this.#state === "unavailable") {
+      this.#detach();
+      return;
     }
+    this.#state = "closed";
     this.#available = false;
     this.#acceptingAssignments = false;
     const error = diagnosticError("WORKER_SESSION_CLOSED", "Worker WebSocket session closed", {
-      code: details.code,
-      reason: details.reason.slice(0, 128),
+      category: "transport-closed",
     });
+    this.#diagnostic = error.diagnostic;
     this.#abort.abort(error);
     this.#handshakeAbort.abort();
     this.#readyDeferred.reject(error);
