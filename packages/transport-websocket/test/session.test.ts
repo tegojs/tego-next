@@ -70,24 +70,47 @@ test("the public protocol registry rejects locally configured unsupported versio
 
 test("an injected epoch allocator preserves the Worker high-water mark across Main restart", async () => {
   const workerId = "epoch-restart-worker" as WorkerId;
-  const epochs = new MemoryWorkerEpochAllocator({ [workerId]: "7" });
-  const main = createMainEndpoint({
+  const durableEpochs = new Map<WorkerId, bigint>([[workerId, 7n]]);
+  const allocator = (): WorkerEpochAllocator => ({
+    next: async (id) => {
+      const next = (durableEpochs.get(id) ?? 0n) + 1n;
+      durableEpochs.set(id, next);
+      return next.toString();
+    },
+  });
+  const firstMain = createMainEndpoint({
     credential: "shared-secret",
     workerId,
-    epochAllocator: epochs,
+    epochAllocator: allocator(),
   });
-  const worker = createWorkerEndpoint({
+  const firstWorker = createWorkerEndpoint({
     credential: "shared-secret",
     workerId,
   });
-  const [mainSocket, workerSocket] = directSocketPair();
-  const mainSession = main.attach(mainSocket);
-  const workerSession = worker.attach(workerSocket);
+  const [firstMainSocket, firstWorkerSocket] = directSocketPair();
+  const firstMainSession = firstMain.attach(firstMainSocket);
+  const firstWorkerSession = firstWorker.attach(firstWorkerSocket);
 
-  await Promise.all([mainSession.ready, workerSession.ready]);
-  assert.equal(mainSession.epoch, "8");
-  assert.equal(workerSession.epoch, "8");
-  await Promise.all([main.close(), worker.close()]);
+  await Promise.all([firstMainSession.ready, firstWorkerSession.ready]);
+  assert.equal(firstMainSession.epoch, "8");
+  await Promise.all([firstMain.close(), firstWorker.close()]);
+
+  const secondMain = createMainEndpoint({
+    credential: "shared-secret",
+    workerId,
+    epochAllocator: allocator(),
+  });
+  const secondWorker = createWorkerEndpoint({
+    credential: "shared-secret",
+    workerId,
+  });
+  const [secondMainSocket, secondWorkerSocket] = directSocketPair();
+  const secondMainSession = secondMain.attach(secondMainSocket);
+  const secondWorkerSession = secondWorker.attach(secondWorkerSocket);
+  await Promise.all([secondMainSession.ready, secondWorkerSession.ready]);
+  assert.equal(secondMainSession.epoch, "9");
+  assert.equal(secondWorkerSession.epoch, "9");
+  await Promise.all([secondMain.close(), secondWorker.close()]);
 });
 
 test("codec accepts only exact JSON data fields and decimal sequence values", () => {

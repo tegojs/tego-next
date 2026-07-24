@@ -1390,9 +1390,9 @@ test("session-loss persistence failure cannot suppress the orphan recovery timer
     attemptStore: {
       save: async (record) => backing.save(record),
       commit: async (record, condition) => {
-        if (record.state === "unknown" && unknownFailures === 0) {
+        if (record.state === "unknown" && unknownFailures < 4) {
           unknownFailures += 1;
-          throw new Error("unknown state store unavailable once");
+          throw new Error("unknown state store unavailable transiently");
         }
         return backing.commit(record, condition);
       },
@@ -1419,6 +1419,13 @@ test("session-loss persistence failure cannot suppress the orphan recovery timer
   main.close();
   await flush();
   clock.advanceBy(101);
+  await flush();
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  assert.equal(settled, false);
+  clock.advanceBy(26);
 
   assert.equal((await handle.result).status, "failed");
   await Promise.all([remote.close(), runtime.close()]);
@@ -1460,6 +1467,65 @@ test("aggregate byte reservation prevents a second valid result from wedging bot
   assert.equal(firstSettled, true);
   assert.equal(secondSettled, true);
   await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("too-small result limits reject before mandatory terminal evidence can be wedged", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxResultBytes: 1,
+    resultBuffer: { maxCount: 10, maxBytes: 1_000 },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const handles = await Promise.all(
+    Array.from({ length: 5 }, async (_, index) =>
+      remote.submit(
+        executionRequest({ mode: "echo", value: index }, `tiny-result-limit-${index}`),
+      ),
+    ),
+  );
+  const results = await Promise.all(handles.map(async (handle) => handle.result));
+
+  assert.equal(local.executions, 0);
+  assert.equal(results.every((result) => result.status === "rejected"), true);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("attempt-store revisions are required unsigned-64 decimal strings", async () => {
+  const clock = new FakeClock(new Date(0));
+  const store = new MemoryRemoteAttemptStore();
+  const request = executionRequest(null, "revision-string");
+  const created = await store.commit(
+    {
+      workerId,
+      request,
+      fingerprint: requestFingerprint(request),
+      revision: "0",
+      state: "assigned",
+      epoch: "1",
+      updatedAt: clock.now().toISOString(),
+    },
+    { expectedRevision: null },
+  );
+  assert.equal(created?.revision, "1");
+  const updated = await store.commit(
+    {
+      ...created!,
+      state: "running",
+    },
+    { expectedRevision: "1", expectedEpoch: "1" },
+  );
+  assert.equal(updated?.revision, "2");
 });
 
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {
