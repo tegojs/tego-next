@@ -56,6 +56,15 @@ interface LoadedTask {
   readonly revision: Revision;
 }
 
+interface ExecutorRegistration {
+  readonly executor: Executor;
+  readonly authority: RuntimeAuthority;
+}
+
+type ObservationOutcome =
+  | { readonly kind: "observed"; readonly value: Awaited<ReturnType<Executor["observe"]>> }
+  | { readonly kind: "timeout" };
+
 interface DeferredWaiter {
   readonly resolve: (record: TaskRecord) => void;
   readonly reject: (error: unknown) => void;
@@ -93,7 +102,7 @@ export class TaskService implements RuntimeTaskLifecycle {
   readonly #selectExecutor: TaskServiceOptions["selectExecutor"];
   readonly #createIdentity: NonNullable<TaskServiceOptions["createIdentity"]>;
   readonly #records = new Map<TaskId, LoadedTask>();
-  readonly #executors = new Map<TaskId, Executor>();
+  readonly #executors = new Map<TaskId, ExecutorRegistration>();
   readonly #dispatches = new Map<TaskId, Promise<TaskRecord>>();
   readonly #cancellations = new Map<TaskId, Promise<TaskRecord>>();
   readonly #waiters = new Map<TaskId, Set<DeferredWaiter>>();
@@ -160,7 +169,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     const proposed = this.#createIdentity(request);
     const admitted = await this.#admit(request, fingerprint, proposed, selected, authority);
     if (admitted.executor?.id === selected.id && admitted.executor.type === selected.type) {
-      this.#executors.set(admitted.taskId, selected);
+      this.#executors.set(admitted.taskId, { executor: selected, authority });
     }
     const existingDispatch = this.#dispatches.get(admitted.taskId);
     if (existingDispatch !== undefined) return structuredClone(await existingDispatch);
@@ -245,12 +254,12 @@ export class TaskService implements RuntimeTaskLifecycle {
           }))
         : current;
     this.#assertAuthority(authority);
-    const executor = this.#executors.get(taskId);
+    const executor = this.#executors.get(taskId)?.executor;
     if (executor === undefined) {
       const dispatch = this.#dispatches.get(taskId);
       if (dispatch !== undefined) await dispatch.catch(() => undefined);
     }
-    const active = this.#executors.get(taskId);
+    const active = this.#executors.get(taskId)?.executor;
     if (active !== undefined) {
       this.#assertAuthority(authority);
       await this.#boundedEffect(active.cancel(intended.taskId, intended.attemptId));
@@ -261,8 +270,8 @@ export class TaskService implements RuntimeTaskLifecycle {
         ? undefined
         : await this.#observeBounded(active, intended.taskId, intended.attemptId);
     this.#assertAuthority(authority);
-    if (observed?.state === "terminal") {
-      await this.#complete(intended, observed.result, authority);
+    if (observed?.kind === "observed" && observed.value?.state === "terminal") {
+      await this.#complete(intended, observed.value.result, authority);
     }
     const completed = await this.#waitBounded(taskId);
     if (completed !== undefined) return completed;
@@ -383,9 +392,10 @@ export class TaskService implements RuntimeTaskLifecycle {
 
   async #dispatch(record: TaskRecord, authority: RuntimeAuthority): Promise<TaskRecord> {
     this.#assertAuthority(authority);
-    const executor = await this.#resolveExecutor(record);
+    const executor = await this.#resolveExecutor(record, authority);
     this.#assertAuthority(authority);
-    this.#executors.set(record.taskId, executor);
+    const registration = { executor, authority };
+    this.#executors.set(record.taskId, registration);
     const request = {
       taskId: record.taskId,
       attemptId: record.attemptId,
@@ -400,11 +410,14 @@ export class TaskService implements RuntimeTaskLifecycle {
     try {
       handle = await executor.submit(request);
     } catch (error) {
-      const observed = await this.#observeBounded(executor, record.taskId, record.attemptId).catch(
+      if (this.#isDefiniteAdmissionRejection(error)) {
+        return this.#rejectAdmission(record, error, authority);
+      }
+      const outcome = await this.#observeBounded(executor, record.taskId, record.attemptId).catch(
         () => undefined,
       );
-      if (observed?.state === "terminal") {
-        await this.#complete(record, observed.result, authority);
+      if (outcome?.kind === "observed" && outcome.value?.state === "terminal") {
+        await this.#complete(record, outcome.value.result, authority, registration);
       } else if (executor.type !== "remote") {
         await this.#settleUncertain(record, error, authority, true);
       } else {
@@ -446,7 +459,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     void completion
       .then((outcome) =>
         outcome.ok
-          ? this.#complete(running, outcome.result, authority)
+          ? this.#complete(running, outcome.result, authority, registration)
           : this.#settleUncertain(running, outcome.error, authority, true),
       )
       .catch(() => undefined);
@@ -457,6 +470,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     record: TaskRecord,
     input: ExecutionResult,
     authority: RuntimeAuthority,
+    registration?: ExecutorRegistration,
   ): Promise<void> {
     try {
       const result = structuredClone(parseExecutionResult(input));
@@ -486,7 +500,9 @@ export class TaskService implements RuntimeTaskLifecycle {
     } catch (error) {
       await this.#settleUncertain(record, error, authority, true);
     } finally {
-      this.#executors.delete(record.taskId);
+      if (registration === undefined || this.#executors.get(record.taskId) === registration) {
+        this.#executors.delete(record.taskId);
+      }
     }
   }
 
@@ -505,7 +521,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     }
     let executor: Executor;
     try {
-      executor = await this.#resolveExecutor(record);
+      executor = await this.#resolveExecutor(record, authority);
     } catch (error) {
       if (record.executor.type === "remote") {
         await this.#markUnknown(record, authority, "EXECUTOR_OBSERVATION_UNKNOWN");
@@ -514,14 +530,22 @@ export class TaskService implements RuntimeTaskLifecycle {
       await this.#settleUncertain(record, error, authority, true);
       return;
     }
-    this.#executors.set(record.taskId, executor);
+    this.#assertAuthority(authority);
+    const registration = { executor, authority };
+    this.#executors.set(record.taskId, registration);
     if (record.cancellation !== undefined) {
+      this.#assertAuthority(authority);
       await this.#boundedEffect(executor.cancel(record.taskId, record.attemptId));
       this.#assertAuthority(authority);
     }
     let observed: Awaited<ReturnType<Executor["observe"]>>;
     try {
-      observed = await this.#observeBounded(executor, record.taskId, record.attemptId);
+      const outcome = await this.#observeBounded(executor, record.taskId, record.attemptId);
+      if (outcome.kind === "timeout") {
+        await this.#markUnknown(record, authority, "EXECUTOR_OBSERVATION_UNKNOWN");
+        return;
+      }
+      observed = outcome.value;
     } catch (error) {
       if (record.executor.type === "remote") return;
       await this.#settleUncertain(record, error, authority, true);
@@ -553,13 +577,21 @@ export class TaskService implements RuntimeTaskLifecycle {
     }
   }
 
-  async #resolveExecutor(record: TaskRecord): Promise<Executor> {
+  async #resolveExecutor(record: TaskRecord, authority: RuntimeAuthority): Promise<Executor> {
     const binding = record.executor;
     if (binding === undefined) {
       throw this.#invalidResult(record.taskId, "Task executor binding is missing");
     }
-    const retained = this.#executors.get(record.taskId);
-    if (retained?.id === binding.id && retained.type === binding.type) return retained;
+    const registration = this.#executors.get(record.taskId);
+    const retained = registration?.executor;
+    if (
+      registration?.authority.resource === authority.resource &&
+      registration.authority.epoch === authority.epoch &&
+      retained?.id === binding.id &&
+      retained.type === binding.type
+    ) {
+      return retained;
+    }
     const resolved = await this.#selectExecutor(record.request, binding);
     if (resolved.id !== binding.id || resolved.type !== binding.type) {
       throw this.#invalidResult(
@@ -677,7 +709,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     executor: Executor,
     taskId: TaskId,
     attemptId: AttemptId,
-  ): Promise<Awaited<ReturnType<Executor["observe"]>>> {
+  ): Promise<ObservationOutcome> {
     const controller = new AbortController();
     this.#observationControllers.add(controller);
     const observation = Promise.resolve(executor.observe(taskId, attemptId)).then(
@@ -691,9 +723,9 @@ export class TaskService implements RuntimeTaskLifecycle {
     const outcome = await Promise.race([observation, timeout]);
     controller.abort();
     this.#observationControllers.delete(controller);
-    if (outcome.kind === "observed") return outcome.value;
+    if (outcome.kind === "observed") return outcome;
     if (outcome.kind === "failed" || outcome.kind === "aborted") throw outcome.error;
-    return undefined;
+    return { kind: "timeout" };
   }
 
   async #markUnknown(
@@ -713,6 +745,46 @@ export class TaskService implements RuntimeTaskLifecycle {
       }),
       updatedAt: this.#clock.now().toISOString(),
     }));
+  }
+
+  #isDefiniteAdmissionRejection(error: unknown): boolean {
+    return new Set([
+      "EXECUTOR_DRAINING",
+      "EXECUTOR_ATTEMPT_CAPACITY_EXCEEDED",
+      "EXECUTOR_QUEUE_CAPACITY_EXCEEDED",
+    ]).has(diagnosticCode(error) ?? "");
+  }
+
+  async #rejectAdmission(
+    record: TaskRecord,
+    error: unknown,
+    authority: RuntimeAuthority,
+  ): Promise<TaskRecord> {
+    const timestamp = this.#clock.now().toISOString();
+    const code = diagnosticCode(error) ?? "EXECUTOR_SUBMISSION_REJECTED";
+    const terminal = await this.#transition(record.taskId, authority, (current) => ({
+      ...current,
+      state: "terminal",
+      authority,
+      updatedAt: timestamp,
+      result: {
+        taskId: record.taskId,
+        attemptId: record.attemptId,
+        executor: { kind: record.executor?.type ?? "process" },
+        status: "rejected",
+        diagnostic: runtimeDiagnostic({
+          code,
+          message: "Executor rejected the task before creating an attempt",
+          source: { kind: "executor", id: record.taskId },
+          retryable: true,
+          observedAt: timestamp,
+        }),
+        startedAt: record.createdAt,
+        completedAt: timestamp,
+      },
+    }));
+    this.#notify(terminal);
+    return terminal;
   }
 
   async #boundedEffect(effect: Promise<void>): Promise<void> {

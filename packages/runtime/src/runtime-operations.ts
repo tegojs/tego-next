@@ -43,6 +43,11 @@ export interface RuntimeTaskOperations {
   cancel(taskId: TaskId): Promise<TaskRecord>;
 }
 
+interface LocatedInstallation {
+  readonly installation: PluginInstallation;
+  readonly storageId: string;
+}
+
 export interface RuntimeOperationControllerOptions {
   readonly clock: Clock;
   readonly state?: StateStore;
@@ -159,7 +164,8 @@ export class RuntimeOperationController implements RuntimeOperations {
     const authority = this.#requireAuthority();
     const state = this.#requireState();
     const request = parseDeployPluginRequest(input);
-    const installation = await this.#findInstallation(request);
+    const located = await this.#findInstallation(request);
+    const installation = located.installation;
     this.#validateDeployment(request, installation);
     const key = deploymentKey(request);
 
@@ -184,6 +190,8 @@ export class RuntimeOperationController implements RuntimeOperations {
             }
             const transactionInstallation = parsePluginInstallation(durableInstallation.value);
             if (
+              located.storageId !==
+                `${transactionInstallation.pluginId}@${transactionInstallation.version}@${transactionInstallation.digest}` ||
               transactionInstallation.pluginId !== request.pluginId ||
               transactionInstallation.digest !== request.artifactDigest ||
               transactionInstallation.manifest.pluginId !== request.pluginId ||
@@ -331,7 +339,7 @@ export class RuntimeOperationController implements RuntimeOperations {
     return structuredClone(this.#recovered);
   }
 
-  async #findInstallation(request: DeployPluginRequest): Promise<PluginInstallation> {
+  async #findInstallation(request: DeployPluginRequest): Promise<LocatedInstallation> {
     for await (const stored of this.#requireState().scan<PluginInstallation>({
       namespace: "tego",
       collection: "installations",
@@ -341,7 +349,7 @@ export class RuntimeOperationController implements RuntimeOperations {
         installation.pluginId === request.pluginId &&
         installation.digest === request.artifactDigest
       ) {
-        return installation;
+        return { installation, storageId: stored.key.id };
       }
     }
     throw this.#deploymentError(
@@ -404,6 +412,13 @@ export class RuntimeOperationController implements RuntimeOperations {
         installation.digest !== provider.artifactDigest
       ) {
         continue;
+      }
+      if (
+        stored.key.id !==
+          `${installation.pluginId}@${installation.version}@${installation.digest}` ||
+        provider.version !== installation.version
+      ) {
+        break;
       }
       const provided = installation.manifest.capabilities.provides.find(
         (candidate) => candidate.name === name,

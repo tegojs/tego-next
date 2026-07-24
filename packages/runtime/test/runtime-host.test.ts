@@ -493,7 +493,11 @@ test("@spec:runtime-operations/plugin-operations/runtime-host-rejects-stale-reco
       expected,
       { ...expected, epoch: parseFencingEpoch("8") },
       expected,
-      { wake: async () => void (wakes += 1) },
+      {
+        wake: async () => {
+          wakes += 1;
+        },
+      },
       clock,
     ),
     (error: unknown) => diagnosticCode(error) === "COORDINATION_FENCE_REJECTED",

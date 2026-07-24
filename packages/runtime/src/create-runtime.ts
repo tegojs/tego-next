@@ -5,6 +5,7 @@ import {
   parseRuntimeStatus,
   runtimeDiagnostic,
   serializeCause,
+  type Clock,
   type Runtime,
   type RuntimeAuthority,
   type RuntimeConfiguration,
@@ -22,6 +23,32 @@ import { recoverRuntimeState, type RuntimeRecoverySnapshot } from "./recovery.js
 import { RuntimeOperationController } from "./runtime-operations.js";
 import { transitionRuntimeState } from "./runtime-state.js";
 import type { RuntimeHostServices } from "./runtime-host.js";
+
+export async function wakeReconcilerForAuthority(
+  expected: RuntimeAuthority,
+  current: RuntimeAuthority | undefined,
+  reconcilerAuthority: RuntimeAuthority | undefined,
+  reconciler: Pick<Reconciler, "wake"> | undefined,
+  clock: Clock,
+): Promise<void> {
+  if (
+    current?.resource !== expected.resource ||
+    current.epoch !== expected.epoch ||
+    reconcilerAuthority?.resource !== expected.resource ||
+    reconcilerAuthority.epoch !== expected.epoch ||
+    reconciler === undefined
+  ) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "COORDINATION_FENCE_REJECTED",
+        message: "Reconciler wake authority no longer matches the active runtime leader",
+        source: { kind: "coordination", id: expected.resource },
+        observedAt: clock.now().toISOString(),
+      }),
+    );
+  }
+  await reconciler.wake();
+}
 
 class RuntimeEventIterator implements AsyncIterable<RuntimeEvent>, AsyncIterator<RuntimeEvent> {
   readonly #onClose: () => void;
@@ -118,6 +145,7 @@ class TegoRuntime implements Runtime {
   #leadership: RuntimeAuthority | undefined;
   #leadershipController: LeadershipController | undefined;
   #reconciler: Reconciler | undefined;
+  #reconcilerAuthority: RuntimeAuthority | undefined;
   #driverHealth: RuntimeStatus["drivers"] = [];
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
@@ -141,7 +169,14 @@ class TegoRuntime implements Runtime {
         : { artifactService: services.artifactService }),
       ...(services === undefined ? {} : { tasks: services.tasks }),
       authority: () => this.#leadership,
-      wake: () => this.#reconciler?.wake(),
+      wake: (expected) =>
+        wakeReconcilerForAuthority(
+          expected,
+          this.#leadership,
+          this.#reconcilerAuthority,
+          this.#reconciler,
+          this.#drivers.clock,
+        ),
     });
     this.events = this.#eventStream;
   }
@@ -362,6 +397,7 @@ class TegoRuntime implements Runtime {
     await this.#services.tasks.setAuthority(authority);
     const reconciler = this.#services.createReconciler(authority);
     this.#reconciler = reconciler;
+    this.#reconcilerAuthority = structuredClone(authority);
     await reconciler.start();
     this.#leadership = structuredClone(authority);
     if (this.#lifecycle === "running" && !this.#stopRequested) {
@@ -409,7 +445,10 @@ class TegoRuntime implements Runtime {
     const reconciler = this.#reconciler;
     if (reconciler === undefined) return;
     await reconciler.stop();
-    if (this.#reconciler === reconciler) this.#reconciler = undefined;
+    if (this.#reconciler === reconciler) {
+      this.#reconciler = undefined;
+      this.#reconcilerAuthority = undefined;
+    }
   }
 
   async #closeServices(): Promise<readonly unknown[]> {
