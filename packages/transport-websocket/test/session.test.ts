@@ -415,6 +415,43 @@ test("authentication failures never expose either credential in diagnostics or c
   await Promise.all([main.close(), worker.close()]);
 });
 
+test("a peer close reason is redacted from diagnostics and pending request failures", async () => {
+  const connection = await directConnection();
+  const sensitiveReason = "remote-token=do-not-expose";
+  const pending = connection.mainSession.request("session.reconcile", { running: [] });
+
+  connection.workerSocket.close(4001, sensitiveReason);
+
+  let rejection: unknown;
+  await assert.rejects(pending, (error: unknown) => {
+    rejection = error;
+    return true;
+  });
+  const diagnostic =
+    typeof rejection === "object" && rejection !== null && "diagnostic" in rejection
+      ? (rejection as { diagnostic: { details?: JsonValue } }).diagnostic
+      : undefined;
+  assert.deepEqual(diagnostic?.details, { category: "transport-closed" });
+  assert.deepEqual(connection.mainSession.diagnostic?.details, {
+    category: "transport-closed",
+  });
+  assert.doesNotMatch(
+    JSON.stringify({
+      rejection:
+        rejection instanceof Error
+          ? {
+              message: rejection.message,
+              diagnostic,
+            }
+          : rejection,
+      session: connection.mainSession.diagnostic,
+    }),
+    new RegExp(sensitiveReason, "u"),
+  );
+
+  await cleanup(connection);
+});
+
 test("endpoints retain only authoritative live sessions across failed reconnects and replacement", async () => {
   const clock = new FakeClock();
   const main = createMainEndpoint({
