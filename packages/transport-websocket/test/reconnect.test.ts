@@ -1554,8 +1554,8 @@ test("a non-settling terminal commit cannot block orphan settlement", async () =
     assert.equal((await backing.load(request.taskId, request.attemptId))?.state, "unknown");
   });
   clock.advanceBy(101);
-  await flush();
-  clock.advanceBy(1_000);
+  await eventually(() => assert.equal(terminalCalls, 1));
+  clock.advanceBy(27);
   for (let index = 0; index < 20; index += 1) await flush();
   let settled = false;
   void handle.result.then(() => {

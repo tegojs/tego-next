@@ -107,6 +107,17 @@ export interface MemoryRemoteAttemptStoreOptions {
 
 const MAXIMUM_UNSIGNED_64 = 18_446_744_073_709_551_615n;
 
+export class RemoteAttemptRevisionError extends RangeError {
+  constructor(message = "Remote attempt revision is not a valid unsigned 64-bit decimal string") {
+    super(message);
+    this.name = "RemoteAttemptRevisionError";
+  }
+}
+
+export function isRemoteAttemptRevisionError(error: unknown): error is RemoteAttemptRevisionError {
+  return error instanceof RemoteAttemptRevisionError;
+}
+
 export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
   readonly #records = new Map<string, RemoteAttemptRecord>();
   readonly #onSave: ((record: RemoteAttemptRecord) => void) | undefined;
@@ -179,18 +190,27 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
 function incrementRevision(revision: string): string {
   const current = BigInt(parseAttemptRevision(revision));
   if (current === MAXIMUM_UNSIGNED_64) {
-    throw new RangeError("Remote attempt revision exceeds the unsigned 64-bit limit");
+    throw new RemoteAttemptRevisionError(
+      "Remote attempt revision exhausted its unsigned 64-bit range",
+    );
   }
   return (current + 1n).toString();
 }
 
 export function parseAttemptRevision(revision: unknown): string {
   if (typeof revision !== "string") {
-    throw new TypeError("Remote attempt revision must be an unsigned 64-bit decimal string");
+    throw new RemoteAttemptRevisionError();
   }
-  const parsed = parseSequence(revision);
+  let parsed: string;
+  try {
+    parsed = parseSequence(revision);
+  } catch {
+    throw new RemoteAttemptRevisionError();
+  }
   if (BigInt(parsed) > MAXIMUM_UNSIGNED_64) {
-    throw new RangeError("Remote attempt revision exceeds the unsigned 64-bit limit");
+    throw new RemoteAttemptRevisionError(
+      "Remote attempt revision exceeds the unsigned 64-bit limit",
+    );
   }
   return parsed;
 }

@@ -23,6 +23,7 @@ import {
   attemptKey,
   cloneJson,
   jsonBytes,
+  isRemoteAttemptRevisionError,
   parseAttemptRevision,
   parseRemoteRequest,
   positiveLimit,
@@ -100,6 +101,7 @@ export class WorkerRuntime {
   #reservedResults = 0;
   #reservedResultBytes = 0;
   #persistenceAvailable = true;
+  #attemptPersistenceAvailable = true;
 
   constructor(options: WorkerRuntimeOptions) {
     this.#workerId = options.workerId;
@@ -411,6 +413,16 @@ export class WorkerRuntime {
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
     await this.#pruneAcknowledged();
+    if (!this.#attemptPersistenceAvailable) {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+        "Worker attempt persistence is unavailable",
+      );
+      return;
+    }
     const existing = this.#attempts.get(key);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -644,18 +656,41 @@ export class WorkerRuntime {
       }
     }
     const terminal = cloneJson(result);
-    await this.#transition(attempt, async () => {
-      if (attempt.state === "terminal") return;
-      await this.#commit(attempt, "terminal", terminal);
-      const authoritative = attempt.result ?? terminal;
-      if (JSON.stringify(authoritative) !== JSON.stringify(terminal)) {
-        throw new Error("Worker attempt lost terminal commit authority to a conflicting result");
-      }
-      this.#results.put(authoritative);
-      this.#reservedResultBytes = Math.max(0, this.#reservedResultBytes - attempt.reservedBytes);
-      attempt.reservedBytes = 0;
-    });
+    try {
+      await this.#transition(attempt, async () => {
+        if (attempt.state === "terminal") return;
+        await this.#commit(attempt, "terminal", terminal);
+        const authoritative = attempt.result ?? terminal;
+        if (JSON.stringify(authoritative) !== JSON.stringify(terminal)) {
+          throw new Error("Worker attempt lost terminal commit authority to a conflicting result");
+        }
+        this.#results.put(authoritative);
+        this.#reservedResultBytes = Math.max(0, this.#reservedResultBytes - attempt.reservedBytes);
+        attempt.reservedBytes = 0;
+      });
+    } catch (error) {
+      if (!isRemoteAttemptRevisionError(error)) throw error;
+      this.#attemptPersistenceAvailable = false;
+      this.#terminalVolatile(
+        attempt,
+        this.#result(
+          attempt.request,
+          "failed",
+          "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+          "Worker attempt persistence returned an invalid revision",
+        ),
+      );
+    }
     this.#background(this.#publish(attempt.result ?? terminal));
+  }
+
+  #terminalVolatile(attempt: WorkerAttempt, result: ExecutionResult): void {
+    const terminal = cloneJson(result);
+    attempt.result = terminal;
+    attempt.state = "terminal";
+    this.#results.put(terminal);
+    this.#reservedResultBytes = Math.max(0, this.#reservedResultBytes - attempt.reservedBytes);
+    attempt.reservedBytes = 0;
   }
 
   async #publish(result: ExecutionResult): Promise<void> {
@@ -763,6 +798,7 @@ export class WorkerRuntime {
     if (retained !== undefined) {
       const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
       if (attempt !== undefined) {
+        if (!this.#attemptPersistenceAvailable) return;
         await this.#transition(attempt, async () => {
           if (attempt.acknowledgedAt === undefined) {
             attempt.acknowledgedAt = this.#clock.now().getTime();
@@ -933,7 +969,7 @@ export class WorkerRuntime {
         }
         throw new Error("Worker attempt transition lost epoch or revision authority");
       } catch (error) {
-        if (isRevisionBoundaryError(error)) throw error;
+        if (isRemoteAttemptRevisionError(error)) throw error;
         if (
           error instanceof Error &&
           /lost epoch or revision authority|disappeared/iu.test(error.message)
@@ -1103,11 +1139,4 @@ function identityFrom(payload: Record<string, JsonValue>): {
     orphanPolicy: "cancel",
   });
   return identity(request);
-}
-
-function isRevisionBoundaryError(error: unknown): boolean {
-  return (
-    (error instanceof RangeError || error instanceof TypeError) &&
-    /revision|unsigned 64-bit/iu.test(error.message)
-  );
 }
