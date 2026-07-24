@@ -412,17 +412,9 @@ export class WorkerRuntime {
     const request = parseRemoteRequest(payload.request);
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
+    if (await this.#rejectUnavailableAttemptStore(session, message.messageId, request)) return;
     await this.#pruneAcknowledged();
-    if (!this.#attemptPersistenceAvailable) {
-      await this.#sendRejected(
-        session,
-        message.messageId,
-        request,
-        "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
-        "Worker attempt persistence is unavailable",
-      );
-      return;
-    }
+    if (await this.#rejectUnavailableAttemptStore(session, message.messageId, request)) return;
     const existing = this.#attempts.get(key);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -884,6 +876,22 @@ export class WorkerRuntime {
       },
       { correlationId },
     );
+  }
+
+  async #rejectUnavailableAttemptStore(
+    session: RemoteSession,
+    correlationId: string,
+    request: ExecutionRequest,
+  ): Promise<boolean> {
+    if (this.#attemptPersistenceAvailable) return false;
+    await this.#sendRejected(
+      session,
+      correlationId,
+      request,
+      "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+      "Worker attempt persistence is unavailable",
+    );
+    return true;
   }
 
   #result(
