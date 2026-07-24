@@ -169,6 +169,7 @@ class ControlledCoordination implements CoordinationProvider {
   failClose = false;
   campaignResult: unknown;
   healthResult: unknown = healthy();
+  releaseCount = 0;
 
   constructor(log: string[], scope: "distributed" | "local" = "local") {
     this.log = log;
@@ -190,7 +191,9 @@ class ControlledCoordination implements CoordinationProvider {
     return {
       leadership,
       lost: new Promise(() => undefined),
-      release: () => Promise.resolve(),
+      release: async () => {
+        this.releaseCount += 1;
+      },
     };
   }
 
@@ -336,7 +339,7 @@ function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] 
 }
 
 test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecycle", async () => {
-  const { drivers, log } = controlledDrivers();
+  const { coordination, drivers, log } = controlledDrivers();
   const runtime = createRuntime(configuration, drivers);
 
   await runtime.start();
@@ -359,7 +362,7 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     tasks: 0,
     workers: 0,
   });
-  assert.deepEqual(log.slice(0, 10), [
+  assert.deepEqual(log.slice(0, 9), [
     "state.open",
     "coordination.open",
     "artifacts.open",
@@ -369,10 +372,19 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     "state.scan:deployments",
     "state.scan:tasks",
     "state.recover:100",
-    "coordination.campaign",
   ]);
+  for (const health of [
+    "state.health",
+    "coordination.health",
+    "artifacts.health",
+    "processHost.health",
+    "secrets.health",
+  ]) {
+    assert.ok(log.indexOf(health) < log.indexOf("coordination.campaign"));
+  }
 
   await runtime.stop();
+  assert.equal(coordination.releaseCount, 1);
   assert.equal((await runtime.status()).lifecycle, "stopped");
   assert.deepEqual(log.slice(-5), [
     "secrets.close",
@@ -575,7 +587,7 @@ test("runtime rejects leadership for a different campaign resource before runnin
   const status = await runtime.status();
   assert.equal(status.lifecycle, "failed");
   assert.equal(status.acceptingOperations, false);
-  assert.equal(log.includes("state.health"), false);
+  assert.ok(log.indexOf("state.health") < log.indexOf("coordination.campaign"));
   assert.deepEqual(log.slice(-5), [
     "secrets.close",
     "processHost.close",
