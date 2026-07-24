@@ -140,11 +140,7 @@ export class RemoteExecutor implements Executor {
       DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
       "maxInventoryBytes",
     );
-    this.#orphanTimeoutMs = positiveLimit(
-      options.orphanTimeoutMs,
-      30_000,
-      "orphanTimeoutMs",
-    );
+    this.#orphanTimeoutMs = positiveLimit(options.orphanTimeoutMs, 30_000, "orphanTimeoutMs");
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
   }
 

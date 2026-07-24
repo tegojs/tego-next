@@ -412,11 +412,7 @@ export class WorkerSession {
       10_000,
       "handshakeTimeoutMs",
     );
-    this.#requestTimeoutMs = positiveDuration(
-      options.requestTimeoutMs,
-      15_000,
-      "requestTimeoutMs",
-    );
+    this.#requestTimeoutMs = positiveDuration(options.requestTimeoutMs, 15_000, "requestTimeoutMs");
     this.#worker = options.worker === undefined ? undefined : normalizeRegistration(options.worker);
     if (this.#role === "worker") {
       if (options.credential === undefined || this.#worker === undefined) {

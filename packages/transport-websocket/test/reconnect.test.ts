@@ -107,11 +107,7 @@ test("permanent disconnect settles Main attempts after the orphan recovery windo
   const [main, worker] = memorySessionPair("1");
   await runtime.attach(worker);
   await remote.attach(main);
-  const request = executionRequest(
-    { mode: "wait" },
-    "permanent-disconnect",
-    "finish-and-buffer",
-  );
+  const request = executionRequest({ mode: "wait" }, "permanent-disconnect", "finish-and-buffer");
   const handle = await remote.submit(request);
   await eventually(() => assert.equal(local.executions, 1));
   main.close();

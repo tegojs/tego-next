@@ -337,8 +337,7 @@ test("application requests expire when the peer never sends a correlated respons
       (error: unknown) =>
         error instanceof Error &&
         "diagnostic" in error &&
-        (error as { diagnostic: { code: string } }).diagnostic.code ===
-          "WORKER_REQUEST_TIMEOUT",
+        (error as { diagnostic: { code: string } }).diagnostic.code === "WORKER_REQUEST_TIMEOUT",
     );
     assert.equal(connection.mainSession.state, "ready");
   } finally {

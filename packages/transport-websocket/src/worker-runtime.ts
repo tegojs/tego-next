@@ -566,11 +566,7 @@ export class WorkerRuntime {
       );
       return;
     }
-    await session.send(
-      REMOTE_INVENTORY_RESULT,
-      inventory,
-      { correlationId: message.messageId },
-    );
+    await session.send(REMOTE_INVENTORY_RESULT, inventory, { correlationId: message.messageId });
   }
 
   async #acknowledgeResult(payloadValue: JsonValue): Promise<void> {
