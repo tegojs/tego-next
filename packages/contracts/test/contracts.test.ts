@@ -402,6 +402,32 @@ test("worker envelopes preserve decimal sequence values and payloads", () => {
   );
 });
 
+test("the public Worker envelope owns handshake and binary wire metadata", () => {
+  const authentication = {
+    ...validWorkerEnvelope,
+    type: "authenticate",
+    payload: { proof: "proof" },
+  } satisfies WorkerEnvelope;
+  assert.deepEqual(parseWorkerEnvelope(authentication), authentication);
+
+  const binary = {
+    ...validWorkerEnvelope,
+    type: "session.reconcile",
+    payload: { running: [] },
+    binaryBytes: 128,
+    binaryChunks: 2,
+  } satisfies WorkerEnvelope;
+  assert.deepEqual(parseWorkerEnvelope(binary), binary);
+  assert.throws(
+    () => parseWorkerEnvelope({ ...binary, binaryChunks: undefined }),
+    (error: unknown) => diagnosticCode(error) === "WORKER_ENVELOPE_INVALID",
+  );
+  assert.throws(
+    () => parseWorkerEnvelope({ ...binary, type: "not.a.worker.message" }),
+    (error: unknown) => diagnosticCode(error) === "WORKER_ENVELOPE_INVALID",
+  );
+});
+
 test("parseSchema supports strict JSON Schema 2020 formats", () => {
   const schema = {
     $schema: "https://json-schema.org/draft/2020-12/schema",
