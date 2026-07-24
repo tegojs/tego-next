@@ -282,7 +282,18 @@ export class WorkerRuntime {
       state: "acknowledged",
       epoch: session.epoch,
     };
-    await this.#save(attempt);
+    try {
+      await this.#save(attempt);
+    } catch {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+        "Worker could not persist assignment acknowledgement",
+      );
+      return;
+    }
     this.#attempts.set(key, attempt);
     this.#reservedResults += 1;
     let acknowledged = false;

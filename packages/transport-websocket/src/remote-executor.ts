@@ -90,6 +90,7 @@ export class RemoteExecutor implements Executor {
   #closed = false;
   #hydrated = false;
   #attachChain = Promise.resolve();
+  #drainPromise: Promise<void> | undefined;
 
   constructor(options: RemoteExecutorOptions) {
     if (options.id.length === 0) throw new TypeError("RemoteExecutor id must not be empty");
@@ -244,23 +245,37 @@ export class RemoteExecutor implements Executor {
     }
   }
 
-  async drain(options: DrainOptions): Promise<void> {
+  drain(options: DrainOptions): Promise<void> {
     const deadline =
       options.deadline === undefined ? undefined : Date.parse(options.deadline);
     if (deadline !== undefined && Number.isNaN(deadline)) {
-      throw new TypeError("drain deadline must be an ISO date");
+      return Promise.reject(new TypeError("drain deadline must be an ISO date"));
     }
     this.#draining = true;
     this.#accepting = false;
-    const active = [...this.#attempts.values()].filter(
-      (attempt) => attempt.state !== "terminal",
-    );
-    if (deadline !== undefined && deadline <= this.#clock.now().getTime()) {
-      await Promise.all(
-        active.map(async (attempt) => this.cancel(attempt.request.taskId, attempt.request.attemptId)),
+    this.#drainPromise ??= (async () => {
+      const controller = new AbortController();
+      const active = [...this.#attempts.values()].filter(
+        (attempt) => attempt.state !== "terminal",
       );
-    }
-    await Promise.all(active.map(async (attempt) => attempt.handle.result));
+      if (deadline !== undefined) {
+        void this.#waitUntil(deadline, controller.signal)
+          .then(async () =>
+            Promise.all(
+              active.map(async (attempt) =>
+                this.cancel(attempt.request.taskId, attempt.request.attemptId),
+              ),
+            ),
+          )
+          .catch(() => undefined);
+      }
+      try {
+        await Promise.all(active.map(async (attempt) => attempt.handle.result));
+      } finally {
+        controller.abort("remote-drained");
+      }
+    })();
+    return this.#drainPromise;
   }
 
   async health(): Promise<ExecutorHealth> {
@@ -575,6 +590,14 @@ export class RemoteExecutor implements Executor {
       }
     } catch {
       // Terminal publication aborts the deadline sleeper.
+    }
+  }
+
+  async #waitUntil(deadline: number, signal: AbortSignal): Promise<void> {
+    while (true) {
+      const remaining = deadline - this.#clock.now().getTime();
+      if (remaining <= 0) return;
+      await this.#clock.sleep(Math.min(remaining, MAX_CLOCK_SLEEP_MS), signal);
     }
   }
 

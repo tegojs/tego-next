@@ -220,8 +220,7 @@ test("future drain deadline cancels active remote attempts with the fake clock",
     });
   try {
     clock.advanceBy(101);
-    await flush();
-    assert.equal(drained, true);
+    await eventually(() => assert.equal(drained, true));
     assert.equal((await handle.result).status, "cancelled");
   } finally {
     await remote.cancel(request.taskId, request.attemptId);
