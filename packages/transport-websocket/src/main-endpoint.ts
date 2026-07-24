@@ -175,18 +175,58 @@ export class MainEndpoint {
     registration: WorkerRegistration,
   ): Promise<string> {
     this.#assertRegistrationCandidate(session);
-    const nextEpoch = parseSequence(await this.#epochAllocator.next(workerId));
-    const lastEpoch = this.#lastEpochs.get(workerId) ?? "0";
-    if (compareWorkerEpoch(nextEpoch, lastEpoch) <= 0) {
-      throw new Error("Worker session epoch allocator returned a stale epoch");
-    }
-    this.#lastEpochs.set(workerId, nextEpoch);
+    const nextEpoch = await this.#allocateEpoch(workerId, session);
     this.#assertRegistrationCandidate(session);
     const predecessor = this.#current.get(workerId);
     this.#current.set(workerId, session);
     this.#registrations.set(workerId, registration);
     predecessor?.replace();
     return nextEpoch;
+  }
+
+  async #allocateEpoch(workerId: WorkerId, session: WorkerSession): Promise<string> {
+    const allocation = Promise.resolve()
+      .then(async () => this.#epochAllocator.next(workerId))
+      .then((epoch) => parseSequence(epoch));
+    let rejectClosed: ((error: Error) => void) | undefined;
+    const closed = new Promise<never>((_resolve, reject) => {
+      rejectClosed = reject;
+    });
+    const unsubscribe = session.onStateChange((state) => {
+      if (state !== "authenticating") {
+        rejectClosed?.(new Error("Worker session closed while allocating a session epoch"));
+      }
+    });
+    if (session.state !== "authenticating") {
+      rejectClosed?.(new Error("Worker session closed while allocating a session epoch"));
+    }
+    try {
+      const nextEpoch = await Promise.race([allocation, closed]);
+      if (!this.#recordAllocatedEpoch(workerId, nextEpoch)) {
+        throw new Error("Worker session epoch allocator returned a stale epoch");
+      }
+      return nextEpoch;
+    } catch (error) {
+      if (session.state !== "authenticating") {
+        void allocation
+          .then((lateEpoch) => {
+            this.#recordAllocatedEpoch(workerId, lateEpoch);
+          })
+          .catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  #recordAllocatedEpoch(workerId: WorkerId, nextEpoch: string): boolean {
+    const lastEpoch = this.#lastEpochs.get(workerId) ?? "0";
+    if (compareWorkerEpoch(nextEpoch, lastEpoch) <= 0) {
+      return false;
+    }
+    this.#lastEpochs.set(workerId, nextEpoch);
+    return true;
   }
 
   #assertRegistrationCandidate(session: WorkerSession): void {

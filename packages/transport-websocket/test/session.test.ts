@@ -171,6 +171,7 @@ test("a timed-out epoch allocation cannot starve a later Worker registration", a
   const clock = new FakeClock();
   const workerId = "stalled-allocation-worker" as WorkerId;
   let allocationCount = 0;
+  let resolveFirstAllocation: ((epoch: string) => void) | undefined;
   let firstAllocationStarted: (() => void) | undefined;
   const allocationStarted = new Promise<void>((resolve) => {
     firstAllocationStarted = resolve;
@@ -180,9 +181,11 @@ test("a timed-out epoch allocation cannot starve a later Worker registration", a
       allocationCount += 1;
       if (allocationCount === 1) {
         firstAllocationStarted?.();
-        return new Promise<string>(() => undefined);
+        return new Promise<string>((resolve) => {
+          resolveFirstAllocation = resolve;
+        });
       }
-      return "2";
+      return allocationCount.toString();
     },
   };
   const main = createMainEndpoint({
@@ -214,12 +217,25 @@ test("a timed-out epoch allocation cannot starve a later Worker registration", a
   const [secondMainSocket, secondWorkerSocket] = directSocketPair();
   const secondMainSession = main.attach(secondMainSocket);
   const secondWorkerSession = secondWorker.attach(secondWorkerSocket);
-  await flush();
 
-  assert.equal(allocationCount, 2);
+  await eventually(() => assert.equal(allocationCount, 2));
   await Promise.all([secondMainSession.ready, secondWorkerSession.ready]);
   assert.equal(main.current(workerId), secondMainSession);
-  await Promise.all([main.close(), firstWorker.close(), secondWorker.close()]);
+
+  resolveFirstAllocation?.("3");
+  await flush();
+  const thirdWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+    handshakeTimeoutMs: 20,
+  });
+  const [thirdMainSocket, thirdWorkerSocket] = directSocketPair();
+  const thirdMainSession = main.attach(thirdMainSocket);
+  const thirdWorkerSession = thirdWorker.attach(thirdWorkerSocket);
+  await assert.rejects(Promise.all([thirdMainSession.ready, thirdWorkerSession.ready]), /epoch/iu);
+  assert.equal(main.current(workerId), secondMainSession);
+  await Promise.all([main.close(), firstWorker.close(), secondWorker.close(), thirdWorker.close()]);
 });
 
 test("codec accepts only exact JSON data fields and decimal sequence values", () => {
