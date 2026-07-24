@@ -88,6 +88,42 @@ test("cancel orphan policy cancels locally and preserves terminal evidence for r
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("permanent disconnect settles Main attempts after the orphan recovery window", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    orphanTimeoutMs: 100,
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  const [main, worker] = memorySessionPair("1");
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const request = executionRequest(
+    { mode: "wait" },
+    "permanent-disconnect",
+    "finish-and-buffer",
+  );
+  const handle = await remote.submit(request);
+  await eventually(() => assert.equal(local.executions, 1));
+  main.close();
+  clock.advanceBy(101);
+
+  const result = await handle.result;
+  assert.equal(result.status, "failed");
+  assert.match(result.diagnostic?.code ?? "", /ORPHAN|UNAVAILABLE/iu);
+  await remote.drain({});
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("finish-and-buffer completes offline and releases only after Main acknowledgement", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
