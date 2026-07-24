@@ -9,10 +9,10 @@ import type { Pool } from "pg";
 import {
   createPool,
   decimal,
-  isoTimestamp,
   openPool,
   type PostgresConnectionOptions,
   postgresError,
+  postgresPoolHealth,
 } from "./shared.js";
 
 export const POSTGRES_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
@@ -135,13 +135,7 @@ export class PostgresArtifactStore implements ArtifactStore {
 
   async health(): Promise<DriverHealth> {
     this.#assertOpen();
-    const result = await this.#pool.query<{ checked_at: Date }>(
-      "SELECT clock_timestamp() AS checked_at",
-    );
-    return {
-      status: "healthy",
-      checkedAt: isoTimestamp(result.rows[0]?.checked_at, "health timestamp"),
-    };
+    return postgresPoolHealth(this.#pool);
   }
 
   close(): Promise<void> {

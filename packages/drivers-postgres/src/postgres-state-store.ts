@@ -35,9 +35,11 @@ import {
   decimal,
   isoTimestamp,
   jsonValue,
+  monitorPostgresClient,
   openPool,
   type PostgresConnectionOptions,
   postgresError,
+  postgresPoolHealth,
 } from "./shared.js";
 
 interface IdempotencyIdentity {
@@ -76,6 +78,7 @@ async function withPostgresTransaction<T>(
   work: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await pool.connect();
+  const monitor = monitorPostgresClient(client, pool);
   const acquiredLocks: string[] = [];
   let failure: unknown;
   let failed = false;
@@ -101,7 +104,7 @@ async function withPostgresTransaction<T>(
       transactionStarted = false;
     }
     failed = true;
-    failure = normalizeTransactionError(error, control.isClosed());
+    failure = normalizeTransactionError(error, control.isClosed(), monitor.failure());
   }
 
   control.stopAcquiring(client);
@@ -121,8 +124,9 @@ async function withPostgresTransaction<T>(
         break;
       }
     }
-    control.release(client, cleanupFailure !== undefined);
+    control.release(client, cleanupFailure !== undefined || monitor.failure() !== undefined);
   }
+  monitor.close();
 
   if (failed) throw failure;
   if (cleanupFailure !== undefined) {
@@ -135,9 +139,20 @@ async function withPostgresTransaction<T>(
   return result as T;
 }
 
-function normalizeTransactionError(error: unknown, closed: boolean): unknown {
+function normalizeTransactionError(
+  error: unknown,
+  closed: boolean,
+  connectionFailure: Error | undefined,
+): unknown {
   if (closed) {
     return postgresError("STATE_CLOSED", "PostgreSQL StateStore is closed", "state");
+  }
+  if (connectionFailure !== undefined) {
+    return postgresError(
+      "STATE_BACKEND_FAILURE",
+      "PostgreSQL state transaction lost its backend connection",
+      "state",
+    );
   }
   const sqlState =
     typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
@@ -149,6 +164,18 @@ function normalizeTransactionError(error: unknown, closed: boolean): unknown {
       "Concurrent PostgreSQL state transaction must be replanned",
       "state",
       { sqlState },
+    );
+  }
+  if (
+    sqlState?.startsWith("08") === true ||
+    sqlState === "57P01" ||
+    sqlState === "57P02" ||
+    sqlState === "57P03"
+  ) {
+    return postgresError(
+      "STATE_BACKEND_FAILURE",
+      "PostgreSQL state transaction lost its backend connection",
+      "state",
     );
   }
   return error;
@@ -1114,13 +1141,7 @@ export class PostgresStateStore implements StateStore {
 
   async health(): Promise<DriverHealth> {
     this.#assertOpen();
-    const result = await this.#pool.query<{ checked_at: Date }>(
-      "SELECT clock_timestamp() AS checked_at",
-    );
-    return {
-      status: "healthy",
-      checkedAt: isoTimestamp(result.rows[0]?.checked_at, "health timestamp"),
-    };
+    return postgresPoolHealth(this.#pool);
   }
 
   close(): Promise<void> {

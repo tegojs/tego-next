@@ -154,6 +154,11 @@ async function applyMigration(client: PoolClient, version: number, sql: string):
 
 export async function applyPostgresMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();
+  let connectionFailed = false;
+  const onError = () => {
+    connectionFailed = true;
+  };
+  client.on("error", onError);
   try {
     await client.query("BEGIN");
     await client.query(
@@ -182,6 +187,7 @@ export async function applyPostgresMigrations(pool: Pool): Promise<void> {
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
-    client.release();
+    client.off("error", onError);
+    client.release(connectionFailed);
   }
 }

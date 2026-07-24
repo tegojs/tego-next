@@ -1,6 +1,7 @@
 import {
   type DiagnosticCode,
   DiagnosticError,
+  type DriverHealth,
   type JsonValue,
   runtimeDiagnostic,
   serializeWireValue,
@@ -9,6 +10,12 @@ import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { applyPostgresMigrations } from "./migrations.js";
 
 const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const poolFailures = new WeakMap<Pool, Error>();
+
+export interface PostgresClientMonitor {
+  readonly close: () => void;
+  readonly failure: () => Error | undefined;
+}
 
 export interface PostgresConnectionOptions {
   readonly connectionString: string;
@@ -26,15 +33,45 @@ export function assertPostgresOptions(options: PostgresConnectionOptions): void 
 
 export function createPool(options: PostgresConnectionOptions, component: string, max = 10): Pool {
   assertPostgresOptions(options);
-  return new Pool({
+  const pool = new Pool({
     application_name: `tego:${options.namespace}:${component}`,
     connectionString: options.connectionString,
     max,
   });
+  pool.on("error", (error: Error) => {
+    poolFailures.set(pool, error);
+  });
+  return pool;
 }
 
 export async function openPool(pool: Pool): Promise<void> {
   await applyPostgresMigrations(pool);
+}
+
+export function monitorPostgresClient(client: PoolClient, pool: Pool): PostgresClientMonitor {
+  let failure: Error | undefined;
+  const onError = (error: Error) => {
+    failure = error;
+    poolFailures.set(pool, error);
+  };
+  client.on("error", onError);
+  return {
+    close: () => client.off("error", onError),
+    failure: () => failure,
+  };
+}
+
+export async function postgresPoolHealth(pool: Pool): Promise<DriverHealth> {
+  const previousFailure = poolFailures.get(pool);
+  const result = await pool.query<{ checked_at: Date }>("SELECT clock_timestamp() AS checked_at");
+  const checkedAt = isoTimestamp(result.rows[0]?.checked_at, "health timestamp");
+  if (previousFailure === undefined) return { status: "healthy", checkedAt };
+  poolFailures.delete(pool);
+  return {
+    status: "degraded",
+    checkedAt,
+    message: "PostgreSQL pool recovered from a connection failure",
+  };
 }
 
 export async function inTransaction<T>(
@@ -42,6 +79,7 @@ export async function inTransaction<T>(
   work: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await pool.connect();
+  const monitor = monitorPostgresClient(client, pool);
   try {
     await client.query("BEGIN");
     const result = await work(client);
@@ -51,7 +89,9 @@ export async function inTransaction<T>(
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
-    client.release();
+    const destroy = monitor.failure() !== undefined;
+    monitor.close();
+    client.release(destroy);
   }
 }
 

@@ -22,9 +22,11 @@ import {
   decimal,
   isoTimestamp,
   jsonValue,
+  monitorPostgresClient,
   openPool,
   type PostgresConnectionOptions,
   postgresError,
+  postgresPoolHealth,
 } from "./shared.js";
 
 const NOTIFICATION_CHANNEL = "tego_coordination_changes";
@@ -243,6 +245,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     }
 
     const client = await this.#pool.connect();
+    const monitor = monitorPostgresClient(client, this.#pool);
     try {
       await client.query("BEGIN");
       await this.#lockEpochRow(client, request.resource);
@@ -315,7 +318,9 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      const destroy = monitor.failure() !== undefined;
+      monitor.close();
+      client.release(destroy);
     }
   }
 
@@ -323,6 +328,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     this.#assertOpen();
     this.#assertResource(resource);
     const client = await this.#pool.connect();
+    const monitor = monitorPostgresClient(client, this.#pool);
     try {
       await client.query("BEGIN");
       const epoch = await this.#incrementEpoch(client, resource);
@@ -332,7 +338,9 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      const destroy = monitor.failure() !== undefined;
+      monitor.close();
+      client.release(destroy);
     }
   }
 
@@ -345,6 +353,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     }
 
     const client = await this.#pool.connect();
+    const monitor = monitorPostgresClient(client, this.#pool);
     try {
       await client.query("BEGIN");
       await client.query(
@@ -424,7 +433,9 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      const destroy = monitor.failure() !== undefined;
+      monitor.close();
+      client.release(destroy);
     }
   }
 
@@ -442,13 +453,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
 
   async health(): Promise<DriverHealth> {
     this.#assertOpen();
-    const result = await this.#pool.query<{ checked_at: Date }>(
-      "SELECT clock_timestamp() AS checked_at",
-    );
-    return {
-      status: "healthy",
-      checkedAt: isoTimestamp(result.rows[0]?.checked_at, "health timestamp"),
-    };
+    return postgresPoolHealth(this.#pool);
   }
 
   close(): Promise<void> {
