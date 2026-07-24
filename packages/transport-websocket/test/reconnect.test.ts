@@ -1895,6 +1895,58 @@ test("WorkerRuntime does not retry a malformed external revision forever", async
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("WorkerRuntime latches invalid acknowledgement revisions and rejects later work", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let invalidAcknowledgements = 0;
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "worker-invalid-ack-revision-remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
+        if (record.acknowledgedAt !== undefined) {
+          invalidAcknowledgements += 1;
+          return {
+            ...record,
+            revision: "01",
+          };
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+    resultBuffer: { maxCount: 8, maxBytes: 256 * 1024 },
+    maxResultBytes: 64 * 1024,
+    maxInventoryBytes: 300 * 1024,
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const firstResult = await (
+    await remote.submit(executionRequest({ mode: "echo", value: "first" }, "invalid-ack-first"))
+  ).result;
+  assert.equal(firstResult.status, "succeeded");
+  await eventually(() => assert.equal(invalidAcknowledgements, 1));
+
+  const secondResult = await (
+    await remote.submit(executionRequest({ mode: "echo", value: "second" }, "invalid-ack-second"))
+  ).result;
+  assert.equal(secondResult.status, "rejected");
+  assert.match(secondResult.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(local.executions, 1);
+  assert.equal(invalidAcknowledgements, 1);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
