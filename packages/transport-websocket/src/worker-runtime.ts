@@ -234,7 +234,7 @@ export class WorkerRuntime {
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
     const records = await this.#attemptStore.list(this.#workerId);
-    for (const record of records) parseAttemptRevision(record.revision);
+    for (const record of records) this.#acceptRevision(record.revision);
     const activeRecords = records.filter((record) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
       throw new Error("Worker attempt inventory exceeds maxInventoryItems");
@@ -261,7 +261,7 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: parseAttemptRevision(record.revision),
+          revision: this.#acceptRevision(record.revision),
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
@@ -282,7 +282,7 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: parseAttemptRevision(record.revision),
+          revision: this.#acceptRevision(record.revision),
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
@@ -299,7 +299,7 @@ export class WorkerRuntime {
         this.#attempts.set(key, {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: parseAttemptRevision(record.revision),
+          revision: this.#acceptRevision(record.revision),
           transition: Promise.resolve(),
           state: "acknowledged",
           epoch: record.epoch,
@@ -455,7 +455,7 @@ export class WorkerRuntime {
       return;
     }
     const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
-    if (persisted !== undefined) parseAttemptRevision(persisted.revision);
+    if (persisted !== undefined) this.#acceptRevision(persisted.revision);
     if (persisted?.state === "expired") {
       await this.#sendRejected(
         session,
@@ -802,7 +802,12 @@ export class WorkerRuntime {
         await this.#transition(attempt, async () => {
           if (attempt.acknowledgedAt === undefined) {
             attempt.acknowledgedAt = this.#clock.now().getTime();
-            await this.#commit(attempt);
+            try {
+              await this.#commit(attempt);
+            } catch (error) {
+              delete attempt.acknowledgedAt;
+              throw error;
+            }
           }
         });
       }
@@ -899,6 +904,17 @@ export class WorkerRuntime {
     };
   }
 
+  #acceptRevision(revision: unknown): string {
+    try {
+      return parseAttemptRevision(revision);
+    } catch (error) {
+      if (isRemoteAttemptRevisionError(error)) {
+        this.#attemptPersistenceAvailable = false;
+      }
+      throw error;
+    }
+  }
+
   #record(
     attempt: WorkerAttempt,
     state = attempt.state,
@@ -927,7 +943,7 @@ export class WorkerRuntime {
     if (committed === undefined) {
       throw new Error("Remote attempt was concurrently admitted by another Worker session");
     }
-    attempt.revision = parseAttemptRevision(committed.revision);
+    attempt.revision = this.#acceptRevision(committed.revision);
   }
 
   async #commit(
@@ -943,7 +959,7 @@ export class WorkerRuntime {
           expectedEpoch: attempt.epoch,
         });
         if (committed !== undefined) {
-          attempt.revision = parseAttemptRevision(committed.revision);
+          attempt.revision = this.#acceptRevision(committed.revision);
           attempt.state = state;
           if (result !== undefined) attempt.result = result;
           return;
@@ -955,7 +971,7 @@ export class WorkerRuntime {
         if (latest === undefined) {
           throw new Error("Worker attempt disappeared during a conditional commit");
         }
-        attempt.revision = parseAttemptRevision(latest.revision);
+        attempt.revision = this.#acceptRevision(latest.revision);
         attempt.epoch = latest.epoch;
         if (latest.cancellation === undefined) {
           delete attempt.cancellation;
@@ -1024,7 +1040,7 @@ export class WorkerRuntime {
           },
         );
         if (expired === undefined) continue;
-        parseAttemptRevision(expired.revision);
+        this.#acceptRevision(expired.revision);
         this.#attempts.delete(key);
       }
     }
