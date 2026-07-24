@@ -82,6 +82,7 @@ class DirectSocket {
   peer?: DirectSocket;
   automaticDelivery = true;
   synchronousDelivery = false;
+  wsRawDelivery = false;
   readonly sent: (string | Uint8Array)[] = [];
   readonly closeReasons: string[] = [];
   readonly #listeners = new Map<SocketEvent, Set<SocketListener>>([
@@ -98,10 +99,21 @@ class DirectSocket {
     this.sent.push(copy);
     if (this.automaticDelivery) {
       const peer = this.peer;
+      const deliver = () => {
+        if (this.wsRawDelivery) {
+          peer.#emit(
+            "message",
+            typeof copy === "string" ? Buffer.from(copy) : Buffer.from(copy),
+            typeof copy !== "string",
+          );
+        } else {
+          peer.#emit("message", { data: copy });
+        }
+      };
       if (this.synchronousDelivery) {
-        peer.#emit("message", { data: copy });
+        deliver();
       } else {
-        queueMicrotask(() => peer.#emit("message", { data: copy }));
+        queueMicrotask(deliver);
       }
     }
   }
@@ -395,4 +407,26 @@ test("endpoints retain only authoritative live sessions across failed reconnects
   await Promise.all([main.close(), firstWorker.close(), replacementWorker.close()]);
   assert.equal(main.activeSessionCount, 0);
   assert.equal(replacementWorker.activeSessionCount, 0);
+});
+
+test("sessions accept the ws message(data, isBinary) event signature", async () => {
+  const clock = new FakeClock();
+  const main = createMainEndpoint({ clock, credential: "shared-secret" });
+  const worker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: "ws-signature-worker" as WorkerId,
+  });
+  const [mainSocket, workerSocket] = directSocketPair();
+  mainSocket.wsRawDelivery = true;
+  workerSocket.wsRawDelivery = true;
+  const mainSession = main.attach(mainSocket);
+  const workerSession = worker.attach(workerSocket);
+  await Promise.all([mainSession.ready, workerSession.ready]);
+  const received: JsonValue[] = [];
+  workerSession.onMessage((message) => received.push(message.payload));
+  await mainSession.send("session.reconcile", { ws: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(received, [{ ws: true }]);
+  await Promise.all([main.close(), worker.close()]);
 });
