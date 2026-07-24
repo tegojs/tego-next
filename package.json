@@ -13,6 +13,7 @@
   "scripts": {
     "prepare": "husky",
     "commitlint": "commitlint",
+    "commitlint:ci": "node scripts/commitlint-ci.mjs",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test:unit": "npm run test:unit --workspaces --if-present",
