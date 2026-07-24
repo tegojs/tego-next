@@ -53,6 +53,7 @@ export interface RemoteExecutorOptions {
   readonly maxResultBytes?: number;
   readonly maxInflight?: number;
   readonly maxInventoryItems?: number;
+  readonly retentionMs?: number;
 }
 
 interface RemoteAttempt {
@@ -65,6 +66,7 @@ interface RemoteAttempt {
   epoch: string;
   terminal?: ExecutionResult;
   cancellation?: "cancelled" | "timed-out";
+  terminalAt?: number;
 }
 
 export class RemoteExecutor implements Executor {
@@ -79,6 +81,7 @@ export class RemoteExecutor implements Executor {
   readonly #maxResultBytes: number;
   readonly #maxInflight: number;
   readonly #maxInventoryItems: number;
+  readonly #retentionMs: number;
   readonly #attempts = new Map<string, RemoteAttempt>();
   #session: RemoteSession | undefined;
   #removeMessageListener: (() => void) | undefined;
@@ -120,6 +123,7 @@ export class RemoteExecutor implements Executor {
       DEFAULT_MAX_INVENTORY,
       "maxInventoryItems",
     );
+    this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
   }
 
   attach(session: RemoteSession): Promise<void> {
@@ -147,6 +151,7 @@ export class RemoteExecutor implements Executor {
   }
 
   async submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
+    await this.#pruneTerminals();
     const request = parseRemoteRequest(requestValue);
     const fingerprint = requestFingerprint(request);
     const key = attemptKey(request.taskId, request.attemptId);
@@ -212,6 +217,7 @@ export class RemoteExecutor implements Executor {
   }
 
   async observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {
+    await this.#pruneTerminals();
     const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
     if (attempt === undefined) return undefined;
     if (attempt.terminal !== undefined) {
@@ -373,6 +379,9 @@ export class RemoteExecutor implements Executor {
         state: record.state,
         epoch: record.epoch,
         ...(record.result === undefined ? {} : { terminal: record.result }),
+        ...(record.result === undefined
+          ? {}
+          : { terminalAt: Date.parse(record.result.completedAt) }),
       };
       this.#attempts.set(attemptKey(record.request.taskId, record.request.attemptId), attempt);
       if (record.result !== undefined) {
@@ -486,6 +495,7 @@ export class RemoteExecutor implements Executor {
     }
     attempt.state = "terminal";
     attempt.terminal = cloneJson(result);
+    attempt.terminalAt = this.#clock.now().getTime();
     attempt.deadline.abort();
     await this.#save(attempt);
     attempt.result.resolve(attempt.terminal);
@@ -629,6 +639,23 @@ export class RemoteExecutor implements Executor {
       if (attempt.state !== "terminal") active += 1;
     }
     return active;
+  }
+
+  async #pruneTerminals(): Promise<void> {
+    const cutoff = this.#clock.now().getTime() - this.#retentionMs;
+    for (const [key, attempt] of this.#attempts) {
+      if (
+        attempt.terminal !== undefined &&
+        attempt.terminalAt !== undefined &&
+        attempt.terminalAt <= cutoff
+      ) {
+        this.#attempts.delete(key);
+        await this.#attemptStore.delete?.(
+          attempt.request.taskId,
+          attempt.request.attemptId,
+        );
+      }
+    }
   }
 }
 

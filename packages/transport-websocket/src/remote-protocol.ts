@@ -76,6 +76,10 @@ export interface RemoteAttemptRecord extends JsonObject {
 
 export interface RemoteAttemptStore {
   save(record: RemoteAttemptRecord): Promise<void>;
+  delete?(
+    taskId: ExecutionRequest["taskId"],
+    attemptId: ExecutionRequest["attemptId"],
+  ): Promise<void>;
   load(
     taskId: ExecutionRequest["taskId"],
     attemptId: ExecutionRequest["attemptId"],
@@ -109,6 +113,13 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     return record === undefined
       ? undefined
       : (cloneJson(record) as unknown as RemoteAttemptRecord);
+  }
+
+  async delete(
+    taskId: ExecutionRequest["taskId"],
+    attemptId: ExecutionRequest["attemptId"],
+  ): Promise<void> {
+    this.#records.delete(attemptKey(taskId, attemptId));
   }
 
   async list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]> {

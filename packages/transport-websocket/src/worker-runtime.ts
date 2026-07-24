@@ -48,6 +48,7 @@ export interface WorkerRuntimeOptions {
   readonly maxAssignments?: number;
   readonly maxAssignmentBytes?: number;
   readonly maxInventoryItems?: number;
+  readonly retentionMs?: number;
   readonly resultBuffer?: ResultBufferOptions;
 }
 
@@ -59,6 +60,7 @@ interface WorkerAttempt {
   executor?: Executor;
   handle?: ExecutionHandle;
   result?: ExecutionResult;
+  acknowledgedAt?: number;
 }
 
 export class WorkerRuntime {
@@ -72,6 +74,7 @@ export class WorkerRuntime {
   readonly #maxAssignmentBytes: number;
   readonly #maxInventoryItems: number;
   readonly #maxBufferedResults: number;
+  readonly #retentionMs: number;
   readonly #results: ResultBuffer;
   readonly #attempts = new Map<string, WorkerAttempt>();
   #session: RemoteSession | undefined;
@@ -110,6 +113,7 @@ export class WorkerRuntime {
       256,
       "maxResultCount",
     );
+    this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
     this.#results = new ResultBuffer(options.resultBuffer);
   }
 
@@ -222,6 +226,7 @@ export class WorkerRuntime {
     const requestBytes = jsonBytes(request);
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
+    await this.#pruneAcknowledged();
     const existing = this.#attempts.get(key);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -475,6 +480,10 @@ export class WorkerRuntime {
     this.#results.acknowledge(request.taskId, request.attemptId);
     if (retained !== undefined) {
       this.#reservedResults = Math.max(0, this.#reservedResults - 1);
+      const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
+      if (attempt !== undefined) {
+        attempt.acknowledgedAt = this.#clock.now().getTime();
+      }
     }
   }
 
@@ -567,6 +576,23 @@ export class WorkerRuntime {
       ...(attempt.result === undefined ? {} : { result: attempt.result }),
     };
     await this.#attemptStore.save(record);
+  }
+
+  async #pruneAcknowledged(): Promise<void> {
+    const cutoff = this.#clock.now().getTime() - this.#retentionMs;
+    for (const [key, attempt] of this.#attempts) {
+      if (
+        attempt.state === "terminal" &&
+        attempt.acknowledgedAt !== undefined &&
+        attempt.acknowledgedAt <= cutoff
+      ) {
+        this.#attempts.delete(key);
+        await this.#attemptStore.delete?.(
+          attempt.request.taskId,
+          attempt.request.attemptId,
+        );
+      }
+    }
   }
 }
 

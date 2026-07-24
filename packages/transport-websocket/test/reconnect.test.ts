@@ -483,6 +483,7 @@ test("acknowledged terminal attempts expire under the configured retention bound
   await reconnect(remote, runtime, "1");
   const firstRequest = executionRequest({ mode: "echo", value: "first" }, "retention-first");
   assert.equal((await (await remote.submit(firstRequest)).result).output, "first");
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
   clock.advanceBy(101);
   await flush();
 
