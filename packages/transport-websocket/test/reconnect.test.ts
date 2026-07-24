@@ -1544,6 +1544,23 @@ test("attempt-store revisions are required unsigned-64 decimal strings", async (
     { expectedRevision: "1", expectedEpoch: "1" },
   );
   assert.equal(updated?.revision, "2");
+
+  const exhausted = new MemoryRemoteAttemptStore();
+  await exhausted.save({
+    ...created,
+    revision: "18446744073709551615",
+  });
+  await assert.rejects(
+    exhausted.commit(
+      {
+        ...created,
+        revision: "18446744073709551615",
+        state: "running",
+      },
+      { expectedRevision: "18446744073709551615", expectedEpoch: "1" },
+    ),
+    /revision|unsigned|64|range/iu,
+  );
 });
 
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {

@@ -121,6 +121,52 @@ test("an injected epoch allocator preserves the Worker high-water mark across Ma
   await Promise.all([secondMain.close(), secondWorker.close()]);
 });
 
+test("a closed replacement cannot claim authority after delayed epoch allocation", async () => {
+  const workerId = "delayed-replacement-worker" as WorkerId;
+  let allocationCount = 0;
+  let resolveReplacementEpoch: ((epoch: string) => void) | undefined;
+  let replacementAllocationStarted: (() => void) | undefined;
+  const replacementAllocation = new Promise<void>((resolve) => {
+    replacementAllocationStarted = resolve;
+  });
+  const epochAllocator: WorkerEpochAllocator = {
+    next: async () => {
+      allocationCount += 1;
+      if (allocationCount === 1) return "1";
+      replacementAllocationStarted?.();
+      return new Promise<string>((resolve) => {
+        resolveReplacementEpoch = resolve;
+      });
+    },
+  };
+  const main = createMainEndpoint({
+    credential: "shared-secret",
+    workerId,
+    epochAllocator,
+  });
+  const firstWorker = createWorkerEndpoint({ credential: "shared-secret", workerId });
+  const [firstMainSocket, firstWorkerSocket] = directSocketPair();
+  const firstMainSession = main.attach(firstMainSocket);
+  const firstWorkerSession = firstWorker.attach(firstWorkerSocket);
+  await Promise.all([firstMainSession.ready, firstWorkerSession.ready]);
+
+  const replacementWorker = createWorkerEndpoint({ credential: "shared-secret", workerId });
+  const [replacementMainSocket, replacementWorkerSocket] = directSocketPair();
+  const replacementMainSession = main.attach(replacementMainSocket);
+  const replacementWorkerSession = replacementWorker.attach(replacementWorkerSocket);
+  await replacementAllocation;
+  await replacementWorker.close();
+  resolveReplacementEpoch?.("2");
+  await assert.rejects(Promise.all([replacementMainSession.ready, replacementWorkerSession.ready]));
+  await flush();
+
+  assert.equal(main.current(workerId), firstMainSession);
+  assert.equal(firstMainSession.state, "ready");
+  assert.equal(firstWorkerSession.state, "ready");
+  assert.equal(main.activeSessionCount, 1);
+  await Promise.all([main.close(), firstWorker.close()]);
+});
+
 test("codec accepts only exact JSON data fields and decimal sequence values", () => {
   const codec = createWorkerCodec();
   assert.deepEqual(codec.decodeControl(codec.encodeControl(ENVELOPE)), ENVELOPE);
