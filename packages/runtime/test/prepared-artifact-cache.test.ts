@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -25,7 +26,10 @@ import {
   type DriverHealth,
 } from "@tegojs/contracts";
 import { canonicalJsonBytes, createDeterministicArchive } from "../src/artifacts/archive-codec.js";
-import { PreparedArtifactCache } from "../src/artifacts/prepared-artifact-cache.js";
+import {
+  PreparedArtifactCache,
+  type PreparedArtifactCacheOptions,
+} from "../src/artifacts/prepared-artifact-cache.js";
 
 const encoder = new TextEncoder();
 const source = "export default { value: 'prepared' };\n";
@@ -198,8 +202,81 @@ test("@spec:plugin-artifacts/immutable-artifacts/concurrent-cache-processes-conv
 
   assert.equal(left.root, right.root);
   assert.equal(await readFile(join(left.root, "components/component.js"), "utf8"), source);
+  const objects = (await readdir(root)).filter((entry) => entry.startsWith(".object-"));
+  const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
+  assert.deepEqual(objects, [pointer.split("/")[0]]);
   await leftCache.release(artifactDigest);
   await rightCache.release(artifactDigest);
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/publishes-only-readonly-roots", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "tego-prepared-publish-crash-"));
+  const artifacts = new MemoryArtifacts();
+  const bytes = archive();
+  const artifactDigest = digest(bytes);
+  artifacts.set(artifactDigest, bytes);
+  let observed = 0;
+  const crashing = new PreparedArtifactCache(
+    {
+      artifacts,
+      root,
+      afterPublish: async (publishedRoot: string) => {
+        observed += 1;
+        assert.equal((await stat(publishedRoot)).mode & 0o222, 0);
+        throw new Error("simulated immediate publisher crash");
+      },
+    } as PreparedArtifactCacheOptions & {
+      readonly afterPublish: (publishedRoot: string) => Promise<void>;
+    },
+  );
+  context.after(async () => {
+    await crashing.close();
+    await cleanupRoot(root);
+  });
+
+  await assert.rejects(
+    crashing.prepare({ digest: artifactDigest }),
+    /simulated immediate publisher crash/u,
+  );
+  assert.equal(observed, 1);
+
+  const restarted = new PreparedArtifactCache({ artifacts, root });
+  const prepared = await restarted.prepare({ digest: artifactDigest });
+  assert.equal((await stat(prepared.root)).mode & 0o222, 0);
+  assert.equal(await readFile(join(prepared.root, "components/component.js"), "utf8"), source);
+  assert.deepEqual(
+    (await readdir(root)).filter((entry) => entry.startsWith(".tmp-")),
+    [],
+  );
+  const objects = (await readdir(root)).filter((entry) => entry.startsWith(".object-"));
+  const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
+  assert.deepEqual(objects, [pointer.split("/")[0]]);
+  await restarted.release(artifactDigest);
+  await restarted.close();
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/reuses-legacy-direct-target", async (context) => {
+  const { artifactDigest, artifacts, cache, root } = await fixture();
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+  const prepared = await cache.prepare({ digest: artifactDigest });
+  await cache.release(artifactDigest);
+  await cache.close();
+  const directTarget = join(root, artifactDigest.slice("sha256:".length));
+  await rm(directTarget);
+  await chmod(prepared.root, 0o700);
+  await rename(prepared.root, directTarget);
+  await chmod(directTarget, 0o555);
+
+  const restarted = new PreparedArtifactCache({ artifacts, root });
+  const reused = await restarted.prepare({ digest: artifactDigest });
+
+  assert.equal(reused.root, await realpath(directTarget));
+  assert.equal((await stat(reused.root)).mode & 0o222, 0);
+  await restarted.release(artifactDigest);
+  await restarted.close();
 });
 
 test("prepared cache rejects changed archive bytes and removes its temporary directory", async (context) => {
