@@ -55,6 +55,7 @@ export interface WorkerSessionRequestOptions {
 
 type SocketListener = (...arguments_: unknown[]) => void;
 const websocketTextDecoder = new TextDecoder("utf-8", { fatal: true });
+const MAXIMUM_UNSIGNED_64 = 18_446_744_073_709_551_615n;
 
 interface WebSocketTransport {
   readonly readyState: number;
@@ -181,6 +182,23 @@ function positiveDuration(value: number | undefined, fallback: number, name: str
     throw new RangeError(`${name} must be a positive safe integer`);
   }
   return duration;
+}
+
+function boundedUnsigned64(value: string, name: string): string {
+  const parsed = BigInt(parseSequence(value));
+  if (parsed > MAXIMUM_UNSIGNED_64) {
+    throw diagnosticError(
+      "PROTOCOL_SEQUENCE_LIMIT_EXCEEDED",
+      `${name} exceeds the unsigned 64-bit protocol limit`,
+    );
+  }
+  return value;
+}
+
+export function compareWorkerEpoch(left: string, right: string): number {
+  const leftValue = BigInt(boundedUnsigned64(left, "Worker epoch"));
+  const rightValue = BigInt(boundedUnsigned64(right, "Worker epoch"));
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }
 
 function normalizeCredential(value: string): string {
@@ -835,7 +853,7 @@ export class WorkerSession {
       "worker.register",
     );
     const registration = normalizeRegistration(payload as unknown as WorkerRegistration);
-    this.#epoch = parseSequence(this.#onRegister(this, registration));
+    this.#epoch = boundedUnsigned64(this.#onRegister(this, registration), "Worker session epoch");
     this.#state = "ready";
     this.#available = true;
     this.#acceptingAssignments = true;
@@ -862,7 +880,7 @@ export class WorkerSession {
     if (typeof payload.epoch !== "string") {
       throw diagnosticError("PROTOCOL_MESSAGE_INVALID", "session epoch must be a string");
     }
-    this.#epoch = parseSequence(payload.epoch);
+    this.#epoch = boundedUnsigned64(payload.epoch, "Worker session epoch");
     this.#state = "ready";
     this.#available = true;
     this.#acceptingAssignments = true;

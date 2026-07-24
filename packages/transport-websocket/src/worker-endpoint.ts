@@ -1,7 +1,7 @@
 import { parseWorkerId, type WorkerId } from "@tegojs/contracts";
 import { systemWorkerClock } from "./clock.js";
 import type { WorkerEndpointOptions, WorkerRegistrationInput } from "./main-endpoint.js";
-import { WorkerSession, type WorkerRegistration } from "./session.js";
+import { compareWorkerEpoch, WorkerSession, type WorkerRegistration } from "./session.js";
 
 function registrationFrom(options: WorkerEndpointOptions): WorkerRegistration {
   const workerId = parseWorkerId(options.workerId);
@@ -78,9 +78,13 @@ export class WorkerEndpoint {
           return;
         }
         const predecessor = this.#current;
-        this.#current = session;
-        if (predecessor !== session) {
-          predecessor?.replace();
+        if (predecessor === undefined || compareWorkerEpoch(session.epoch, predecessor.epoch) > 0) {
+          this.#current = session;
+          if (predecessor !== session) {
+            predecessor?.replace();
+          }
+        } else if (predecessor !== session) {
+          session.replace();
         }
       },
       () => {
