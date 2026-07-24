@@ -1,3 +1,4 @@
+export * from "./coordination-suite.js";
 export * from "./eventually.js";
 export * from "./executor-suite.js";
 export * from "./fake-clock.js";
