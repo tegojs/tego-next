@@ -38,6 +38,7 @@ const DEFAULT_MAX_ASSIGNMENTS = 256;
 const DEFAULT_MAX_CONTROL_PAYLOAD_BYTES = 48 * 1024;
 const DEFAULT_MAX_ASSIGNMENT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
 const DEFAULT_MAX_INVENTORY = 512;
+const INVENTORY_ENVELOPE_RESERVE_BYTES = 4 * 1024;
 
 export interface WorkerRuntimeOptions {
   readonly workerId: WorkerId;
@@ -122,12 +123,30 @@ export class WorkerRuntime {
     );
     this.#maxResultBytes = positiveLimit(
       options.maxResultBytes,
-      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
+      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES - INVENTORY_ENVELOPE_RESERVE_BYTES,
       "maxResultBytes",
     );
     this.#maxBufferedResults = positiveLimit(options.resultBuffer?.maxCount, 256, "maxResultCount");
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
-    this.#results = new ResultBuffer(options.resultBuffer);
+    const recoverableResultBytes = this.#maxInventoryBytes - INVENTORY_ENVELOPE_RESERVE_BYTES;
+    if (recoverableResultBytes <= 0) {
+      throw new RangeError("maxInventoryBytes is too small for recovery metadata");
+    }
+    const resultBufferBytes = positiveLimit(
+      options.resultBuffer?.maxBytes,
+      recoverableResultBytes,
+      "maxResultBytes",
+    );
+    if (resultBufferBytes > recoverableResultBytes) {
+      throw new RangeError("result buffer bytes must fit in one recovery inventory");
+    }
+    if (this.#maxResultBytes > recoverableResultBytes) {
+      throw new RangeError("maxResultBytes must fit in one recovery inventory");
+    }
+    this.#results = new ResultBuffer({
+      ...options.resultBuffer,
+      maxBytes: resultBufferBytes,
+    });
   }
 
   get bufferedResultCount(): number {
@@ -180,11 +199,40 @@ export class WorkerRuntime {
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
     const records = await this.#attemptStore.list(this.#workerId);
-    if (records.length > this.#maxInventoryItems) {
+    const activeRecords = records.filter((record) => record.state !== "expired");
+    if (activeRecords.length > this.#maxInventoryItems) {
       throw new Error("Worker attempt inventory exceeds maxInventoryItems");
     }
+    const durableResults = new Map(
+      ((await this.#resultStore?.list()) ?? []).map((result) => [
+        attemptKey(result.taskId, result.attemptId),
+        parseExecutionResult(result),
+      ]),
+    );
     for (const record of records) {
       const key = attemptKey(record.request.taskId, record.request.attemptId);
+      if (record.state === "expired") continue;
+      const durableResult = durableResults.get(key);
+      if (durableResult !== undefined) {
+        if (
+          durableResult.taskId !== record.request.taskId ||
+          durableResult.attemptId !== record.request.attemptId
+        ) {
+          throw new Error("Durable remote result identity does not match its attempt record");
+        }
+        const attempt: WorkerAttempt = {
+          request: record.request,
+          fingerprint: record.fingerprint,
+          state: "terminal",
+          epoch: record.epoch,
+          result: durableResult,
+        };
+        this.#attempts.set(key, attempt);
+        this.#results.put(durableResult);
+        durableResults.delete(key);
+        await this.#save(attempt);
+        continue;
+      }
       if (record.state === "terminal" && record.result !== undefined) {
         const attempt: WorkerAttempt = {
           request: record.request,
@@ -207,8 +255,8 @@ export class WorkerRuntime {
         });
       }
     }
-    for (const result of (await this.#resultStore?.list()) ?? []) {
-      this.#results.put(parseExecutionResult(result));
+    for (const result of durableResults.values()) {
+      this.#results.put(result);
     }
     this.#reservedResults =
       [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal").length +
@@ -324,6 +372,21 @@ export class WorkerRuntime {
       }
       return;
     }
+    const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
+    if (persisted?.state === "expired") {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        persisted.fingerprint === fingerprint
+          ? "EXECUTOR_REMOTE_ATTEMPT_EXPIRED"
+          : "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
+        persisted.fingerprint === fingerprint
+          ? "Remote attempt identity has expired and cannot be reused"
+          : "Expired remote attempt identity has a different request fingerprint",
+      );
+      return;
+    }
     if (
       this.#attempts.size >= this.#maxAssignments ||
       this.#reservedResults >= this.#maxBufferedResults
@@ -418,17 +481,26 @@ export class WorkerRuntime {
       attempt.state = "running";
       await this.#save(attempt);
       const localResult = await handle.result;
-      const result: ExecutionResult = {
-        ...localResult,
-        executor: {
-          kind: "remote",
-          workerId: this.#workerId,
-          metadata: {
-            localExecutorId: executor.id,
-            localExecutorKind: executor.type,
-          },
-        },
-      };
+      const result: ExecutionResult =
+        localResult.taskId !== attempt.request.taskId ||
+        localResult.attemptId !== attempt.request.attemptId
+          ? this.#result(
+              attempt.request,
+              "failed",
+              "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH",
+              "Worker local Executor returned a result for a different attempt identity",
+            )
+          : {
+              ...localResult,
+              executor: {
+                kind: "remote",
+                workerId: this.#workerId,
+                metadata: {
+                  localExecutorId: executor.id,
+                  localExecutorKind: executor.type,
+                },
+              },
+            };
       await this.#terminal(attempt, result);
     } catch {
       await this.#terminal(
@@ -715,20 +787,19 @@ export class WorkerRuntime {
     this.#recovered = true;
     for (const attempt of this.#attempts.values()) {
       if (attempt.state === "terminal") continue;
-      if (attempt.request.orphanPolicy === "cancel") {
-        attempt.cancellation = "cancelled";
-        await this.#terminal(
-          attempt,
-          this.#result(
-            attempt.request,
-            "cancelled",
-            "EXECUTOR_REMOTE_ORPHAN_CANCELLED",
-            "Worker restart cancelled an unfinished remote attempt",
-          ),
-        );
-      } else {
-        this.#background(this.#execute(attempt));
-      }
+      const cancelled = attempt.request.orphanPolicy === "cancel";
+      if (cancelled) attempt.cancellation = "cancelled";
+      await this.#terminal(
+        attempt,
+        this.#result(
+          attempt.request,
+          cancelled ? "cancelled" : "failed",
+          cancelled ? "EXECUTOR_REMOTE_ORPHAN_CANCELLED" : "EXECUTOR_REMOTE_RESTART_UNCERTAIN",
+          cancelled
+            ? "Worker restart cancelled an unfinished remote attempt"
+            : "Worker restart cannot safely re-execute an unfinished remote attempt",
+        ),
+      );
     }
   }
 

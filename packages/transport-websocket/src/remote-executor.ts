@@ -411,7 +411,8 @@ export class RemoteExecutor implements Executor {
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
     const records = await this.#attemptStore.list(this.#workerId);
-    if (records.length > this.#maxInventoryItems) {
+    const activeRecords = records.filter((record) => record.state !== "expired");
+    if (activeRecords.length > this.#maxInventoryItems) {
       throw remoteError(
         "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
         "Persisted RemoteExecutor inventory exceeds maxInventoryItems",
@@ -679,7 +680,9 @@ export class RemoteExecutor implements Executor {
       const attempt = this.#attempts.get(key);
       if (attempt !== undefined) {
         attempt.epoch = session.epoch;
-        await this.#publish(attempt, result);
+        if (attempt.terminal === undefined) {
+          await this.#publish(attempt, result);
+        }
         await session.send(REMOTE_RESULT_ACK, {
           kind: "result",
           taskId: result.taskId,

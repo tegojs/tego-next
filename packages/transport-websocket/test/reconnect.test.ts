@@ -368,7 +368,7 @@ test("Worker reserves bounded terminal-result capacity before starting finish-an
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
-    resultBuffer: { maxCount: 1, maxBytes: 1024 * 1024 },
+    resultBuffer: { maxCount: 1, maxBytes: 40 * 1024 },
     selectExecutor: () => local,
   });
   await reconnect(remote, runtime, "1");
