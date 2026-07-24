@@ -804,6 +804,7 @@ export class WorkerRuntime {
     }
     const inventory = {
       epoch: session.epoch,
+      attemptPersistenceAvailable: this.#attemptPersistenceAvailable,
       acknowledged: attempts
         .filter((attempt) => attempt.state === "acknowledged")
         .map((attempt) => identity(attempt.request)),
@@ -862,6 +863,7 @@ export class WorkerRuntime {
       REMOTE_INVENTORY_RESULT,
       {
         epoch: session.epoch,
+        attemptPersistenceAvailable: this.#attemptPersistenceAvailable,
         error: {
           code: "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
           message,
@@ -945,14 +947,25 @@ export class WorkerRuntime {
     message: string,
   ): ExecutionResult {
     const now = this.#clock.now().toISOString();
-    return {
+    const diagnostic = remoteDiagnostic(code, message, "worker-runtime", now);
+    const base = {
       taskId: request.taskId,
       attemptId: request.attemptId,
-      status,
-      diagnostic: remoteDiagnostic(code, message, "worker-runtime", now),
       executor: { kind: "remote", workerId: this.#workerId },
       startedAt: now,
       completedAt: now,
+    } as const;
+    if (status === "indeterminate") {
+      return {
+        ...base,
+        status,
+        diagnostic: { ...diagnostic, retryable: false },
+      };
+    }
+    return {
+      ...base,
+      status,
+      diagnostic,
     };
   }
 

@@ -924,7 +924,7 @@ export class ProcessExecutor implements Executor {
       this.#decide(entry, {
         taskId: entry.request.taskId,
         attemptId: entry.request.attemptId,
-        status: status as ExecutionResult["status"],
+        status: status as Exclude<ExecutionResult["status"], "indeterminate">,
         ...(resultValue.output === undefined ? {} : { output: resultValue.output }),
         executor: this.#executorMetadata(process_, channel),
         startedAt,

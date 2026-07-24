@@ -1077,7 +1077,7 @@ export class ThreadExecutor implements Executor {
       candidate = {
         taskId: entry.request.taskId,
         attemptId: entry.request.attemptId,
-        status: status as ExecutionResult["status"],
+        status: status as Exclude<ExecutionResult["status"], "indeterminate">,
         ...(resultValue.output === undefined ? {} : { output: resultValue.output }),
         executor: this.#executorMetadata(lease),
         startedAt,

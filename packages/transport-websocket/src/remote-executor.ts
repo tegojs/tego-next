@@ -427,9 +427,10 @@ export class RemoteExecutor implements Executor {
       }
     });
     try {
-      await this.#reconcile(session);
+      const workerPersistenceAvailable = await this.#reconcile(session);
       if (this.#session === session && session.state === "ready") {
         if (
+          workerPersistenceAvailable &&
           this.#workerUnavailableEpoch !== undefined &&
           epoch > BigInt(this.#workerUnavailableEpoch)
         ) {
@@ -726,7 +727,7 @@ export class RemoteExecutor implements Executor {
     }
   }
 
-  async #reconcile(session: RemoteSession): Promise<void> {
+  async #reconcile(session: RemoteSession): Promise<boolean> {
     const response = await session.request(REMOTE_INVENTORY, {
       workerId: this.#workerId,
       epoch: session.epoch,
@@ -743,6 +744,14 @@ export class RemoteExecutor implements Executor {
     }
     if (payload.epoch !== session.epoch) {
       throw new Error("Remote inventory epoch does not match the authoritative session");
+    }
+    if (typeof payload.attemptPersistenceAvailable !== "boolean") {
+      throw new Error("Remote inventory persistence health is invalid");
+    }
+    const workerPersistenceAvailable = payload.attemptPersistenceAvailable;
+    if (!workerPersistenceAvailable) {
+      this.#workerUnavailableEpoch = session.epoch;
+      this.#accepting = false;
     }
     if (payload.error !== undefined) {
       const error = asObject(payload.error, "remote inventory error");
@@ -831,6 +840,7 @@ export class RemoteExecutor implements Executor {
     for (const attempt of cancellations) {
       await this.#requestCancel(attempt, session);
     }
+    return workerPersistenceAvailable;
   }
 
   async #sessionLost(session: RemoteSession): Promise<void> {
@@ -1201,14 +1211,25 @@ export class RemoteExecutor implements Executor {
     message: string,
   ): ExecutionResult {
     const now = this.#clock.now().toISOString();
-    return {
+    const diagnostic = remoteError(code, message, this.id, now).diagnostic;
+    const base = {
       taskId: request.taskId,
       attemptId: request.attemptId,
-      status,
-      diagnostic: remoteError(code, message, this.id, now).diagnostic,
       executor: { kind: "remote", workerId: this.#workerId },
       startedAt: now,
       completedAt: now,
+    } as const;
+    if (status === "indeterminate") {
+      return {
+        ...base,
+        status,
+        diagnostic: { ...diagnostic, retryable: false },
+      };
+    }
+    return {
+      ...base,
+      status,
+      diagnostic,
     };
   }
 

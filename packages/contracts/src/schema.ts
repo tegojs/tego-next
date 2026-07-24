@@ -698,6 +698,35 @@ const executionResultSchema = {
     startedAt: { type: "string", format: "date-time" },
     completedAt: { type: "string", format: "date-time" },
   },
+  allOf: [
+    {
+      if: {
+        required: ["status"],
+        properties: {
+          status: { const: "indeterminate" },
+        },
+      },
+      // biome-ignore lint/suspicious/noThenProperty: JSON Schema conditional keyword.
+      then: {
+        required: ["diagnostic"],
+        properties: {
+          output: false,
+          diagnostic: {
+            allOf: [
+              { $ref: DIAGNOSTIC_SCHEMA_ID },
+              {
+                type: "object",
+                required: ["retryable"],
+                properties: {
+                  retryable: { const: false },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  ],
 } as const;
 
 const workerEnvelopeSchema = {

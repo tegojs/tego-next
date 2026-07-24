@@ -37,16 +37,27 @@ export interface ExecutionExecutor extends JsonObject {
   readonly metadata?: JsonObject;
 }
 
-export interface ExecutionResult extends JsonObject {
+interface ExecutionResultBase extends JsonObject {
   readonly taskId: TaskId;
   readonly attemptId: AttemptId;
-  readonly status: ExecutionTerminalStatus;
-  readonly output?: JsonValue;
-  readonly diagnostic?: RuntimeDiagnostic;
   readonly executor: ExecutionExecutor;
   readonly startedAt: string;
   readonly completedAt: string;
 }
+
+type DeterminateExecutionStatus = Exclude<ExecutionTerminalStatus, "indeterminate">;
+
+export type ExecutionResult =
+  | (ExecutionResultBase & {
+      readonly status: "indeterminate";
+      readonly output?: never;
+      readonly diagnostic: RuntimeDiagnostic & { readonly retryable: false };
+    })
+  | (ExecutionResultBase & {
+      readonly status: DeterminateExecutionStatus;
+      readonly output?: JsonValue;
+      readonly diagnostic?: RuntimeDiagnostic;
+    });
 
 export interface ExecutorCapabilities extends JsonObject {
   readonly id: string;

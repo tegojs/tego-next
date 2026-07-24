@@ -295,7 +295,11 @@ export class TestLocalExecutor implements Executor {
     return this.drain({});
   }
 
-  complete(attempt: LocalAttempt, status: ExecutionResult["status"], output?: JsonValue): void {
+  complete(
+    attempt: LocalAttempt,
+    status: Exclude<ExecutionResult["status"], "indeterminate">,
+    output?: JsonValue,
+  ): void {
     if (attempt.terminal !== undefined) return;
     const result: ExecutionResult = {
       taskId: attempt.request.taskId,
