@@ -430,3 +430,20 @@ test("sessions accept the ws message(data, isBinary) event signature", async () 
   assert.deepEqual(received, [{ ws: true }]);
   await Promise.all([main.close(), worker.close()]);
 });
+
+test("an incomplete authentication handshake expires without retaining the socket", async () => {
+  const clock = new FakeClock();
+  const main = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    handshakeTimeoutMs: 100,
+  });
+  const [mainSocket] = directSocketPair();
+  const mainSession = main.attach(mainSocket);
+  clock.advanceBy(101);
+  await assert.rejects(mainSession.ready, /handshake|auth/iu);
+  assert.equal(mainSession.diagnostic?.code, "PROTOCOL_HANDSHAKE_TIMEOUT");
+  assert.equal(main.activeSessionCount, 0);
+  assert.equal(mainSocket.listenerCount(), 0);
+  await main.close();
+});
