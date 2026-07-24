@@ -575,6 +575,18 @@ test("malformed executor completion becomes one durable indeterminate result for
   assert.deepEqual(await service.status(identity.taskId), left);
 });
 
+test("@spec:runtime-operations/task-operations/inspect-indeterminate-task", async () => {
+  const { executor, service } = serviceFixture();
+  await service.setAuthority(authority);
+  await service.run(request);
+  executor.result.reject(new Error("secret-token-must-not-leak"));
+  const terminal = await service.wait(identity.taskId);
+  assert.equal(terminal.result?.status, "indeterminate");
+  assert.equal(terminal.result?.output, undefined);
+  assert.equal(terminal.result?.diagnostic?.retryable, false);
+  assert.doesNotMatch(JSON.stringify(terminal), /secret-token-must-not-leak/u);
+});
+
 test("cancel is idempotent and close releases all waiters", async () => {
   const { executor, service } = serviceFixture();
   await service.setAuthority(authority);
