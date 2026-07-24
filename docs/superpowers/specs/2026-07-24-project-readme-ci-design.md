@@ -145,9 +145,10 @@ starts `postgres:16.14-alpine` as a service with:
 - port 5432 exposed to the runner;
 - `pg_isready` health checks.
 
-The job installs dependencies with `npm ci` and runs the root integration test
-script with `TEGO_POSTGRES_URL` pointing to the service database. The tests are
-responsible for their existing namespace isolation and cleanup behavior.
+The job installs dependencies with `npm ci`, builds workspace packages, and
+runs the root integration test script with `TEGO_POSTGRES_URL` pointing to the
+service database. The tests are responsible for their existing namespace
+isolation and cleanup behavior.
 
 Credentials are non-secret, disposable CI-only values and will be defined in
 the workflow rather than GitHub Secrets.

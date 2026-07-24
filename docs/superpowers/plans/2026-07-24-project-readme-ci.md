@@ -443,6 +443,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Build
+        run: npm run build
       - name: Run integration tests
         run: npm run test:integration
         env:

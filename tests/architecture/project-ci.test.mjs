@@ -98,4 +98,13 @@ test("GitHub CI declares quality and PostgreSQL integration gates", async () => 
     workflow.indexOf("run: npm run build") < workflow.indexOf("run: npm run typecheck"),
     "clean CI must build workspace dependencies before typechecking their consumers",
   );
+
+  const integrationJob = workflow.slice(workflow.indexOf("postgres-integration:"));
+  const integrationBuild = integrationJob.indexOf("run: npm run build");
+  const integrationTests = integrationJob.indexOf("run: npm run test:integration");
+  assert.notEqual(integrationBuild, -1, "PostgreSQL CI must build workspace packages");
+  assert.ok(
+    integrationBuild < integrationTests,
+    "PostgreSQL CI must build workspace packages before importing them in integration tests",
+  );
 });
