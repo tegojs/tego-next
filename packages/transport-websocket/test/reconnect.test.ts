@@ -499,3 +499,128 @@ test("acknowledged terminal attempts expire under the configured retention bound
   assert.equal(local.executions, 2);
   await Promise.all([remote.close(), runtime.close()]);
 });
+
+test("concurrent duplicate submit waits for one persisted assignment and returns one handle", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const saveGate = Promise.withResolvers<void>();
+  const backing = new MemoryRemoteAttemptStore();
+  let assignedSaves = 0;
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => {
+        if (record.state === "assigned") {
+          assignedSaves += 1;
+          await saveGate.promise;
+        }
+        await backing.save(record);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const request = executionRequest({ mode: "wait" }, "concurrent-duplicate");
+  const firstPromise = remote.submit(request);
+  const secondPromise = remote.submit(request);
+  saveGate.resolve();
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  try {
+    assert.strictEqual(second, first);
+    assert.equal(assignedSaves, 1);
+    assert.equal(local.executions, 1);
+  } finally {
+    await remote.cancel(request.taskId, request.attemptId);
+    await second.result;
+    await Promise.all([remote.close(), runtime.close()]);
+  }
+});
+
+test("late rejection from a stale assignment cannot roll back the reconciled epoch", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const mainStore = new MemoryRemoteAttemptStore();
+  const remote = new RemoteExecutor({ id: "remote", workerId, clock, attemptStore: mainStore });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  const [oldMain, oldWorker] = memorySessionPair("1");
+  await runtime.attach(oldWorker);
+  await remote.attach(oldMain);
+  const oldRequest = oldMain.request.bind(oldMain);
+  const staleAssignment = Promise.withResolvers<never>();
+  oldMain.request = (type, payload) =>
+    type === "task.assign" ? staleAssignment.promise : oldRequest(type, payload);
+  const request = executionRequest({ mode: "wait" }, "stale-assignment");
+  const handle = await remote.submit(request);
+  await reconnect(remote, runtime, "2");
+  await eventually(() => assert.equal(local.executions, 1));
+  staleAssignment.reject(new Error("stale session rejected"));
+  await flush();
+
+  const record = await mainStore.load(request.taskId, request.attemptId);
+  assert.equal(record?.epoch, "2");
+  assert.equal(record?.state, "running");
+  await remote.cancel(request.taskId, request.attemptId);
+  await handle.result;
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("retention delete failure keeps terminal identity in memory", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const backing = new MemoryRemoteAttemptStore();
+  let deletes = 0;
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    maxAssignments: 1,
+    retentionMs: 100,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      delete: async (taskId, attemptId) => {
+        deletes += 1;
+        throw new Error(`delete unavailable for ${taskId}/${attemptId}`);
+      },
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    retentionMs: 100,
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const firstRequest = executionRequest({ mode: "echo", value: "first" }, "delete-retention");
+  await (await remote.submit(firstRequest)).result;
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
+  clock.advanceBy(101);
+
+  await assert.rejects(
+    remote.submit(executionRequest({ mode: "echo", value: "second" }, "delete-retention-next")),
+    /delete unavailable/iu,
+  );
+  assert.equal(deletes, 1);
+  assert.equal(
+    (await remote.observe(firstRequest.taskId, firstRequest.attemptId))?.state,
+    "terminal",
+  );
+  await Promise.all([remote.close(), runtime.close()]);
+});
