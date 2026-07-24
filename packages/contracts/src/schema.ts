@@ -705,6 +705,10 @@ const workerEnvelopeSchema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
   type: "object",
   additionalProperties: false,
+  dependentRequired: {
+    binaryBytes: ["binaryChunks"],
+    binaryChunks: ["binaryBytes"],
+  },
   required: ["protocol", "messageId", "sessionId", "sequence", "type", "sentAt", "payload"],
   properties: {
     protocol: { const: "1.0" },
@@ -716,8 +720,10 @@ const workerEnvelopeSchema = {
       enum: [
         "artifact.prepare",
         "artifact.prepared",
+        "authenticate",
         "heartbeat",
         "hello",
+        "session.ready",
         "session.reconcile",
         "task.acknowledge",
         "task.assign",
@@ -728,6 +734,8 @@ const workerEnvelopeSchema = {
     },
     sentAt: { type: "string", format: "date-time" },
     payload: { $ref: JSON_VALUE_SCHEMA_ID },
+    binaryBytes: { type: "integer", minimum: 0 },
+    binaryChunks: { type: "integer", minimum: 1 },
   },
   $defs: {
     identity: { type: "string", pattern: IDENTITY_PATTERN },

@@ -3,9 +3,12 @@ import {
   parseMessageId,
   parseSequence,
   parseSessionId,
+  parseWorkerEnvelope,
   runtimeDiagnostic,
   serializeWireValue,
   type JsonValue,
+  type WorkerEnvelope,
+  type WorkerMessageType,
 } from "@tegojs/contracts";
 
 const CONTROL_FIELDS = new Set([
@@ -49,18 +52,20 @@ export const DEFAULT_WORKER_PROTOCOL_LIMITS: WorkerProtocolLimits = {
 
 export type WorkerProtocolLimitOverrides = Partial<WorkerProtocolLimits>;
 
-export interface WorkerControlEnvelope {
+export type WorkerControlEnvelope = Pick<
+  WorkerEnvelope,
+  | "binaryBytes"
+  | "binaryChunks"
+  | "correlationId"
+  | "messageId"
+  | "payload"
+  | "sentAt"
+  | "sequence"
+  | "sessionId"
+  | "type"
+> & {
   readonly protocol: string;
-  readonly messageId: string;
-  readonly sessionId: string;
-  readonly sequence: string;
-  readonly correlationId?: string;
-  readonly type: string;
-  readonly sentAt: string;
-  readonly payload: JsonValue;
-  readonly binaryBytes?: number;
-  readonly binaryChunks?: number;
-}
+};
 
 export interface WorkerBinaryChunk {
   readonly correlationId: string;
@@ -169,7 +174,6 @@ export function createWorkerCodec(
 
   function validateControl(value: unknown): WorkerControlEnvelope {
     const record = asRecord(value);
-    exactFields(record);
     if (record.protocol !== supportedProtocol) {
       throw protocolError(
         "PROTOCOL_VERSION_UNSUPPORTED",
@@ -180,6 +184,24 @@ export function createWorkerCodec(
         },
       );
     }
+    if (record.protocol === "1.0") {
+      const envelope = parseWorkerEnvelope(record);
+      if (
+        envelope.binaryBytes !== undefined &&
+        (envelope.binaryBytes > limits.maxBinaryBytes ||
+          envelope.binaryChunks === undefined ||
+          envelope.binaryChunks > limits.maxBinaryChunks)
+      ) {
+        throw protocolError(
+          "PROTOCOL_BINARY_LIMIT_EXCEEDED",
+          "Worker binary payload exceeds configured limits",
+        );
+      }
+      return envelope;
+    }
+
+    // A non-current local version is accepted only so a peer can reject it during negotiation.
+    exactFields(record);
     if (typeof record.messageId !== "string") {
       throw protocolError("PROTOCOL_ENVELOPE_INVALID", "messageId must be a string");
     }
@@ -203,12 +225,11 @@ export function createWorkerCodec(
     ) {
       throw protocolError("PROTOCOL_ENVELOPE_INVALID", "sentAt must be an ISO timestamp");
     }
-    parseMessageId(record.messageId);
-    parseSessionId(record.sessionId);
-    parseSequence(record.sequence);
-    if (record.correlationId !== undefined) {
-      parseMessageId(record.correlationId);
-    }
+    const messageId = parseMessageId(record.messageId);
+    const sessionId = parseSessionId(record.sessionId);
+    const sequence = parseSequence(record.sequence);
+    const correlationId =
+      record.correlationId === undefined ? undefined : parseMessageId(record.correlationId);
     const payload = serializeWireValue(record.payload);
     const binaryBytes = finiteNonNegativeInteger(record.binaryBytes, "binaryBytes");
     const binaryChunks = finiteNonNegativeInteger(record.binaryChunks, "binaryChunks");
@@ -232,13 +253,11 @@ export function createWorkerCodec(
     }
     return {
       protocol: record.protocol,
-      messageId: record.messageId,
-      sessionId: record.sessionId,
-      sequence: record.sequence,
-      ...(record.correlationId === undefined
-        ? {}
-        : { correlationId: record.correlationId as string }),
-      type: record.type,
+      messageId,
+      sessionId,
+      sequence,
+      ...(correlationId === undefined ? {} : { correlationId }),
+      type: record.type as WorkerMessageType,
       sentAt: record.sentAt,
       payload,
       ...(binaryBytes === undefined ? {} : { binaryBytes }),

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   DiagnosticError,
+  parseMessageId,
   parseSequence,
   parseSessionId,
   parseWorkerId,
@@ -11,6 +12,7 @@ import {
   type JsonValue,
   type RuntimeDiagnostic,
   type SessionId,
+  type WorkerMessageType,
   type WorkerId,
 } from "@tegojs/contracts";
 import {
@@ -37,7 +39,7 @@ export interface WorkerRegistration extends JsonObject {
 export interface WorkerSessionMessage {
   readonly messageId: string;
   readonly correlationId?: string;
-  readonly type: string;
+  readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
 }
@@ -494,7 +496,7 @@ export class WorkerSession {
   }
 
   async send(
-    type: string,
+    type: WorkerMessageType,
     payload: JsonValue,
     options: WorkerSessionSendOptions = {},
   ): Promise<string> {
@@ -509,7 +511,7 @@ export class WorkerSession {
   }
 
   async request(
-    type: string,
+    type: WorkerMessageType,
     payload: JsonValue,
     options: WorkerSessionRequestOptions = {},
   ): Promise<WorkerSessionMessage> {
@@ -1026,12 +1028,12 @@ export class WorkerSession {
     this.#detach();
   }
 
-  #sendInternal(type: string, payload: JsonValue): string {
+  #sendInternal(type: WorkerMessageType, payload: JsonValue): string {
     return this.#sendEnvelope(type, payload, {});
   }
 
   #sendEnvelope(
-    type: string,
+    type: WorkerMessageType,
     payload: JsonValue,
     options: WorkerSessionSendOptions,
     suppliedMessageId?: string,
@@ -1043,7 +1045,9 @@ export class WorkerSession {
     ) {
       throw diagnosticError("WORKER_SESSION_CLOSED", "Worker session is closed");
     }
-    const messageId = suppliedMessageId ?? `message-${randomUUID()}`;
+    const messageId = parseMessageId(
+      suppliedMessageId ?? `message-${randomUUID()}`,
+    );
     const binary = options.binary;
     const maxChunkPayload = Math.max(1, this.#codec.limits.maxFrameBytes - 160);
     const binaryChunks =
@@ -1064,8 +1068,10 @@ export class WorkerSession {
       protocol: this.#protocol,
       messageId,
       sessionId: this.#sessionId,
-      sequence: this.#nextSequence.toString(),
-      ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
+      sequence: parseSequence(this.#nextSequence.toString()),
+      ...(options.correlationId === undefined
+        ? {}
+        : { correlationId: parseMessageId(options.correlationId) }),
       type,
       sentAt: this.#clock.now().toISOString(),
       payload: serializeWireValue(payload),

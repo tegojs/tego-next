@@ -5,8 +5,10 @@ export type WorkerProtocolVersion = "1.0";
 export type WorkerMessageType =
   | "artifact.prepare"
   | "artifact.prepared"
+  | "authenticate"
   | "heartbeat"
   | "hello"
+  | "session.ready"
   | "session.reconcile"
   | "task.acknowledge"
   | "task.assign"
@@ -23,4 +25,6 @@ export interface WorkerEnvelope<T extends JsonValue = JsonValue> extends JsonObj
   readonly type: WorkerMessageType;
   readonly sentAt: string;
   readonly payload: T;
+  readonly binaryBytes?: number;
+  readonly binaryChunks?: number;
 }

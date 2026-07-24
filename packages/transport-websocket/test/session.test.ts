@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { JsonValue, WorkerId } from "@tegojs/contracts";
+import {
+  parseMessageId,
+  parseSequence,
+  parseSessionId,
+  type JsonValue,
+  type WorkerId,
+  type WorkerMessageType,
+} from "@tegojs/contracts";
 import { FakeClock, workerSessionConformance } from "@tegojs/testkit";
 import {
   createMainEndpoint,
@@ -17,9 +24,9 @@ workerSessionConformance(createMainEndpoint, createWorkerEndpoint);
 
 const ENVELOPE: WorkerControlEnvelope = {
   protocol: "1.0",
-  messageId: "message-1",
-  sessionId: "session-1",
-  sequence: "0",
+  messageId: parseMessageId("message-1"),
+  sessionId: parseSessionId("session-1"),
+  sequence: parseSequence("0"),
   type: "heartbeat",
   sentAt: new Date(0).toISOString(),
   payload: {},
@@ -297,7 +304,7 @@ test("request correlation is installed before a synchronous transport can respon
 test("an invalid outgoing message cannot consume a sequence number", async () => {
   const connection = await directConnection();
   try {
-    await assert.rejects(connection.mainSession.send("INVALID", {}));
+    await assert.rejects(connection.mainSession.send("INVALID" as WorkerMessageType, {}));
     const received: JsonValue[] = [];
     connection.workerSession.onMessage((message) => received.push(message.payload));
     await connection.mainSession.send("session.reconcile", { valid: true });
@@ -505,9 +512,9 @@ test("a peer hello arriving first cannot move authenticate before the local hell
   mainSocket.inject(
     codec.encodeControl({
       protocol: "1.0",
-      messageId: "peer-hello",
-      sessionId: "peer-session",
-      sequence: "0",
+      messageId: parseMessageId("peer-hello"),
+      sessionId: parseSessionId("peer-session"),
+      sequence: parseSequence("0"),
       type: "hello",
       sentAt: clock.now().toISOString(),
       payload: {

@@ -6,6 +6,7 @@ import type {
   JsonValue,
   RuntimeDiagnostic,
   SessionId,
+  WorkerMessageType,
   WorkerId,
 } from "@tegojs/contracts";
 import { FakeClock } from "./fake-clock.js";
@@ -51,7 +52,7 @@ export interface WorkerRegistrationInput {
 export interface WorkerSessionMessage {
   readonly messageId: string;
   readonly correlationId?: string;
-  readonly type: string;
+  readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
 }
@@ -65,7 +66,7 @@ export interface WorkerSessionLike {
   readonly acceptingAssignments: boolean;
   readonly diagnostic: RuntimeDiagnostic | undefined;
   send(
-    type: string,
+    type: WorkerMessageType,
     payload: JsonValue,
     options?: {
       readonly correlationId?: string;
