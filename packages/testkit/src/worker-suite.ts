@@ -421,6 +421,58 @@ export function workerSessionConformance(
       }
     });
 
+    test("out-of-order ready messages cannot roll back the Worker epoch", async () => {
+      const clock = new FakeClock();
+      const mainA = await mainFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+      });
+      const mainB = await mainFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+      });
+      const seedWorker = await workerFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+        registration: REGISTRATION,
+      });
+      const [seedMainSocket, seedWorkerSocket] = socketPair();
+      const seedMainSession = mainB.attach(seedMainSocket);
+      const seedWorkerSession = seedWorker.attach(seedWorkerSocket);
+      await Promise.all([seedMainSession.ready, seedWorkerSession.ready]);
+      await seedWorker.close();
+
+      const targetWorker = await workerFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+        registration: REGISTRATION,
+      });
+      const [delayedMainSocket, delayedWorkerSocket] = socketPair();
+      delayedMainSocket.holdControlType("session.ready");
+      const delayedMainSession = mainA.attach(delayedMainSocket);
+      const delayedWorkerSession = targetWorker.attach(delayedWorkerSocket);
+      await delayedMainSession.ready;
+
+      const [currentMainSocket, currentWorkerSocket] = socketPair();
+      const currentMainSession = mainB.attach(currentMainSocket);
+      const currentWorkerSession = targetWorker.attach(currentWorkerSocket);
+      await Promise.all([currentMainSession.ready, currentWorkerSession.ready]);
+      assert.equal(currentWorkerSession.epoch, "2");
+
+      delayedMainSocket.releaseHeld();
+      await delayedWorkerSession.ready;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(delayedWorkerSession.epoch, "1");
+      assert.equal(delayedWorkerSession.state, "unavailable");
+      assert.equal(currentWorkerSession.state, "ready");
+
+      await Promise.all([mainA.close(), mainB.close(), targetWorker.close()]);
+    });
+
     test("close is idempotent and rejects later sends", async () => {
       const clock = new FakeClock();
       const main = await mainFactory({
