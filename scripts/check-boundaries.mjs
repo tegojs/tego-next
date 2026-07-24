@@ -446,6 +446,14 @@ function referencedWorkspace(specifier, workspaces, importingFile) {
   );
 }
 
+function containsForbiddenBoundary(source, specifiers, workspaces, importingFile) {
+  return specifiers.some(
+    (specifier) =>
+      containsForbiddenFragment(specifier) &&
+      referencedWorkspace(specifier, workspaces, importingFile) !== source,
+  );
+}
+
 function importTargets(specifier, dependencies, source, workspaces) {
   const aliases = dependencies.filter(
     (dependency) =>
@@ -531,7 +539,12 @@ export async function checkWorkspaceBoundaries(root) {
     for (const dependency of dependencies) {
       if (
         workspace.kind === "first-layer" &&
-        [dependency.specifier, dependency.targetSpecifier].some(containsForbiddenFragment)
+        containsForbiddenBoundary(
+          workspace,
+          [dependency.specifier, dependency.targetSpecifier],
+          workspaces,
+          new URL("package.json", workspace.directory),
+        )
       ) {
         violations.add(`${workspace.manifest.name} -> ${dependency.targetSpecifier}`);
       }
@@ -567,7 +580,7 @@ export async function checkWorkspaceBoundaries(root) {
         )) {
           if (
             workspace.kind === "first-layer" &&
-            [specifier, targetSpecifier].some(containsForbiddenFragment)
+            containsForbiddenBoundary(workspace, [specifier, targetSpecifier], workspaces, file)
           ) {
             violations.add(`${workspace.manifest.name} -> ${targetSpecifier}`);
           }
