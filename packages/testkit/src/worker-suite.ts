@@ -118,6 +118,8 @@ class MemorySocket implements WorkerSessionSocket {
   readonly #closes = new Set<CloseListener>();
   readonly #errors = new Set<ErrorListener>();
   readonly #sent: (string | Uint8Array)[] = [];
+  readonly #heldTypes = new Set<string>();
+  readonly #held: (string | Uint8Array)[] = [];
 
   send(data: string | Uint8Array): void {
     if (this.readyState !== 1 || this.peer?.readyState !== 1) {
@@ -125,6 +127,17 @@ class MemorySocket implements WorkerSessionSocket {
     }
     const copy = typeof data === "string" ? data : Uint8Array.from(data);
     this.#sent.push(copy);
+    if (
+      typeof copy === "string" &&
+      this.#heldTypes.has((JSON.parse(copy) as { type?: unknown }).type as string)
+    ) {
+      this.#held.push(copy);
+      return;
+    }
+    this.#deliver(copy);
+  }
+
+  #deliver(copy: string | Uint8Array): void {
     queueMicrotask(() => {
       const peer = this.peer;
       for (const listener of peer === undefined ? [] : peer.#messages) {
@@ -183,6 +196,16 @@ class MemorySocket implements WorkerSessionSocket {
     const copy = typeof data === "string" ? data : Uint8Array.from(data);
     for (const listener of this.#messages) {
       listener({ data: copy });
+    }
+  }
+
+  holdControlType(type: string): void {
+    this.#heldTypes.add(type);
+  }
+
+  releaseHeld(): void {
+    for (const frame of this.#held.splice(0)) {
+      this.#deliver(frame);
     }
   }
 
