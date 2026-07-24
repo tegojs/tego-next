@@ -216,15 +216,15 @@ export class ComponentRegistry {
         effect,
       );
     }
-    if (sameAuthority(entry.binding.authority, authority)) return entry;
     if (
       entry.binding.authority === undefined ||
       authority === undefined ||
-      entry.binding.authority.resource !== authority.resource
+      entry.binding.authority.resource !== authority.resource ||
+      BigInt(authority.epoch) <= BigInt(entry.binding.authority.epoch)
     ) {
       throw lifecycleError(
         "LIFECYCLE_INSTANCE_IDENTITY_MISMATCH",
-        "Stopping cleanup authority does not match the registered resource",
+        "Stopping cleanup takeover requires a strictly newer epoch for the registered resource",
         effect,
       );
     }

@@ -195,7 +195,11 @@ export class ComponentEffects implements ComponentEffectExecutor {
     }
     let entry = this.#registry.require(effect.instanceId);
     if (effect.kind === "stop" && entry.state === "stopping") {
-      entry = this.#registry.takeoverStopping(effect, authority);
+      if (sameAuthority(entry.binding.authority, authority)) {
+        this.#registry.assertMatches(effect, entry, authority);
+      } else {
+        entry = this.#registry.takeoverStopping(effect, authority);
+      }
     } else {
       this.#registry.assertMatches(effect, entry, authority);
     }

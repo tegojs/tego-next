@@ -369,7 +369,11 @@ test("@spec:coordination-provider/fenced-leadership/stop-takeover-requires-stric
     };
     const { effects, registry } = harness({ authority });
     await effects.perform(effect("prepare"));
-    return { authority, registry, stopping: registry.transition(effect("stop"), "prepared", "stopping", authority) };
+    return {
+      authority,
+      registry,
+      stopping: registry.transition(effect("stop"), "prepared", "stopping", authority),
+    };
   }
 
   await context.test("rejects epoch rollback", async () => {
