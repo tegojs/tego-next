@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -38,6 +50,14 @@ const manifest = {
 
 function digest(bytes: Uint8Array): ArtifactDigest {
   return parseArtifactDigest(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
 }
 
 function archive(componentSource = source): Uint8Array {
@@ -103,11 +123,27 @@ async function fixture() {
   return { artifactDigest, artifacts, cache, root };
 }
 
+async function cleanupRoot(root: string): Promise<void> {
+  async function writable(path: string): Promise<void> {
+    let identity: Awaited<ReturnType<typeof lstat>>;
+    try {
+      identity = await lstat(path);
+    } catch {
+      return;
+    }
+    if (identity.isSymbolicLink() || !identity.isDirectory()) return;
+    await chmod(path, 0o700);
+    for (const entry of await readdir(path)) await writable(join(path, entry));
+  }
+  await writable(root);
+  await rm(root, { force: true, recursive: true });
+}
+
 test("@spec:plugin-artifacts/immutable-artifacts/prepares-atomically", async (context) => {
   const { artifactDigest, artifacts, cache, root } = await fixture();
   context.after(async () => {
     await cache.close();
-    await rm(root, { force: true, recursive: true });
+    await cleanupRoot(root);
   });
 
   const [left, right] = await Promise.all([
@@ -127,11 +163,50 @@ test("@spec:plugin-artifacts/immutable-artifacts/prepares-atomically", async (co
   await cache.release(artifactDigest);
 });
 
+test("@spec:plugin-artifacts/immutable-artifacts/crash-stale-lock-does-not-block-prepare", async (context) => {
+  const { artifactDigest, cache, root } = await fixture();
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+  const legacyLock = join(root, `${artifactDigest.slice("sha256:".length)}.lock`);
+  await writeFile(legacyLock, "stale legacy lock\n");
+
+  const prepared = await cache.prepare({ digest: artifactDigest });
+
+  assert.equal(await readFile(join(prepared.root, "components/component.js"), "utf8"), source);
+  await cache.release(artifactDigest);
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/concurrent-cache-processes-converge", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "tego-prepared-concurrent-"));
+  const artifacts = new MemoryArtifacts();
+  const bytes = archive();
+  const artifactDigest = digest(bytes);
+  artifacts.set(artifactDigest, bytes);
+  const leftCache = new PreparedArtifactCache({ artifacts, root });
+  const rightCache = new PreparedArtifactCache({ artifacts, root });
+  context.after(async () => {
+    await Promise.all([leftCache.close(), rightCache.close()]);
+    await cleanupRoot(root);
+  });
+
+  const [left, right] = await Promise.all([
+    leftCache.prepare({ digest: artifactDigest }),
+    rightCache.prepare({ digest: artifactDigest }),
+  ]);
+
+  assert.equal(left.root, right.root);
+  assert.equal(await readFile(join(left.root, "components/component.js"), "utf8"), source);
+  await leftCache.release(artifactDigest);
+  await rightCache.release(artifactDigest);
+});
+
 test("prepared cache rejects changed archive bytes and removes its temporary directory", async (context) => {
   const { artifactDigest, artifacts, cache, root } = await fixture();
   context.after(async () => {
     await cache.close();
-    await rm(root, { force: true, recursive: true });
+    await cleanupRoot(root);
   });
   artifacts.set(artifactDigest, archive("export default { changed: true };\n"));
 
@@ -150,10 +225,11 @@ test("prepared cache never trusts or overwrites a changed completed directory", 
   const { artifactDigest, artifacts, cache, root } = await fixture();
   context.after(async () => {
     await cache.close();
-    await rm(root, { force: true, recursive: true });
+    await cleanupRoot(root);
   });
   const prepared = await cache.prepare({ digest: artifactDigest });
   await cache.release(artifactDigest);
+  await chmod(join(prepared.root, "components/component.js"), 0o600);
   await writeFile(join(prepared.root, "components/component.js"), "tampered\n");
 
   const restarted = new PreparedArtifactCache({ artifacts, root });
@@ -166,4 +242,164 @@ test("prepared cache never trusts or overwrites a changed completed directory", 
     "tampered\n",
   );
   await restarted.close();
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/published-tree-is-read-only", async (context) => {
+  const { artifactDigest, cache, root } = await fixture();
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+
+  const prepared = await cache.prepare({ digest: artifactDigest });
+  const [rootMode, componentMode] = await Promise.all([
+    stat(prepared.root),
+    stat(join(prepared.root, "components/component.js")),
+  ]);
+
+  assert.equal(rootMode.mode & 0o222, 0);
+  assert.equal(componentMode.mode & 0o222, 0);
+  await cache.release(artifactDigest);
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/live-cache-hit-revalidates-content", async (context) => {
+  const { artifactDigest, cache, root } = await fixture();
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+  const prepared = await cache.prepare({ digest: artifactDigest });
+  await cache.release(artifactDigest);
+  await chmod(join(prepared.root, "components/component.js"), 0o600);
+  await writeFile(join(prepared.root, "components/component.js"), "live tamper\n");
+
+  await assert.rejects(cache.prepare({ digest: artifactDigest }), /cache|conflict|digest/iu);
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/rejects-extra-empty-directory", async (context) => {
+  const { artifactDigest, cache, root } = await fixture();
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+  const prepared = await cache.prepare({ digest: artifactDigest });
+  await cache.release(artifactDigest);
+  await chmod(prepared.root, 0o700);
+  await mkdir(join(prepared.root, "unexpected-empty"));
+
+  await assert.rejects(cache.prepare({ digest: artifactDigest }), /cache|conflict|directory/iu);
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/rejects-published-root-replacement", async (context) => {
+  const { artifactDigest, cache, root } = await fixture();
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+  const prepared = await cache.prepare({ digest: artifactDigest });
+  await cache.release(artifactDigest);
+  const moved = `${prepared.root}-moved`;
+  await chmod(prepared.root, 0o700);
+  await rename(prepared.root, moved);
+  await symlink(moved, prepared.root);
+
+  await assert.rejects(
+    cache.prepare({ digest: artifactDigest }),
+    /cache|conflict|identity|symlink/iu,
+  );
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/close-fences-pending-reference-acquisition", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "tego-prepared-close-"));
+  const bytes = archive();
+  const artifactDigest = digest(bytes);
+  const started = deferred();
+  const proceed = deferred();
+  const artifacts: ArtifactStore = {
+    scope: "local",
+    open: async () => {},
+    close: async () => {},
+    health: async () => ({ status: "healthy", checkedAt: new Date(0).toISOString() }),
+    put: async () => {},
+    read: async function* () {
+      yield bytes.subarray(0, 600);
+      started.resolve();
+      await proceed.promise;
+      yield bytes.subarray(600);
+    },
+  };
+  const cache = new PreparedArtifactCache({ artifacts, root });
+  context.after(async () => {
+    await cache.close();
+    await cleanupRoot(root);
+  });
+
+  const pending = cache.prepare({ digest: artifactDigest });
+  await started.promise;
+  const closing = cache.close();
+  proceed.resolve();
+
+  await assert.rejects(
+    pending,
+    (error: unknown) =>
+      typeof error === "object" &&
+      error !== null &&
+      "diagnostic" in error &&
+      (error as { diagnostic: { code?: unknown } }).diagnostic.code === "ARTIFACT_CACHE_CLOSED",
+  );
+  await closing;
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/acquired-reference-releases-after-close", async (context) => {
+  const { artifactDigest, cache, root } = await fixture();
+  context.after(async () => {
+    await cleanupRoot(root);
+  });
+  await cache.prepare({ digest: artifactDigest });
+  await cache.close();
+
+  await cache.release(artifactDigest);
+});
+
+test("@spec:plugin-artifacts/immutable-artifacts/cleanup-failure-is-diagnostic", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "tego-prepared-cleanup-"));
+  const original = archive();
+  const changed = archive("export default { changed: true };\n");
+  const artifactDigest = digest(original);
+  const started = deferred();
+  const proceed = deferred();
+  const artifacts: ArtifactStore = {
+    scope: "local",
+    open: async () => {},
+    close: async () => {},
+    health: async () => ({ status: "healthy", checkedAt: new Date(0).toISOString() }),
+    put: async () => {},
+    read: async function* () {
+      yield changed.subarray(0, 600);
+      started.resolve();
+      await proceed.promise;
+      yield changed.subarray(600);
+    },
+  };
+  const cache = new PreparedArtifactCache({ artifacts, root });
+  context.after(async () => {
+    await chmod(root, 0o700);
+    await cache.close();
+    await cleanupRoot(root);
+  });
+
+  const pending = cache.prepare({ digest: artifactDigest });
+  await started.promise;
+  await chmod(root, 0o500);
+  proceed.resolve();
+
+  await assert.rejects(
+    pending,
+    (error: unknown) =>
+      typeof error === "object" &&
+      error !== null &&
+      "diagnostic" in error &&
+      (error as { diagnostic: { code?: unknown } }).diagnostic.code ===
+        "ARTIFACT_PREPARATION_CLEANUP_FAILED",
+  );
 });

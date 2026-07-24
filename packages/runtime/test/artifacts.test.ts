@@ -272,7 +272,7 @@ test("invalid manifest is rejected without evaluating component code", async () 
   assert.equal((globalThis as Record<string, unknown>)[marker], undefined);
 });
 
-test("artifact parsing closes its source iterator without masking parse failures", async (context) => {
+test("@spec:plugin-artifacts/immutable-artifacts/reader-cleanup-failures-are-structured", async (context) => {
   await context.test("successful parse", async () => {
     const archive = tar(validEntries());
     let returned = 0;
@@ -314,8 +314,36 @@ test("artifact parsing closes its source iterator without masking parse failures
       },
     };
 
-    await rejectsCode(() => readPluginArtifact(source), "ARTIFACT_HEADER_CHECKSUM_INVALID");
+    await assert.rejects(
+      readPluginArtifact(source),
+      (error: unknown) =>
+        error instanceof DiagnosticError &&
+        error.diagnostic.code === "ARTIFACT_READER_CLEANUP_FAILED" &&
+        JSON.stringify(error.diagnostic.details).includes("ARTIFACT_HEADER_CHECKSUM_INVALID") &&
+        JSON.stringify(error.diagnostic.details).includes("iterator cleanup failed"),
+    );
     assert.equal(returned, 1);
+  });
+
+  await context.test("successful parse propagates close failure", async () => {
+    const archive = tar(validEntries());
+    let yielded = false;
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            if (yielded) return { done: true, value: undefined };
+            yielded = true;
+            return { done: false, value: archive };
+          },
+          async return() {
+            throw new Error("successful iterator cleanup failed");
+          },
+        };
+      },
+    };
+
+    await assert.rejects(readPluginArtifact(source), /successful iterator cleanup failed/u);
   });
 });
 
