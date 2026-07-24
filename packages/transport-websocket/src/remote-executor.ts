@@ -24,6 +24,7 @@ import {
   asObject,
   attemptKey,
   cloneJson,
+  jsonFingerprint,
   jsonBytes,
   parseRemoteRequest,
   positiveLimit,
@@ -67,6 +68,10 @@ interface RemoteAttempt {
   terminal?: ExecutionResult;
   cancellation?: "cancelled" | "timed-out";
   terminalAt?: number;
+  publication?: {
+    readonly fingerprint: string;
+    readonly promise: Promise<void>;
+  };
 }
 
 export class RemoteExecutor implements Executor {
@@ -457,17 +462,6 @@ export class RemoteExecutor implements Executor {
   }
 
   async #publish(attempt: RemoteAttempt, candidate: ExecutionResult): Promise<void> {
-    if (attempt.terminal !== undefined) {
-      if (JSON.stringify(attempt.terminal) !== JSON.stringify(candidate)) {
-        throw remoteError(
-          "EXECUTOR_REMOTE_RESULT_CONFLICT",
-          "Remote attempt produced conflicting terminal results",
-          this.id,
-          this.#clock.now().toISOString(),
-        );
-      }
-      return;
-    }
     let result = parseExecutionResult(candidate);
     if (attempt.cancellation === "timed-out" && result.status === "cancelled") {
       result = {
@@ -492,12 +486,48 @@ export class RemoteExecutor implements Executor {
         completedAt: now,
       };
     }
-    attempt.state = "terminal";
-    attempt.terminal = cloneJson(result);
-    attempt.terminalAt = this.#clock.now().getTime();
-    attempt.deadline.abort();
-    await this.#save(attempt);
-    attempt.result.resolve(attempt.terminal);
+    const fingerprint = jsonFingerprint(result);
+    if (attempt.terminal !== undefined) {
+      if (jsonFingerprint(attempt.terminal) !== fingerprint) {
+        throw remoteError(
+          "EXECUTOR_REMOTE_RESULT_CONFLICT",
+          "Remote attempt produced conflicting terminal results",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      }
+      return;
+    }
+    if (attempt.publication !== undefined) {
+      if (attempt.publication.fingerprint !== fingerprint) {
+        throw remoteError(
+          "EXECUTOR_REMOTE_RESULT_CONFLICT",
+          "Remote attempt produced conflicting terminal results",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      }
+      await attempt.publication.promise;
+      return;
+    }
+    const terminal = cloneJson(result);
+    const promise = (async () => {
+      await this.#saveTerminal(attempt, terminal);
+      attempt.state = "terminal";
+      attempt.terminal = terminal;
+      attempt.terminalAt = this.#clock.now().getTime();
+      attempt.deadline.abort();
+      attempt.result.resolve(terminal);
+    })();
+    const publication = { fingerprint, promise };
+    attempt.publication = publication;
+    try {
+      await promise;
+    } finally {
+      if (attempt.publication === publication) {
+        delete attempt.publication;
+      }
+    }
   }
 
   async #reconcile(session: RemoteSession): Promise<void> {
@@ -627,6 +657,18 @@ export class RemoteExecutor implements Executor {
       ...(attempt.terminal === undefined ? {} : { result: attempt.terminal }),
     };
     await this.#attemptStore.save(record);
+  }
+
+  async #saveTerminal(attempt: RemoteAttempt, result: ExecutionResult): Promise<void> {
+    await this.#attemptStore.save({
+      workerId: this.#workerId,
+      request: attempt.request,
+      fingerprint: attempt.fingerprint,
+      state: "terminal",
+      epoch: attempt.epoch,
+      updatedAt: this.#clock.now().toISOString(),
+      result,
+    });
   }
 
   #activeCount(): number {

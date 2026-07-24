@@ -191,7 +191,11 @@ export function jsonBytes(value: JsonValue): number {
 }
 
 export function requestFingerprint(request: ExecutionRequest): string {
-  return createHash("sha256").update(canonical(request)).digest("hex");
+  return jsonFingerprint(request);
+}
+
+export function jsonFingerprint(value: JsonValue): string {
+  return createHash("sha256").update(canonical(value)).digest("hex");
 }
 
 export function parseRemoteRequest(value: unknown): ExecutionRequest {
