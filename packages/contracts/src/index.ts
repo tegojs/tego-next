@@ -7,6 +7,7 @@ export * from "./drivers.js";
 export * from "./execution.js";
 export * from "./identity.js";
 export * from "./json.js";
+export * from "./operations.js";
 export * from "./permission.js";
 export * from "./permission-grant.js";
 export * from "./plugin.js";

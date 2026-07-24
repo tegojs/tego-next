@@ -5,12 +5,14 @@ import {
   parsePluginInstallation,
   runtimeDiagnostic,
   type ArtifactDigest,
+  type ArtifactSignatureEnvelope,
   type ArtifactStore,
   type Clock,
   type JsonObject,
   type PluginManifest,
   type PluginInstallation,
   type PluginSignature,
+  type RuntimeAuthority,
   type StateKey,
   type StateStore,
 } from "@tegojs/contracts";
@@ -21,12 +23,7 @@ import {
 } from "./manifest-reader.js";
 import { satisfiesVersionRange } from "../capabilities/version.js";
 
-export interface ArtifactSignatureEnvelope extends JsonObject {
-  readonly algorithm: "Ed25519";
-  readonly digest: ArtifactDigest;
-  readonly keyId: string;
-  readonly signature: string;
-}
+export type { ArtifactSignatureEnvelope } from "@tegojs/contracts";
 
 export interface ArtifactTrustKey {
   readonly keyId: string;
@@ -124,7 +121,10 @@ export class ArtifactService {
     };
   }
 
-  async install(request: InstallArtifactRequest): Promise<PluginInstallation> {
+  async install(
+    request: InstallArtifactRequest,
+    authority?: RuntimeAuthority,
+  ): Promise<PluginInstallation> {
     const validated = await this.validate(request);
     const candidate: PluginInstallation = {
       pluginId: validated.manifest.pluginId,
@@ -138,36 +138,39 @@ export class ArtifactService {
     const versionKey = this.#versionKey(candidate);
 
     try {
-      return await this.#state.transact({}, async (transaction) => {
-        const indexed = await transaction.get(versionKey);
-        if (indexed !== undefined) {
-          const existingDigest = this.#parseVersionIndex(indexed.value, candidate);
-          if (existingDigest !== candidate.digest) {
-            throw this.#installationConflict(existingDigest, candidate);
+      return await this.#state.transact(
+        authority === undefined ? {} : { fencing: authority },
+        async (transaction) => {
+          const indexed = await transaction.get(versionKey);
+          if (indexed !== undefined) {
+            const existingDigest = this.#parseVersionIndex(indexed.value, candidate);
+            if (existingDigest !== candidate.digest) {
+              throw this.#installationConflict(existingDigest, candidate);
+            }
+            const stored = await transaction.get(installationKey);
+            if (stored === undefined) {
+              throw artifactError(
+                "ARTIFACT_INSTALLATION_CORRUPT",
+                "Plugin version index refers to a missing installation record",
+                {
+                  digest: candidate.digest,
+                  pluginId: candidate.pluginId,
+                  version: candidate.version,
+                },
+              );
+            }
+            return parsePluginInstallation(stored.value);
           }
-          const stored = await transaction.get(installationKey);
-          if (stored === undefined) {
-            throw artifactError(
-              "ARTIFACT_INSTALLATION_CORRUPT",
-              "Plugin version index refers to a missing installation record",
-              {
-                digest: candidate.digest,
-                pluginId: candidate.pluginId,
-                version: candidate.version,
-              },
-            );
-          }
-          return parsePluginInstallation(stored.value);
-        }
-        const versionIndex: InstalledVersionIndex = {
-          digest: candidate.digest,
-          pluginId: candidate.pluginId,
-          version: candidate.version,
-        };
-        await transaction.put(versionKey, versionIndex, { expectedRevision: "absent" });
-        await transaction.put(installationKey, candidate, { expectedRevision: "absent" });
-        return candidate;
-      });
+          const versionIndex: InstalledVersionIndex = {
+            digest: candidate.digest,
+            pluginId: candidate.pluginId,
+            version: candidate.version,
+          };
+          await transaction.put(versionKey, versionIndex, { expectedRevision: "absent" });
+          await transaction.put(installationKey, candidate, { expectedRevision: "absent" });
+          return candidate;
+        },
+      );
     } catch (error) {
       if (diagnosticCode(error) !== "STATE_REVISION_CONFLICT") throw error;
       const indexed = await this.#state.read(versionKey);

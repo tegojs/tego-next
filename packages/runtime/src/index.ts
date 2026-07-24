@@ -71,6 +71,17 @@ export {
   type RuntimeHostServices,
 } from "./runtime-host.js";
 export {
+  RuntimeOperationController,
+  type RuntimeArtifactInstaller,
+  type RuntimeOperationControllerOptions,
+  type RuntimeTaskOperations,
+} from "./runtime-operations.js";
+export {
+  TaskService,
+  type TaskIdentity,
+  type TaskServiceOptions,
+} from "./tasks/task-service.js";
+export {
   CapabilitySchemaGate,
   CapabilitySchemaRegistry,
   gateCapabilityRequest,

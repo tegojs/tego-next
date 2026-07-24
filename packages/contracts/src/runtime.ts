@@ -1,7 +1,8 @@
 import type { ApplicationId, FencingEpoch, NodeId, RuntimeId } from "./identity.js";
 import type { JsonObject } from "./json.js";
 import type { WorkerResourceCeilings } from "./permission.js";
-import type { DriverHealth, PersistedOperationJournalEntry } from "./state.js";
+import type { DriverHealth } from "./state.js";
+import type { RuntimeOperations } from "./operations.js";
 
 export type RuntimeMode = "multi-main" | "single-main";
 
@@ -89,10 +90,6 @@ export interface RuntimeEvent extends JsonObject {
   readonly previous: RuntimeLifecycleState;
   readonly current: RuntimeLifecycleState;
   readonly occurredAt: string;
-}
-
-export interface RuntimeOperations {
-  recoveredOperations(): Promise<readonly PersistedOperationJournalEntry[]>;
 }
 
 export interface Runtime {

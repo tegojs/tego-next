@@ -53,6 +53,7 @@ class TransactionalState implements StateStore {
   readonly records = new Map<string, { value: JsonValue; revision: number }>();
   readonly writes: string[] = [];
   readonly accepted = Promise.withResolvers<void>();
+  rejectTerminalWrites = false;
   #revision = 0;
   #tail = Promise.resolve();
 
@@ -100,6 +101,9 @@ class TransactionalState implements StateStore {
       };
       const result = await work(transaction);
       for (const item of staged) {
+        if (this.rejectTerminalWrites && (item.value as { state?: unknown }).state === "terminal") {
+          throw new Error("terminal persistence unavailable");
+        }
         const storageKey = this.#key(item.key);
         const current = this.records.get(storageKey);
         const actual = current === undefined ? "absent" : String(current.revision);
@@ -358,7 +362,7 @@ test("@spec:runtime-operations/task-operations/unkeyed-runs-are-distinct", async
 });
 
 test("leadership loss fences terminal commit and reports indeterminate without output", async () => {
-  const { executor, service } = serviceFixture();
+  const { executor, service, state } = serviceFixture();
   await service.setAuthority(authority);
   await service.run(request);
   await service.setAuthority(undefined);
@@ -375,6 +379,12 @@ test("leadership loss fences terminal commit and reports indeterminate without o
   assert.equal(terminal.result?.status, "indeterminate");
   assert.equal(terminal.result?.output, undefined);
   assert.equal(terminal.result?.diagnostic?.retryable, false);
+  const durable = await state.read<JsonValue>({
+    namespace: "tego",
+    collection: "tasks",
+    id: identity.taskId,
+  });
+  assert.equal((durable?.value as { readonly state?: JsonValue } | undefined)?.state, "running");
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/tasks-recover-before-dispatch", async () => {
@@ -386,6 +396,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/tasks-recover-before-disp
     state: "accepted",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
+    executor: { id: executor.id, type: executor.type },
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
@@ -428,6 +439,64 @@ test("recovery commits a locally observed terminal attempt without redispatch", 
   await service.setAuthority(authority);
   assert.equal(executor.submitted.length, 0);
   assert.equal((await service.status(identity.taskId))?.result?.status, "succeeded");
+});
+
+test("missing local running attempt recovers as durable indeterminate without retry", async () => {
+  const { executor, service, state } = serviceFixture();
+  const running = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "running",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    executor: { id: executor.id, type: executor.type },
+    authority,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
+
+  await service.recover();
+  await service.setAuthority(authority);
+  assert.equal(executor.submitted.length, 0);
+  assert.equal((await service.status(identity.taskId))?.result?.status, "indeterminate");
+});
+
+test("terminal persistence uncertainty retains recoverable evidence for restart observation", async () => {
+  const executor = new ControlledExecutor();
+  const { service, state } = serviceFixture(executor);
+  await service.setAuthority(authority);
+  await service.run(request);
+  state.rejectTerminalWrites = true;
+  const succeeded: ExecutionResult = {
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    executor: { kind: "process" },
+    status: "succeeded",
+    output: { recovered: true },
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  };
+  executor.result.resolve(succeeded);
+  assert.equal((await service.wait(identity.taskId)).result?.status, "indeterminate");
+  const durable = await state.read<JsonValue>({
+    namespace: "tego",
+    collection: "tasks",
+    id: identity.taskId,
+  });
+  assert.equal((durable?.value as { readonly state?: JsonValue } | undefined)?.state, "running");
+
+  state.rejectTerminalWrites = false;
+  executor.observed = { state: "terminal", result: succeeded };
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => executor,
+    createIdentity: () => identity,
+  });
+  await restarted.recover();
+  await restarted.setAuthority(authority);
+  assert.equal((await restarted.status(identity.taskId))?.result?.status, "succeeded");
+  assert.equal(executor.submitted.length, 1);
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/accepted-remote-unknown-is-not-redispatched", async () => {

@@ -5,6 +5,7 @@ import {
   diagnosticCode,
   compareOperationJournalCursors,
   parseApplicationId,
+  parseArtifactDigest,
   parseFencingEpoch,
   parseNodeId,
   parseOperationId,
@@ -406,7 +407,9 @@ test("follower rejects mutation before reading artifact bytes", async () => {
 
   await assert.rejects(
     runtime.operations.installPlugin({
-      digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      digest: parseArtifactDigest(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
     }),
     (error: unknown) => diagnosticCode(error) === "COORDINATION_NOT_LEADER",
   );

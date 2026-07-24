@@ -133,7 +133,16 @@ class TegoRuntime implements Runtime {
     this.#drivers = drivers;
     this.#services = services;
     this.#supervisor = new DriverSupervisor(drivers);
-    this.operations = new RuntimeOperationController(drivers.clock);
+    this.operations = new RuntimeOperationController({
+      clock: drivers.clock,
+      state: drivers.state,
+      ...(services?.artifactService === undefined
+        ? {}
+        : { artifactService: services.artifactService }),
+      ...(services?.taskOperations === undefined ? {} : { tasks: services.taskOperations }),
+      authority: () => this.#leadership,
+      wake: () => this.#reconciler?.wake(),
+    });
     this.events = this.#eventStream;
   }
 
