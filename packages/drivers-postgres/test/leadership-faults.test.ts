@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { diagnosticCode, parseRevision } from "@tegojs/contracts";
 import { PostgresCoordinationProvider, PostgresStateStore } from "../src/index.js";
 

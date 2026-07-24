@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import {
+  type ArtifactDigest,
   diagnosticCode,
   parseArtifactDigest,
   parseMessageId,
   parseOperationId,
   parseRevision,
-  type ArtifactDigest,
 } from "@tegojs/contracts";
 import { coordinationConformance, stateStoreConformance } from "@tegojs/testkit";
 import { Pool } from "pg";
@@ -135,10 +135,7 @@ test("concurrent idempotent transactions commit one durable state and outbox eff
         },
       );
 
-    const [leftResult, rightResult] = await Promise.all([
-      run(left, "left"),
-      run(right, "right"),
-    ]);
+    const [leftResult, rightResult] = await Promise.all([run(left, "left"), run(right, "right")]);
     assert.deepEqual(rightResult, leftResult);
     assert.deepEqual(await left.read(record), {
       revision: parseRevision("1"),

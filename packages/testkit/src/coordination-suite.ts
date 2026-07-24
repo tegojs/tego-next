@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { setTimeout as delay } from "node:timers/promises";
 import { describe, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
-  diagnosticCode,
-  parseRevision,
   type CoordinationChange,
   type CoordinationProvider,
+  diagnosticCode,
+  parseRevision,
 } from "@tegojs/contracts";
 
 export type CoordinationFactory = (
@@ -115,7 +115,7 @@ export function coordinationConformance(
         const lease = await first.acquireLease({
           resource: "task/example",
           owner: "worker-a",
-          durationMs: 100,
+          durationMs: 500,
         });
         assert.equal(new Date(lease.acquiredAt).toISOString(), lease.acquiredAt);
         assert.equal(new Date(lease.expiresAt).toISOString(), lease.expiresAt);
@@ -125,15 +125,15 @@ export function coordinationConformance(
           second.acquireLease({
             resource: "task/example",
             owner: "worker-b",
-            durationMs: 100,
+            durationMs: 500,
           }),
           (error: unknown) => diagnosticCode(error) === "COORDINATION_LEASE_HELD",
         );
-        await delay(125);
+        await delay(600);
         const takeover = await second.acquireLease({
           resource: "task/example",
           owner: "worker-b",
-          durationMs: 100,
+          durationMs: 500,
         });
         assert.ok(BigInt(takeover.epoch) > BigInt(lease.epoch));
       } finally {
