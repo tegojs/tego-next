@@ -59,13 +59,15 @@ export interface WorkerRuntimeOptions {
 interface WorkerAttempt {
   readonly request: ExecutionRequest;
   readonly fingerprint: string;
+  revision: number;
+  transition: Promise<void>;
   state: "acknowledged" | "running" | "terminal";
   epoch: string;
   executor?: Executor;
   handle?: ExecutionHandle;
   result?: ExecutionResult;
   acknowledgedAt?: number;
-  cancellation?: "cancelled";
+  cancellation?: "cancelled" | "timed-out";
 }
 
 export class WorkerRuntime {
@@ -88,10 +90,13 @@ export class WorkerRuntime {
   #removeMessageListener: (() => void) | undefined;
   #removeStateListener: (() => void) | undefined;
   #receiveChain = Promise.resolve();
+  #attachChain = Promise.resolve();
+  #highestEpoch = 0n;
   #hydrated = false;
   #recovered = false;
   #closed = false;
   #reservedResults = 0;
+  #reservedResultBytes = 0;
   #persistenceAvailable = true;
 
   constructor(options: WorkerRuntimeOptions) {
@@ -153,10 +158,21 @@ export class WorkerRuntime {
     return this.#results.count;
   }
 
-  async attach(session: RemoteSession): Promise<void> {
+  attach(session: RemoteSession): Promise<void> {
+    const attached = this.#attachChain.then(async () => this.#attach(session));
+    this.#attachChain = attached.catch(() => undefined);
+    return attached;
+  }
+
+  async #attach(session: RemoteSession): Promise<void> {
     if (this.#closed) throw new Error("Worker runtime is closed");
     if (session.state !== "ready" || !session.available) {
       throw new Error("Worker session must be ready before attaching execution");
+    }
+    await this.#hydrate();
+    const epoch = BigInt(session.epoch);
+    if (epoch <= this.#highestEpoch && this.#session !== session) {
+      throw new Error("Worker runtime session epoch is stale");
     }
     const current = this.#session;
     if (current !== undefined && current !== session) {
@@ -164,7 +180,7 @@ export class WorkerRuntime {
     }
     this.#removeMessageListener?.();
     this.#removeStateListener?.();
-    await this.#hydrate();
+    this.#highestEpoch = epoch;
     this.#session = session;
     this.#removeMessageListener = session.onMessage((message) => {
       if (this.#session === session) {
@@ -188,10 +204,22 @@ export class WorkerRuntime {
     if (session !== undefined) await this.#sessionLost(session);
     await Promise.all(
       [...this.#attempts.values()].map(async (attempt) => {
-        if (attempt.state !== "terminal" && attempt.executor !== undefined) {
-          await attempt.executor.cancel(attempt.request.taskId, attempt.request.attemptId);
-          await attempt.handle?.result;
+        if (attempt.state === "terminal") return;
+        await this.#markCancelled(attempt);
+        if (attempt.executor === undefined) {
+          await this.#terminal(
+            attempt,
+            this.#result(
+              attempt.request,
+              "cancelled",
+              "EXECUTOR_REMOTE_CANCELLED",
+              "Worker runtime closed before local execution completed",
+            ),
+          );
+          return;
         }
+        await attempt.executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+        await attempt.handle?.result;
       }),
     );
   }
@@ -210,6 +238,8 @@ export class WorkerRuntime {
       ]),
     );
     for (const record of records) {
+      const persistedEpoch = BigInt(record.epoch);
+      if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
       const key = attemptKey(record.request.taskId, record.request.attemptId);
       if (record.state === "expired") continue;
       const durableResult = durableResults.get(key);
@@ -223,23 +253,32 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
+          revision: record.revision ?? 0,
+          transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
           result: durableResult,
+          ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
+          ...(record.acknowledgedAt === undefined
+            ? {}
+            : { acknowledgedAt: Date.parse(record.acknowledgedAt) }),
         };
         this.#attempts.set(key, attempt);
         this.#results.put(durableResult);
         durableResults.delete(key);
-        await this.#save(attempt);
+        await this.#commit(attempt, "terminal", durableResult);
         continue;
       }
       if (record.state === "terminal" && record.result !== undefined) {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
+          revision: record.revision ?? 0,
+          transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
           result: record.result,
+          ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
           ...(record.acknowledgedAt === undefined
             ? {}
             : { acknowledgedAt: Date.parse(record.acknowledgedAt) }),
@@ -250,8 +289,11 @@ export class WorkerRuntime {
         this.#attempts.set(key, {
           request: record.request,
           fingerprint: record.fingerprint,
+          revision: record.revision ?? 0,
+          transition: Promise.resolve(),
           state: "acknowledged",
           epoch: record.epoch,
+          ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
         });
       }
     }
@@ -261,6 +303,12 @@ export class WorkerRuntime {
     this.#reservedResults =
       [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal").length +
       this.#results.count;
+    this.#reservedResultBytes =
+      [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal").length *
+      this.#resultReservationBytes();
+    if (this.#results.bytes + this.#reservedResultBytes > this.#results.maxBytes) {
+      throw new Error("Persisted Worker result reservations exceed recovery buffer bytes");
+    }
     this.#hydrated = true;
   }
 
@@ -277,7 +325,10 @@ export class WorkerRuntime {
           await this.#inventory(session, message);
           break;
         case REMOTE_ACK:
-          if (asObject(message.payload, REMOTE_ACK).kind === "result") {
+          if (
+            asObject(message.payload, REMOTE_ACK).kind === "result" &&
+            asObject(message.payload, REMOTE_ACK).error === undefined
+          ) {
             await this.#acknowledgeResult(message.payload);
           }
           break;
@@ -389,7 +440,9 @@ export class WorkerRuntime {
     }
     if (
       this.#attempts.size >= this.#maxAssignments ||
-      this.#reservedResults >= this.#maxBufferedResults
+      this.#reservedResults >= this.#maxBufferedResults ||
+      this.#results.bytes + this.#reservedResultBytes + this.#resultReservationBytes() >
+        this.#results.maxBytes
     ) {
       await this.#sendRejected(
         session,
@@ -416,11 +469,13 @@ export class WorkerRuntime {
     const attempt: WorkerAttempt = {
       request: cloneJson(request),
       fingerprint,
+      revision: 0,
+      transition: Promise.resolve(),
       state: "acknowledged",
       epoch: session.epoch,
     };
     try {
-      await this.#save(attempt);
+      await this.#create(attempt);
     } catch {
       await this.#sendRejected(
         session,
@@ -433,6 +488,7 @@ export class WorkerRuntime {
     }
     this.#attempts.set(key, attempt);
     this.#reservedResults += 1;
+    this.#reservedResultBytes += this.#resultReservationBytes();
     let acknowledged = false;
     try {
       await session.send(
@@ -465,21 +521,35 @@ export class WorkerRuntime {
 
   async #execute(attempt: WorkerAttempt): Promise<void> {
     try {
-      if (attempt.cancellation !== undefined) return;
+      if (this.#isStopped(attempt)) return;
       const executor = await this.#selectExecutor(attempt.request);
-      if (attempt.state === "terminal" || attempt.cancellation !== undefined) return;
+      if (this.#isStopped(attempt)) return;
       if (executor.type === "remote") {
         throw new Error("Worker runtime cannot delegate an assignment to another RemoteExecutor");
       }
       attempt.executor = executor;
       const handle = await executor.submit(attempt.request);
       attempt.handle = handle;
-      if (attempt.cancellation !== undefined) {
+      if (this.#isTerminal(attempt)) {
         await executor.cancel(attempt.request.taskId, attempt.request.attemptId);
         return;
       }
-      attempt.state = "running";
-      await this.#save(attempt);
+      if (attempt.cancellation !== undefined || this.#closed) {
+        await executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+      } else {
+        await this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal" && attempt.cancellation === undefined && !this.#closed) {
+            await this.#commit(attempt, "running");
+          }
+        });
+      }
+      if (this.#isTerminal(attempt)) {
+        await executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+        return;
+      }
+      if (attempt.cancellation !== undefined || this.#closed) {
+        await executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+      }
       const localResult = await handle.result;
       const result: ExecutionResult =
         localResult.taskId !== attempt.request.taskId ||
@@ -503,6 +573,7 @@ export class WorkerRuntime {
             };
       await this.#terminal(attempt, result);
     } catch {
+      if (attempt.state === "terminal") return;
       await this.#terminal(
         attempt,
         this.#result(
@@ -518,7 +589,7 @@ export class WorkerRuntime {
   async #terminal(attempt: WorkerAttempt, candidate: ExecutionResult): Promise<void> {
     if (attempt.state === "terminal") return;
     let result =
-      jsonBytes(candidate) > this.#maxResultBytes
+      jsonBytes(candidate) > this.#resultReservationBytes()
         ? this.#result(
             attempt.request,
             "failed",
@@ -526,6 +597,17 @@ export class WorkerRuntime {
             "Worker local result exceeds maxResultBytes",
           )
         : parseExecutionResult(candidate);
+    if (
+      jsonBytes(result) > this.#resultReservationBytes() &&
+      candidate.diagnostic?.code !== "EXECUTOR_REMOTE_RESULT_TOO_LARGE"
+    ) {
+      result = this.#result(
+        attempt.request,
+        "failed",
+        "EXECUTOR_REMOTE_RESULT_TOO_LARGE",
+        "Worker terminal diagnostic exceeds maxResultBytes",
+      );
+    }
     if (attempt.request.orphanPolicy === "finish-and-persist") {
       try {
         await this.#resultStore?.put(result);
@@ -539,31 +621,42 @@ export class WorkerRuntime {
         );
       }
     }
-    try {
-      this.#results.put(result);
-    } catch {
-      result = this.#result(
-        attempt.request,
-        "failed",
-        "EXECUTOR_REMOTE_RESULT_BUFFER_EXHAUSTED",
-        "Worker could not retain the unacknowledged terminal result",
-      );
-      if (attempt.request.orphanPolicy === "finish-and-persist") {
-        await this.#resultStore?.put(result);
+    const terminal = cloneJson(result);
+    await this.#transition(attempt, async () => {
+      if (attempt.state === "terminal") return;
+      await this.#commit(attempt, "terminal", terminal);
+      const authoritative = attempt.result ?? terminal;
+      if (JSON.stringify(authoritative) !== JSON.stringify(terminal)) {
+        throw new Error("Worker attempt lost terminal commit authority to a conflicting result");
       }
-      this.#results.put(result);
-    }
-    attempt.state = "terminal";
-    attempt.result = result;
-    await this.#save(attempt);
-    await this.#publish(result);
+      this.#results.put(authoritative);
+      this.#reservedResultBytes = Math.max(
+        0,
+        this.#reservedResultBytes - this.#resultReservationBytes(),
+      );
+    });
+    this.#background(this.#publish(attempt.result ?? terminal));
   }
 
   async #publish(result: ExecutionResult): Promise<void> {
     const session = this.#session;
     if (session === undefined || session.state !== "ready" || !session.available) return;
     try {
-      await session.send(REMOTE_RESULT, { result });
+      const response = await session.request(REMOTE_RESULT, { result });
+      if (response.type !== REMOTE_ACK) {
+        throw new Error("Remote result response is not an acknowledgement");
+      }
+      const payload = asObject(response.payload, REMOTE_RESULT_ACK);
+      const identity = identityFrom(payload);
+      if (
+        payload.kind !== "result" ||
+        identity.taskId !== result.taskId ||
+        identity.attemptId !== result.attemptId ||
+        payload.error !== undefined
+      ) {
+        throw new Error("Remote result acknowledgement is invalid");
+      }
+      await this.#acknowledgeResult(payload);
     } catch {
       // The retained result is replayed from reconnect inventory.
     }
@@ -574,7 +667,7 @@ export class WorkerRuntime {
     const request = parseRemoteRequest(payload.request);
     const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
     if (attempt !== undefined && attempt.state !== "terminal") {
-      attempt.cancellation = "cancelled";
+      await this.#markCancelled(attempt);
       if (attempt.executor === undefined) {
         await this.#terminal(
           attempt,
@@ -594,6 +687,8 @@ export class WorkerRuntime {
       {
         taskId: request.taskId,
         attemptId: request.attemptId,
+        found: attempt !== undefined,
+        ...(attempt?.result === undefined ? {} : { result: attempt.result }),
       },
       { correlationId: message.messageId },
     );
@@ -645,15 +740,19 @@ export class WorkerRuntime {
     const payload = asObject(payloadValue, REMOTE_RESULT_ACK);
     const request = identityFrom(payload);
     const retained = this.#results.get(request.taskId, request.attemptId);
-    await this.#resultStore?.delete(request.taskId, request.attemptId);
-    this.#results.acknowledge(request.taskId, request.attemptId);
     if (retained !== undefined) {
-      this.#reservedResults = Math.max(0, this.#reservedResults - 1);
       const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
       if (attempt !== undefined) {
-        attempt.acknowledgedAt = this.#clock.now().getTime();
-        await this.#save(attempt);
+        await this.#transition(attempt, async () => {
+          if (attempt.acknowledgedAt === undefined) {
+            attempt.acknowledgedAt = this.#clock.now().getTime();
+            await this.#commit(attempt);
+          }
+        });
       }
+      await this.#resultStore?.delete(request.taskId, request.attemptId);
+      this.#results.acknowledge(request.taskId, request.attemptId);
+      this.#reservedResults = Math.max(0, this.#reservedResults - 1);
     }
   }
 
@@ -688,7 +787,7 @@ export class WorkerRuntime {
     this.#session = undefined;
     for (const attempt of this.#attempts.values()) {
       if (attempt.state !== "terminal" && attempt.request.orphanPolicy === "cancel") {
-        attempt.cancellation = "cancelled";
+        await this.#markCancelled(attempt);
         if (attempt.executor === undefined) {
           await this.#terminal(
             attempt,
@@ -744,20 +843,108 @@ export class WorkerRuntime {
     };
   }
 
-  async #save(attempt: WorkerAttempt): Promise<void> {
-    const record: RemoteAttemptRecord = {
+  #record(
+    attempt: WorkerAttempt,
+    state = attempt.state,
+    result = attempt.result,
+  ): RemoteAttemptRecord {
+    return {
       workerId: this.#workerId,
       request: attempt.request,
       fingerprint: attempt.fingerprint,
-      state: attempt.state,
+      state,
       epoch: attempt.epoch,
       updatedAt: this.#clock.now().toISOString(),
-      ...(attempt.result === undefined ? {} : { result: attempt.result }),
+      revision: attempt.revision,
+      ...(result === undefined ? {} : { result }),
+      ...(attempt.cancellation === undefined ? {} : { cancellation: attempt.cancellation }),
       ...(attempt.acknowledgedAt === undefined
         ? {}
         : { acknowledgedAt: new Date(attempt.acknowledgedAt).toISOString() }),
     };
-    await this.#attemptStore.save(record);
+  }
+
+  async #create(attempt: WorkerAttempt): Promise<void> {
+    const committed = await this.#attemptStore.commit(this.#record(attempt), {
+      expectedRevision: null,
+    });
+    if (committed === undefined) {
+      throw new Error("Remote attempt was concurrently admitted by another Worker session");
+    }
+    attempt.revision = committed.revision ?? 0;
+  }
+
+  async #commit(
+    attempt: WorkerAttempt,
+    state = attempt.state,
+    result = attempt.result,
+  ): Promise<void> {
+    let failures = 0;
+    while (true) {
+      try {
+        const committed = await this.#attemptStore.commit(this.#record(attempt, state, result), {
+          expectedRevision: attempt.revision,
+          expectedEpoch: attempt.epoch,
+        });
+        if (committed !== undefined) {
+          attempt.revision = committed.revision ?? attempt.revision + 1;
+          attempt.state = state;
+          if (result !== undefined) attempt.result = result;
+          return;
+        }
+        const latest = await this.#attemptStore.load(
+          attempt.request.taskId,
+          attempt.request.attemptId,
+        );
+        if (latest === undefined) {
+          throw new Error("Worker attempt disappeared during a conditional commit");
+        }
+        attempt.revision = latest.revision ?? attempt.revision;
+        attempt.epoch = latest.epoch;
+        if (latest.cancellation === undefined) {
+          delete attempt.cancellation;
+        } else {
+          attempt.cancellation = latest.cancellation;
+        }
+        if (latest.result !== undefined || latest.state === "terminal") {
+          attempt.state = "terminal";
+          if (latest.result !== undefined) attempt.result = latest.result;
+          return;
+        }
+        throw new Error("Worker attempt transition lost epoch or revision authority");
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          /lost epoch or revision authority|disappeared/iu.test(error.message)
+        ) {
+          throw error;
+        }
+        failures += 1;
+        if (failures < 3) {
+          await Promise.resolve();
+        } else {
+          await this.#clock.sleep(25);
+        }
+      }
+    }
+  }
+
+  #transition<T>(attempt: WorkerAttempt, operation: () => Promise<T>): Promise<T> {
+    const transitioned = attempt.transition.then(operation, operation);
+    attempt.transition = transitioned.then(
+      () => undefined,
+      () => undefined,
+    );
+    return transitioned;
+  }
+
+  async #markCancelled(attempt: WorkerAttempt): Promise<void> {
+    if (attempt.state === "terminal") return;
+    attempt.cancellation = "cancelled";
+    await this.#transition(attempt, async () => {
+      if (attempt.state === "terminal") return;
+      await this.#commit(attempt);
+    });
   }
 
   async #pruneAcknowledged(): Promise<void> {
@@ -768,15 +955,18 @@ export class WorkerRuntime {
         attempt.acknowledgedAt !== undefined &&
         attempt.acknowledgedAt <= cutoff
       ) {
-        await this.#attemptStore.save({
-          workerId: this.#workerId,
-          request: attempt.request,
-          fingerprint: attempt.fingerprint,
-          state: "expired",
-          epoch: attempt.epoch,
-          updatedAt: this.#clock.now().toISOString(),
-          acknowledgedAt: new Date(attempt.acknowledgedAt).toISOString(),
-        });
+        const expired = await this.#attemptStore.commit(
+          {
+            ...this.#record(attempt),
+            state: "expired",
+            updatedAt: this.#clock.now().toISOString(),
+          },
+          {
+            expectedRevision: attempt.revision,
+            expectedEpoch: attempt.epoch,
+          },
+        );
+        if (expired === undefined) continue;
         this.#attempts.delete(key);
       }
     }
@@ -787,8 +977,9 @@ export class WorkerRuntime {
     this.#recovered = true;
     for (const attempt of this.#attempts.values()) {
       if (attempt.state === "terminal") continue;
-      const cancelled = attempt.request.orphanPolicy === "cancel";
-      if (cancelled) attempt.cancellation = "cancelled";
+      const cancelled =
+        attempt.cancellation !== undefined || attempt.request.orphanPolicy === "cancel";
+      if (cancelled && attempt.cancellation === undefined) await this.#markCancelled(attempt);
       await this.#terminal(
         attempt,
         this.#result(
@@ -805,6 +996,18 @@ export class WorkerRuntime {
 
   #background(promise: Promise<unknown>): void {
     void promise.catch(() => undefined);
+  }
+
+  #isStopped(attempt: WorkerAttempt): boolean {
+    return attempt.state === "terminal" || attempt.cancellation !== undefined || this.#closed;
+  }
+
+  #isTerminal(attempt: WorkerAttempt): boolean {
+    return attempt.state === "terminal";
+  }
+
+  #resultReservationBytes(): number {
+    return Math.min(this.#maxResultBytes, this.#results.maxBytes);
   }
 }
 

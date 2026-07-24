@@ -30,6 +30,10 @@ export class ResultBuffer {
     return this.#bytes;
   }
 
+  get maxBytes(): number {
+    return this.#maxBytes;
+  }
+
   put(result: ExecutionResult): void {
     const key = attemptKey(result.taskId, result.attemptId);
     const bytes = jsonBytes(result);

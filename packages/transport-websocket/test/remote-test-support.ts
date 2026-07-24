@@ -18,7 +18,13 @@ import {
   type TaskId,
   type WorkerMessageType,
 } from "@tegojs/contracts";
-import type { RemoteSession, RemoteSessionMessage, RemoteSessionState } from "../src/index.js";
+import {
+  MemoryRemoteResultStore,
+  type RemoteResultStore,
+  type RemoteSession,
+  type RemoteSessionMessage,
+  type RemoteSessionState,
+} from "../src/index.js";
 
 interface PendingRequest {
   readonly resolve: (message: RemoteSessionMessage) => void;
@@ -168,6 +174,23 @@ export function memorySessionPair(
   main.link(worker);
   worker.link(main);
   return [main, worker];
+}
+
+export class TestDurableRemoteResultStore implements RemoteResultStore {
+  readonly durable = true;
+  readonly #memory = new MemoryRemoteResultStore();
+
+  put(result: ExecutionResult): Promise<void> {
+    return this.#memory.put(result);
+  }
+
+  delete(taskId: TaskId, attemptId: AttemptId): Promise<void> {
+    return this.#memory.delete(taskId, attemptId);
+  }
+
+  list(): Promise<readonly ExecutionResult[]> {
+    return this.#memory.list();
+  }
 }
 
 interface LocalAttempt {

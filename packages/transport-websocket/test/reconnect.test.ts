@@ -13,6 +13,7 @@ import {
   executionRequest,
   flush,
   memorySessionPair,
+  TestDurableRemoteResultStore,
   TestLocalExecutor,
 } from "./remote-test-support.js";
 
@@ -188,7 +189,7 @@ test("finish-and-persist rejects without a durable result boundary", async () =>
 test("finish-and-persist recovers terminal result from an injected durable store", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
-  const results = new MemoryRemoteResultStore({ durable: true });
+  const results = new TestDurableRemoteResultStore();
   const remote = new RemoteExecutor({
     id: "remote",
     workerId,
@@ -433,7 +434,7 @@ test("durable result write failure becomes a structured terminal failure", async
 test("failed durable result deletion keeps the memory result until a later acknowledgement succeeds", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
-  const durable = new MemoryRemoteResultStore({ durable: true });
+  const durable = new TestDurableRemoteResultStore();
   let deletes = 0;
   const remote = new RemoteExecutor({
     id: "remote",
@@ -563,12 +564,13 @@ test("concurrent duplicate submit waits for one persisted assignment and returns
     workerId,
     clock,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "assigned") {
           assignedSaves += 1;
           await saveGate.promise;
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
@@ -643,14 +645,15 @@ test("retention tombstone failure keeps terminal identity in memory", async () =
     maxAssignments: 1,
     retentionMs: 100,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "expired") {
           tombstones += 1;
           throw new Error(
             `tombstone unavailable for ${record.request.taskId}/${record.request.attemptId}`,
           );
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
       list: async (id) => backing.list(id),
@@ -694,13 +697,14 @@ test("duplicate terminal result cannot acknowledge Worker evidence before Main p
     workerId,
     clock,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "terminal") {
           terminalResult = record.result;
           terminalSaveStarted.resolve();
           await terminalSaveGate.promise;
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
@@ -916,12 +920,13 @@ test("drain observes a submit whose durable assignment save is still in progress
     workerId,
     clock,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "assigned") {
           saveStarted.resolve();
           await saveGate.promise;
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
       list: async (id) => backing.list(id),
@@ -1042,7 +1047,7 @@ test("durable terminal evidence wins over an uncertain running record after Work
     updatedAt: clock.now().toISOString(),
   });
   const now = clock.now().toISOString();
-  const durable = new MemoryRemoteResultStore({ durable: true });
+  const durable = new TestDurableRemoteResultStore();
   await durable.put({
     taskId: request.taskId,
     attemptId: request.attemptId,
@@ -1165,12 +1170,16 @@ test("a delayed acknowledgement save cannot overwrite a committed terminal state
   const acknowledgementStarted = Promise.withResolvers<void>();
   const acknowledgementGate = Promise.withResolvers<void>();
   const store = {
-    save: async (record: Parameters<MemoryRemoteAttemptStore["save"]>[0]) => {
-      if (record.state === "acknowledged") {
+    save: async (record: Parameters<MemoryRemoteAttemptStore["save"]>[0]) => backing.save(record),
+    commit: async (
+      record: Parameters<MemoryRemoteAttemptStore["commit"]>[0],
+      condition: Parameters<MemoryRemoteAttemptStore["commit"]>[1],
+    ) => {
+      if (record.state === "running") {
         acknowledgementStarted.resolve();
         await acknowledgementGate.promise;
       }
-      await backing.save(record);
+      return backing.commit(record, condition);
     },
     delete: async (
       taskId: Parameters<MemoryRemoteAttemptStore["delete"]>[0],
@@ -1198,9 +1207,10 @@ test("a delayed acknowledgement save cannot overwrite a committed terminal state
   void handle.result.then(() => {
     settled = true;
   });
-  await eventually(() => assert.equal(settled, true));
-  acknowledgementGate.resolve();
   await flush();
+  assert.equal(settled, false);
+  acknowledgementGate.resolve();
+  await handle.result;
 
   assert.equal((await backing.load(request.taskId, request.attemptId))?.state, "terminal");
   await Promise.all([remote.close(), runtime.close()]);
@@ -1221,7 +1231,8 @@ test("WorkerRuntime rejects a stale attached epoch before it can execute assignm
 
   await assert.rejects(runtime.attach(staleWorker), /epoch|stale/iu);
   const request = executionRequest({ mode: "echo", value: "never" }, "stale-worker-runtime");
-  await assert.rejects(staleMain.request("task.assign", { request }), /closed|available|session/iu);
+  await staleMain.send("task.assign", { request });
+  await flush();
   assert.equal(local.executions, 0);
   await runtime.close();
 });
@@ -1290,12 +1301,13 @@ test("Main retries a transient terminal state-store failure without reconnect", 
     workerId,
     clock,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "terminal" && terminalFailures === 0) {
           terminalFailures += 1;
           throw new Error("terminal store unavailable once");
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
@@ -1337,12 +1349,13 @@ test("Worker retries a transient terminal attempt-store failure without rerunnin
     workerId,
     clock,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "terminal" && terminalFailures === 0) {
           terminalFailures += 1;
           throw new Error("worker terminal store unavailable once");
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
@@ -1375,12 +1388,13 @@ test("session-loss persistence failure cannot suppress the orphan recovery timer
     clock,
     orphanTimeoutMs: 100,
     attemptStore: {
-      save: async (record) => {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
         if (record.state === "unknown" && unknownFailures === 0) {
           unknownFailures += 1;
           throw new Error("unknown state store unavailable once");
         }
-        await backing.save(record);
+        return backing.commit(record, condition);
       },
       delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
       load: async (taskId, attemptId) => backing.load(taskId, attemptId),
@@ -1495,10 +1509,31 @@ test("assignment and cancellation acknowledgements are bound to type and attempt
     }
     return originalRequest(type, payload);
   };
-  const handle = await remote.submit(assigned);
+  const rejected = await remote.submit(assigned);
   await flush();
+  assert.match((await rejected.result).diagnostic?.code ?? "", /identity/iu);
 
-  await assert.rejects(remote.cancel(assigned.taskId, assigned.attemptId), /identity|acknowledge/iu);
+  main.request = async (type, payload) => {
+    if (type === "task.cancel") {
+      return {
+        messageId: "wrong-cancel-ack",
+        type: "task.acknowledge",
+        payload: {
+          taskId: wrong.taskId,
+          attemptId: wrong.attemptId,
+          found: true,
+        },
+      };
+    }
+    return originalRequest(type, payload);
+  };
+  const cancelledRequest = executionRequest({ mode: "wait" }, "cancel-ack-identity");
+  const handle = await remote.submit(cancelledRequest);
+  await eventually(() => assert.equal(local.executions, 1));
+  await assert.rejects(
+    remote.cancel(cancelledRequest.taskId, cancelledRequest.attemptId),
+    /identity|acknowledge/iu,
+  );
   main.close();
   await flush();
   clock.advanceBy(101);
@@ -1548,9 +1583,6 @@ test("WorkerRuntime close latches selector-pending work before local execution",
 });
 
 test("the in-memory result store cannot claim crash durability", () => {
-  assert.throws(
-    () => new MemoryRemoteResultStore({ durable: true }),
-    /durable|memory/iu,
-  );
+  assert.throws(() => new MemoryRemoteResultStore({ durable: true }), /durable|memory/iu);
   assert.equal(new MemoryRemoteResultStore().durable, false);
 });

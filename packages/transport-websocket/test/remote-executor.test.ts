@@ -221,7 +221,8 @@ test("future drain deadline cancels active remote attempts with the fake clock",
     });
   try {
     clock.advanceBy(101);
-    await eventually(() => assert.equal(drained, true));
+    await draining;
+    assert.equal(drained, true);
     assert.equal((await handle.result).status, "cancelled");
   } finally {
     await remote.cancel(request.taskId, request.attemptId);
@@ -237,6 +238,9 @@ test("Worker attempt-store failure rejects before local execution instead of lea
     clock,
     attemptStore: {
       save: async () => {
+        throw new Error("attempt store unavailable");
+      },
+      commit: async () => {
         throw new Error("attempt store unavailable");
       },
       load: async () => undefined,

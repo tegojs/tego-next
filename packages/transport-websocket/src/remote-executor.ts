@@ -18,6 +18,7 @@ import {
   REMOTE_ACK,
   REMOTE_ASSIGN,
   REMOTE_CANCEL,
+  REMOTE_CANCEL_ACK,
   REMOTE_INVENTORY,
   REMOTE_RESULT,
   REMOTE_RESULT_ACK,
@@ -66,9 +67,12 @@ interface RemoteAttempt {
   readonly handle: ExecutionHandle;
   readonly result: PromiseWithResolvers<ExecutionResult>;
   readonly deadline: AbortController;
+  revision: number;
+  transition: Promise<void>;
   state: "acknowledged" | "assigned" | "running" | "terminal" | "unknown";
   epoch: string;
   terminal?: ExecutionResult;
+  settled: boolean;
   cancellation?: "cancelled" | "timed-out";
   terminalAt?: number;
   publication?: {
@@ -257,10 +261,13 @@ export class RemoteExecutor implements Executor {
       handle,
       result,
       deadline: new AbortController(),
+      revision: 0,
+      transition: Promise.resolve(),
       state: "assigned",
       epoch: this.#session.epoch,
+      settled: false,
     };
-    await this.#save(attempt);
+    await this.#create(attempt);
     this.#attempts.set(key, attempt);
     this.#background(this.#assign(attempt, this.#session));
     this.#background(this.#watchDeadline(attempt));
@@ -282,32 +289,20 @@ export class RemoteExecutor implements Executor {
   async cancel(taskId: TaskId, attemptId: AttemptId): Promise<void> {
     const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
     if (attempt === undefined || attempt.state === "terminal") return;
-    attempt.cancellation = attempt.cancellation ?? "cancelled";
+    await this.#transition(attempt, async () => {
+      if (attempt.state === "terminal") return;
+      attempt.cancellation = attempt.cancellation ?? "cancelled";
+      await this.#commit(attempt);
+    });
     const session = this.#session;
     if (session === undefined || session.state !== "ready") {
-      await this.#publish(
-        attempt,
-        this.#failure(
-          attempt.request,
-          attempt.cancellation === "timed-out" ? "timed-out" : "cancelled",
-          attempt.cancellation === "timed-out"
-            ? "EXECUTOR_REMOTE_DEADLINE_EXCEEDED"
-            : "EXECUTOR_REMOTE_CANCELLED",
-          attempt.cancellation === "timed-out"
-            ? "Remote attempt deadline expired while disconnected"
-            : "Remote attempt was cancelled while disconnected",
-        ),
-      );
+      await this.#transition(attempt, async () => {
+        if (attempt.state === "terminal") return;
+        await this.#commit(attempt, "unknown");
+      });
       return;
     }
-    try {
-      await session.request(REMOTE_CANCEL, { request: attempt.request });
-    } catch {
-      if (this.#session === session && attempt.terminal === undefined) {
-        attempt.state = "unknown";
-        await this.#save(attempt);
-      }
-    }
+    await this.#requestCancel(attempt, session);
   }
 
   drain(options: DrainOptions): Promise<void> {
@@ -436,8 +431,12 @@ export class RemoteExecutor implements Executor {
         handle,
         result,
         deadline: new AbortController(),
+        revision: record.revision ?? 0,
+        transition: Promise.resolve(),
         state: record.state,
         epoch: record.epoch,
+        settled: record.result !== undefined,
+        ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
         ...(record.result === undefined ? {} : { terminal: record.result }),
         ...(record.result === undefined
           ? {}
@@ -462,6 +461,10 @@ export class RemoteExecutor implements Executor {
       if (this.#session !== session || attempt.terminal !== undefined) return;
       if (response.type !== REMOTE_ACK) throw new Error("Remote assignment response is invalid");
       const payload = asObject(response.payload, REMOTE_ACK);
+      this.#assertResponseIdentity(payload, attempt, "assignment acknowledgement");
+      if (payload.error !== undefined) {
+        throw new Error("Remote assignment acknowledgement contains an error");
+      }
       if (payload.accepted === false) {
         if (payload.result === undefined) {
           await this.#publish(
@@ -480,11 +483,8 @@ export class RemoteExecutor implements Executor {
       }
       if (payload.accepted !== true)
         throw new Error("Remote assignment acknowledgement is invalid");
-      attempt.state = "acknowledged";
-      attempt.epoch = session.epoch;
-      await this.#save(attempt);
       if (payload.result !== undefined) {
-        await this.#publish(attempt, parseExecutionResult(payload.result));
+        await this.#publish(attempt, parseExecutionResult(payload.result), false);
         if (this.#session === session && session.state === "ready") {
           await session.send(REMOTE_RESULT_ACK, {
             kind: "result",
@@ -492,31 +492,52 @@ export class RemoteExecutor implements Executor {
             attemptId: attempt.request.attemptId,
           });
         }
+        this.#settle(attempt);
       } else {
-        attempt.state = "running";
-        await this.#save(attempt);
+        await this.#transition(attempt, async () => {
+          if (
+            this.#session !== session ||
+            attempt.state === "terminal" ||
+            attempt.epoch !== session.epoch
+          ) {
+            return;
+          }
+          await this.#commit(attempt, "running");
+        });
       }
     } catch (error) {
       if (this.#session === session && attempt.terminal === undefined) {
         if (
           error instanceof Error &&
-          "diagnostic" in error &&
-          (error as { diagnostic?: { code?: unknown } }).diagnostic?.code ===
-            "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH"
+          (/assignment response|assignment acknowledgement|identity/iu.test(error.message) ||
+            ("diagnostic" in error &&
+              (error as { diagnostic?: { code?: unknown } }).diagnostic?.code ===
+                "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH"))
         ) {
           await this.#publish(
             attempt,
             this.#failure(
               attempt.request,
               "failed",
-              "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH",
-              "Remote assignment returned a result for a different attempt identity",
+              /identity/iu.test(error.message)
+                ? "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH"
+                : "EXECUTOR_REMOTE_ASSIGNMENT_REJECTED",
+              /identity/iu.test(error.message)
+                ? "Remote assignment returned a response for a different attempt identity"
+                : "Worker returned an invalid remote assignment acknowledgement",
             ),
           );
         } else {
-          attempt.state = "unknown";
-          attempt.epoch = session.epoch;
-          await this.#save(attempt);
+          await this.#transition(attempt, async () => {
+            if (
+              this.#session !== session ||
+              attempt.state === "terminal" ||
+              attempt.epoch !== session.epoch
+            ) {
+              return;
+            }
+            await this.#commit(attempt, "unknown");
+          });
         }
       }
     } finally {
@@ -531,20 +552,25 @@ export class RemoteExecutor implements Executor {
       const result = parseExecutionResult(payload.result);
       const attempt = this.#attempts.get(attemptKey(result.taskId, result.attemptId));
       if (attempt === undefined || attempt.epoch !== session.epoch) return;
-      await this.#publish(attempt, result);
+      await this.#publish(attempt, result, false);
       if (this.#session === session && session.state === "ready") {
-        await session.send(REMOTE_RESULT_ACK, {
-          kind: "result",
-          taskId: result.taskId,
-          attemptId: result.attemptId,
-        });
+        await session.send(
+          REMOTE_RESULT_ACK,
+          {
+            kind: "result",
+            taskId: result.taskId,
+            attemptId: result.attemptId,
+          },
+          { correlationId: message.messageId },
+        );
       }
+      this.#settle(attempt);
     } catch {
       // Invalid or stale application results never overwrite authoritative state.
     }
   }
 
-  async #publish(attempt: RemoteAttempt, candidate: ExecutionResult): Promise<void> {
+  async #publish(attempt: RemoteAttempt, candidate: ExecutionResult, settle = true): Promise<void> {
     if (
       candidate.taskId !== attempt.request.taskId ||
       candidate.attemptId !== attempt.request.attemptId
@@ -591,6 +617,7 @@ export class RemoteExecutor implements Executor {
           this.#clock.now().toISOString(),
         );
       }
+      if (settle) this.#settle(attempt);
       return;
     }
     if (attempt.publication !== undefined) {
@@ -603,21 +630,40 @@ export class RemoteExecutor implements Executor {
         );
       }
       await attempt.publication.promise;
+      if (settle) this.#settle(attempt);
       return;
     }
     const terminal = cloneJson(result);
-    const promise = (async () => {
-      await this.#saveTerminal(attempt, terminal);
-      attempt.state = "terminal";
-      attempt.terminal = terminal;
+    const promise = this.#transition(attempt, async () => {
+      if (attempt.terminal !== undefined) {
+        if (jsonFingerprint(attempt.terminal) !== fingerprint) {
+          throw remoteError(
+            "EXECUTOR_REMOTE_RESULT_CONFLICT",
+            "Remote attempt produced conflicting terminal results",
+            this.id,
+            this.#clock.now().toISOString(),
+          );
+        }
+        return;
+      }
+      await this.#commit(attempt, "terminal", terminal);
+      const authoritative = attempt.terminal ?? terminal;
+      if (jsonFingerprint(authoritative) !== fingerprint) {
+        throw remoteError(
+          "EXECUTOR_REMOTE_RESULT_CONFLICT",
+          "Remote attempt lost terminal commit authority to a conflicting result",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      }
       attempt.terminalAt = this.#clock.now().getTime();
       attempt.deadline.abort();
-      attempt.result.resolve(terminal);
-    })();
+    });
     const publication = { fingerprint, promise };
     attempt.publication = publication;
     try {
       await promise;
+      if (settle) this.#settle(attempt);
     } finally {
       if (attempt.publication === publication) {
         delete attempt.publication;
@@ -679,31 +725,45 @@ export class RemoteExecutor implements Executor {
       terminalKeys.add(key);
       const attempt = this.#attempts.get(key);
       if (attempt !== undefined) {
-        attempt.epoch = session.epoch;
         if (attempt.terminal === undefined) {
-          await this.#publish(attempt, result);
+          await this.#publish(attempt, result, false);
         }
         await session.send(REMOTE_RESULT_ACK, {
           kind: "result",
           taskId: result.taskId,
           attemptId: result.attemptId,
         });
+        this.#settle(attempt);
       }
     }
     const missing: RemoteAttempt[] = [];
+    const cancellations: RemoteAttempt[] = [];
     for (const [key, attempt] of this.#attempts) {
       if (attempt.state === "terminal" || terminalKeys.has(key)) continue;
-      attempt.epoch = session.epoch;
       if (running.has(key)) {
-        attempt.state = "running";
-        await this.#save(attempt);
+        await this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal") {
+            await this.#commit(attempt, "running", undefined, session.epoch);
+          }
+        });
       } else if (acknowledged.has(key)) {
-        attempt.state = "acknowledged";
-        await this.#save(attempt);
+        await this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal") {
+            await this.#commit(attempt, "acknowledged", undefined, session.epoch);
+          }
+        });
       } else {
-        attempt.state = "assigned";
-        await this.#save(attempt);
-        missing.push(attempt);
+        if (attempt.cancellation === undefined) {
+          await this.#transition(attempt, async () => {
+            if (attempt.state !== "terminal") {
+              await this.#commit(attempt, "assigned", undefined, session.epoch);
+            }
+          });
+          missing.push(attempt);
+        }
+      }
+      if (attempt.cancellation !== undefined) {
+        cancellations.push(attempt);
       }
     }
     for (let index = 0; index < missing.length; index += this.#maxInflight) {
@@ -713,19 +773,29 @@ export class RemoteExecutor implements Executor {
         }),
       );
     }
+    for (const attempt of cancellations) {
+      await this.#requestCancel(attempt, session);
+    }
   }
 
   async #sessionLost(session: RemoteSession): Promise<void> {
     if (this.#session !== session) return;
     this.#accepting = false;
     this.#detachSession(true);
-    for (const attempt of this.#attempts.values()) {
-      if (attempt.state !== "terminal") {
-        attempt.state = "unknown";
-        await this.#save(attempt);
-      }
-    }
     const recovery = this.#orphanRecovery;
+    this.#background(
+      (async () => {
+        await Promise.allSettled(
+          [...this.#attempts.values()].map(async (attempt) =>
+            this.#transition(attempt, async () => {
+              if (attempt.state !== "terminal" && attempt.epoch === session.epoch) {
+                await this.#commit(attempt, "unknown");
+              }
+            }),
+          ),
+        );
+      })(),
+    );
     this.#background(this.#expireOrphans(recovery));
   }
 
@@ -782,29 +852,115 @@ export class RemoteExecutor implements Executor {
     }
   }
 
-  async #save(attempt: RemoteAttempt): Promise<void> {
-    const record: RemoteAttemptRecord = {
+  #record(
+    attempt: RemoteAttempt,
+    state = attempt.state,
+    result = attempt.terminal,
+    epoch = attempt.epoch,
+  ): RemoteAttemptRecord {
+    return {
       workerId: this.#workerId,
       request: attempt.request,
       fingerprint: attempt.fingerprint,
-      state: attempt.state,
-      epoch: attempt.epoch,
+      state,
+      epoch,
       updatedAt: this.#clock.now().toISOString(),
-      ...(attempt.terminal === undefined ? {} : { result: attempt.terminal }),
+      ...(result === undefined ? {} : { result }),
+      ...(attempt.cancellation === undefined ? {} : { cancellation: attempt.cancellation }),
+      revision: attempt.revision,
     };
-    await this.#attemptStore.save(record);
   }
 
-  async #saveTerminal(attempt: RemoteAttempt, result: ExecutionResult): Promise<void> {
-    await this.#attemptStore.save({
-      workerId: this.#workerId,
-      request: attempt.request,
-      fingerprint: attempt.fingerprint,
-      state: "terminal",
-      epoch: attempt.epoch,
-      updatedAt: this.#clock.now().toISOString(),
-      result,
+  async #create(attempt: RemoteAttempt): Promise<void> {
+    const committed = await this.#attemptStore.commit(this.#record(attempt), {
+      expectedRevision: null,
     });
+    if (committed === undefined) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
+        "Remote attempt identity was concurrently created",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    attempt.revision = committed.revision ?? 0;
+  }
+
+  async #commit(
+    attempt: RemoteAttempt,
+    state = attempt.state,
+    result = attempt.terminal,
+    epoch = attempt.epoch,
+  ): Promise<void> {
+    let immediateRetries = 0;
+    while (true) {
+      try {
+        const committed = await this.#attemptStore.commit(
+          this.#record(attempt, state, result, epoch),
+          {
+            expectedRevision: attempt.revision,
+            expectedEpoch: attempt.epoch,
+          },
+        );
+        if (committed !== undefined) {
+          attempt.revision = committed.revision ?? attempt.revision + 1;
+          attempt.state = state;
+          attempt.epoch = epoch;
+          if (result !== undefined) attempt.terminal = result;
+          return;
+        }
+        const latest = await this.#attemptStore.load(
+          attempt.request.taskId,
+          attempt.request.attemptId,
+        );
+        if (latest === undefined) {
+          throw new Error("Remote attempt state disappeared during a conditional commit");
+        }
+        attempt.revision = latest.revision ?? attempt.revision;
+        attempt.epoch = latest.epoch;
+        attempt.state = latest.state === "expired" ? "terminal" : latest.state;
+        if (latest.cancellation === undefined) {
+          delete attempt.cancellation;
+        } else {
+          attempt.cancellation = latest.cancellation;
+        }
+        if (latest.result !== undefined) {
+          attempt.terminal = latest.result;
+          attempt.state = "terminal";
+        }
+        if (attempt.state === "terminal") return;
+        throw remoteError(
+          "EXECUTOR_REMOTE_STALE_EPOCH",
+          "Remote attempt transition lost conditional authority",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      } catch (error) {
+        immediateRetries += 1;
+        if (
+          error instanceof Error &&
+          "diagnostic" in error &&
+          (error as { diagnostic?: { code?: string } }).diagnostic?.code ===
+            "EXECUTOR_REMOTE_STALE_EPOCH"
+        ) {
+          throw error;
+        }
+        if (immediateRetries >= 3) {
+          await this.#clock.sleep(25);
+        } else {
+          await Promise.resolve();
+        }
+      }
+    }
+  }
+
+  #transition<T>(attempt: RemoteAttempt, operation: () => Promise<T>): Promise<T> {
+    const transitioned = attempt.transition.then(operation, operation);
+    attempt.transition = transitioned.then(
+      () => undefined,
+      () => undefined,
+    );
+    return transitioned;
   }
 
   #failure(
@@ -823,6 +979,79 @@ export class RemoteExecutor implements Executor {
       startedAt: now,
       completedAt: now,
     };
+  }
+
+  #settle(attempt: RemoteAttempt): void {
+    if (attempt.settled || attempt.terminal === undefined) return;
+    attempt.settled = true;
+    attempt.result.resolve(attempt.terminal);
+  }
+
+  async #requestCancel(attempt: RemoteAttempt, session: RemoteSession): Promise<void> {
+    try {
+      const response = await session.request(REMOTE_CANCEL, { request: attempt.request });
+      if (response.type !== REMOTE_ACK) {
+        throw new Error("Remote cancellation response is not an acknowledgement");
+      }
+      const payload = asObject(response.payload, REMOTE_CANCEL_ACK);
+      this.#assertResponseIdentity(payload, attempt, "cancellation acknowledgement");
+      if (payload.error !== undefined) {
+        throw new Error("Remote cancellation acknowledgement contains an error");
+      }
+      if (typeof payload.found !== "boolean") {
+        throw new Error("Remote cancellation acknowledgement is invalid");
+      }
+      if (payload.result !== undefined) {
+        await this.#publish(attempt, parseExecutionResult(payload.result), false);
+        if (this.#session === session && session.state === "ready") {
+          await session.send(REMOTE_RESULT_ACK, {
+            kind: "result",
+            taskId: attempt.request.taskId,
+            attemptId: attempt.request.attemptId,
+          });
+        }
+        this.#settle(attempt);
+      } else if (payload.found === false && attempt.terminal === undefined) {
+        await this.#publish(
+          attempt,
+          this.#failure(
+            attempt.request,
+            attempt.cancellation === "timed-out" ? "timed-out" : "cancelled",
+            attempt.cancellation === "timed-out"
+              ? "EXECUTOR_REMOTE_DEADLINE_EXCEEDED"
+              : "EXECUTOR_REMOTE_CANCELLED",
+            "Worker confirmed that the cancelled remote attempt was never admitted",
+          ),
+        );
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        /identity|acknowledgement|contains an error|invalid/iu.test(error.message)
+      ) {
+        throw error;
+      }
+      if (this.#session === session && attempt.terminal === undefined) {
+        await this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal" && attempt.epoch === session.epoch) {
+            await this.#commit(attempt, "unknown");
+          }
+        });
+      }
+    }
+  }
+
+  #assertResponseIdentity(
+    payload: Record<string, JsonValue>,
+    attempt: RemoteAttempt,
+    name: string,
+  ): void {
+    if (
+      payload.taskId !== attempt.request.taskId ||
+      payload.attemptId !== attempt.request.attemptId
+    ) {
+      throw new Error(`${name} identity does not match the requested attempt`);
+    }
   }
 
   #background(promise: Promise<unknown>): void {
@@ -845,15 +1074,24 @@ export class RemoteExecutor implements Executor {
         attempt.terminalAt !== undefined &&
         attempt.terminalAt <= cutoff
       ) {
-        await this.#attemptStore.save({
-          workerId: this.#workerId,
-          request: attempt.request,
-          fingerprint: attempt.fingerprint,
-          state: "expired",
-          epoch: attempt.epoch,
-          updatedAt: this.#clock.now().toISOString(),
+        await this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal") return;
+          const { result: _result, ...record } = this.#record(attempt);
+          const committed = await this.#attemptStore.commit(
+            {
+              ...record,
+              state: "expired",
+            },
+            {
+              expectedRevision: attempt.revision,
+              expectedEpoch: attempt.epoch,
+            },
+          );
+          if (committed === undefined) {
+            throw new Error("Remote terminal tombstone lost conditional authority");
+          }
+          this.#attempts.delete(key);
         });
-        this.#attempts.delete(key);
       }
     }
   }

@@ -9,17 +9,23 @@ import {
   type WorkerMessageType,
   type WorkerProtocolVersion,
 } from "@tegojs/contracts";
-import { FakeClock, workerSessionConformance } from "@tegojs/testkit";
+import { eventually, FakeClock, workerSessionConformance } from "@tegojs/testkit";
 import {
   createMainEndpoint,
   createWorkerCodec,
   createWorkerEndpoint,
+  MemoryRemoteAttemptStore,
+  MemoryWorkerEpochAllocator,
+  RemoteExecutor,
   systemWorkerClock,
+  WorkerRuntime,
   type MainEndpoint,
+  type WorkerEpochAllocator,
   type WorkerControlEnvelope,
   type WorkerEndpoint,
   type WorkerSession,
 } from "../src/index.js";
+import { executionRequest, flush, TestLocalExecutor } from "./remote-test-support.js";
 
 workerSessionConformance(createMainEndpoint, createWorkerEndpoint);
 
@@ -60,6 +66,28 @@ test("the public protocol registry rejects locally configured unsupported versio
       }),
     /protocol|version|supported/iu,
   );
+});
+
+test("an injected epoch allocator preserves the Worker high-water mark across Main restart", async () => {
+  const workerId = "epoch-restart-worker" as WorkerId;
+  const epochs = new MemoryWorkerEpochAllocator({ [workerId]: "7" });
+  const main = createMainEndpoint({
+    credential: "shared-secret",
+    workerId,
+    epochAllocator: epochs,
+  });
+  const worker = createWorkerEndpoint({
+    credential: "shared-secret",
+    workerId,
+  });
+  const [mainSocket, workerSocket] = directSocketPair();
+  const mainSession = main.attach(mainSocket);
+  const workerSession = worker.attach(workerSocket);
+
+  await Promise.all([mainSession.ready, workerSession.ready]);
+  assert.equal(mainSession.epoch, "8");
+  assert.equal(workerSession.epoch, "8");
+  await Promise.all([main.close(), worker.close()]);
 });
 
 test("codec accepts only exact JSON data fields and decimal sequence values", () => {
@@ -245,6 +273,7 @@ async function directConnection(options?: {
   readonly maxPendingCorrelations?: number;
   readonly maxInflightMessages?: number;
   readonly requestTimeoutMs?: number;
+  readonly epochAllocator?: WorkerEpochAllocator;
 }): Promise<DirectConnection> {
   const clock = new FakeClock();
   const limits = {
@@ -261,6 +290,7 @@ async function directConnection(options?: {
     credential: "shared-secret",
     workerId: "direct-worker" as WorkerId,
     limits,
+    ...(options?.epochAllocator === undefined ? {} : { epochAllocator: options.epochAllocator }),
     ...(options?.requestTimeoutMs === undefined
       ? {}
       : { requestTimeoutMs: options.requestTimeoutMs }),
@@ -304,6 +334,71 @@ async function cleanup(connection: DirectConnection): Promise<void> {
   assert.equal(connection.mainSocket.listenerCount(), 0);
   assert.equal(connection.workerSocket.listenerCount(), 0);
 }
+
+test("RemoteExecutor and WorkerRuntime survive timeout and reconnect over authenticated sessions", async () => {
+  const workerId = "direct-worker" as WorkerId;
+  const epochs = new MemoryWorkerEpochAllocator();
+  const first = await directConnection({
+    epochAllocator: epochs,
+    maxFrameBytes: 64 * 1024,
+    requestTimeoutMs: 100,
+  });
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote-authenticated",
+    workerId,
+    clock: first.clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock: first.clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  let second: DirectConnection | undefined;
+  try {
+    await runtime.attach(first.workerSession);
+    await remote.attach(first.mainSession);
+    const echoed = await (
+      await remote.submit(executionRequest({ mode: "echo", value: "secure" }, "real-session-echo"))
+    ).result;
+    assert.equal(echoed.output, "secure");
+
+    first.mainSocket.holdControlType = "task.assign";
+    const request = executionRequest({ mode: "wait" }, "real-session-timeout-reconnect");
+    const handle = await remote.submit(request);
+    await eventually(() => assert.equal(first.mainSocket.held.length, 1));
+    first.clock.advanceBy(101);
+    await flush();
+    first.mainSocket.close();
+
+    second = await directConnection({
+      epochAllocator: epochs,
+      maxFrameBytes: 64 * 1024,
+      requestTimeoutMs: 100,
+    });
+    await runtime.attach(second.workerSession);
+    await remote.attach(second.mainSession);
+    await eventually(() => assert.equal(local.executions, 2));
+    await remote.cancel(request.taskId, request.attemptId);
+    assert.equal((await handle.result).status, "cancelled");
+    assert.equal(local.executions, 2);
+
+    await assert.rejects(
+      remote.submit(
+        executionRequest({ mode: "echo", value: "x".repeat(70 * 1024) }, "real-session-oversized"),
+      ),
+      /assignment|maxAssignmentBytes/iu,
+    );
+    assert.equal(second.mainSession.state, "ready");
+    assert.equal(second.workerSession.state, "ready");
+  } finally {
+    await Promise.all([remote.close(), runtime.close()]);
+    await cleanup(first);
+    if (second !== undefined) await cleanup(second);
+  }
+});
 
 test("request correlation is installed before a synchronous transport can respond", async () => {
   const connection = await directConnection({ maxInflightMessages: 1 });

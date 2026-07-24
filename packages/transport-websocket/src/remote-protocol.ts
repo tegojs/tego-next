@@ -74,10 +74,21 @@ export interface RemoteAttemptRecord extends JsonObject {
   readonly updatedAt: string;
   readonly result?: ExecutionResult;
   readonly acknowledgedAt?: string;
+  readonly cancellation?: "cancelled" | "timed-out";
+  readonly revision?: number;
+}
+
+export interface RemoteAttemptCommitCondition {
+  readonly expectedRevision: number | null;
+  readonly expectedEpoch?: string;
 }
 
 export interface RemoteAttemptStore {
   save(record: RemoteAttemptRecord): Promise<void>;
+  commit(
+    record: RemoteAttemptRecord,
+    condition: RemoteAttemptCommitCondition,
+  ): Promise<RemoteAttemptRecord | undefined>;
   delete?(
     taskId: ExecutionRequest["taskId"],
     attemptId: ExecutionRequest["attemptId"],
@@ -102,9 +113,39 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
   }
 
   async save(record: RemoteAttemptRecord): Promise<void> {
-    const snapshot = cloneJson(record) as unknown as RemoteAttemptRecord;
-    this.#records.set(attemptKey(record.request.taskId, record.request.attemptId), snapshot);
+    const key = attemptKey(record.request.taskId, record.request.attemptId);
+    const current = this.#records.get(key);
+    const snapshot = cloneJson({
+      ...record,
+      revision: record.revision ?? (current?.revision ?? 0) + 1,
+    }) as unknown as RemoteAttemptRecord;
+    this.#records.set(key, snapshot);
     this.#onSave?.(snapshot);
+  }
+
+  async commit(
+    record: RemoteAttemptRecord,
+    condition: RemoteAttemptCommitCondition,
+  ): Promise<RemoteAttemptRecord | undefined> {
+    const key = attemptKey(record.request.taskId, record.request.attemptId);
+    const current = this.#records.get(key);
+    const currentRevision = current?.revision ?? 0;
+    if (
+      (condition.expectedRevision === null && current !== undefined) ||
+      (condition.expectedRevision !== null && currentRevision !== condition.expectedRevision) ||
+      (condition.expectedEpoch !== undefined &&
+        current !== undefined &&
+        current.epoch !== condition.expectedEpoch)
+    ) {
+      return undefined;
+    }
+    const snapshot = cloneJson({
+      ...record,
+      revision: currentRevision + 1,
+    }) as unknown as RemoteAttemptRecord;
+    this.#records.set(key, snapshot);
+    this.#onSave?.(snapshot);
+    return cloneJson(snapshot) as unknown as RemoteAttemptRecord;
   }
 
   async load(
@@ -144,11 +185,13 @@ export interface MemoryRemoteResultStoreOptions {
 }
 
 export class MemoryRemoteResultStore implements RemoteResultStore {
-  readonly durable: boolean;
+  readonly durable = false;
   readonly #results = new Map<string, ExecutionResult>();
 
   constructor(options: MemoryRemoteResultStoreOptions = {}) {
-    this.durable = options.durable ?? false;
+    if (options.durable === true) {
+      throw new TypeError("MemoryRemoteResultStore cannot claim crash durability");
+    }
   }
 
   async put(result: ExecutionResult): Promise<void> {

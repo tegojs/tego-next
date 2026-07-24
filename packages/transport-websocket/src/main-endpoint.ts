@@ -31,6 +31,7 @@ export interface MainEndpointOptions extends WorkerSessionEndpointOptions {
   readonly credential?: string;
   readonly workerId?: WorkerId;
   readonly credentials?: Readonly<Record<string, string>>;
+  readonly epochAllocator?: WorkerEpochAllocator;
 }
 
 export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
@@ -39,13 +40,35 @@ export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
   readonly registration?: WorkerRegistrationInput;
 }
 
+export interface WorkerEpochAllocator {
+  next(workerId: WorkerId): string;
+}
+
+export class MemoryWorkerEpochAllocator implements WorkerEpochAllocator {
+  readonly #epochs = new Map<WorkerId, bigint>();
+
+  constructor(highWaterMarks: Readonly<Record<string, string>> = {}) {
+    for (const [workerId, epoch] of Object.entries(highWaterMarks)) {
+      this.#epochs.set(parseWorkerId(workerId), BigInt(parseSequence(epoch)));
+    }
+  }
+
+  next(workerIdValue: WorkerId): string {
+    const workerId = parseWorkerId(workerIdValue);
+    const nextEpoch = (this.#epochs.get(workerId) ?? 0n) + 1n;
+    const parsed = parseSequence(nextEpoch.toString());
+    this.#epochs.set(workerId, nextEpoch);
+    return parsed;
+  }
+}
+
 export class MainEndpoint {
   readonly #options: MainEndpointOptions;
   readonly #credentials: ReadonlyMap<WorkerId, string>;
   readonly #sessions = new Set<WorkerSession>();
   readonly #current = new Map<WorkerId, WorkerSession>();
   readonly #registrations = new Map<WorkerId, WorkerRegistration>();
-  readonly #epochs = new Map<WorkerId, bigint>();
+  readonly #epochAllocator: WorkerEpochAllocator;
   #closed = false;
 
   constructor(options: MainEndpointOptions) {
@@ -65,6 +88,7 @@ export class MainEndpoint {
       throw new TypeError("Main endpoint requires at least one Worker-bound credential");
     }
     this.#credentials = credentials;
+    this.#epochAllocator = options.epochAllocator ?? new MemoryWorkerEpochAllocator();
   }
 
   get activeSessionCount(): number {
@@ -128,13 +152,12 @@ export class MainEndpoint {
       throw new Error("Main Worker endpoint is closed");
     }
     const workerId = parseWorkerId(registration.workerId);
-    const nextEpoch = (this.#epochs.get(workerId) ?? 0n) + 1n;
+    const nextEpoch = this.#epochAllocator.next(workerId);
     const predecessor = this.#current.get(workerId);
-    this.#epochs.set(workerId, nextEpoch);
     this.#current.set(workerId, session);
     this.#registrations.set(workerId, registration);
     predecessor?.replace();
-    return parseSequence(nextEpoch.toString());
+    return nextEpoch;
   }
 
   #release(session: WorkerSession): void {
