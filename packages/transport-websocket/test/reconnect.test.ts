@@ -8,6 +8,8 @@ import {
   RemoteExecutor,
   WorkerRuntime,
   requestFingerprint,
+  type RemoteAttemptRecord,
+  type RemoteAttemptStore,
 } from "../src/index.js";
 import {
   executionRequest,
@@ -1447,6 +1449,65 @@ test("session-loss persistence failure cannot suppress the orphan recovery timer
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("permanent orphan persistence failure settles locally and degrades durability", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let unavailable = false;
+  let failures = 0;
+  const store: RemoteAttemptStore = {
+    save: async (record) => backing.save(record),
+    commit: async (record, condition) => {
+      if (unavailable) {
+        failures += 1;
+        throw new Error("attempt store permanently unavailable");
+      }
+      return backing.commit(record, condition);
+    },
+    delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+    load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+    list: async (id) => backing.list(id),
+  };
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    orphanTimeoutMs: 100,
+    attemptStore: store,
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  const [main, worker] = memorySessionPair("1");
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const handle = await remote.submit(
+    executionRequest({ mode: "wait" }, "permanent-store-failure", "finish-and-buffer"),
+  );
+  unavailable = true;
+  main.close();
+  clock.advanceBy(101);
+  for (let index = 0; index < 20; index += 1) {
+    clock.advanceBy(25);
+    await flush();
+  }
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  await flush();
+
+  assert.equal(settled, true);
+  assert.equal((await handle.result).status, "failed");
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.health()).active, 0);
+  assert.ok(failures > 0);
+  await remote.drain({});
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("aggregate byte reservation prevents a second valid result from wedging both attempts", async () => {
   const clock = new FakeClock(new Date(0));
   const remote = new RemoteExecutor({
@@ -1561,6 +1622,159 @@ test("attempt-store revisions are required unsigned-64 decimal strings", async (
     ),
     /revision|unsigned|64|range/iu,
   );
+});
+
+function invalidRevisionRecord(id: string): RemoteAttemptRecord {
+  const request = executionRequest(null, id);
+  const completedAt = new Date(0).toISOString();
+  return {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    revision: "18446744073709551616",
+    state: "terminal",
+    epoch: "1",
+    updatedAt: completedAt,
+    result: {
+      taskId: request.taskId,
+      attemptId: request.attemptId,
+      status: "failed",
+      executor: { kind: "remote", workerId },
+      startedAt: completedAt,
+      completedAt,
+    },
+  };
+}
+
+function externalStore(options: {
+  readonly listed?: RemoteAttemptRecord;
+  readonly loaded?: RemoteAttemptRecord;
+  readonly committed?: "invalid";
+}): RemoteAttemptStore {
+  return {
+    save: async () => undefined,
+    commit: async (record) =>
+      options.committed === "invalid"
+        ? {
+            ...record,
+            revision: "18446744073709551616",
+          }
+        : undefined,
+    load: async () => options.loaded,
+    list: async () => (options.listed === undefined ? [] : [options.listed]),
+  };
+}
+
+test("RemoteExecutor rejects invalid revisions returned by external store list, load, and commit", async () => {
+  const clock = new FakeClock(new Date(0));
+  const listed = invalidRevisionRecord("remote-invalid-list-revision");
+  const listRemote = new RemoteExecutor({
+    id: "remote-list",
+    workerId,
+    clock,
+    attemptStore: externalStore({ listed }),
+  });
+  const listRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  const [listMain, listWorker] = memorySessionPair("2");
+  await listRuntime.attach(listWorker);
+  await assert.rejects(listRemote.attach(listMain), /revision|unsigned|64|range/iu);
+  await Promise.all([listRemote.close(), listRuntime.close()]);
+
+  const loaded = invalidRevisionRecord("remote-invalid-load-revision");
+  const loadStore = externalStore({ loaded });
+  const loadRemote = new RemoteExecutor({
+    id: "remote-load",
+    workerId,
+    clock,
+    attemptStore: loadStore,
+  });
+  const loadRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await reconnect(loadRemote, loadRuntime, "3");
+  await assert.rejects(loadRemote.submit(loaded.request), /revision|unsigned|64|range/iu);
+  await Promise.all([loadRemote.close(), loadRuntime.close()]);
+
+  const commitRemote = new RemoteExecutor({
+    id: "remote-commit",
+    workerId,
+    clock,
+    attemptStore: externalStore({ committed: "invalid" }),
+  });
+  const commitRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await reconnect(commitRemote, commitRuntime, "4");
+  await assert.rejects(
+    commitRemote.submit(executionRequest(null, "remote-invalid-commit-revision")),
+    /revision|unsigned|64|range/iu,
+  );
+  await Promise.all([commitRemote.close(), commitRuntime.close()]);
+});
+
+test("WorkerRuntime rejects invalid revisions returned by external store list, load, and commit", async () => {
+  const clock = new FakeClock(new Date(0));
+  const listed = invalidRevisionRecord("worker-invalid-list-revision");
+  const listRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: externalStore({ listed }),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  const [, listWorker] = memorySessionPair("2");
+  await assert.rejects(listRuntime.attach(listWorker), /revision|unsigned|64|range/iu);
+
+  const loaded = invalidRevisionRecord("worker-invalid-load-revision");
+  const loadLocal = new TestLocalExecutor();
+  const loadRemote = new RemoteExecutor({
+    id: "worker-load-remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const loadRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: externalStore({ loaded }),
+    selectExecutor: () => loadLocal,
+  });
+  await reconnect(loadRemote, loadRuntime, "3");
+  const loadResult = await (await loadRemote.submit(loaded.request)).result;
+  assert.match(loadResult.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(loadLocal.executions, 0);
+  await Promise.all([loadRemote.close(), loadRuntime.close()]);
+
+  const commitLocal = new TestLocalExecutor();
+  const commitRemote = new RemoteExecutor({
+    id: "worker-commit-remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const commitRuntime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: externalStore({ committed: "invalid" }),
+    selectExecutor: () => commitLocal,
+  });
+  await reconnect(commitRemote, commitRuntime, "4");
+  const commitResult = await (
+    await commitRemote.submit(executionRequest(null, "worker-invalid-commit-revision"))
+  ).result;
+  assert.match(commitResult.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(commitLocal.executions, 0);
+  await Promise.all([commitRemote.close(), commitRuntime.close()]);
 });
 
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {
