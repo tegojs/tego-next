@@ -201,9 +201,9 @@ test("@spec:plugin-artifacts/immutable-artifacts/concurrent-cache-processes-conv
 
   assert.equal(left.root, right.root);
   assert.equal(await readFile(join(left.root, "components/component.js"), "utf8"), source);
-  const objects = (await readdir(root)).filter((entry) => entry.startsWith(".object-"));
   const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
-  assert.deepEqual(objects, [pointer.split("/")[0]]);
+  assert.equal(pointer, `.objects/${artifactDigest.slice("sha256:".length)}/artifact\n`);
+  assert.deepEqual(await readdir(join(root, ".objects")), [artifactDigest.slice("sha256:".length)]);
   await leftCache.release(artifactDigest);
   await rightCache.release(artifactDigest);
 });
@@ -243,9 +243,9 @@ test("@spec:plugin-artifacts/immutable-artifacts/publishes-only-readonly-roots",
     (await readdir(root)).filter((entry) => entry.startsWith(".tmp-")),
     [],
   );
-  const objects = (await readdir(root)).filter((entry) => entry.startsWith(".object-"));
   const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
-  assert.deepEqual(objects, [pointer.split("/")[0]]);
+  assert.equal(pointer, `.objects/${artifactDigest.slice("sha256:".length)}/artifact\n`);
+  assert.deepEqual(await readdir(join(root, ".objects")), [artifactDigest.slice("sha256:".length)]);
   await restarted.release(artifactDigest);
   await restarted.close();
 });
@@ -283,15 +283,7 @@ test("@spec:plugin-artifacts/immutable-artifacts/pre-pointer-crash-reuses-determ
   `;
   const child = spawn(
     process.execPath,
-    [
-      "--input-type=module",
-      "--eval",
-      childSource,
-      moduleUrl,
-      root,
-      archivePath,
-      artifactDigest,
-    ],
+    ["--input-type=module", "--eval", childSource, moduleUrl, root, archivePath, artifactDigest],
     { stdio: ["ignore", "pipe", "pipe"] },
   );
   context.after(async () => {
@@ -321,9 +313,7 @@ test("@spec:plugin-artifacts/immutable-artifacts/pre-pointer-crash-reuses-determ
 
   const pointer = await readFile(join(root, artifactDigest.slice("sha256:".length)), "utf8");
   assert.equal(pointer, `.objects/${artifactDigest.slice("sha256:".length)}/artifact\n`);
-  assert.deepEqual(await readdir(join(root, ".objects")), [
-    artifactDigest.slice("sha256:".length),
-  ]);
+  assert.deepEqual(await readdir(join(root, ".objects")), [artifactDigest.slice("sha256:".length)]);
   assert.equal((await stat(prepared.root)).mode & 0o222, 0);
   await restarted.release(artifactDigest);
   await restarted.close();

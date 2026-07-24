@@ -39,6 +39,7 @@ export interface PreparedArtifactCacheOptions {
   readonly artifacts: ArtifactStore;
   readonly root: string;
   readonly limits?: ArtifactReadLimits;
+  readonly beforePointerPublish?: (publishedRoot: string) => Promise<void>;
   readonly afterPublish?: (publishedRoot: string) => Promise<void>;
 }
 
@@ -97,8 +98,8 @@ function digestPath(digest: ArtifactDigest): string {
   return digest.slice("sha256:".length);
 }
 
-function objectPath(temporary: string): string {
-  return `.object-${basename(temporary).slice(".tmp-".length)}`;
+function objectPath(digest: ArtifactDigest): string {
+  return `.objects/${digestPath(digest)}`;
 }
 
 function errorCode(error: unknown): unknown {
@@ -298,7 +299,8 @@ async function readPublishedRoot(canonicalRoot: string, target: string): Promise
     await handle.close();
   }
   const relative = value.endsWith("\n") ? value.slice(0, -1) : "";
-  if (!/^\.object-[A-Za-z0-9_-]+\/artifact$/u.test(relative)) {
+  const deterministic = `.objects/${basename(target)}/artifact`;
+  if (relative !== deterministic && !/^\.object-[A-Za-z0-9_-]+\/artifact$/u.test(relative)) {
     throw cacheError(
       "ARTIFACT_CACHE_CONFLICT",
       "Prepared artifact publication pointer contains an invalid object path",
@@ -424,6 +426,7 @@ export class PreparedArtifactCache {
   readonly #artifacts: ArtifactStore;
   readonly #root: string;
   readonly #limits: ArtifactReadLimits;
+  readonly #beforePointerPublish: ((publishedRoot: string) => Promise<void>) | undefined;
   readonly #afterPublish: ((publishedRoot: string) => Promise<void>) | undefined;
   readonly #entries = new Map<ArtifactDigest, CacheEntry>();
   readonly #preparing = new Map<ArtifactDigest, Promise<PreparedArtifact>>();
@@ -435,6 +438,7 @@ export class PreparedArtifactCache {
     this.#artifacts = options.artifacts;
     this.#root = resolve(options.root);
     this.#limits = options.limits ?? {};
+    this.#beforePointerPublish = options.beforePointerPublish;
     this.#afterPublish = options.afterPublish;
   }
 
@@ -609,19 +613,46 @@ export class PreparedArtifactCache {
         }
         publishedSnapshot = existingSnapshot;
       } else {
-        const objectRelative = objectPath(temporary);
+        const objectRelative = objectPath(request.digest);
+        const objectsRoot = join(canonicalRoot, ".objects");
         const objectWrapper = join(canonicalRoot, objectRelative);
         const pointerRelative = `${objectRelative}/artifact`;
         const pointerSource = join(temporary, "entry");
         await writePublicationPointer(pointerSource, pointerRelative);
         await syncDirectory(temporary);
-        await rename(temporary, objectWrapper);
-        cleanupRootPath = objectWrapper;
+        await mkdir(objectsRoot, { mode: 0o700, recursive: true });
+        const objectsIdentity = await lstat(objectsRoot);
+        if (
+          objectsIdentity.isSymbolicLink() ||
+          !objectsIdentity.isDirectory() ||
+          (await realpath(objectsRoot)) !== objectsRoot
+        ) {
+          throw cacheError(
+            "ARTIFACT_CACHE_ROOT_INVALID",
+            "Prepared artifact object namespace must be a non-symlink directory",
+          );
+        }
+        let ownsObject = false;
+        try {
+          await rename(temporary, objectWrapper);
+          ownsObject = true;
+          cleanupRootPath = objectWrapper;
+          await syncDirectory(objectsRoot);
+          await syncDirectory(canonicalRoot);
+        } catch (error) {
+          if (
+            errorCode(error) !== "EEXIST" &&
+            errorCode(error) !== "ENOTEMPTY" &&
+            errorCode(error) !== "EACCES"
+          ) {
+            throw error;
+          }
+        }
         const candidateRoot = join(objectWrapper, "artifact");
         const candidateSnapshot = await snapshotDirectory(candidateRoot);
         if (
           !isReadOnlySnapshot(candidateSnapshot) ||
-          !compareSnapshot(candidateSnapshot, preparedSnapshot, true)
+          !compareSnapshot(candidateSnapshot, preparedSnapshot, ownsObject)
         ) {
           throw cacheError(
             "ARTIFACT_CACHE_CONFLICT",
@@ -629,12 +660,14 @@ export class PreparedArtifactCache {
             { digest: request.digest },
           );
         }
+        await this.#beforePointerPublish?.(candidateRoot);
+        const linkSource = ownsObject ? join(objectWrapper, "entry") : pointerSource;
         try {
-          await link(join(objectWrapper, "entry"), target);
+          await link(linkSource, target);
           await syncDirectory(canonicalRoot);
           publishedRoot = candidateRoot;
           publishedSnapshot = candidateSnapshot;
-          cleanupRootPath = undefined;
+          if (ownsObject) cleanupRootPath = undefined;
           await this.#afterPublish?.(publishedRoot);
         } catch (error) {
           if (errorCode(error) !== "EEXIST") throw error;
@@ -651,6 +684,7 @@ export class PreparedArtifactCache {
             );
           }
           publishedSnapshot = existingSnapshot;
+          if (ownsObject && publishedRoot === candidateRoot) cleanupRootPath = undefined;
         }
       }
 
