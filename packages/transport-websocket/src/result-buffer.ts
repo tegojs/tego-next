@@ -32,11 +32,10 @@ export class ResultBuffer {
 
   put(result: ExecutionResult): void {
     const key = attemptKey(result.taskId, result.attemptId);
-    const snapshot = cloneJson(result);
-    const bytes = jsonBytes(snapshot);
+    const bytes = jsonBytes(result);
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
-      if (JSON.stringify(existing.result) !== JSON.stringify(snapshot)) {
+      if (JSON.stringify(existing.result) !== JSON.stringify(result)) {
         throw remoteError(
           "EXECUTOR_REMOTE_RESULT_CONFLICT",
           "Remote terminal result conflicts with the retained attempt",
@@ -61,6 +60,7 @@ export class ResultBuffer {
         },
       );
     }
+    const snapshot = cloneJson(result);
     this.#entries.set(key, { result: snapshot, bytes });
     this.#bytes += bytes;
   }

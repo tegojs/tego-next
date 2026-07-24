@@ -54,6 +54,7 @@ export interface WorkerSessionSendOptions {
 
 export interface WorkerSessionRequestOptions {
   readonly binary?: Uint8Array;
+  readonly timeoutMs?: number;
 }
 
 type SocketListener = (...arguments_: unknown[]) => void;
@@ -92,6 +93,7 @@ interface PendingBinary {
 interface PendingRequest {
   readonly resolve: (message: WorkerSessionMessage) => void;
   readonly reject: (error: unknown) => void;
+  readonly timeout: AbortController;
 }
 
 export interface WorkerSessionOptions {
@@ -105,6 +107,7 @@ export interface WorkerSessionOptions {
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
   readonly handshakeTimeoutMs?: number;
+  readonly requestTimeoutMs?: number;
   readonly worker?: WorkerRegistration;
   readonly onRegister?: (session: WorkerSession, registration: WorkerRegistration) => string;
   readonly onUnavailable?: (session: WorkerSession) => void;
@@ -337,6 +340,7 @@ export class WorkerSession {
   readonly #heartbeatIntervalMs: number;
   readonly #heartbeatTimeoutMs: number;
   readonly #handshakeTimeoutMs: number;
+  readonly #requestTimeoutMs: number;
   readonly #worker: WorkerRegistration | undefined;
   readonly #onRegister: WorkerSessionOptions["onRegister"] | undefined;
   readonly #onUnavailable: WorkerSessionOptions["onUnavailable"] | undefined;
@@ -407,6 +411,11 @@ export class WorkerSession {
       options.handshakeTimeoutMs,
       10_000,
       "handshakeTimeoutMs",
+    );
+    this.#requestTimeoutMs = positiveDuration(
+      options.requestTimeoutMs,
+      15_000,
+      "requestTimeoutMs",
     );
     this.#worker = options.worker === undefined ? undefined : normalizeRegistration(options.worker);
     if (this.#role === "worker") {
@@ -513,14 +522,32 @@ export class WorkerSession {
     }
     const messageId = `message-${randomUUID()}`;
     const response = deferred<WorkerSessionMessage>();
+    const timeout = new AbortController();
     this.#pendingRequests.set(messageId, {
       resolve: response.resolve,
       reject: response.reject,
+      timeout,
     });
+    const timeoutMs = positiveDuration(options.timeoutMs, this.#requestTimeoutMs, "timeoutMs");
+    void this.#clock
+      .sleep(timeoutMs, timeout.signal)
+      .then(() => {
+        const pending = this.#pendingRequests.get(messageId);
+        if (pending === undefined) return;
+        this.#pendingRequests.delete(messageId);
+        pending.reject(
+          diagnosticError(
+            "WORKER_REQUEST_TIMEOUT",
+            "Worker application request timed out before a correlated response arrived",
+          ),
+        );
+      })
+      .catch(() => undefined);
     try {
       this.#sendEnvelope(type, payload, options, messageId);
     } catch (error) {
       this.#pendingRequests.delete(messageId);
+      timeout.abort();
       response.reject(error);
       throw error;
     }
@@ -740,6 +767,7 @@ export class WorkerSession {
         : this.#pendingRequests.get(envelope.correlationId);
     if (request !== undefined) {
       this.#pendingRequests.delete(envelope.correlationId as string);
+      request.timeout.abort();
       request.resolve(message);
       return;
     }
@@ -1144,6 +1172,7 @@ export class WorkerSession {
 
   #rejectPending(error: DiagnosticError): void {
     for (const request of this.#pendingRequests.values()) {
+      request.timeout.abort();
       request.reject(error);
     }
     this.#pendingRequests.clear();

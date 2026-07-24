@@ -69,6 +69,9 @@ export class WorkerEndpoint {
       ...(this.#options.handshakeTimeoutMs === undefined
         ? {}
         : { handshakeTimeoutMs: this.#options.handshakeTimeoutMs }),
+      ...(this.#options.requestTimeoutMs === undefined
+        ? {}
+        : { requestTimeoutMs: this.#options.requestTimeoutMs }),
       worker: this.#registration,
       onClosed: (closedSession) => {
         this.#sessions.delete(closedSession);

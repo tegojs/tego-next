@@ -35,7 +35,8 @@ import {
 } from "./remote-protocol.js";
 
 const DEFAULT_MAX_ASSIGNMENTS = 256;
-const DEFAULT_MAX_ASSIGNMENT_BYTES = 1024 * 1024;
+const DEFAULT_MAX_CONTROL_PAYLOAD_BYTES = 48 * 1024;
+const DEFAULT_MAX_ASSIGNMENT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
 const DEFAULT_MAX_INVENTORY = 512;
 
 export interface WorkerRuntimeOptions {
@@ -48,6 +49,8 @@ export interface WorkerRuntimeOptions {
   readonly maxAssignments?: number;
   readonly maxAssignmentBytes?: number;
   readonly maxInventoryItems?: number;
+  readonly maxInventoryBytes?: number;
+  readonly maxResultBytes?: number;
   readonly retentionMs?: number;
   readonly resultBuffer?: ResultBufferOptions;
 }
@@ -61,6 +64,7 @@ interface WorkerAttempt {
   handle?: ExecutionHandle;
   result?: ExecutionResult;
   acknowledgedAt?: number;
+  cancellation?: "cancelled";
 }
 
 export class WorkerRuntime {
@@ -73,6 +77,8 @@ export class WorkerRuntime {
   readonly #maxAssignments: number;
   readonly #maxAssignmentBytes: number;
   readonly #maxInventoryItems: number;
+  readonly #maxInventoryBytes: number;
+  readonly #maxResultBytes: number;
   readonly #maxBufferedResults: number;
   readonly #retentionMs: number;
   readonly #results: ResultBuffer;
@@ -82,6 +88,7 @@ export class WorkerRuntime {
   #removeStateListener: (() => void) | undefined;
   #receiveChain = Promise.resolve();
   #hydrated = false;
+  #recovered = false;
   #closed = false;
   #reservedResults = 0;
   #persistenceAvailable = true;
@@ -108,6 +115,16 @@ export class WorkerRuntime {
       DEFAULT_MAX_INVENTORY,
       "maxInventoryItems",
     );
+    this.#maxInventoryBytes = positiveLimit(
+      options.maxInventoryBytes,
+      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
+      "maxInventoryBytes",
+    );
+    this.#maxResultBytes = positiveLimit(
+      options.maxResultBytes,
+      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
+      "maxResultBytes",
+    );
     this.#maxBufferedResults = positiveLimit(options.resultBuffer?.maxCount, 256, "maxResultCount");
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
     this.#results = new ResultBuffer(options.resultBuffer);
@@ -124,7 +141,7 @@ export class WorkerRuntime {
     }
     const current = this.#session;
     if (current !== undefined && current !== session) {
-      this.#sessionLost(current);
+      await this.#sessionLost(current);
     }
     this.#removeMessageListener?.();
     this.#removeStateListener?.();
@@ -139,16 +156,17 @@ export class WorkerRuntime {
     });
     this.#removeStateListener = session.onStateChange((state) => {
       if (this.#session === session && state !== "ready") {
-        this.#sessionLost(session);
+        this.#background(this.#sessionLost(session));
       }
     });
+    await this.#recoverHydrated();
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     const session = this.#session;
-    if (session !== undefined) this.#sessionLost(session);
+    if (session !== undefined) await this.#sessionLost(session);
     await Promise.all(
       [...this.#attempts.values()].map(async (attempt) => {
         if (attempt.state !== "terminal" && attempt.executor !== undefined) {
@@ -168,13 +186,18 @@ export class WorkerRuntime {
     for (const record of records) {
       const key = attemptKey(record.request.taskId, record.request.attemptId);
       if (record.state === "terminal" && record.result !== undefined) {
-        this.#attempts.set(key, {
+        const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
           state: "terminal",
           epoch: record.epoch,
           result: record.result,
-        });
+          ...(record.acknowledgedAt === undefined
+            ? {}
+            : { acknowledgedAt: Date.parse(record.acknowledgedAt) }),
+        };
+        this.#attempts.set(key, attempt);
+        if (record.acknowledgedAt === undefined) this.#results.put(record.result);
       } else if (record.state === "acknowledged" || record.state === "running") {
         this.#attempts.set(key, {
           request: record.request,
@@ -212,14 +235,61 @@ export class WorkerRuntime {
           break;
       }
     } catch {
-      // A malformed application message cannot escape into the authenticated session.
+      if (session.state !== "ready") return;
+      if (message.type === REMOTE_INVENTORY) {
+        await this.#inventoryError(
+          session,
+          message.messageId,
+          "Worker could not produce reconnect inventory",
+        );
+        return;
+      }
+      if (message.type === REMOTE_ASSIGN) {
+        try {
+          const request = parseRemoteRequest(asObject(message.payload, REMOTE_ASSIGN).request);
+          await this.#sendRejected(
+            session,
+            message.messageId,
+            request,
+            "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+            "Worker could not process the remote assignment",
+          );
+        } catch {
+          await session.send(
+            REMOTE_ACK,
+            {
+              accepted: false,
+              error: {
+                code: "EXECUTOR_REMOTE_ASSIGNMENT_INVALID",
+                message: "Worker could not parse the remote assignment",
+              },
+            },
+            { correlationId: message.messageId },
+          );
+        }
+        return;
+      }
+      if (message.type === REMOTE_CANCEL) {
+        await session.send(
+          REMOTE_CANCEL_ACK,
+          {
+            error: {
+              code: "EXECUTOR_REMOTE_CANCEL_FAILED",
+              message: "Worker could not process remote cancellation",
+            },
+          },
+          { correlationId: message.messageId },
+        );
+      }
     }
   }
 
   async #assign(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
     const payload = asObject(message.payload, REMOTE_ASSIGN);
+    if (payload.request === undefined || jsonBytes(payload.request) > this.#maxAssignmentBytes) {
+      throw new Error("Remote assignment exceeds maxAssignmentBytes");
+    }
     const request = parseRemoteRequest(payload.request);
-    const requestBytes = jsonBytes(request);
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
     await this.#pruneAcknowledged();
@@ -255,7 +325,6 @@ export class WorkerRuntime {
       return;
     }
     if (
-      requestBytes > this.#maxAssignmentBytes ||
       this.#attempts.size >= this.#maxAssignments ||
       this.#reservedResults >= this.#maxBufferedResults
     ) {
@@ -316,7 +385,7 @@ export class WorkerRuntime {
       acknowledged = true;
     } finally {
       if (acknowledged || request.orphanPolicy !== "cancel") {
-        void this.#execute(attempt);
+        this.#background(this.#execute(attempt));
       } else {
         await this.#terminal(
           attempt,
@@ -333,13 +402,19 @@ export class WorkerRuntime {
 
   async #execute(attempt: WorkerAttempt): Promise<void> {
     try {
+      if (attempt.cancellation !== undefined) return;
       const executor = await this.#selectExecutor(attempt.request);
+      if (attempt.state === "terminal" || attempt.cancellation !== undefined) return;
       if (executor.type === "remote") {
         throw new Error("Worker runtime cannot delegate an assignment to another RemoteExecutor");
       }
       attempt.executor = executor;
       const handle = await executor.submit(attempt.request);
       attempt.handle = handle;
+      if (attempt.cancellation !== undefined) {
+        await executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+        return;
+      }
       attempt.state = "running";
       await this.#save(attempt);
       const localResult = await handle.result;
@@ -370,7 +445,15 @@ export class WorkerRuntime {
 
   async #terminal(attempt: WorkerAttempt, candidate: ExecutionResult): Promise<void> {
     if (attempt.state === "terminal") return;
-    let result = parseExecutionResult(candidate);
+    let result =
+      jsonBytes(candidate) > this.#maxResultBytes
+        ? this.#result(
+            attempt.request,
+            "failed",
+            "EXECUTOR_REMOTE_RESULT_TOO_LARGE",
+            "Worker local result exceeds maxResultBytes",
+          )
+        : parseExecutionResult(candidate);
     if (attempt.request.orphanPolicy === "finish-and-persist") {
       try {
         await this.#resultStore?.put(result);
@@ -419,7 +502,20 @@ export class WorkerRuntime {
     const request = parseRemoteRequest(payload.request);
     const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
     if (attempt !== undefined && attempt.state !== "terminal") {
-      await attempt.executor?.cancel(request.taskId, request.attemptId);
+      attempt.cancellation = "cancelled";
+      if (attempt.executor === undefined) {
+        await this.#terminal(
+          attempt,
+          this.#result(
+            request,
+            "cancelled",
+            "EXECUTOR_REMOTE_CANCELLED",
+            "Remote attempt was cancelled before local execution",
+          ),
+        );
+      } else {
+        await attempt.executor.cancel(request.taskId, request.attemptId);
+      }
     }
     await session.send(
       REMOTE_CANCEL_ACK,
@@ -451,19 +547,28 @@ export class WorkerRuntime {
       );
       return;
     }
+    const inventory = {
+      epoch: session.epoch,
+      acknowledged: attempts
+        .filter((attempt) => attempt.state === "acknowledged")
+        .map((attempt) => identity(attempt.request)),
+      running: attempts
+        .filter((attempt) => attempt.state === "running")
+        .map((attempt) => identity(attempt.request)),
+      terminalUnacknowledged: buffered.map((result) => ({ result })),
+      preparedArtifacts: artifacts,
+    } as const;
+    if (jsonBytes(inventory) > this.#maxInventoryBytes) {
+      await this.#inventoryError(
+        session,
+        message.messageId,
+        "Worker reconnect inventory exceeds maxInventoryBytes",
+      );
+      return;
+    }
     await session.send(
       REMOTE_INVENTORY_RESULT,
-      {
-        epoch: session.epoch,
-        acknowledged: attempts
-          .filter((attempt) => attempt.state === "acknowledged")
-          .map((attempt) => identity(attempt.request)),
-        running: attempts
-          .filter((attempt) => attempt.state === "running")
-          .map((attempt) => identity(attempt.request)),
-        terminalUnacknowledged: buffered.map((result) => ({ result })),
-        preparedArtifacts: artifacts,
-      },
+      inventory,
       { correlationId: message.messageId },
     );
   }
@@ -479,6 +584,7 @@ export class WorkerRuntime {
       const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
       if (attempt !== undefined) {
         attempt.acknowledgedAt = this.#clock.now().getTime();
+        await this.#save(attempt);
       }
     }
   }
@@ -505,7 +611,7 @@ export class WorkerRuntime {
     );
   }
 
-  #sessionLost(session: RemoteSession): void {
+  async #sessionLost(session: RemoteSession): Promise<void> {
     if (this.#session !== session) return;
     this.#removeMessageListener?.();
     this.#removeStateListener?.();
@@ -513,12 +619,21 @@ export class WorkerRuntime {
     this.#removeStateListener = undefined;
     this.#session = undefined;
     for (const attempt of this.#attempts.values()) {
-      if (
-        attempt.state !== "terminal" &&
-        attempt.request.orphanPolicy === "cancel" &&
-        attempt.executor !== undefined
-      ) {
-        void attempt.executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+      if (attempt.state !== "terminal" && attempt.request.orphanPolicy === "cancel") {
+        attempt.cancellation = "cancelled";
+        if (attempt.executor === undefined) {
+          await this.#terminal(
+            attempt,
+            this.#result(
+              attempt.request,
+              "cancelled",
+              "EXECUTOR_REMOTE_ORPHAN_CANCELLED",
+              "Worker session was lost before local execution",
+            ),
+          );
+        } else {
+          await attempt.executor.cancel(attempt.request.taskId, attempt.request.attemptId);
+        }
       }
     }
   }
@@ -570,6 +685,9 @@ export class WorkerRuntime {
       epoch: attempt.epoch,
       updatedAt: this.#clock.now().toISOString(),
       ...(attempt.result === undefined ? {} : { result: attempt.result }),
+      ...(attempt.acknowledgedAt === undefined
+        ? {}
+        : { acknowledgedAt: new Date(attempt.acknowledgedAt).toISOString() }),
     };
     await this.#attemptStore.save(record);
   }
@@ -582,10 +700,44 @@ export class WorkerRuntime {
         attempt.acknowledgedAt !== undefined &&
         attempt.acknowledgedAt <= cutoff
       ) {
-        await this.#attemptStore.delete?.(attempt.request.taskId, attempt.request.attemptId);
+        await this.#attemptStore.save({
+          workerId: this.#workerId,
+          request: attempt.request,
+          fingerprint: attempt.fingerprint,
+          state: "expired",
+          epoch: attempt.epoch,
+          updatedAt: this.#clock.now().toISOString(),
+          acknowledgedAt: new Date(attempt.acknowledgedAt).toISOString(),
+        });
         this.#attempts.delete(key);
       }
     }
+  }
+
+  async #recoverHydrated(): Promise<void> {
+    if (this.#recovered) return;
+    this.#recovered = true;
+    for (const attempt of this.#attempts.values()) {
+      if (attempt.state === "terminal") continue;
+      if (attempt.request.orphanPolicy === "cancel") {
+        attempt.cancellation = "cancelled";
+        await this.#terminal(
+          attempt,
+          this.#result(
+            attempt.request,
+            "cancelled",
+            "EXECUTOR_REMOTE_ORPHAN_CANCELLED",
+            "Worker restart cancelled an unfinished remote attempt",
+          ),
+        );
+      } else {
+        this.#background(this.#execute(attempt));
+      }
+    }
+  }
+
+  #background(promise: Promise<unknown>): void {
+    void promise.catch(() => undefined);
   }
 }
 

@@ -24,6 +24,7 @@ export interface WorkerSessionEndpointOptions {
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
   readonly handshakeTimeoutMs?: number;
+  readonly requestTimeoutMs?: number;
 }
 
 export interface MainEndpointOptions extends WorkerSessionEndpointOptions {
@@ -90,6 +91,9 @@ export class MainEndpoint {
       ...(this.#options.handshakeTimeoutMs === undefined
         ? {}
         : { handshakeTimeoutMs: this.#options.handshakeTimeoutMs }),
+      ...(this.#options.requestTimeoutMs === undefined
+        ? {}
+        : { requestTimeoutMs: this.#options.requestTimeoutMs }),
       onRegister: (registeredSession, registration) =>
         this.#register(registeredSession, registration),
       onClosed: (closedSession) => {

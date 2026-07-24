@@ -57,7 +57,13 @@ export interface RemoteAttemptIdentity extends JsonObject {
   readonly attemptId: ExecutionRequest["attemptId"];
 }
 
-export type RemoteAttemptState = "acknowledged" | "assigned" | "running" | "terminal" | "unknown";
+export type RemoteAttemptState =
+  | "acknowledged"
+  | "assigned"
+  | "expired"
+  | "running"
+  | "terminal"
+  | "unknown";
 
 export interface RemoteAttemptRecord extends JsonObject {
   readonly workerId: WorkerId;
@@ -67,6 +73,7 @@ export interface RemoteAttemptRecord extends JsonObject {
   readonly epoch: string;
   readonly updatedAt: string;
   readonly result?: ExecutionResult;
+  readonly acknowledgedAt?: string;
 }
 
 export interface RemoteAttemptStore {

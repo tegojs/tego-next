@@ -115,6 +115,7 @@ test("permanent disconnect settles Main attempts after the orphan recovery windo
   const handle = await remote.submit(request);
   await eventually(() => assert.equal(local.executions, 1));
   main.close();
+  await flush();
   clock.advanceBy(101);
 
   const result = await handle.result;
@@ -494,12 +495,7 @@ test("oversized reconnect inventory rejects attach instead of leaving a pending 
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
   });
-  let rejected = false;
-  void remote.attach(main).catch(() => {
-    rejected = true;
-  });
-  for (let index = 0; index < 10; index += 1) await flush();
-  assert.equal(rejected, true);
+  await assert.rejects(remote.attach(main), /inventory/iu);
   await runtime.close();
 });
 
@@ -522,12 +518,7 @@ test("inventory provider failure rejects attach instead of leaving a pending cor
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
   });
-  let rejected = false;
-  void remote.attach(main).catch(() => {
-    rejected = true;
-  });
-  for (let index = 0; index < 10; index += 1) await flush();
-  assert.equal(rejected, true);
+  await assert.rejects(remote.attach(main), /inventory/iu);
   await runtime.close();
 });
 

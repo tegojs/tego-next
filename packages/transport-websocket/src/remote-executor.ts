@@ -37,8 +37,9 @@ import {
 } from "./remote-protocol.js";
 
 const DEFAULT_MAX_ASSIGNMENTS = 256;
-const DEFAULT_MAX_ASSIGNMENT_BYTES = 1024 * 1024;
-const DEFAULT_MAX_RESULT_BYTES = 1024 * 1024;
+const DEFAULT_MAX_CONTROL_PAYLOAD_BYTES = 48 * 1024;
+const DEFAULT_MAX_ASSIGNMENT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
+const DEFAULT_MAX_RESULT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
 const DEFAULT_MAX_INFLIGHT = 64;
 const DEFAULT_MAX_INVENTORY = 512;
 const MAX_CLOCK_SLEEP_MS = 2_147_483_647;
@@ -54,6 +55,8 @@ export interface RemoteExecutorOptions {
   readonly maxResultBytes?: number;
   readonly maxInflight?: number;
   readonly maxInventoryItems?: number;
+  readonly maxInventoryBytes?: number;
+  readonly orphanTimeoutMs?: number;
   readonly retentionMs?: number;
 }
 
@@ -86,6 +89,8 @@ export class RemoteExecutor implements Executor {
   readonly #maxResultBytes: number;
   readonly #maxInflight: number;
   readonly #maxInventoryItems: number;
+  readonly #maxInventoryBytes: number;
+  readonly #orphanTimeoutMs: number;
   readonly #retentionMs: number;
   readonly #attempts = new Map<string, RemoteAttempt>();
   #session: RemoteSession | undefined;
@@ -100,6 +105,7 @@ export class RemoteExecutor implements Executor {
   #attachChain = Promise.resolve();
   #submitChain = Promise.resolve();
   #drainPromise: Promise<void> | undefined;
+  #orphanRecovery = new AbortController();
 
   constructor(options: RemoteExecutorOptions) {
     if (options.id.length === 0) throw new TypeError("RemoteExecutor id must not be empty");
@@ -128,6 +134,16 @@ export class RemoteExecutor implements Executor {
       options.maxInventoryItems,
       DEFAULT_MAX_INVENTORY,
       "maxInventoryItems",
+    );
+    this.#maxInventoryBytes = positiveLimit(
+      options.maxInventoryBytes,
+      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
+      "maxInventoryBytes",
+    );
+    this.#orphanTimeoutMs = positiveLimit(
+      options.orphanTimeoutMs,
+      30_000,
+      "orphanTimeoutMs",
     );
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
   }
@@ -167,6 +183,14 @@ export class RemoteExecutor implements Executor {
 
   async #submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
     await this.#pruneTerminals();
+    if (jsonBytes(requestValue) > this.#maxAssignmentBytes) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_ADMISSION_EXHAUSTED",
+        "RemoteExecutor assignment exceeds maxAssignmentBytes",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     const request = parseRemoteRequest(requestValue);
     const fingerprint = requestFingerprint(request);
     const key = attemptKey(request.taskId, request.attemptId);
@@ -181,6 +205,23 @@ export class RemoteExecutor implements Executor {
         );
       }
       return existing.handle;
+    }
+    const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
+    if (persisted?.state === "expired") {
+      if (persisted.fingerprint !== fingerprint) {
+        throw remoteError(
+          "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
+          "Expired remote attempt identity has a different request fingerprint",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      }
+      throw remoteError(
+        "EXECUTOR_REMOTE_ATTEMPT_EXPIRED",
+        "Remote attempt result retention expired; the attempt identity cannot be reused",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
     }
     if (
       this.#closed ||
@@ -197,7 +238,6 @@ export class RemoteExecutor implements Executor {
       );
     }
     if (
-      jsonBytes(request) > this.#maxAssignmentBytes ||
       this.#attempts.size >= this.#maxAssignments ||
       this.#activeCount() >= this.#maxConcurrency ||
       this.#inflight >= this.#maxInflight
@@ -226,8 +266,8 @@ export class RemoteExecutor implements Executor {
     };
     await this.#save(attempt);
     this.#attempts.set(key, attempt);
-    void this.#assign(attempt, this.#session);
-    void this.#watchDeadline(attempt);
+    this.#background(this.#assign(attempt, this.#session));
+    this.#background(this.#watchDeadline(attempt));
     return handle;
   }
 
@@ -249,8 +289,19 @@ export class RemoteExecutor implements Executor {
     attempt.cancellation = attempt.cancellation ?? "cancelled";
     const session = this.#session;
     if (session === undefined || session.state !== "ready") {
-      attempt.state = "unknown";
-      await this.#save(attempt);
+      await this.#publish(
+        attempt,
+        this.#failure(
+          attempt.request,
+          attempt.cancellation === "timed-out" ? "timed-out" : "cancelled",
+          attempt.cancellation === "timed-out"
+            ? "EXECUTOR_REMOTE_DEADLINE_EXCEEDED"
+            : "EXECUTOR_REMOTE_CANCELLED",
+          attempt.cancellation === "timed-out"
+            ? "Remote attempt deadline expired while disconnected"
+            : "Remote attempt was cancelled while disconnected",
+        ),
+      );
       return;
     }
     try {
@@ -271,6 +322,7 @@ export class RemoteExecutor implements Executor {
     this.#draining = true;
     this.#accepting = false;
     this.#drainPromise ??= (async () => {
+      await this.#submitChain;
       const controller = new AbortController();
       const active = [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal");
       if (deadline !== undefined) {
@@ -322,6 +374,7 @@ export class RemoteExecutor implements Executor {
     if (session.state !== "ready" || !session.available) {
       throw new Error("Remote Worker session must be ready before attaching execution");
     }
+    await this.#hydrate();
     const epoch = BigInt(session.epoch);
     if (epoch <= this.#highestEpoch && this.#session !== session) {
       throw remoteError(
@@ -333,18 +386,19 @@ export class RemoteExecutor implements Executor {
       );
     }
     this.#accepting = false;
+    this.#orphanRecovery.abort("remote-reconnected");
+    this.#orphanRecovery = new AbortController();
     this.#detachSession(true);
-    await this.#hydrate();
     this.#session = session;
     this.#highestEpoch = epoch;
     this.#removeMessageListener = session.onMessage((message) => {
       if (this.#session === session) {
-        void this.#receive(session, message);
+        this.#background(this.#receive(session, message));
       }
     });
     this.#removeStateListener = session.onStateChange((state) => {
       if (this.#session === session && state !== "ready") {
-        void this.#sessionLost(session);
+        this.#background(this.#sessionLost(session));
       }
     });
     try {
@@ -370,6 +424,9 @@ export class RemoteExecutor implements Executor {
       );
     }
     for (const record of records) {
+      const persistedEpoch = BigInt(record.epoch);
+      if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
+      if (record.state === "expired") continue;
       const result = Promise.withResolvers<ExecutionResult>();
       const handle = Object.freeze({
         taskId: record.request.taskId,
@@ -394,7 +451,7 @@ export class RemoteExecutor implements Executor {
         attempt.deadline.abort();
         result.resolve(record.result);
       } else {
-        void this.#watchDeadline(attempt);
+        this.#background(this.#watchDeadline(attempt));
       }
     }
     this.#hydrated = true;
@@ -409,7 +466,19 @@ export class RemoteExecutor implements Executor {
       if (response.type !== REMOTE_ACK) throw new Error("Remote assignment response is invalid");
       const payload = asObject(response.payload, REMOTE_ACK);
       if (payload.accepted === false) {
-        await this.#publish(attempt, parseExecutionResult(payload.result));
+        if (payload.result === undefined) {
+          await this.#publish(
+            attempt,
+            this.#failure(
+              attempt.request,
+              "rejected",
+              "EXECUTOR_REMOTE_ASSIGNMENT_REJECTED",
+              "Worker rejected the remote assignment without a terminal result",
+            ),
+          );
+        } else {
+          await this.#publish(attempt, parseExecutionResult(payload.result));
+        }
         return;
       }
       if (payload.accepted !== true)
@@ -430,11 +499,28 @@ export class RemoteExecutor implements Executor {
         attempt.state = "running";
         await this.#save(attempt);
       }
-    } catch {
+    } catch (error) {
       if (this.#session === session && attempt.terminal === undefined) {
-        attempt.state = "unknown";
-        attempt.epoch = session.epoch;
-        await this.#save(attempt);
+        if (
+          error instanceof Error &&
+          "diagnostic" in error &&
+          (error as { diagnostic?: { code?: unknown } }).diagnostic?.code ===
+            "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH"
+        ) {
+          await this.#publish(
+            attempt,
+            this.#failure(
+              attempt.request,
+              "failed",
+              "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH",
+              "Remote assignment returned a result for a different attempt identity",
+            ),
+          );
+        } else {
+          attempt.state = "unknown";
+          attempt.epoch = session.epoch;
+          await this.#save(attempt);
+        }
       }
     } finally {
       this.#inflight -= 1;
@@ -462,6 +548,18 @@ export class RemoteExecutor implements Executor {
   }
 
   async #publish(attempt: RemoteAttempt, candidate: ExecutionResult): Promise<void> {
+    if (
+      candidate.taskId !== attempt.request.taskId ||
+      candidate.attemptId !== attempt.request.attemptId
+    ) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH",
+        "Remote result does not match the assigned attempt identity",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    const candidateBytes = jsonBytes(candidate);
     let result = parseExecutionResult(candidate);
     if (attempt.cancellation === "timed-out" && result.status === "cancelled") {
       result = {
@@ -469,7 +567,7 @@ export class RemoteExecutor implements Executor {
         status: "timed-out",
       };
     }
-    if (jsonBytes(result) > this.#maxResultBytes) {
+    if (candidateBytes > this.#maxResultBytes) {
       const now = this.#clock.now().toISOString();
       result = {
         taskId: attempt.request.taskId,
@@ -537,6 +635,14 @@ export class RemoteExecutor implements Executor {
     });
     if (this.#session !== session) throw new Error("Remote session changed during reconciliation");
     const payload = asObject(response.payload, REMOTE_INVENTORY);
+    if (jsonBytes(response.payload) > this.#maxInventoryBytes) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
+        "Remote inventory exceeds maxInventoryBytes",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     if (payload.epoch !== session.epoch) {
       throw new Error("Remote inventory epoch does not match the authoritative session");
     }
@@ -585,6 +691,7 @@ export class RemoteExecutor implements Executor {
         });
       }
     }
+    const missing: RemoteAttempt[] = [];
     for (const [key, attempt] of this.#attempts) {
       if (attempt.state === "terminal" || terminalKeys.has(key)) continue;
       attempt.epoch = session.epoch;
@@ -597,8 +704,15 @@ export class RemoteExecutor implements Executor {
       } else {
         attempt.state = "assigned";
         await this.#save(attempt);
-        void this.#assign(attempt, session);
+        missing.push(attempt);
       }
+    }
+    for (let index = 0; index < missing.length; index += this.#maxInflight) {
+      await Promise.all(
+        missing.slice(index, index + this.#maxInflight).map(async (attempt) => {
+          await this.#assign(attempt, session);
+        }),
+      );
     }
   }
 
@@ -611,6 +725,29 @@ export class RemoteExecutor implements Executor {
         attempt.state = "unknown";
         await this.#save(attempt);
       }
+    }
+    const recovery = this.#orphanRecovery;
+    this.#background(this.#expireOrphans(recovery));
+  }
+
+  async #expireOrphans(recovery: AbortController): Promise<void> {
+    try {
+      await this.#clock.sleep(this.#orphanTimeoutMs, recovery.signal);
+    } catch {
+      return;
+    }
+    if (this.#session !== undefined || recovery !== this.#orphanRecovery) return;
+    for (const attempt of this.#attempts.values()) {
+      if (attempt.state !== "unknown" || attempt.terminal !== undefined) continue;
+      await this.#publish(
+        attempt,
+        this.#failure(
+          attempt.request,
+          "failed",
+          "EXECUTOR_REMOTE_ORPHAN_UNAVAILABLE",
+          "Remote Worker did not reconnect within the orphan recovery window",
+        ),
+      );
     }
   }
 
@@ -671,6 +808,28 @@ export class RemoteExecutor implements Executor {
     });
   }
 
+  #failure(
+    request: ExecutionRequest,
+    status: ExecutionResult["status"],
+    code: `EXECUTOR_${string}`,
+    message: string,
+  ): ExecutionResult {
+    const now = this.#clock.now().toISOString();
+    return {
+      taskId: request.taskId,
+      attemptId: request.attemptId,
+      status,
+      diagnostic: remoteError(code, message, this.id, now).diagnostic,
+      executor: { kind: "remote", workerId: this.#workerId },
+      startedAt: now,
+      completedAt: now,
+    };
+  }
+
+  #background(promise: Promise<unknown>): void {
+    void promise.catch(() => undefined);
+  }
+
   #activeCount(): number {
     let active = 0;
     for (const attempt of this.#attempts.values()) {
@@ -687,7 +846,14 @@ export class RemoteExecutor implements Executor {
         attempt.terminalAt !== undefined &&
         attempt.terminalAt <= cutoff
       ) {
-        await this.#attemptStore.delete?.(attempt.request.taskId, attempt.request.attemptId);
+        await this.#attemptStore.save({
+          workerId: this.#workerId,
+          request: attempt.request,
+          fingerprint: attempt.fingerprint,
+          state: "expired",
+          epoch: attempt.epoch,
+          updatedAt: this.#clock.now().toISOString(),
+        });
         this.#attempts.delete(key);
       }
     }
