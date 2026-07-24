@@ -354,3 +354,109 @@ test("Worker reserves bounded terminal-result capacity before starting finish-an
     await Promise.all([remote.close(), runtime.close()]);
   }
 });
+
+test("durable result write failure becomes a structured terminal failure", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    resultStore: {
+      durable: true,
+      put: async () => {
+        throw new Error("durable result store unavailable");
+      },
+      delete: async () => undefined,
+      list: async () => [],
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const result = await (
+    await remote.submit(
+      executionRequest({ mode: "echo", value: "lost" }, "persist-write-failure", "finish-and-persist"),
+    )
+  ).result;
+  assert.equal(result.status, "failed");
+  assert.match(result.diagnostic?.code ?? "", /PERSIST/iu);
+  assert.equal(local.executions, 1);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("failed durable result deletion keeps the memory result until a later acknowledgement succeeds", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const durable = new MemoryRemoteResultStore({ durable: true });
+  let deletes = 0;
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    resultStore: {
+      durable: true,
+      put: async (result) => durable.put(result),
+      list: async () => durable.list(),
+      delete: async (taskId, attemptId) => {
+        deletes += 1;
+        if (deletes === 1) throw new Error("durable delete unavailable");
+        await durable.delete(taskId, attemptId);
+      },
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const result = await (
+    await remote.submit(
+      executionRequest({ mode: "echo", value: "retained" }, "delete-failure", "finish-and-persist"),
+    )
+  ).result;
+  assert.equal(result.output, "retained");
+  await eventually(() => assert.equal(deletes, 1));
+  assert.equal(runtime.bufferedResultCount, 1);
+
+  await reconnect(remote, runtime, "2");
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
+  assert.equal(deletes, 2);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("oversized reconnect inventory rejects attach instead of leaving a pending correlation", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const [main, worker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxInventoryItems: 1,
+    preparedArtifacts: () => ["sha256:first", "sha256:second"],
+    selectExecutor: () => local,
+  });
+  await runtime.attach(worker);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  let rejected = false;
+  void remote.attach(main).catch(() => {
+    rejected = true;
+  });
+  for (let index = 0; index < 10; index += 1) await flush();
+  assert.equal(rejected, true);
+  await runtime.close();
+});
