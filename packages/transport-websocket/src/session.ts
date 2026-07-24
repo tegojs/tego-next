@@ -349,10 +349,18 @@ export class WorkerSession {
     this.#socket.on("error", this.#errorListener);
     queueMicrotask(() => {
       if (this.#state === "authenticating") {
-        this.#sendInternal("hello", {
-          role: this.#role,
-          nonce: this.#nonce,
-        });
+        try {
+          this.#sendInternal("hello", {
+            role: this.#role,
+            nonce: this.#nonce,
+          });
+        } catch (error) {
+          this.#fail(
+            error instanceof DiagnosticError
+              ? error
+              : diagnosticError("WORKER_TRANSPORT_ERROR", "Worker hello could not be sent"),
+          );
+        }
       }
     });
   }
@@ -411,12 +419,25 @@ export class WorkerSession {
         "Worker session inflight request limit was reached",
       );
     }
-    const messageId = await this.send(type, payload, options);
+    if (this.#state !== "ready" || !this.#available) {
+      throw diagnosticError(
+        "WORKER_SESSION_NOT_AVAILABLE",
+        this.#state === "closed" ? "Worker session is closed" : "Worker session is not available",
+      );
+    }
+    const messageId = `message-${randomUUID()}`;
     const response = deferred<WorkerSessionMessage>();
     this.#pendingRequests.set(messageId, {
       resolve: response.resolve,
       reject: response.reject,
     });
+    try {
+      this.#sendEnvelope(type, payload, options, messageId);
+    } catch (error) {
+      this.#pendingRequests.delete(messageId);
+      response.reject(error);
+      throw error;
+    }
     return response.promise;
   }
 
@@ -633,7 +654,11 @@ export class WorkerSession {
       return;
     }
     for (const listener of this.#listeners) {
-      listener(message);
+      try {
+        listener(message);
+      } catch {
+        // Consumer callbacks do not participate in the authenticated protocol state machine.
+      }
     }
   }
 
@@ -835,7 +860,12 @@ export class WorkerSession {
     return this.#sendEnvelope(type, payload, {});
   }
 
-  #sendEnvelope(type: string, payload: JsonValue, options: WorkerSessionSendOptions): string {
+  #sendEnvelope(
+    type: string,
+    payload: JsonValue,
+    options: WorkerSessionSendOptions,
+    suppliedMessageId?: string,
+  ): string {
     if (
       this.#state === "closed" ||
       this.#state === "unavailable" ||
@@ -843,7 +873,7 @@ export class WorkerSession {
     ) {
       throw diagnosticError("WORKER_SESSION_CLOSED", "Worker session is closed");
     }
-    const messageId = `message-${randomUUID()}`;
+    const messageId = suppliedMessageId ?? `message-${randomUUID()}`;
     const binary = options.binary;
     const maxChunkPayload = Math.max(1, this.#codec.limits.maxFrameBytes - 160);
     const binaryChunks =
@@ -864,7 +894,7 @@ export class WorkerSession {
       protocol: this.#protocol,
       messageId,
       sessionId: this.#sessionId,
-      sequence: (this.#nextSequence++).toString(),
+      sequence: this.#nextSequence.toString(),
       ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
       type,
       sentAt: this.#clock.now().toISOString(),
@@ -872,11 +902,11 @@ export class WorkerSession {
       ...(binary === undefined ? {} : { binaryBytes: binary.byteLength }),
       ...(binaryChunks === undefined ? {} : { binaryChunks }),
     };
-    this.#socket.send(this.#codec.encodeControl(envelope));
+    const frames: (string | Uint8Array)[] = [this.#codec.encodeControl(envelope)];
     if (binary !== undefined && binaryChunks !== undefined) {
       for (let chunkIndex = 0; chunkIndex < binaryChunks; chunkIndex += 1) {
         const start = chunkIndex * maxChunkPayload;
-        this.#socket.send(
+        frames.push(
           this.#codec.encodeBinary({
             correlationId: messageId,
             chunkIndex,
@@ -885,6 +915,19 @@ export class WorkerSession {
           }),
         );
       }
+    }
+    this.#nextSequence += 1n;
+    try {
+      for (const frame of frames) {
+        this.#socket.send(frame);
+      }
+    } catch {
+      const error = diagnosticError(
+        "WORKER_TRANSPORT_ERROR",
+        "Worker WebSocket transport could not send a frame",
+      );
+      this.#fail(error);
+      throw error;
     }
     return messageId;
   }
