@@ -207,3 +207,150 @@ test("stale session results cannot override a newer authoritative epoch", async 
   await assert.rejects(remote.attach(staleMain), /epoch|stale/iu);
   await Promise.all([remote.close(), runtime.close()]);
 });
+
+test("Worker records acknowledgement before delegating to the local Executor", async () => {
+  const clock = new FakeClock(new Date(0));
+  const events: string[] = [];
+  const local = new TestLocalExecutor();
+  const originalSubmit = local.submit.bind(local);
+  local.submit = async (request) => {
+    events.push("execute");
+    return originalSubmit(request);
+  };
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore({
+      onSave: (record) => events.push(`store:${record.state}`),
+    }),
+    selectExecutor: () => local,
+  });
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await reconnect(remote, runtime, "1");
+  await (
+    await remote.submit(executionRequest({ mode: "echo", value: "ordered" }, "worker-order"))
+  ).result;
+  assert.ok(events.indexOf("store:acknowledged") < events.indexOf("execute"));
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("disconnect before assignment delivery replays the same attempt only after inventory", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  const [main, worker] = memorySessionPair("1");
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const delivery = Promise.withResolvers<void>();
+  main.gateNextMessage(delivery.promise);
+  const request = executionRequest({ mode: "echo", value: "replayed" }, "pre-send");
+  const handle = await remote.submit(request);
+  main.close();
+  delivery.resolve();
+  await flush();
+  assert.equal(local.executions, 0);
+
+  await reconnect(remote, runtime, "2");
+  assert.equal((await handle.result).output, "replayed");
+  assert.equal(local.executions, 1);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("lost result acknowledgement retains one terminal result and duplicate inventory releases it", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  const [main, worker] = memorySessionPair("1");
+  const originalSend = main.send.bind(main);
+  let dropped = false;
+  main.send = async (type, payload, options) => {
+    if (
+      type === "task.acknowledge" &&
+      typeof payload === "object" &&
+      payload !== null &&
+      !Array.isArray(payload) &&
+      "kind" in payload &&
+      payload.kind === "result" &&
+      !dropped
+    ) {
+      dropped = true;
+      return "message-dropped-result-ack";
+    }
+    return originalSend(type, payload, options);
+  };
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const result = await (
+    await remote.submit(executionRequest({ mode: "echo", value: "once" }, "lost-result-ack"))
+  ).result;
+  assert.equal(result.output, "once");
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 1));
+
+  await reconnect(remote, runtime, "2");
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
+  assert.equal(local.executions, 1);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("Worker reserves bounded terminal-result capacity before starting finish-and-buffer work", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    resultBuffer: { maxCount: 1, maxBytes: 1024 * 1024 },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const firstRequest = executionRequest({ mode: "wait" }, "buffer-slot-1", "finish-and-buffer");
+  const secondRequest = executionRequest({ mode: "wait" }, "buffer-slot-2", "finish-and-buffer");
+  const first = await remote.submit(firstRequest);
+  const second = await remote.submit(secondRequest);
+  try {
+    for (let index = 0; index < 10; index += 1) await flush();
+    assert.equal(local.executions, 1);
+    const rejected = await second.result;
+    assert.equal(rejected.status, "rejected");
+    assert.match(rejected.diagnostic?.code ?? "", /BUFFER|ADMISSION/iu);
+  } finally {
+    await remote.cancel(firstRequest.taskId, firstRequest.attemptId);
+    await remote.cancel(secondRequest.taskId, secondRequest.attemptId);
+    await first.result;
+    await second.result;
+    await Promise.all([remote.close(), runtime.close()]);
+  }
+});
