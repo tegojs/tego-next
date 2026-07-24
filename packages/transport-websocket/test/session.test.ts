@@ -7,6 +7,7 @@ import {
   type JsonValue,
   type WorkerId,
   type WorkerMessageType,
+  type WorkerProtocolVersion,
 } from "@tegojs/contracts";
 import { FakeClock, workerSessionConformance } from "@tegojs/testkit";
 import {
@@ -40,6 +41,24 @@ test("codec rejects oversized control frames before JSON parsing", () => {
       error instanceof Error &&
       "diagnostic" in error &&
       (error as { diagnostic: { code: string } }).diagnostic.code === "PROTOCOL_FRAME_TOO_LARGE",
+  );
+});
+
+test("the public protocol registry rejects locally configured unsupported versions", () => {
+  assert.throws(
+    () => createWorkerCodec({}, "2.0" as WorkerProtocolVersion),
+    /protocol|version|supported/iu,
+  );
+  const clock = new FakeClock();
+  assert.throws(
+    () =>
+      createMainEndpoint({
+        clock,
+        credential: "shared-secret",
+        workerId: "unsupported-local" as WorkerId,
+        protocol: "2.0" as WorkerProtocolVersion,
+      }),
+    /protocol|version|supported/iu,
   );
 });
 

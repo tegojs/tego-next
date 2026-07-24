@@ -7,6 +7,7 @@ import type {
   RuntimeDiagnostic,
   SessionId,
   WorkerMessageType,
+  WorkerProtocolVersion,
   WorkerId,
 } from "@tegojs/contracts";
 import { FakeClock } from "./fake-clock.js";
@@ -92,7 +93,7 @@ export interface WorkerEndpointLike {
 export interface WorkerEndpointFactoryOptions {
   readonly clock: Clock;
   readonly credential: string;
-  readonly protocol?: string;
+  readonly protocol?: WorkerProtocolVersion;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
   readonly workerId?: WorkerId;
@@ -320,22 +321,26 @@ export function workerSessionConformance(
         credential: "shared-secret",
         workerId: WORKER_ID,
       });
-      const worker = await workerFactory({
-        clock,
-        credential: "shared-secret",
-        protocol: "2.0",
-        workerId: WORKER_ID,
-        registration: REGISTRATION,
-      });
       const [mainSocket, workerSocket] = socketPair();
       const mainSession = main.attach(mainSocket);
-      const workerSession = worker.attach(workerSocket);
-      await assert.rejects(
-        Promise.all([mainSession.ready, workerSession.ready]),
-        /protocol|version/iu,
+      workerSocket.send(
+        JSON.stringify({
+          protocol: "2.0",
+          messageId: "unsupported-version",
+          sessionId: "unsupported-session",
+          sequence: "0",
+          type: "hello",
+          sentAt: clock.now().toISOString(),
+          payload: {
+            role: "worker",
+            nonce: "0123456789abcdefghijklmn",
+            workerId: WORKER_ID,
+          },
+        }),
       );
+      await assert.rejects(mainSession.ready, /protocol|version/iu);
       assert.equal(mainSession.diagnostic?.code, "PROTOCOL_VERSION_UNSUPPORTED");
-      await Promise.all([main.close(), worker.close()]);
+      await main.close();
     });
 
     test("messages are correlated and replayed message IDs are delivered once", async () => {
