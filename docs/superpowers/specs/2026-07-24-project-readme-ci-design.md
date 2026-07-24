@@ -122,9 +122,9 @@ The `quality` job runs on Ubuntu and performs:
 4. commit-range validation;
 5. formatting check;
 6. lint;
-7. TypeScript typecheck;
-8. unit and architecture tests;
-9. build.
+7. build workspace dependencies;
+8. TypeScript typecheck;
+9. unit and architecture tests.
 
 These commands remain separate workflow steps so GitHub identifies the failing
 gate directly.

@@ -39,12 +39,12 @@ jobs:
         run: npm run format:check
       - name: Lint
         run: npm run lint
+      - name: Build
+        run: npm run build
       - name: Typecheck
         run: npm run typecheck
       - name: Run unit and architecture tests
         run: npm test
-      - name: Build
-        run: npm run build
 
   postgres-integration:
     name: PostgreSQL integration

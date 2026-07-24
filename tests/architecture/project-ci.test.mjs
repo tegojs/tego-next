@@ -53,4 +53,9 @@ test("GitHub CI declares quality and PostgreSQL integration gates", async () => 
   ]) {
     assert.match(workflow, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   }
+
+  assert.ok(
+    workflow.indexOf("run: npm run build") < workflow.indexOf("run: npm run typecheck"),
+    "clean CI must build workspace dependencies before typechecking their consumers",
+  );
 });

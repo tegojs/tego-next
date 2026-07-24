@@ -404,12 +404,12 @@ jobs:
         run: npm run format:check
       - name: Lint
         run: npm run lint
+      - name: Build
+        run: npm run build
       - name: Typecheck
         run: npm run typecheck
       - name: Run unit and architecture tests
         run: npm test
-      - name: Build
-        run: npm run build
 
   postgres-integration:
     name: PostgreSQL integration
@@ -698,9 +698,9 @@ Run:
 ```sh
 PATH=/Users/seal/.volta/tools/image/node/26.5.0/bin:$PATH npm run format:check
 PATH=/Users/seal/.volta/tools/image/node/26.5.0/bin:$PATH npm run lint
+PATH=/Users/seal/.volta/tools/image/node/26.5.0/bin:$PATH npm run build
 PATH=/Users/seal/.volta/tools/image/node/26.5.0/bin:$PATH npm run typecheck
 PATH=/Users/seal/.volta/tools/image/node/26.5.0/bin:$PATH npm test
-PATH=/Users/seal/.volta/tools/image/node/26.5.0/bin:$PATH npm run build
 ```
 
 Expected: every command exits 0; all new architecture tests are included by
