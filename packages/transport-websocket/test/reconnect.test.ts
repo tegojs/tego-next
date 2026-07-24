@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseWorkerId } from "@tegojs/contracts";
+import { parseWorkerId, type ExecutionResult } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import {
   MemoryRemoteAttemptStore,
@@ -622,5 +622,58 @@ test("retention delete failure keeps terminal identity in memory", async () => {
     (await remote.observe(firstRequest.taskId, firstRequest.attemptId))?.state,
     "terminal",
   );
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("duplicate terminal result cannot acknowledge Worker evidence before Main persistence commits", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const backing = new MemoryRemoteAttemptStore();
+  const terminalSaveStarted = Promise.withResolvers<void>();
+  const terminalSaveGate = Promise.withResolvers<void>();
+  let terminalResult: ExecutionResult | undefined;
+  const [main, worker] = memorySessionPair("1");
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => {
+        if (record.state === "terminal") {
+          terminalResult = record.result;
+          terminalSaveStarted.resolve();
+          await terminalSaveGate.promise;
+        }
+        await backing.save(record);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const request = executionRequest({ mode: "echo", value: "barrier" }, "publication-barrier");
+  const handle = await remote.submit(request);
+  await terminalSaveStarted.promise;
+  if (terminalResult === undefined) throw new Error("terminal result was not captured");
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  await worker.send("task.result", { result: terminalResult });
+  await flush();
+  assert.equal(settled, false);
+  assert.equal(runtime.bufferedResultCount, 1);
+
+  terminalSaveGate.resolve();
+  assert.equal((await handle.result).output, "barrier");
+  await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
   await Promise.all([remote.close(), runtime.close()]);
 });
