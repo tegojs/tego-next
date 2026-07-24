@@ -6,7 +6,14 @@ import {
   parseArtifactDigest,
 } from "@tegojs/contracts";
 import type { Pool } from "pg";
-import { createPool, openPool, type PostgresConnectionOptions, postgresError } from "./shared.js";
+import {
+  createPool,
+  decimal,
+  isoTimestamp,
+  openPool,
+  type PostgresConnectionOptions,
+  postgresError,
+} from "./shared.js";
 
 export const POSTGRES_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -54,9 +61,11 @@ export class PostgresArtifactStore implements ArtifactStore {
     let size = 0;
     const hash = createHash("sha256");
     for await (const chunk of source) {
-      const copy = Buffer.from(chunk);
-      size += copy.byteLength;
-      if (size > POSTGRES_ARTIFACT_MAX_BYTES) {
+      const nextSize = size + chunk.byteLength;
+      if (
+        chunk.byteLength > POSTGRES_ARTIFACT_MAX_BYTES ||
+        nextSize > POSTGRES_ARTIFACT_MAX_BYTES
+      ) {
         throw postgresError(
           "ARTIFACT_SIZE_EXCEEDED",
           "Artifact exceeds the PostgreSQL storage limit",
@@ -64,6 +73,8 @@ export class PostgresArtifactStore implements ArtifactStore {
           { digest: parsed, maximumBytes: POSTGRES_ARTIFACT_MAX_BYTES },
         );
       }
+      const copy = Buffer.from(chunk);
+      size = nextSize;
       chunks.push(copy);
       hash.update(copy);
     }
@@ -85,20 +96,8 @@ export class PostgresArtifactStore implements ArtifactStore {
       `,
       [this.#namespace, parsed, content, size.toString()],
     );
-    const existing = await this.#pool.query<{ content: Buffer; size_bytes: string }>(
-      `
-        SELECT content, size_bytes::text
-        FROM tego_artifacts
-        WHERE driver_namespace = $1 AND digest = $2
-      `,
-      [this.#namespace, parsed],
-    );
-    const row = existing.rows[0];
-    if (
-      row === undefined ||
-      row.size_bytes !== size.toString() ||
-      !Buffer.from(row.content).equals(content)
-    ) {
+    const stored = await this.#loadContent(parsed);
+    if (stored === undefined || !stored.equals(content)) {
       throw postgresError(
         "ARTIFACT_DIGEST_MISMATCH",
         "Artifact digest is already bound to different bytes",
@@ -111,21 +110,12 @@ export class PostgresArtifactStore implements ArtifactStore {
   async *read(digest: ArtifactDigest): AsyncIterable<Uint8Array> {
     this.#assertOpen();
     const parsed = parseArtifactDigest(digest);
-    const result = await this.#pool.query<{ content: Buffer }>(
-      `
-        SELECT content
-        FROM tego_artifacts
-        WHERE driver_namespace = $1 AND digest = $2
-      `,
-      [this.#namespace, parsed],
-    );
-    const row = result.rows[0];
-    if (row === undefined) {
+    const content = await this.#loadContent(parsed);
+    if (content === undefined) {
       throw postgresError("ARTIFACT_NOT_FOUND", "Artifact does not exist", "artifact", {
         digest: parsed,
       });
     }
-    const content = Buffer.from(row.content);
     const actual = parseArtifactDigest(
       `sha256:${createHash("sha256").update(content).digest("hex")}`,
     );
@@ -150,7 +140,7 @@ export class PostgresArtifactStore implements ArtifactStore {
     );
     return {
       status: "healthy",
-      checkedAt: (result.rows[0]?.checked_at ?? new Date()).toISOString(),
+      checkedAt: isoTimestamp(result.rows[0]?.checked_at, "health timestamp"),
     };
   }
 
@@ -168,6 +158,56 @@ export class PostgresArtifactStore implements ArtifactStore {
 
   #assertOpen(): void {
     if (this.#lifecycle !== "open") throw this.#closedError();
+  }
+
+  async #loadContent(digest: ArtifactDigest): Promise<Buffer | undefined> {
+    const result = await this.#pool.query<{
+      content: Buffer | null;
+      content_bytes: string;
+      size_bytes: string;
+    }>(
+      `
+        SELECT
+          CASE
+            WHEN size_bytes <= $3::bigint
+              AND octet_length(content) <= $3::bigint
+              AND size_bytes = octet_length(content)
+            THEN content
+            ELSE NULL
+          END AS content,
+          octet_length(content)::text AS content_bytes,
+          size_bytes::text
+        FROM tego_artifacts
+        WHERE driver_namespace = $1 AND digest = $2
+      `,
+      [this.#namespace, digest, POSTGRES_ARTIFACT_MAX_BYTES],
+    );
+    const row = result.rows[0];
+    if (row === undefined) return undefined;
+    const contentBytes = BigInt(decimal(row.content_bytes, "artifact content size"));
+    const declaredBytes = BigInt(decimal(row.size_bytes, "artifact declared size"));
+    const maximumBytes = BigInt(POSTGRES_ARTIFACT_MAX_BYTES);
+    if (contentBytes > maximumBytes || declaredBytes > maximumBytes) {
+      throw postgresError(
+        "ARTIFACT_SIZE_EXCEEDED",
+        "Stored artifact exceeds the PostgreSQL storage limit",
+        "artifact",
+        { digest, maximumBytes: POSTGRES_ARTIFACT_MAX_BYTES },
+      );
+    }
+    if (contentBytes !== declaredBytes || row.content === null) {
+      throw postgresError(
+        "ARTIFACT_DIGEST_MISMATCH",
+        "Stored artifact size metadata does not match its bytes",
+        "artifact",
+        {
+          actualBytes: contentBytes.toString(),
+          declaredBytes: declaredBytes.toString(),
+          digest,
+        },
+      );
+    }
+    return Buffer.from(row.content);
   }
 
   #closedError() {

@@ -133,6 +133,11 @@ const migrations = [
     CREATE INDEX tego_coordination_changes_cursor
       ON tego_coordination_changes(driver_namespace, revision, sequence);
   `,
+  `
+    ALTER TABLE tego_artifacts
+      ADD CONSTRAINT tego_artifacts_size_limit
+      CHECK (size_bytes <= 16777216);
+  `,
 ] as const;
 
 export const postgresSchemaVersion = migrations.length;
