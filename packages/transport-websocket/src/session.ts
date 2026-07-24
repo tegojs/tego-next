@@ -346,6 +346,7 @@ export class WorkerSession {
   #remoteRole?: WorkerSessionRole;
   #remoteHelloSessionId?: string;
   #peerAuthenticated = false;
+  #helloSent = false;
   #authenticationSent = false;
   #registrationSent = false;
   #lastHeartbeatAt = 0;
@@ -400,10 +401,7 @@ export class WorkerSession {
     queueMicrotask(() => {
       if (this.#state === "authenticating") {
         try {
-          this.#sendInternal("hello", {
-            role: this.#role,
-            nonce: this.#nonce,
-          });
+          this.#sendHello();
         } catch (error) {
           this.#fail(
             error instanceof DiagnosticError
@@ -735,12 +733,30 @@ export class WorkerSession {
     if (this.#role === "main") {
       this.#sessionId = parseSessionId(envelope.sessionId);
     }
+    this.#sendHello();
     this.#sendAuthentication();
+  }
+
+  #sendHello(): void {
+    if (this.#helloSent) {
+      return;
+    }
+    this.#helloSent = true;
+    try {
+      this.#sendInternal("hello", {
+        role: this.#role,
+        nonce: this.#nonce,
+      });
+    } catch (error) {
+      this.#helloSent = false;
+      throw error;
+    }
   }
 
   #sendAuthentication(): void {
     if (
       this.#authenticationSent ||
+      !this.#helloSent ||
       this.#remoteNonce === undefined ||
       this.#remoteRole === undefined
     ) {
