@@ -95,7 +95,8 @@ export interface WorkerSessionOptions {
   readonly role: WorkerSessionRole;
   readonly socket: unknown;
   readonly clock: Clock;
-  readonly credential: string;
+  readonly credential?: string;
+  readonly resolveCredential?: (workerId: WorkerId) => string | undefined;
   readonly protocol?: string;
   readonly limits?: WorkerProtocolLimitOverrides;
   readonly heartbeatIntervalMs?: number;
@@ -349,7 +350,8 @@ export class WorkerSession {
   readonly #readyDeferred = deferred<void>();
   readonly #socket: WebSocketTransport;
   readonly #clock: Clock;
-  readonly #credential: string;
+  #credential: string;
+  readonly #resolveCredential: WorkerSessionOptions["resolveCredential"] | undefined;
   readonly #protocol: string;
   readonly #codec: WorkerCodec;
   readonly #role: WorkerSessionRole;
@@ -379,6 +381,8 @@ export class WorkerSession {
   #remoteNonce?: string;
   #remoteRole?: WorkerSessionRole;
   #remoteHelloSessionId?: string;
+  #principalWorkerId?: WorkerId;
+  #principalAuthorized = false;
   #peerAuthenticated = false;
   #helloSent = false;
   #authenticationSent = false;
@@ -402,7 +406,11 @@ export class WorkerSession {
     this.#role = options.role;
     this.#socket = normalizeSocket(options.socket);
     this.#clock = options.clock;
-    this.#credential = normalizeCredential(options.credential);
+    this.#credential =
+      options.credential === undefined
+        ? `unauthorized-${randomUUID()}`
+        : normalizeCredential(options.credential);
+    this.#resolveCredential = options.resolveCredential;
     this.#protocol = options.protocol ?? "1.0";
     this.#codec = createWorkerCodec(options.limits, this.#protocol);
     this.#heartbeatIntervalMs = positiveDuration(
@@ -421,6 +429,15 @@ export class WorkerSession {
       "handshakeTimeoutMs",
     );
     this.#worker = options.worker === undefined ? undefined : normalizeRegistration(options.worker);
+    if (this.#role === "worker") {
+      if (options.credential === undefined || this.#worker === undefined) {
+        throw new TypeError("Worker sessions require a credential-bound Worker identity");
+      }
+      this.#principalWorkerId = this.#worker.workerId;
+      this.#principalAuthorized = true;
+    } else if (this.#resolveCredential === undefined) {
+      throw new TypeError("Main sessions require a Worker credential resolver");
+    }
     this.#onRegister = options.onRegister;
     this.#onUnavailable = options.onUnavailable;
     this.#onClosed = options.onClosed;
@@ -753,7 +770,12 @@ export class WorkerSession {
       throw diagnosticError("PROTOCOL_HANDSHAKE_ORDER_INVALID", "Worker hello was duplicated");
     }
     const payload = asObject(envelope.payload, "hello");
-    requireExactFields(payload, ["role", "nonce"], "hello");
+    const peerIsWorker = payload.role === "worker";
+    requireExactFields(
+      payload,
+      peerIsWorker ? ["role", "nonce", "workerId"] : ["role", "nonce"],
+      "hello",
+    );
     if (
       (payload.role !== "main" && payload.role !== "worker") ||
       payload.role === this.#role ||
@@ -767,6 +789,16 @@ export class WorkerSession {
     this.#remoteNonce = payload.nonce;
     this.#remoteHelloSessionId = envelope.sessionId;
     if (this.#role === "main") {
+      if (typeof payload.workerId !== "string") {
+        throw diagnosticError("PROTOCOL_HANDSHAKE_INVALID", "Worker hello principal is invalid");
+      }
+      const workerId = parseWorkerId(payload.workerId);
+      const resolvedCredential = this.#resolveCredential?.(workerId);
+      this.#principalWorkerId = workerId;
+      this.#principalAuthorized = resolvedCredential !== undefined;
+      if (resolvedCredential !== undefined) {
+        this.#credential = normalizeCredential(resolvedCredential);
+      }
       this.#sessionId = parseSessionId(envelope.sessionId);
     }
     this.#sendHello();
@@ -782,6 +814,9 @@ export class WorkerSession {
       this.#sendInternal("hello", {
         role: this.#role,
         nonce: this.#nonce,
+        ...(this.#role === "worker" && this.#principalWorkerId !== undefined
+          ? { workerId: this.#principalWorkerId }
+          : {}),
       });
     } catch (error) {
       this.#helloSent = false;
@@ -794,7 +829,8 @@ export class WorkerSession {
       this.#authenticationSent ||
       !this.#helloSent ||
       this.#remoteNonce === undefined ||
-      this.#remoteRole === undefined
+      this.#remoteRole === undefined ||
+      this.#principalWorkerId === undefined
     ) {
       return;
     }
@@ -802,6 +838,7 @@ export class WorkerSession {
     this.#sendInternal("authenticate", {
       proof: createAuthenticationProof({
         credential: this.#credential,
+        workerId: this.#principalWorkerId,
         senderNonce: this.#nonce,
         receiverNonce: this.#remoteNonce,
         senderRole: this.#role,
@@ -813,7 +850,8 @@ export class WorkerSession {
     if (
       this.#peerAuthenticated ||
       this.#remoteNonce === undefined ||
-      this.#remoteRole === undefined
+      this.#remoteRole === undefined ||
+      this.#principalWorkerId === undefined
     ) {
       throw diagnosticError(
         "PROTOCOL_HANDSHAKE_ORDER_INVALID",
@@ -822,16 +860,17 @@ export class WorkerSession {
     }
     const payload = asObject(envelope.payload, "authenticate");
     requireExactFields(payload, ["proof"], "authenticate");
-    if (
-      typeof payload.proof !== "string" ||
-      !verifyAuthenticationProof({
+    const proofValid =
+      typeof payload.proof === "string" &&
+      verifyAuthenticationProof({
         credential: this.#credential,
+        workerId: this.#principalWorkerId,
         senderNonce: this.#remoteNonce,
         receiverNonce: this.#nonce,
         senderRole: this.#remoteRole,
         proof: payload.proof,
-      })
-    ) {
+      });
+    if (!proofValid || !this.#principalAuthorized) {
       throw diagnosticError(
         "PROTOCOL_AUTHENTICATION_FAILED",
         "Worker session authentication failed",
@@ -872,6 +911,12 @@ export class WorkerSession {
       "worker.register",
     );
     const registration = normalizeRegistration(payload as unknown as WorkerRegistration);
+    if (registration.workerId !== this.#principalWorkerId) {
+      throw diagnosticError(
+        "PROTOCOL_AUTHENTICATION_FAILED",
+        "Worker registration does not match the authenticated principal",
+      );
+    }
     this.#epoch = boundedUnsigned64(this.#onRegister(this, registration), "Worker session epoch");
     this.#state = "ready";
     this.#available = true;

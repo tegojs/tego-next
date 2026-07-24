@@ -16,28 +16,52 @@ export interface WorkerRegistrationInput {
   readonly preparedArtifacts: readonly string[];
 }
 
-export interface WorkerEndpointOptions {
+export interface WorkerSessionEndpointOptions {
   readonly clock?: Clock;
-  readonly credential: string;
   readonly protocol?: string;
   readonly limits?: WorkerProtocolLimitOverrides;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
   readonly handshakeTimeoutMs?: number;
+}
+
+export interface MainEndpointOptions extends WorkerSessionEndpointOptions {
+  readonly credential?: string;
+  readonly workerId?: WorkerId;
+  readonly credentials?: Readonly<Record<string, string>>;
+}
+
+export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
+  readonly credential: string;
   readonly workerId?: WorkerId;
   readonly registration?: WorkerRegistrationInput;
 }
 
 export class MainEndpoint {
-  readonly #options: WorkerEndpointOptions;
+  readonly #options: MainEndpointOptions;
+  readonly #credentials: ReadonlyMap<WorkerId, string>;
   readonly #sessions = new Set<WorkerSession>();
   readonly #current = new Map<WorkerId, WorkerSession>();
   readonly #registrations = new Map<WorkerId, WorkerRegistration>();
   readonly #epochs = new Map<WorkerId, bigint>();
   #closed = false;
 
-  constructor(options: WorkerEndpointOptions) {
+  constructor(options: MainEndpointOptions) {
     this.#options = options;
+    const credentials = new Map<WorkerId, string>();
+    for (const [workerId, credential] of Object.entries(options.credentials ?? {})) {
+      credentials.set(parseWorkerId(workerId), credential);
+    }
+    if (options.credential !== undefined || options.workerId !== undefined) {
+      if (options.credential === undefined || options.workerId === undefined) {
+        throw new TypeError("A single Worker credential requires its bound workerId");
+      }
+      credentials.set(parseWorkerId(options.workerId), options.credential);
+    }
+    if (credentials.size === 0) {
+      throw new TypeError("Main endpoint requires at least one Worker-bound credential");
+    }
+    this.#credentials = credentials;
   }
 
   get activeSessionCount(): number {
@@ -52,7 +76,7 @@ export class MainEndpoint {
       role: "main",
       socket,
       clock: this.#options.clock ?? systemWorkerClock,
-      credential: this.#options.credential,
+      resolveCredential: (workerId) => this.#credentials.get(workerId),
       ...(this.#options.protocol === undefined ? {} : { protocol: this.#options.protocol }),
       ...(this.#options.limits === undefined ? {} : { limits: this.#options.limits }),
       ...(this.#options.heartbeatIntervalMs === undefined
@@ -108,6 +132,6 @@ export class MainEndpoint {
   }
 }
 
-export function createMainEndpoint(options: WorkerEndpointOptions): MainEndpoint {
+export function createMainEndpoint(options: MainEndpointOptions): MainEndpoint {
   return new MainEndpoint(options);
 }

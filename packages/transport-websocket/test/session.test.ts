@@ -232,6 +232,7 @@ async function directConnection(options?: {
   const main = createMainEndpoint({
     clock,
     credential: "shared-secret",
+    workerId: "direct-worker" as WorkerId,
     limits,
   });
   const worker = createWorkerEndpoint({
@@ -365,7 +366,11 @@ test("binary chunks are correlated and reject out-of-order delivery before aggre
 
 test("authentication failures never expose either credential in diagnostics or close reasons", async () => {
   const clock = new FakeClock();
-  const main = createMainEndpoint({ clock, credential: "main-private-value" });
+  const main = createMainEndpoint({
+    clock,
+    credential: "main-private-value",
+    workerId: "redacted-worker" as WorkerId,
+  });
   const worker = createWorkerEndpoint({
     clock,
     credential: "worker-private-value",
@@ -386,7 +391,11 @@ test("authentication failures never expose either credential in diagnostics or c
 
 test("endpoints retain only authoritative live sessions across failed reconnects and replacement", async () => {
   const clock = new FakeClock();
-  const main = createMainEndpoint({ clock, credential: "shared-secret" });
+  const main = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: "retained-worker" as WorkerId,
+  });
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const rejectedWorker = createWorkerEndpoint({
@@ -432,7 +441,11 @@ test("endpoints retain only authoritative live sessions across failed reconnects
 
 test("sessions accept the ws message(data, isBinary) event signature", async () => {
   const clock = new FakeClock();
-  const main = createMainEndpoint({ clock, credential: "shared-secret" });
+  const main = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: "ws-signature-worker" as WorkerId,
+  });
   const worker = createWorkerEndpoint({
     clock,
     credential: "shared-secret",
@@ -457,6 +470,7 @@ test("an incomplete authentication handshake expires without retaining the socke
   const main = createMainEndpoint({
     clock,
     credential: "shared-secret",
+    workerId: "incomplete-worker" as WorkerId,
     handshakeTimeoutMs: 100,
   });
   const [mainSocket] = directSocketPair();
@@ -480,7 +494,11 @@ test("the default Worker clock removes abort listeners after completed sleeps", 
 
 test("a peer hello arriving first cannot move authenticate before the local hello", async () => {
   const clock = new FakeClock();
-  const main = createMainEndpoint({ clock, credential: "shared-secret" });
+  const main = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: "peer-worker" as WorkerId,
+  });
   const [mainSocket] = directSocketPair();
   const session = main.attach(mainSocket);
   const codec = createWorkerCodec();
@@ -495,6 +513,7 @@ test("a peer hello arriving first cannot move authenticate before the local hell
       payload: {
         role: "worker",
         nonce: "0123456789abcdefghijklmn",
+        workerId: "peer-worker",
       },
     }),
   );
@@ -511,8 +530,16 @@ test("a peer hello arriving first cannot move authenticate before the local hell
 test("a late lower epoch cannot replace the authoritative Worker session", async () => {
   const clock = new FakeClock();
   const workerId = "epoch-worker" as WorkerId;
-  const mainA = createMainEndpoint({ clock, credential: "shared-secret" });
-  const mainB = createMainEndpoint({ clock, credential: "shared-secret" });
+  const mainA = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+  });
+  const mainB = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+  });
 
   const seedWorker = createWorkerEndpoint({
     clock,

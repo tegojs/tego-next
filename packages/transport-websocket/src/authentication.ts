@@ -10,12 +10,15 @@ export function createAuthenticationNonce(): string {
 
 export function createAuthenticationProof(input: {
   readonly credential: string;
+  readonly workerId: string;
   readonly senderNonce: string;
   readonly receiverNonce: string;
   readonly senderRole: WorkerSessionRole;
 }): string {
   return createHmac("sha256", input.credential)
     .update(AUTHENTICATION_DOMAIN)
+    .update("\0")
+    .update(input.workerId)
     .update("\0")
     .update(input.senderNonce)
     .update("\0")
@@ -27,6 +30,7 @@ export function createAuthenticationProof(input: {
 
 export function verifyAuthenticationProof(input: {
   readonly credential: string;
+  readonly workerId: string;
   readonly senderNonce: string;
   readonly receiverNonce: string;
   readonly senderRole: WorkerSessionRole;

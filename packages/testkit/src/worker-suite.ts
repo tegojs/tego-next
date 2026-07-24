@@ -219,7 +219,11 @@ export function workerSessionConformance(
     for (const direction of ["worker-initiated", "main-initiated"] as const) {
       test(`@spec:worker-protocol/direction-neutral-authenticated-session/${direction}`, async () => {
         const clock = new FakeClock();
-        const main = await mainFactory({ clock, credential: "shared-secret" });
+        const main = await mainFactory({
+          clock,
+          credential: "shared-secret",
+          workerId: WORKER_ID,
+        });
         const worker = await workerFactory({
           clock,
           credential: "shared-secret",
@@ -243,7 +247,11 @@ export function workerSessionConformance(
 
     test("@spec:worker-protocol/direction-neutral-authenticated-session/invalid-bootstrap-credential", async () => {
       const clock = new FakeClock();
-      const main = await mainFactory({ clock, credential: "correct-secret" });
+      const main = await mainFactory({
+        clock,
+        credential: "correct-secret",
+        workerId: WORKER_ID,
+      });
       const worker = await workerFactory({
         clock,
         credential: "wrong-secret",
@@ -264,7 +272,11 @@ export function workerSessionConformance(
 
     test("@spec:worker-protocol/versioned-reliable-message-envelope/unsupported-protocol-version", async () => {
       const clock = new FakeClock();
-      const main = await mainFactory({ clock, credential: "shared-secret" });
+      const main = await mainFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+      });
       const worker = await workerFactory({
         clock,
         credential: "shared-secret",
@@ -285,7 +297,11 @@ export function workerSessionConformance(
 
     test("messages are correlated and replayed message IDs are delivered once", async () => {
       const clock = new FakeClock();
-      const main = await mainFactory({ clock, credential: "shared-secret" });
+      const main = await mainFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+      });
       const worker = await workerFactory({
         clock,
         credential: "shared-secret",
@@ -312,6 +328,7 @@ export function workerSessionConformance(
       const main = await mainFactory({
         clock,
         credential: "shared-secret",
+        workerId: WORKER_ID,
         heartbeatTimeoutMs: 100,
       });
       const worker = await workerFactory({
@@ -335,7 +352,11 @@ export function workerSessionConformance(
 
     test("a replacement session is authoritative and fences its predecessor", async () => {
       const clock = new FakeClock();
-      const main = await mainFactory({ clock, credential: "shared-secret" });
+      const main = await mainFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+      });
       const firstWorker = await workerFactory({
         clock,
         credential: "shared-secret",
@@ -367,7 +388,11 @@ export function workerSessionConformance(
 
     test("close is idempotent and rejects later sends", async () => {
       const clock = new FakeClock();
-      const main = await mainFactory({ clock, credential: "shared-secret" });
+      const main = await mainFactory({
+        clock,
+        credential: "shared-secret",
+        workerId: WORKER_ID,
+      });
       const worker = await workerFactory({
         clock,
         credential: "shared-secret",
