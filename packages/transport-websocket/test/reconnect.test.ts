@@ -1947,6 +1947,84 @@ test("WorkerRuntime latches invalid acknowledgement revisions and rejects later 
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("WorkerRuntime rejects before pruning after revision corruption is latched", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  const firstRequest = executionRequest(
+    { mode: "echo", value: "first" },
+    "latch-before-prune-first",
+  );
+  const corruptRequest = executionRequest(
+    { mode: "echo", value: "corrupt" },
+    "latch-before-prune-corrupt",
+  );
+  const thirdRequest = executionRequest(
+    { mode: "echo", value: "third" },
+    "latch-before-prune-third",
+  );
+  const expiredGate = Promise.withResolvers<RemoteAttemptRecord | undefined>();
+  let invalidAcknowledgements = 0;
+  let expiredCalls = 0;
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "worker-latch-before-prune-remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
+        if (record.state === "expired") {
+          expiredCalls += 1;
+          return expiredGate.promise;
+        }
+        if (
+          record.acknowledgedAt !== undefined &&
+          record.request.attemptId === corruptRequest.attemptId
+        ) {
+          invalidAcknowledgements += 1;
+          return {
+            ...record,
+            revision: "01",
+          };
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+    retentionMs: 100,
+    resultBuffer: { maxCount: 8, maxBytes: 256 * 1024 },
+    maxResultBytes: 64 * 1024,
+    maxInventoryBytes: 300 * 1024,
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  assert.equal((await (await remote.submit(firstRequest)).result).status, "succeeded");
+  await eventually(async () => {
+    assert.notEqual(
+      (await backing.load(firstRequest.taskId, firstRequest.attemptId))?.acknowledgedAt,
+      undefined,
+    );
+  });
+  assert.equal((await (await remote.submit(corruptRequest)).result).status, "succeeded");
+  await eventually(() => assert.equal(invalidAcknowledgements, 1));
+  clock.advanceBy(101);
+
+  void remote.submit(thirdRequest);
+  for (let index = 0; index < 20; index += 1) await flush();
+  expiredGate.resolve(undefined);
+
+  assert.equal(expiredCalls, 0);
+  assert.equal(local.executions, 2);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
