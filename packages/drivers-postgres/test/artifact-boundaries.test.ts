@@ -26,7 +26,7 @@ test("an oversized source chunk is rejected before its bytes are copied", async 
     namespace: namespace("artifact_source_limit"),
   });
   const oversized = new Proxy(new Uint8Array(1), {
-    get(target, property) {
+    get(_target, property) {
       if (property === "byteLength") return POSTGRES_ARTIFACT_MAX_BYTES + 1;
       throw new Error(`Oversized chunk bytes were accessed through ${String(property)}`);
     },

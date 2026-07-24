@@ -837,7 +837,7 @@ Commit: `git add packages/transport-websocket && git commit -m "feat: add recove
 - Produces: `coordinationConformance(factory)`.
 - Produces: `createPostgresDrivers({ connectionString, namespace })`.
 
-- [ ] **Step 1: Write and commit failing PostgreSQL conformance and fault tests**
+- [x] **Step 1: Write and commit failing PostgreSQL conformance and fault tests**
 
 Cover shared state, artifact uniqueness, exclusive leadership, monotonic epoch,
 database-time lease expiry, concurrent CAS, namespace isolation, watch catch-up,
@@ -853,19 +853,19 @@ Expected: FAIL because PostgreSQL driver exports are absent.
 
 Commit: `git add compose.yaml packages/testkit packages/drivers-postgres && git commit -m "test: define PostgreSQL runtime drivers"`
 
-- [ ] **Step 2: Implement migrations, state, and artifact transactions**
+- [x] **Step 2: Implement migrations, state, and artifact transactions**
 
 Use one migration lock, `bigint` revisions returned as strings, JSONB records,
 bytea artifacts, durable changes, operations, outbox, and conditional epoch
 checks in every leader-owned transaction.
 
-- [ ] **Step 3: Implement leadership, leases, CAS, and lossless watch**
+- [x] **Step 3: Implement leadership, leases, CAS, and lossless watch**
 
 Hold advisory leadership on a dedicated client. Increment epoch transactionally
 after lock acquisition. Use database time for lease predicates. Treat
 `LISTEN/NOTIFY` as wake-up only and scan changes from the last revision.
 
-- [ ] **Step 4: Run integration and fault suites, then commit**
+- [x] **Step 4: Run integration and fault suites, then commit**
 
 Run:
 
@@ -877,6 +877,10 @@ docker compose down -v
 ```
 
 Expected: PASS; stale leader writes are rejected and all connections close.
+
+Verified against local PostgreSQL 16.14 with the same major/minor version as the
+pinned Compose image. The exact Docker-image CI run remains tracked separately
+in OpenSpec task 3.7.
 
 Commit: `git add packages/testkit packages/drivers-postgres compose.yaml && git commit -m "feat: add fenced PostgreSQL runtime drivers"`
 
