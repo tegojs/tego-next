@@ -12,6 +12,7 @@ import {
   parseRunTaskRequest,
   parseArtifactDigest,
   parsePluginInstallation,
+  parseOperationId,
   type Clock,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -276,13 +277,14 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
   assert.deepEqual(await service.status(identity.taskId), terminal);
 });
 
-test("accepted task is durable before executor submission and duplicate identity replays", async () => {
+test("@spec:runtime-operations/task-operations/idempotent-run-replay", async () => {
   const { executor, service, state } = serviceFixture();
   await service.setAuthority(authority);
   const gate = Promise.withResolvers<void>();
   executor.submitGate = gate.promise;
+  const replayable = { ...request, operationId: parseOperationId("run-01") };
 
-  const first = service.run(request);
+  const first = service.run(replayable);
   await Promise.resolve();
   await Promise.resolve();
   const durable = await state.read<JsonValue>({
@@ -296,11 +298,50 @@ test("accepted task is durable before executor submission and duplicate identity
       : undefined,
     "accepted",
   );
-  const duplicate = service.run(structuredClone(request));
+  const duplicate = service.run(structuredClone(replayable));
   gate.resolve();
   assert.equal((await first).taskId, identity.taskId);
   assert.equal((await duplicate).taskId, identity.taskId);
   assert.equal(executor.submitted.length, 1);
+});
+
+test("@spec:runtime-operations/task-operations/idempotency-conflict", async () => {
+  const { executor, service } = serviceFixture();
+  await service.setAuthority(authority);
+  const first = { ...request, operationId: parseOperationId("run-01") };
+  await service.run(first);
+  await assert.rejects(
+    service.run({ ...first, input: { value: "different" } }),
+    (error: unknown) => diagnosticCode(error) === "STATE_IDEMPOTENCY_CONFLICT",
+  );
+  assert.equal(executor.submitted.length, 1);
+});
+
+test("@spec:runtime-operations/task-operations/unkeyed-runs-are-distinct", async () => {
+  const state = new TransactionalState();
+  const executors: ControlledExecutor[] = [];
+  let sequence = 0;
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      const executor = new ControlledExecutor();
+      executors.push(executor);
+      return executor;
+    },
+    createIdentity: () => {
+      sequence += 1;
+      return {
+        taskId: parseTaskId(`task-${String(sequence)}`),
+        attemptId: parseAttemptId(`attempt-${String(sequence)}`),
+      };
+    },
+  });
+  await service.setAuthority(authority);
+  const first = await service.run(request);
+  const second = await service.run(structuredClone(request));
+  assert.notEqual(first.taskId, second.taskId);
+  assert.equal(executors.length, 2);
 });
 
 test("leadership loss fences terminal commit and reports indeterminate without output", async () => {
