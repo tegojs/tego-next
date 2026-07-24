@@ -388,6 +388,13 @@ export class RemoteExecutor implements Executor {
       await this.#save(attempt);
       if (payload.result !== undefined) {
         await this.#publish(attempt, parseExecutionResult(payload.result));
+        if (this.#session === session && session.state === "ready") {
+          await session.send(REMOTE_RESULT_ACK, {
+            kind: "result",
+            taskId: attempt.request.taskId,
+            attemptId: attempt.request.attemptId,
+          });
+        }
       } else {
         attempt.state = "running";
         await this.#save(attempt);

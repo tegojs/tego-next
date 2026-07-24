@@ -71,6 +71,7 @@ export class WorkerRuntime {
   readonly #maxAssignments: number;
   readonly #maxAssignmentBytes: number;
   readonly #maxInventoryItems: number;
+  readonly #maxBufferedResults: number;
   readonly #results: ResultBuffer;
   readonly #attempts = new Map<string, WorkerAttempt>();
   #session: RemoteSession | undefined;
@@ -79,6 +80,7 @@ export class WorkerRuntime {
   #receiveChain = Promise.resolve();
   #hydrated = false;
   #closed = false;
+  #reservedResults = 0;
 
   constructor(options: WorkerRuntimeOptions) {
     this.#workerId = options.workerId;
@@ -101,6 +103,11 @@ export class WorkerRuntime {
       options.maxInventoryItems,
       DEFAULT_MAX_INVENTORY,
       "maxInventoryItems",
+    );
+    this.#maxBufferedResults = positiveLimit(
+      options.resultBuffer?.maxCount,
+      256,
+      "maxResultCount",
     );
     this.#results = new ResultBuffer(options.resultBuffer);
   }
@@ -179,6 +186,9 @@ export class WorkerRuntime {
     for (const result of (await this.#resultStore?.list()) ?? []) {
       this.#results.put(parseExecutionResult(result));
     }
+    this.#reservedResults =
+      [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal").length +
+      this.#results.count;
     this.#hydrated = true;
   }
 
@@ -234,12 +244,18 @@ export class WorkerRuntime {
         },
         { correlationId: message.messageId },
       );
-      if (existing.result !== undefined) await this.#publish(existing.result);
+      if (
+        existing.result !== undefined &&
+        this.#results.get(existing.result.taskId, existing.result.attemptId) !== undefined
+      ) {
+        await this.#publish(existing.result);
+      }
       return;
     }
     if (
       requestBytes > this.#maxAssignmentBytes ||
-      this.#attempts.size >= this.#maxAssignments
+      this.#attempts.size >= this.#maxAssignments ||
+      this.#reservedResults >= this.#maxBufferedResults
     ) {
       await this.#sendRejected(
         session,
@@ -268,6 +284,7 @@ export class WorkerRuntime {
     };
     await this.#save(attempt);
     this.#attempts.set(key, attempt);
+    this.#reservedResults += 1;
     let acknowledged = false;
     try {
       await session.send(
@@ -418,8 +435,12 @@ export class WorkerRuntime {
   async #acknowledgeResult(payloadValue: JsonValue): Promise<void> {
     const payload = asObject(payloadValue, REMOTE_RESULT_ACK);
     const request = identityFrom(payload);
+    const retained = this.#results.get(request.taskId, request.attemptId);
     this.#results.acknowledge(request.taskId, request.attemptId);
     await this.#resultStore?.delete(request.taskId, request.attemptId);
+    if (retained !== undefined) {
+      this.#reservedResults = Math.max(0, this.#reservedResults - 1);
+    }
   }
 
   #sessionLost(session: RemoteSession): void {
