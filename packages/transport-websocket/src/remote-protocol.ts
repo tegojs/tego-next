@@ -3,6 +3,7 @@ import {
   DiagnosticError,
   parseExecutionRequest,
   parseExecutionResult,
+  parseSequence,
   runtimeDiagnostic,
   serializeWireValue,
   type ExecutionRequest,
@@ -75,11 +76,11 @@ export interface RemoteAttemptRecord extends JsonObject {
   readonly result?: ExecutionResult;
   readonly acknowledgedAt?: string;
   readonly cancellation?: "cancelled" | "timed-out";
-  readonly revision?: number;
+  readonly revision: string;
 }
 
 export interface RemoteAttemptCommitCondition {
-  readonly expectedRevision: number | null;
+  readonly expectedRevision: string | null;
   readonly expectedEpoch?: string;
 }
 
@@ -114,10 +115,9 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
 
   async save(record: RemoteAttemptRecord): Promise<void> {
     const key = attemptKey(record.request.taskId, record.request.attemptId);
-    const current = this.#records.get(key);
     const snapshot = cloneJson({
       ...record,
-      revision: record.revision ?? (current?.revision ?? 0) + 1,
+      revision: parseSequence(record.revision),
     }) as unknown as RemoteAttemptRecord;
     this.#records.set(key, snapshot);
     this.#onSave?.(snapshot);
@@ -129,10 +129,12 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
   ): Promise<RemoteAttemptRecord | undefined> {
     const key = attemptKey(record.request.taskId, record.request.attemptId);
     const current = this.#records.get(key);
-    const currentRevision = current?.revision ?? 0;
+    const currentRevision = current?.revision;
     if (
       (condition.expectedRevision === null && current !== undefined) ||
-      (condition.expectedRevision !== null && currentRevision !== condition.expectedRevision) ||
+      (condition.expectedRevision !== null &&
+        (currentRevision === undefined ||
+          parseSequence(currentRevision) !== parseSequence(condition.expectedRevision))) ||
       (condition.expectedEpoch !== undefined &&
         current !== undefined &&
         current.epoch !== condition.expectedEpoch)
@@ -141,7 +143,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     }
     const snapshot = cloneJson({
       ...record,
-      revision: currentRevision + 1,
+      revision: incrementRevision(currentRevision ?? "0"),
     }) as unknown as RemoteAttemptRecord;
     this.#records.set(key, snapshot);
     this.#onSave?.(snapshot);
@@ -168,6 +170,10 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       .filter((record) => record.workerId === workerId)
       .map((record) => cloneJson(record) as unknown as RemoteAttemptRecord);
   }
+}
+
+function incrementRevision(revision: string): string {
+  return parseSequence((BigInt(parseSequence(revision)) + 1n).toString());
 }
 
 export interface RemoteResultStore {

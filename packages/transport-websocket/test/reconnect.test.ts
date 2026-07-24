@@ -783,6 +783,7 @@ test("a restarted Worker terminates uncertain finish-and-buffer work without re-
     workerId,
     request,
     fingerprint: requestFingerprint(request),
+    revision: "0",
     state: "running",
     epoch: "4",
     updatedAt: clock.now().toISOString(),
@@ -850,6 +851,7 @@ test("persisted attempt epochs fence stale sessions after Main restart", async (
     workerId,
     request,
     fingerprint: "persisted-fingerprint",
+    revision: "0",
     state: "assigned",
     epoch: "7",
     updatedAt: clock.now().toISOString(),
@@ -965,6 +967,7 @@ test("Worker rejects an assignment whose expired tombstone exists only in durabl
     workerId,
     request,
     fingerprint: requestFingerprint(request),
+    revision: "0",
     state: "expired",
     epoch: "1",
     updatedAt: clock.now().toISOString(),
@@ -1042,6 +1045,7 @@ test("durable terminal evidence wins over an uncertain running record after Work
     workerId,
     request,
     fingerprint: requestFingerprint(request),
+    revision: "0",
     state: "running",
     epoch: "3",
     updatedAt: clock.now().toISOString(),
@@ -1091,6 +1095,7 @@ test("expired tombstones do not consume active restart inventory capacity", asyn
       workerId,
       request,
       fingerprint: requestFingerprint(request),
+      revision: "0",
       state: "expired",
       epoch: "1",
       updatedAt: clock.now().toISOString(),
@@ -1417,16 +1422,27 @@ test("session-loss persistence failure cannot suppress the orphan recovery timer
   );
   const handle = await remote.submit(request);
   main.close();
-  await flush();
+  for (let index = 0; index < 20; index += 1) await flush();
+  assert.equal(unknownFailures, 3);
   clock.advanceBy(101);
-  await flush();
+  for (let index = 0; index < 20; index += 1) await flush();
+  assert.equal(unknownFailures, 4);
   let settled = false;
   void handle.result.then(() => {
     settled = true;
   });
   assert.equal(settled, false);
   clock.advanceBy(26);
+  for (let index = 0; index < 20; index += 1) await flush();
 
+  assert.deepEqual(
+    {
+      settled,
+      state: (await backing.load(request.taskId, request.attemptId))?.state,
+      unknownFailures,
+    },
+    { settled: true, state: "terminal", unknownFailures: 4 },
+  );
   assert.equal((await handle.result).status, "failed");
   await Promise.all([remote.close(), runtime.close()]);
 });
@@ -1489,15 +1505,16 @@ test("too-small result limits reject before mandatory terminal evidence can be w
   await reconnect(remote, runtime, "1");
   const handles = await Promise.all(
     Array.from({ length: 5 }, async (_, index) =>
-      remote.submit(
-        executionRequest({ mode: "echo", value: index }, `tiny-result-limit-${index}`),
-      ),
+      remote.submit(executionRequest({ mode: "echo", value: index }, `tiny-result-limit-${index}`)),
     ),
   );
   const results = await Promise.all(handles.map(async (handle) => handle.result));
 
   assert.equal(local.executions, 0);
-  assert.equal(results.every((result) => result.status === "rejected"), true);
+  assert.equal(
+    results.every((result) => result.status === "rejected"),
+    true,
+  );
   await Promise.all([remote.close(), runtime.close()]);
 });
 
@@ -1518,9 +1535,10 @@ test("attempt-store revisions are required unsigned-64 decimal strings", async (
     { expectedRevision: null },
   );
   assert.equal(created?.revision, "1");
+  if (created === undefined) throw new Error("attempt revision was not created");
   const updated = await store.commit(
     {
-      ...created!,
+      ...created,
       state: "running",
     },
     { expectedRevision: "1", expectedEpoch: "1" },

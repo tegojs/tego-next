@@ -59,10 +59,11 @@ export interface WorkerRuntimeOptions {
 interface WorkerAttempt {
   readonly request: ExecutionRequest;
   readonly fingerprint: string;
-  revision: number;
+  revision: string;
   transition: Promise<void>;
   state: "acknowledged" | "running" | "terminal";
   epoch: string;
+  reservedBytes: number;
   executor?: Executor;
   handle?: ExecutionHandle;
   result?: ExecutionResult;
@@ -126,11 +127,6 @@ export class WorkerRuntime {
       DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
       "maxInventoryBytes",
     );
-    this.#maxResultBytes = positiveLimit(
-      options.maxResultBytes,
-      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES - INVENTORY_ENVELOPE_RESERVE_BYTES,
-      "maxResultBytes",
-    );
     this.#maxBufferedResults = positiveLimit(options.resultBuffer?.maxCount, 256, "maxResultCount");
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
     const recoverableResultBytes = this.#maxInventoryBytes - INVENTORY_ENVELOPE_RESERVE_BYTES;
@@ -145,8 +141,16 @@ export class WorkerRuntime {
     if (resultBufferBytes > recoverableResultBytes) {
       throw new RangeError("result buffer bytes must fit in one recovery inventory");
     }
-    if (this.#maxResultBytes > recoverableResultBytes) {
-      throw new RangeError("maxResultBytes must fit in one recovery inventory");
+    this.#maxResultBytes = positiveLimit(
+      options.maxResultBytes,
+      Math.min(
+        DEFAULT_MAX_CONTROL_PAYLOAD_BYTES - INVENTORY_ENVELOPE_RESERVE_BYTES,
+        resultBufferBytes,
+      ),
+      "maxResultBytes",
+    );
+    if (this.#maxResultBytes > recoverableResultBytes || this.#maxResultBytes > resultBufferBytes) {
+      throw new RangeError("maxResultBytes must fit in one recovery result buffer");
     }
     this.#results = new ResultBuffer({
       ...options.resultBuffer,
@@ -253,10 +257,11 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: record.revision ?? 0,
+          revision: record.revision,
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
+          reservedBytes: 0,
           result: durableResult,
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
           ...(record.acknowledgedAt === undefined
@@ -273,10 +278,11 @@ export class WorkerRuntime {
         const attempt: WorkerAttempt = {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: record.revision ?? 0,
+          revision: record.revision,
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
+          reservedBytes: 0,
           result: record.result,
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
           ...(record.acknowledgedAt === undefined
@@ -289,10 +295,11 @@ export class WorkerRuntime {
         this.#attempts.set(key, {
           request: record.request,
           fingerprint: record.fingerprint,
-          revision: record.revision ?? 0,
+          revision: record.revision,
           transition: Promise.resolve(),
           state: "acknowledged",
           epoch: record.epoch,
+          reservedBytes: this.#resultReservationBytes(record.request),
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
         });
       }
@@ -303,9 +310,19 @@ export class WorkerRuntime {
     this.#reservedResults =
       [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal").length +
       this.#results.count;
-    this.#reservedResultBytes =
-      [...this.#attempts.values()].filter((attempt) => attempt.state !== "terminal").length *
-      this.#resultReservationBytes();
+    this.#reservedResultBytes = [...this.#attempts.values()].reduce(
+      (total, attempt) => total + attempt.reservedBytes,
+      0,
+    );
+    if (
+      [...this.#attempts.values()].some(
+        (attempt) =>
+          attempt.state !== "terminal" &&
+          this.#minimumTerminalBytes(attempt.request) > this.#maxResultBytes,
+      )
+    ) {
+      throw new Error("Configured maxResultBytes cannot retain mandatory terminal evidence");
+    }
     if (this.#results.bytes + this.#reservedResultBytes > this.#results.maxBytes) {
       throw new Error("Persisted Worker result reservations exceed recovery buffer bytes");
     }
@@ -441,7 +458,8 @@ export class WorkerRuntime {
     if (
       this.#attempts.size >= this.#maxAssignments ||
       this.#reservedResults >= this.#maxBufferedResults ||
-      this.#results.bytes + this.#reservedResultBytes + this.#resultReservationBytes() >
+      this.#minimumTerminalBytes(request) > this.#maxResultBytes ||
+      this.#results.bytes + this.#reservedResultBytes + this.#resultReservationBytes(request) >
         this.#results.maxBytes
     ) {
       await this.#sendRejected(
@@ -469,10 +487,11 @@ export class WorkerRuntime {
     const attempt: WorkerAttempt = {
       request: cloneJson(request),
       fingerprint,
-      revision: 0,
+      revision: "0",
       transition: Promise.resolve(),
       state: "acknowledged",
       epoch: session.epoch,
+      reservedBytes: this.#resultReservationBytes(request),
     };
     try {
       await this.#create(attempt);
@@ -488,7 +507,7 @@ export class WorkerRuntime {
     }
     this.#attempts.set(key, attempt);
     this.#reservedResults += 1;
-    this.#reservedResultBytes += this.#resultReservationBytes();
+    this.#reservedResultBytes += attempt.reservedBytes;
     let acknowledged = false;
     try {
       await session.send(
@@ -589,7 +608,7 @@ export class WorkerRuntime {
   async #terminal(attempt: WorkerAttempt, candidate: ExecutionResult): Promise<void> {
     if (attempt.state === "terminal") return;
     let result =
-      jsonBytes(candidate) > this.#resultReservationBytes()
+      jsonBytes(candidate) > this.#maxResultBytes
         ? this.#result(
             attempt.request,
             "failed",
@@ -598,7 +617,7 @@ export class WorkerRuntime {
           )
         : parseExecutionResult(candidate);
     if (
-      jsonBytes(result) > this.#resultReservationBytes() &&
+      jsonBytes(result) > attempt.reservedBytes &&
       candidate.diagnostic?.code !== "EXECUTOR_REMOTE_RESULT_TOO_LARGE"
     ) {
       result = this.#result(
@@ -630,10 +649,8 @@ export class WorkerRuntime {
         throw new Error("Worker attempt lost terminal commit authority to a conflicting result");
       }
       this.#results.put(authoritative);
-      this.#reservedResultBytes = Math.max(
-        0,
-        this.#reservedResultBytes - this.#resultReservationBytes(),
-      );
+      this.#reservedResultBytes = Math.max(0, this.#reservedResultBytes - attempt.reservedBytes);
+      attempt.reservedBytes = 0;
     });
     this.#background(this.#publish(attempt.result ?? terminal));
   }
@@ -871,7 +888,7 @@ export class WorkerRuntime {
     if (committed === undefined) {
       throw new Error("Remote attempt was concurrently admitted by another Worker session");
     }
-    attempt.revision = committed.revision ?? 0;
+    attempt.revision = committed.revision;
   }
 
   async #commit(
@@ -887,7 +904,7 @@ export class WorkerRuntime {
           expectedEpoch: attempt.epoch,
         });
         if (committed !== undefined) {
-          attempt.revision = committed.revision ?? attempt.revision + 1;
+          attempt.revision = committed.revision;
           attempt.state = state;
           if (result !== undefined) attempt.result = result;
           return;
@@ -899,7 +916,7 @@ export class WorkerRuntime {
         if (latest === undefined) {
           throw new Error("Worker attempt disappeared during a conditional commit");
         }
-        attempt.revision = latest.revision ?? attempt.revision;
+        attempt.revision = latest.revision;
         attempt.epoch = latest.epoch;
         if (latest.cancellation === undefined) {
           delete attempt.cancellation;
@@ -1006,8 +1023,56 @@ export class WorkerRuntime {
     return attempt.state === "terminal";
   }
 
-  #resultReservationBytes(): number {
-    return Math.min(this.#maxResultBytes, this.#results.maxBytes);
+  #resultReservationBytes(request: ExecutionRequest): number {
+    return Math.max(this.#maxResultBytes, this.#minimumTerminalBytes(request));
+  }
+
+  #minimumTerminalBytes(request: ExecutionRequest): number {
+    const failures = [
+      this.#result(
+        request,
+        "cancelled",
+        "EXECUTOR_REMOTE_CANCELLED",
+        "Worker runtime closed before local execution completed",
+      ),
+      this.#result(
+        request,
+        "cancelled",
+        "EXECUTOR_REMOTE_ORPHAN_CANCELLED",
+        "Assignment acknowledgement was interrupted",
+      ),
+      this.#result(
+        request,
+        "failed",
+        "EXECUTOR_REMOTE_RESULT_IDENTITY_MISMATCH",
+        "Worker local Executor returned a result for a different attempt identity",
+      ),
+      this.#result(
+        request,
+        "failed",
+        "EXECUTOR_REMOTE_LOCAL_FAILURE",
+        "Worker local executor failed to run the remote assignment",
+      ),
+      this.#result(
+        request,
+        "failed",
+        "EXECUTOR_REMOTE_RESULT_TOO_LARGE",
+        "Worker terminal diagnostic exceeds maxResultBytes",
+      ),
+      this.#result(
+        request,
+        "failed",
+        "EXECUTOR_REMOTE_PERSISTENCE_FAILED",
+        "Worker durable result persistence failed",
+      ),
+      this.#result(
+        request,
+        "failed",
+        "EXECUTOR_REMOTE_RESTART_UNCERTAIN",
+        "Worker restart cannot safely re-execute an unfinished remote attempt",
+      ),
+    ];
+    return Math.max(...failures.map((result) => jsonBytes(result)));
   }
 }
 

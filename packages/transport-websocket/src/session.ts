@@ -109,7 +109,10 @@ export interface WorkerSessionOptions {
   readonly handshakeTimeoutMs?: number;
   readonly requestTimeoutMs?: number;
   readonly worker?: WorkerRegistration;
-  readonly onRegister?: (session: WorkerSession, registration: WorkerRegistration) => string;
+  readonly onRegister?: (
+    session: WorkerSession,
+    registration: WorkerRegistration,
+  ) => string | Promise<string>;
   readonly onUnavailable?: (session: WorkerSession) => void;
   readonly onClosed?: (session: WorkerSession) => void;
 }
@@ -371,6 +374,7 @@ export class WorkerSession {
   #helloSent = false;
   #authenticationSent = false;
   #registrationSent = false;
+  #registrationPending = false;
   #lastHeartbeatAt = 0;
   #pendingBinaryBytes = 0;
   #detached = false;
@@ -731,7 +735,16 @@ export class WorkerSession {
       return;
     }
     if (envelope.type === "worker.register") {
-      this.#receiveRegistration(envelope);
+      void this.#receiveRegistration(envelope).catch((error: unknown) => {
+        this.#fail(
+          error instanceof DiagnosticError
+            ? error
+            : diagnosticError(
+                "PROTOCOL_HANDSHAKE_INVALID",
+                "Worker session epoch allocation failed",
+              ),
+        );
+      });
       return;
     }
     if (envelope.type === "session.ready") {
@@ -901,10 +914,11 @@ export class WorkerSession {
     this.#sendInternal("worker.register", this.#worker);
   }
 
-  #receiveRegistration(envelope: WorkerControlEnvelope): void {
+  async #receiveRegistration(envelope: WorkerControlEnvelope): Promise<void> {
     if (
       this.#role !== "main" ||
       this.#state !== "authenticating" ||
+      this.#registrationPending ||
       !this.#peerAuthenticated ||
       this.#remoteRole !== "worker" ||
       this.#onRegister === undefined ||
@@ -928,7 +942,10 @@ export class WorkerSession {
         "Worker registration does not match the authenticated principal",
       );
     }
-    this.#epoch = boundedUnsigned64(this.#onRegister(this, registration), "Worker session epoch");
+    this.#registrationPending = true;
+    const epoch = await this.#onRegister(this, registration);
+    if (this.#state !== "authenticating") return;
+    this.#epoch = boundedUnsigned64(epoch, "Worker session epoch");
     this.#state = "ready";
     this.#notifyState();
     this.#available = true;

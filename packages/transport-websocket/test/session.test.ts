@@ -27,7 +27,14 @@ import {
 } from "../src/index.js";
 import { executionRequest, flush, TestLocalExecutor } from "./remote-test-support.js";
 
-workerSessionConformance(createMainEndpoint, createWorkerEndpoint);
+workerSessionConformance(
+  (options) =>
+    createMainEndpoint({
+      ...options,
+      epochAllocator: new MemoryWorkerEpochAllocator(),
+    }),
+  createWorkerEndpoint,
+);
 
 const ENVELOPE: WorkerControlEnvelope = {
   protocol: "1.0",
@@ -62,6 +69,7 @@ test("the public protocol registry rejects locally configured unsupported versio
         clock,
         credential: "shared-secret",
         workerId: "unsupported-local" as WorkerId,
+        epochAllocator: new MemoryWorkerEpochAllocator(),
         protocol: "2.0" as WorkerProtocolVersion,
       }),
     /protocol|version|supported/iu,
@@ -313,7 +321,7 @@ async function directConnection(options?: {
     credential: "shared-secret",
     workerId: "direct-worker" as WorkerId,
     limits,
-    ...(options?.epochAllocator === undefined ? {} : { epochAllocator: options.epochAllocator }),
+    epochAllocator: options?.epochAllocator ?? new MemoryWorkerEpochAllocator(),
     ...(options?.requestTimeoutMs === undefined
       ? {}
       : { requestTimeoutMs: options.requestTimeoutMs }),
@@ -539,6 +547,7 @@ test("authentication failures never expose either credential in diagnostics or c
     clock,
     credential: "main-private-value",
     workerId: "redacted-worker" as WorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
   const worker = createWorkerEndpoint({
     clock,
@@ -601,6 +610,7 @@ test("endpoints retain only authoritative live sessions across failed reconnects
     clock,
     credential: "shared-secret",
     workerId: "retained-worker" as WorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -651,6 +661,7 @@ test("sessions accept the ws message(data, isBinary) event signature", async () 
     clock,
     credential: "shared-secret",
     workerId: "ws-signature-worker" as WorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
   const worker = createWorkerEndpoint({
     clock,
@@ -677,6 +688,7 @@ test("an incomplete authentication handshake expires without retaining the socke
     clock,
     credential: "shared-secret",
     workerId: "incomplete-worker" as WorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
     handshakeTimeoutMs: 100,
   });
   const [mainSocket] = directSocketPair();
@@ -704,6 +716,7 @@ test("a peer hello arriving first cannot move authenticate before the local hell
     clock,
     credential: "shared-secret",
     workerId: "peer-worker" as WorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
   const [mainSocket] = directSocketPair();
   const session = main.attach(mainSocket);
@@ -740,11 +753,13 @@ test("a late lower epoch cannot replace the authoritative Worker session", async
     clock,
     credential: "shared-secret",
     workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
   const mainB = createMainEndpoint({
     clock,
     credential: "shared-secret",
     workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
 
   const seedWorker = createWorkerEndpoint({
@@ -821,6 +836,7 @@ test("a credential is bound to its authenticated Worker principal", async () => 
       "bound-worker": "bound-secret",
       "other-worker": "other-secret",
     },
+    epochAllocator: new MemoryWorkerEpochAllocator(),
   });
   const impersonator = createWorkerEndpoint({
     clock,

@@ -31,7 +31,7 @@ export interface MainEndpointOptions extends WorkerSessionEndpointOptions {
   readonly credential?: string;
   readonly workerId?: WorkerId;
   readonly credentials?: Readonly<Record<string, string>>;
-  readonly epochAllocator?: WorkerEpochAllocator;
+  readonly epochAllocator: WorkerEpochAllocator;
 }
 
 export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
@@ -41,7 +41,7 @@ export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
 }
 
 export interface WorkerEpochAllocator {
-  next(workerId: WorkerId): string;
+  next(workerId: WorkerId): Promise<string>;
 }
 
 export class MemoryWorkerEpochAllocator implements WorkerEpochAllocator {
@@ -53,7 +53,7 @@ export class MemoryWorkerEpochAllocator implements WorkerEpochAllocator {
     }
   }
 
-  next(workerIdValue: WorkerId): string {
+  async next(workerIdValue: WorkerId): Promise<string> {
     const workerId = parseWorkerId(workerIdValue);
     const nextEpoch = (this.#epochs.get(workerId) ?? 0n) + 1n;
     const parsed = parseSequence(nextEpoch.toString());
@@ -88,7 +88,7 @@ export class MainEndpoint {
       throw new TypeError("Main endpoint requires at least one Worker-bound credential");
     }
     this.#credentials = credentials;
-    this.#epochAllocator = options.epochAllocator ?? new MemoryWorkerEpochAllocator();
+    this.#epochAllocator = options.epochAllocator;
   }
 
   get activeSessionCount(): number {
@@ -147,12 +147,15 @@ export class MainEndpoint {
     this.#registrations.clear();
   }
 
-  #register(session: WorkerSession, registration: WorkerRegistration): string {
+  async #register(session: WorkerSession, registration: WorkerRegistration): Promise<string> {
     if (this.#closed) {
       throw new Error("Main Worker endpoint is closed");
     }
     const workerId = parseWorkerId(registration.workerId);
-    const nextEpoch = this.#epochAllocator.next(workerId);
+    const nextEpoch = parseSequence(await this.#epochAllocator.next(workerId));
+    if (this.#closed) {
+      throw new Error("Main Worker endpoint closed while allocating a session epoch");
+    }
     const predecessor = this.#current.get(workerId);
     this.#current.set(workerId, session);
     this.#registrations.set(workerId, registration);

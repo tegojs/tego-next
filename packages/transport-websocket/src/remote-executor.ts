@@ -67,7 +67,7 @@ interface RemoteAttempt {
   readonly handle: ExecutionHandle;
   readonly result: PromiseWithResolvers<ExecutionResult>;
   readonly deadline: AbortController;
-  revision: number;
+  revision: string;
   transition: Promise<void>;
   state: "acknowledged" | "assigned" | "running" | "terminal" | "unknown";
   epoch: string;
@@ -261,7 +261,7 @@ export class RemoteExecutor implements Executor {
       handle,
       result,
       deadline: new AbortController(),
-      revision: 0,
+      revision: "0",
       transition: Promise.resolve(),
       state: "assigned",
       epoch: this.#session.epoch,
@@ -431,7 +431,7 @@ export class RemoteExecutor implements Executor {
         handle,
         result,
         deadline: new AbortController(),
-        revision: record.revision ?? 0,
+        revision: record.revision,
         transition: Promise.resolve(),
         state: record.state,
         epoch: record.epoch,
@@ -783,28 +783,30 @@ export class RemoteExecutor implements Executor {
     this.#accepting = false;
     this.#detachSession(true);
     const recovery = this.#orphanRecovery;
-    this.#background(
-      (async () => {
-        await Promise.allSettled(
-          [...this.#attempts.values()].map(async (attempt) =>
-            this.#transition(attempt, async () => {
-              if (attempt.state !== "terminal" && attempt.epoch === session.epoch) {
-                await this.#commit(attempt, "unknown");
-              }
-            }),
-          ),
-        );
-      })(),
+    const persisted = Promise.allSettled(
+      [...this.#attempts.values()].map(async (attempt) =>
+        this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal" && attempt.epoch === session.epoch) {
+            await this.#commit(attempt, "unknown");
+          }
+        }),
+      ),
     );
-    this.#background(this.#expireOrphans(recovery));
+    this.#background(persisted);
+    this.#background(this.#expireOrphans(recovery, persisted));
   }
 
-  async #expireOrphans(recovery: AbortController): Promise<void> {
+  async #expireOrphans(
+    recovery: AbortController,
+    persisted: Promise<readonly PromiseSettledResult<void>[]>,
+  ): Promise<void> {
+    const expiresAt = this.#clock.now().getTime() + this.#orphanTimeoutMs;
     try {
-      await this.#clock.sleep(this.#orphanTimeoutMs, recovery.signal);
+      await this.#waitUntil(expiresAt, recovery.signal);
     } catch {
       return;
     }
+    await persisted;
     if (this.#session !== undefined || recovery !== this.#orphanRecovery) return;
     for (const attempt of this.#attempts.values()) {
       if (attempt.state !== "unknown" || attempt.terminal !== undefined) continue;
@@ -883,7 +885,7 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    attempt.revision = committed.revision ?? 0;
+    attempt.revision = committed.revision;
   }
 
   async #commit(
@@ -903,7 +905,7 @@ export class RemoteExecutor implements Executor {
           },
         );
         if (committed !== undefined) {
-          attempt.revision = committed.revision ?? attempt.revision + 1;
+          attempt.revision = committed.revision;
           attempt.state = state;
           attempt.epoch = epoch;
           if (result !== undefined) attempt.terminal = result;
@@ -916,7 +918,7 @@ export class RemoteExecutor implements Executor {
         if (latest === undefined) {
           throw new Error("Remote attempt state disappeared during a conditional commit");
         }
-        attempt.revision = latest.revision ?? attempt.revision;
+        attempt.revision = latest.revision;
         attempt.epoch = latest.epoch;
         attempt.state = latest.state === "expired" ? "terminal" : latest.state;
         if (latest.cancellation === undefined) {
