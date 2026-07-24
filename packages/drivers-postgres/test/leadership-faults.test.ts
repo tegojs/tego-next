@@ -3,12 +3,12 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { diagnosticCode, parseRevision } from "@tegojs/contracts";
+import { Pool } from "pg";
 import { PostgresCoordinationProvider, PostgresStateStore } from "../src/index.js";
 
-const connectionString = process.env.TEGO_POSTGRES_URL;
-if (connectionString === undefined) {
-  throw new Error("TEGO_POSTGRES_URL is required");
-}
+const connectionString =
+  process.env.TEGO_POSTGRES_URL ??
+  "postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test";
 
 function namespace(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll("-", "")}`;
@@ -21,6 +21,48 @@ async function within<T>(promise: Promise<T>, message: string, timeoutMs = 2_000
       throw new Error(message);
     }),
   ]);
+}
+
+async function terminateLeadershipBackend(sharedNamespace: string): Promise<void> {
+  const admin = new Pool({ connectionString });
+  try {
+    const result = await admin.query<{ terminated: boolean }>(
+      `SELECT pg_terminate_backend(activity.pid) AS terminated
+         FROM pg_stat_activity AS activity
+        WHERE activity.application_name = $1
+          AND activity.pid <> pg_backend_pid()
+          AND EXISTS (
+            SELECT 1
+              FROM pg_locks AS locks
+             WHERE locks.pid = activity.pid
+               AND locks.locktype = 'advisory'
+               AND locks.granted
+          )`,
+      [`tego:${sharedNamespace}:coordination`.slice(0, 63)],
+    );
+    assert.equal(result.rowCount, 1);
+    assert.equal(result.rows[0]?.terminated, true);
+  } finally {
+    await admin.end();
+  }
+}
+
+async function terminateNotificationBackends(sharedNamespace: string): Promise<void> {
+  const admin = new Pool({ connectionString });
+  try {
+    const result = await admin.query<{ terminated: boolean }>(
+      `SELECT pg_terminate_backend(activity.pid) AS terminated
+         FROM pg_stat_activity AS activity
+        WHERE activity.application_name = $1
+          AND activity.pid <> pg_backend_pid()
+          AND activity.query = $2`,
+      [`tego:${sharedNamespace}:coordination`.slice(0, 63), "LISTEN tego_coordination_changes"],
+    );
+    assert.ok((result.rowCount ?? 0) >= 1);
+    assert.ok(result.rows.every((row) => row.terminated));
+  } finally {
+    await admin.end();
+  }
 }
 
 test("a stale leader is fenced immediately after takeover before the new leader writes state", async () => {
@@ -50,7 +92,7 @@ test("a stale leader is fenced immediately after takeover before the new leader 
   try {
     const first = await firstCoordination.campaign({ resource: "runtime" });
     const takeover = secondCoordination.campaign({ resource: "runtime" });
-    await firstCoordination.terminateLeadershipConnectionForTest("runtime");
+    await terminateLeadershipBackend(sharedNamespace);
     const second = await within(takeover, "Timed out waiting for leadership takeover");
     assert.ok(BigInt(second.epoch) > BigInt(first.epoch));
 
@@ -103,10 +145,26 @@ test("unexpected leadership backend termination releases the advisory lock with 
     const first = await firstCoordination.campaign({ resource: "runtime" });
     const takeover = secondCoordination.campaign({ resource: "runtime" });
 
-    await firstCoordination.terminateLeadershipConnectionForTest("runtime");
+    await terminateLeadershipBackend(sharedNamespace);
 
     const second = await within(takeover, "Timed out waiting for the advisory lock to release");
     assert.ok(BigInt(second.epoch) > BigInt(first.epoch));
+
+    let reacquisitionSettled = false;
+    const reacquisition = firstCoordination.campaign({ resource: "runtime" }).then((leadership) => {
+      reacquisitionSettled = true;
+      return leadership;
+    });
+    await delay(25);
+    assert.equal(reacquisitionSettled, false);
+
+    await secondCoordination.close();
+    const third = await within(reacquisition, "Timed out waiting for the terminated provider");
+    assert.ok(BigInt(third.epoch) > BigInt(second.epoch));
+    assert.equal("terminateLeadershipConnectionForTest" in firstCoordination, false);
+    assert.equal("interruptNotificationsForTest" in firstCoordination, false);
+    assert.equal("scanChanges" in firstCoordination, false);
+    assert.equal("removeWatch" in firstCoordination, false);
   } finally {
     await Promise.all([firstCoordination.close(), secondCoordination.close()]);
   }
@@ -126,7 +184,7 @@ test("a pending watch catches up in exact order after notification interruption 
   try {
     const iterator = watcher.watch({ cursor: parseRevision("0") })[Symbol.asyncIterator]();
     const firstPending = iterator.next();
-    await watcher.interruptNotificationsForTest();
+    await terminateNotificationBackends(sharedNamespace);
     const committed = [];
     for (const sequence of [1, 2, 3]) {
       const result = await writer.compareAndSet({

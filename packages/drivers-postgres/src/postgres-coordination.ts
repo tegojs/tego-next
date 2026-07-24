@@ -66,7 +66,8 @@ interface PendingNext {
 class PostgresCoordinationWatch
   implements AsyncIterable<CoordinationChange>, AsyncIterator<CoordinationChange>
 {
-  readonly #provider: PostgresCoordinationProvider;
+  readonly #scanChanges: (cursor: Revision) => Promise<readonly CoordinationChange[]>;
+  readonly #onClose: () => void;
   readonly #queue: CoordinationChange[] = [];
   readonly #pending: PendingNext[] = [];
   #cursor: Revision;
@@ -74,9 +75,14 @@ class PostgresCoordinationWatch
   #pumping = false;
   #wake: (() => void) | undefined;
 
-  constructor(provider: PostgresCoordinationProvider, cursor: Revision) {
-    this.#provider = provider;
+  constructor(
+    cursor: Revision,
+    scanChanges: (cursor: Revision) => Promise<readonly CoordinationChange[]>,
+    onClose: () => void,
+  ) {
     this.#cursor = cursor;
+    this.#scanChanges = scanChanges;
+    this.#onClose = onClose;
   }
 
   [Symbol.asyncIterator](): AsyncIterator<CoordinationChange> {
@@ -117,7 +123,7 @@ class PostgresCoordinationWatch
     for (const pending of this.#pending.splice(0)) {
       pending.resolve({ done: true, value: undefined });
     }
-    this.#provider.removeWatch(this);
+    this.#onClose();
   }
 
   #startPump(): void {
@@ -136,7 +142,7 @@ class PostgresCoordinationWatch
 
   async #pump(): Promise<void> {
     while (!this.#closed && this.#pending.length > 0) {
-      const changes = await this.#provider.scanChanges(this.#cursor);
+      const changes = await this.#scanChanges(this.#cursor);
       if (this.#closed) return;
       if (changes.length === 0) {
         await this.#waitForWake();
@@ -181,7 +187,6 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
   readonly #watches = new Set<PostgresCoordinationWatch>();
   #listener: PoolClient | undefined;
   #listenerPromise: Promise<void> | undefined;
-  #notificationsInterruptedForTest = false;
   #openPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #lifecycle: "closed" | "created" | "open" = "created";
@@ -425,7 +430,12 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
 
   watch(request: CoordinationWatchRequest): AsyncIterable<CoordinationChange> {
     this.#assertOpen();
-    const watch = new PostgresCoordinationWatch(this, parseRevision(request.cursor));
+    let watch: PostgresCoordinationWatch;
+    watch = new PostgresCoordinationWatch(
+      parseRevision(request.cursor),
+      (cursor) => this.#scanChanges(cursor),
+      () => this.#watches.delete(watch),
+    );
     this.#watches.add(watch);
     return watch;
   }
@@ -450,23 +460,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     return closing;
   }
 
-  async terminateLeadershipConnectionForTest(resource: string): Promise<void> {
-    const session = this.#leadership.get(resource);
-    if (session === undefined) return;
-    this.#leadership.delete(resource);
-    this.#campaigns.delete(resource);
-    this.#releaseClient(session.client, true);
-  }
-
-  async interruptNotificationsForTest(): Promise<void> {
-    this.#notificationsInterruptedForTest = true;
-    const listener = this.#listener;
-    this.#listener = undefined;
-    if (listener !== undefined) this.#releaseClient(listener, true);
-    this.#wakeWatches();
-  }
-
-  async scanChanges(cursor: Revision): Promise<readonly CoordinationChange[]> {
+  async #scanChanges(cursor: Revision): Promise<readonly CoordinationChange[]> {
     if (this.#lifecycle === "closed") return [];
     const result = await this.#pool.query<ChangeRow>(
       `SELECT record_key, value_json, revision::text
@@ -476,14 +470,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
         LIMIT $3`,
       [this.#options.namespace, cursor, WATCH_BATCH_SIZE],
     );
-    if (this.#notificationsInterruptedForTest && result.rows.length > 0) {
-      this.#notificationsInterruptedForTest = false;
-    }
-    if (
-      !this.#notificationsInterruptedForTest &&
-      this.#listener === undefined &&
-      this.#lifecycle === "open"
-    ) {
+    if (this.#listener === undefined && this.#lifecycle === "open") {
       await this.#ensureListener().catch(() => undefined);
     }
     return result.rows.map((row) => ({
@@ -491,10 +478,6 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
       revision: parseRevision(decimal(row.revision, "coordination revision")),
       value: jsonValue(row, "value_json"),
     }));
-  }
-
-  removeWatch(watch: PostgresCoordinationWatch): void {
-    this.#watches.delete(watch);
   }
 
   async #acquireLeadership(resource: string): Promise<Leadership> {
