@@ -105,6 +105,8 @@ export interface MemoryRemoteAttemptStoreOptions {
   readonly onSave?: (record: RemoteAttemptRecord) => void;
 }
 
+const MAXIMUM_UNSIGNED_64 = 18_446_744_073_709_551_615n;
+
 export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
   readonly #records = new Map<string, RemoteAttemptRecord>();
   readonly #onSave: ((record: RemoteAttemptRecord) => void) | undefined;
@@ -117,7 +119,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     const key = attemptKey(record.request.taskId, record.request.attemptId);
     const snapshot = cloneJson({
       ...record,
-      revision: parseSequence(record.revision),
+      revision: boundedRevision(record.revision),
     }) as unknown as RemoteAttemptRecord;
     this.#records.set(key, snapshot);
     this.#onSave?.(snapshot);
@@ -134,7 +136,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       (condition.expectedRevision === null && current !== undefined) ||
       (condition.expectedRevision !== null &&
         (currentRevision === undefined ||
-          parseSequence(currentRevision) !== parseSequence(condition.expectedRevision))) ||
+          boundedRevision(currentRevision) !== boundedRevision(condition.expectedRevision))) ||
       (condition.expectedEpoch !== undefined &&
         current !== undefined &&
         current.epoch !== condition.expectedEpoch)
@@ -173,7 +175,19 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
 }
 
 function incrementRevision(revision: string): string {
-  return parseSequence((BigInt(parseSequence(revision)) + 1n).toString());
+  const current = BigInt(boundedRevision(revision));
+  if (current === MAXIMUM_UNSIGNED_64) {
+    throw new RangeError("Remote attempt revision exceeds the unsigned 64-bit limit");
+  }
+  return (current + 1n).toString();
+}
+
+function boundedRevision(revision: string): string {
+  const parsed = parseSequence(revision);
+  if (BigInt(parsed) > MAXIMUM_UNSIGNED_64) {
+    throw new RangeError("Remote attempt revision exceeds the unsigned 64-bit limit");
+  }
+  return parsed;
 }
 
 export interface RemoteResultStore {

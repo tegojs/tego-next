@@ -8,7 +8,7 @@ import {
 } from "@tegojs/contracts";
 import { assertWorkerProtocolVersion, type WorkerProtocolLimitOverrides } from "./codec.js";
 import { systemWorkerClock } from "./clock.js";
-import { WorkerSession, type WorkerRegistration } from "./session.js";
+import { compareWorkerEpoch, WorkerSession, type WorkerRegistration } from "./session.js";
 
 export interface WorkerRegistrationInput {
   readonly labels: JsonObject;
@@ -68,6 +68,8 @@ export class MainEndpoint {
   readonly #sessions = new Set<WorkerSession>();
   readonly #current = new Map<WorkerId, WorkerSession>();
   readonly #registrations = new Map<WorkerId, WorkerRegistration>();
+  readonly #registrationTails = new Map<WorkerId, Promise<void>>();
+  readonly #lastEpochs = new Map<WorkerId, string>();
   readonly #epochAllocator: WorkerEpochAllocator;
   #closed = false;
 
@@ -148,19 +150,52 @@ export class MainEndpoint {
   }
 
   async #register(session: WorkerSession, registration: WorkerRegistration): Promise<string> {
-    if (this.#closed) {
-      throw new Error("Main Worker endpoint is closed");
-    }
     const workerId = parseWorkerId(registration.workerId);
-    const nextEpoch = parseSequence(await this.#epochAllocator.next(workerId));
-    if (this.#closed) {
-      throw new Error("Main Worker endpoint closed while allocating a session epoch");
+    const predecessor = this.#registrationTails.get(workerId) ?? Promise.resolve();
+    const registrationAttempt = predecessor
+      .catch(() => undefined)
+      .then(async () => this.#claimRegistration(workerId, session, registration));
+    const tail = registrationAttempt.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#registrationTails.set(workerId, tail);
+    try {
+      return await registrationAttempt;
+    } finally {
+      if (this.#registrationTails.get(workerId) === tail) {
+        this.#registrationTails.delete(workerId);
+      }
     }
+  }
+
+  async #claimRegistration(
+    workerId: WorkerId,
+    session: WorkerSession,
+    registration: WorkerRegistration,
+  ): Promise<string> {
+    this.#assertRegistrationCandidate(session);
+    const nextEpoch = parseSequence(await this.#epochAllocator.next(workerId));
+    const lastEpoch = this.#lastEpochs.get(workerId) ?? "0";
+    if (compareWorkerEpoch(nextEpoch, lastEpoch) <= 0) {
+      throw new Error("Worker session epoch allocator returned a stale epoch");
+    }
+    this.#lastEpochs.set(workerId, nextEpoch);
+    this.#assertRegistrationCandidate(session);
     const predecessor = this.#current.get(workerId);
     this.#current.set(workerId, session);
     this.#registrations.set(workerId, registration);
     predecessor?.replace();
     return nextEpoch;
+  }
+
+  #assertRegistrationCandidate(session: WorkerSession): void {
+    if (this.#closed) {
+      throw new Error("Main Worker endpoint is closed");
+    }
+    if (!this.#sessions.has(session) || session.state !== "authenticating") {
+      throw new Error("Worker session closed while allocating a session epoch");
+    }
   }
 
   #release(session: WorkerSession): void {
