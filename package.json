@@ -11,6 +11,8 @@
     "examples/*"
   ],
   "scripts": {
+    "prepare": "husky",
+    "commitlint": "commitlint",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test:unit": "npm run test:unit --workspaces --if-present",
@@ -22,8 +24,11 @@
     "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run test:integration && npm run build && npm run test:e2e"
   },
   "devDependencies": {
+    "@commitlint/cli": "21.2.1",
+    "@commitlint/config-conventional": "21.2.0",
     "@biomejs/biome": "2.5.5",
     "@types/node": "26.1.1",
+    "husky": "9.1.7",
     "typescript": "7.0.2"
   }
 }
