@@ -167,6 +167,61 @@ test("a closed replacement cannot claim authority after delayed epoch allocation
   await Promise.all([main.close(), firstWorker.close()]);
 });
 
+test("a timed-out epoch allocation cannot starve a later Worker registration", async () => {
+  const clock = new FakeClock();
+  const workerId = "stalled-allocation-worker" as WorkerId;
+  let allocationCount = 0;
+  let firstAllocationStarted: (() => void) | undefined;
+  const allocationStarted = new Promise<void>((resolve) => {
+    firstAllocationStarted = resolve;
+  });
+  const epochAllocator: WorkerEpochAllocator = {
+    next: async () => {
+      allocationCount += 1;
+      if (allocationCount === 1) {
+        firstAllocationStarted?.();
+        return new Promise<string>(() => undefined);
+      }
+      return "2";
+    },
+  };
+  const main = createMainEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+    epochAllocator,
+    handshakeTimeoutMs: 20,
+  });
+  const firstWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+    handshakeTimeoutMs: 20,
+  });
+  const [firstMainSocket, firstWorkerSocket] = directSocketPair();
+  const firstMainSession = main.attach(firstMainSocket);
+  const firstWorkerSession = firstWorker.attach(firstWorkerSocket);
+  await allocationStarted;
+  clock.advanceBy(21);
+  await assert.rejects(Promise.all([firstMainSession.ready, firstWorkerSession.ready]));
+
+  const secondWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId,
+    handshakeTimeoutMs: 20,
+  });
+  const [secondMainSocket, secondWorkerSocket] = directSocketPair();
+  const secondMainSession = main.attach(secondMainSocket);
+  const secondWorkerSession = secondWorker.attach(secondWorkerSocket);
+  await flush();
+
+  assert.equal(allocationCount, 2);
+  await Promise.all([secondMainSession.ready, secondWorkerSession.ready]);
+  assert.equal(main.current(workerId), secondMainSession);
+  await Promise.all([main.close(), firstWorker.close(), secondWorker.close()]);
+});
+
 test("codec accepts only exact JSON data fields and decimal sequence values", () => {
   const codec = createWorkerCodec();
   assert.deepEqual(codec.decodeControl(codec.encodeControl(ENVELOPE)), ENVELOPE);
