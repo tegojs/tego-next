@@ -78,6 +78,7 @@ interface RemoteAttempt {
   epoch: string;
   terminal?: ExecutionResult;
   settled: boolean;
+  persistenceFailed?: boolean;
   cancellation?: "cancelled" | "timed-out";
   terminalAt?: number;
   publication?: {
@@ -195,7 +196,9 @@ export class RemoteExecutor implements Executor {
   }
 
   async #submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
+    this.#assertPersistenceAvailable();
     await this.#pruneTerminals();
+    this.#assertPersistenceAvailable();
     if (jsonBytes(requestValue) > this.#maxAssignmentBytes) {
       throw remoteError(
         "EXECUTOR_REMOTE_ADMISSION_EXHAUSTED",
@@ -219,7 +222,9 @@ export class RemoteExecutor implements Executor {
       }
       return existing.handle;
     }
-    const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
+    const persisted = await this.#storeOperation(
+      this.#attemptStore.load(request.taskId, request.attemptId),
+    );
     if (persisted !== undefined) parseAttemptRevision(persisted.revision);
     if (persisted?.state === "expired") {
       if (persisted.fingerprint !== fingerprint) {
@@ -431,7 +436,8 @@ export class RemoteExecutor implements Executor {
 
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
-    const records = await this.#attemptStore.list(this.#workerId);
+    this.#assertPersistenceAvailable();
+    const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
     for (const record of records) parseAttemptRevision(record.revision);
     const activeRecords = records.filter((record) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
@@ -960,9 +966,11 @@ export class RemoteExecutor implements Executor {
   }
 
   async #create(attempt: RemoteAttempt): Promise<void> {
-    const committed = await this.#attemptStore.commit(this.#record(attempt), {
-      expectedRevision: null,
-    });
+    const committed = await this.#storeOperation(
+      this.#attemptStore.commit(this.#record(attempt), {
+        expectedRevision: null,
+      }),
+    );
     if (committed === undefined) {
       throw remoteError(
         "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
@@ -989,9 +997,17 @@ export class RemoteExecutor implements Executor {
           expectedRevision: attempt.revision,
           expectedEpoch: attempt.epoch,
         };
-        const committed = boundedPersistence
-          ? await this.#storeCommit(record, condition)
-          : await this.#attemptStore.commit(record, condition);
+        const useBoundedPersistence = boundedPersistence || state === "terminal";
+        const timeout = useBoundedPersistence ? undefined : this.#watchPersistence(attempt);
+        let committed: RemoteAttemptRecord | undefined;
+        try {
+          committed = useBoundedPersistence
+            ? await this.#storeCommit(record, condition)
+            : await this.#attemptStore.commit(record, condition);
+        } finally {
+          timeout?.abort("remote-persistence-completed");
+        }
+        if (attempt.persistenceFailed) return;
         if (committed !== undefined) {
           const revision = parseAttemptRevision(committed.revision);
           if (attempt.terminal !== undefined && state !== "terminal") return;
@@ -1001,9 +1017,8 @@ export class RemoteExecutor implements Executor {
           if (result !== undefined) attempt.terminal = result;
           return;
         }
-        const latest = await this.#attemptStore.load(
-          attempt.request.taskId,
-          attempt.request.attemptId,
+        const latest = await this.#storeOperation(
+          this.#attemptStore.load(attempt.request.taskId, attempt.request.attemptId),
         );
         if (latest === undefined) {
           throw new Error("Remote attempt state disappeared during a conditional commit");
@@ -1029,6 +1044,18 @@ export class RemoteExecutor implements Executor {
         );
       } catch (error) {
         immediateRetries += 1;
+        if (attempt.persistenceFailed) {
+          throw remoteError(
+            "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+            "Remote attempt persistence is unavailable",
+            this.id,
+            this.#clock.now().toISOString(),
+          );
+        }
+        if (this.#isStateUnavailable(error)) {
+          this.#failAttemptPersistence(attempt, "Remote attempt persistence operation timed out");
+          throw error;
+        }
         if (
           error instanceof Error &&
           "diagnostic" in error &&
@@ -1039,13 +1066,17 @@ export class RemoteExecutor implements Executor {
         }
         if (isRemoteAttemptRevisionError(error)) throw error;
         if (immediateRetries >= MAX_PERSISTENCE_ATTEMPTS) {
-          this.#degradePersistence();
-          throw remoteError(
+          const unavailable = remoteError(
             "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
             "Remote attempt persistence remained unavailable after bounded retries",
             this.id,
             this.#clock.now().toISOString(),
           );
+          this.#failAttemptPersistence(
+            attempt,
+            "Remote attempt persistence remained unavailable after bounded retries",
+          );
+          throw unavailable;
         }
         if (immediateRetries >= 3) {
           await this.#clock.sleep(25);
@@ -1069,24 +1100,68 @@ export class RemoteExecutor implements Executor {
     record: RemoteAttemptRecord,
     condition: Parameters<RemoteAttemptStore["commit"]>[1],
   ): Promise<RemoteAttemptRecord | undefined> {
+    return this.#storeOperation(this.#attemptStore.commit(record, condition), false);
+  }
+
+  async #storeOperation<T>(operation: Promise<T>, latchFailure = true): Promise<T> {
     const timeout = new AbortController();
     try {
       return await Promise.race([
-        this.#attemptStore.commit(record, condition),
-        this.#clock
-          .sleep(this.#persistenceTimeoutMs, timeout.signal)
-          .then<RemoteAttemptRecord | undefined>(() => {
-            throw remoteError(
-              "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
-              "Remote attempt persistence operation timed out",
-              this.id,
-              this.#clock.now().toISOString(),
-            );
-          }),
+        operation,
+        this.#clock.sleep(this.#persistenceTimeoutMs, timeout.signal).then<T>(() => {
+          this.#degradePersistence();
+          throw remoteError(
+            "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+            "Remote attempt persistence operation timed out",
+            this.id,
+            this.#clock.now().toISOString(),
+          );
+        }),
       ]);
+    } catch (error) {
+      if (latchFailure) this.#degradePersistence();
+      throw error;
     } finally {
       timeout.abort("remote-persistence-completed");
     }
+  }
+
+  #watchPersistence(attempt: RemoteAttempt): AbortController {
+    const timeout = new AbortController();
+    this.#background(
+      this.#clock.sleep(this.#persistenceTimeoutMs, timeout.signal).then(() => {
+        this.#failAttemptPersistence(attempt, "Remote attempt persistence operation timed out");
+      }),
+    );
+    return timeout;
+  }
+
+  #failAttemptPersistence(attempt: RemoteAttempt, message: string): void {
+    if (attempt.persistenceFailed) return;
+    attempt.persistenceFailed = true;
+    this.#publishVolatile(
+      attempt,
+      this.#failure(attempt.request, "failed", "EXECUTOR_REMOTE_STATE_UNAVAILABLE", message),
+    );
+  }
+
+  #assertPersistenceAvailable(): void {
+    if (!this.#persistenceDegraded) return;
+    throw remoteError(
+      "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+      "Remote attempt persistence is degraded",
+      this.id,
+      this.#clock.now().toISOString(),
+    );
+  }
+
+  #isStateUnavailable(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      "diagnostic" in error &&
+      (error as { diagnostic?: { code?: string } }).diagnostic?.code ===
+        "EXECUTOR_REMOTE_STATE_UNAVAILABLE"
+    );
   }
 
   #failure(
@@ -1219,15 +1294,17 @@ export class RemoteExecutor implements Executor {
         await this.#transition(attempt, async () => {
           if (attempt.state !== "terminal") return;
           const { result: _result, ...record } = this.#record(attempt);
-          const committed = await this.#attemptStore.commit(
-            {
-              ...record,
-              state: "expired",
-            },
-            {
-              expectedRevision: attempt.revision,
-              expectedEpoch: attempt.epoch,
-            },
+          const committed = await this.#storeOperation(
+            this.#attemptStore.commit(
+              {
+                ...record,
+                state: "expired",
+              },
+              {
+                expectedRevision: attempt.revision,
+                expectedEpoch: attempt.epoch,
+              },
+            ),
           );
           if (committed === undefined) {
             throw new Error("Remote terminal tombstone lost conditional authority");

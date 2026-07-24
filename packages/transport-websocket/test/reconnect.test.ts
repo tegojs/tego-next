@@ -1659,14 +1659,12 @@ test("a live Worker terminal commit timeout fails closed and retains evidence", 
   );
   await eventually(() => assert.equal(terminalCalls, 1), { advance: flush });
   clock.advanceBy(1_001);
-  await flush();
   let settled = false;
   void handle.result.then(() => {
     settled = true;
   });
-  await flush();
+  await eventually(() => assert.equal(settled, true), { advance: flush });
 
-  assert.equal(settled, true);
   assert.equal((await handle.result).status, "failed");
   assert.match((await handle.result).diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
   assert.equal(local.executions, 1);
@@ -1699,7 +1697,7 @@ test("Main attach bounds a non-settling attempt-store list", async () => {
   });
   await eventually(() => assert.equal(listCalls, 1), { advance: flush });
   clock.advanceBy(51);
-  await flush();
+  await eventually(() => assert.ok(rejection instanceof Error), { advance: flush });
 
   assert.ok(rejection instanceof Error);
   assert.match(rejection.message, /STATE_UNAVAILABLE|persistence/iu);
@@ -1743,12 +1741,17 @@ test("Main submit bounds a non-settling attempt-store load", async () => {
     });
   await eventually(() => assert.equal(loadCalls, 1), { advance: flush });
   clock.advanceBy(51);
-  await flush();
+  await eventually(() => assert.ok(rejection instanceof Error), { advance: flush });
 
   assert.ok(rejection instanceof Error);
   assert.match(rejection.message, /STATE_UNAVAILABLE|persistence/iu);
   assert.equal((await remote.health()).status, "degraded");
   assert.equal((await remote.health()).active, 0);
+  await assert.rejects(
+    remote.submit(executionRequest({ mode: "echo" }, "main-load-timeout-latched")),
+    /STATE_UNAVAILABLE|persistence/iu,
+  );
+  assert.equal(loadCalls, 1);
   await Promise.all([remote.close(), runtime.close()]);
 });
 
@@ -1790,12 +1793,175 @@ test("Main submit bounds a non-settling attempt-store create", async () => {
     });
   await eventually(() => assert.equal(createCalls, 1), { advance: flush });
   clock.advanceBy(51);
-  await flush();
+  await eventually(() => assert.ok(rejection instanceof Error), { advance: flush });
 
   assert.ok(rejection instanceof Error);
   assert.match(rejection.message, /STATE_UNAVAILABLE|persistence/iu);
   assert.equal((await remote.health()).status, "degraded");
   assert.equal((await remote.health()).active, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("Worker attach bounds a non-settling attempt-store list", async () => {
+  const clock = new FakeClock(new Date(0));
+  let listCalls = 0;
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: () => Promise.resolve(),
+      commit: () => Promise.resolve(undefined),
+      load: () => Promise.resolve(undefined),
+      list: () => {
+        listCalls += 1;
+        return new Promise<readonly RemoteAttemptRecord[]>(() => undefined);
+      },
+    },
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  const [, worker] = memorySessionPair("1");
+  let rejection: unknown;
+  void runtime.attach(worker).catch((error: unknown) => {
+    rejection = error;
+  });
+  await eventually(() => assert.equal(listCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+  await eventually(() => assert.ok(rejection instanceof Error), { advance: flush });
+
+  assert.ok(rejection instanceof Error);
+  assert.match(rejection.message, /persistence/iu);
+  await runtime.close();
+});
+
+test("Worker assignment bounds a non-settling attempt-store load", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  const local = new TestLocalExecutor();
+  let loadCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "worker-load-timeout",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => backing.commit(record, condition),
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: () => {
+        loadCalls += 1;
+        return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+      },
+      list: async (id) => backing.list(id),
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const handle = await remote.submit(executionRequest({ mode: "echo" }, "worker-load-timeout"));
+  await eventually(() => assert.equal(loadCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+
+  const result = await handle.result;
+  assert.equal(result.status, "rejected");
+  assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  const latched = await (
+    await remote.submit(executionRequest({ mode: "echo" }, "worker-load-timeout-latched"))
+  ).result;
+  assert.equal(latched.status, "rejected");
+  assert.match(latched.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(loadCalls, 1);
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("Worker assignment bounds a non-settling attempt-store create", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  const local = new TestLocalExecutor();
+  let createCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "worker-create-timeout",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: (record, condition) => {
+        if (condition.expectedRevision === null) {
+          createCalls += 1;
+          return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const handle = await remote.submit(executionRequest({ mode: "echo" }, "worker-create-timeout"));
+  await eventually(() => assert.equal(createCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+
+  const result = await handle.result;
+  assert.equal(result.status, "rejected");
+  assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("a live Worker running commit timeout fails closed", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  const local = new TestLocalExecutor();
+  let runningCalls = 0;
+  const remote = new RemoteExecutor({
+    id: "live-worker-running-timeout",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    persistenceTimeoutMs: 50,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: (record, condition) => {
+        if (record.state === "running") {
+          runningCalls += 1;
+          return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+        }
+        return backing.commit(record, condition);
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const handle = await remote.submit(
+    executionRequest({ mode: "echo" }, "live-worker-running-timeout"),
+  );
+  await eventually(() => assert.equal(runningCalls, 1), { advance: flush });
+  clock.advanceBy(51);
+
+  const result = await handle.result;
+  assert.equal(result.status, "failed");
+  assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(local.executions, 1);
   await Promise.all([remote.close(), runtime.close()]);
 });
 

@@ -41,6 +41,14 @@ const DEFAULT_MAX_CONTROL_PAYLOAD_BYTES = 48 * 1024;
 const DEFAULT_MAX_ASSIGNMENT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
 const DEFAULT_MAX_INVENTORY = 512;
 const INVENTORY_ENVELOPE_RESERVE_BYTES = 4 * 1024;
+const MAX_PERSISTENCE_ATTEMPTS = 8;
+
+class AttemptPersistenceUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AttemptPersistenceUnavailableError";
+  }
+}
 
 export interface WorkerRuntimeOptions {
   readonly workerId: WorkerId;
@@ -54,6 +62,7 @@ export interface WorkerRuntimeOptions {
   readonly maxInventoryItems?: number;
   readonly maxInventoryBytes?: number;
   readonly maxResultBytes?: number;
+  readonly persistenceTimeoutMs?: number;
   readonly retentionMs?: number;
   readonly resultBuffer?: ResultBufferOptions;
 }
@@ -86,6 +95,7 @@ export class WorkerRuntime {
   readonly #maxInventoryBytes: number;
   readonly #maxResultBytes: number;
   readonly #maxBufferedResults: number;
+  readonly #persistenceTimeoutMs: number;
   readonly #retentionMs: number;
   readonly #results: ResultBuffer;
   readonly #attempts = new Map<string, WorkerAttempt>();
@@ -131,6 +141,11 @@ export class WorkerRuntime {
       "maxInventoryBytes",
     );
     this.#maxBufferedResults = positiveLimit(options.resultBuffer?.maxCount, 256, "maxResultCount");
+    this.#persistenceTimeoutMs = positiveLimit(
+      options.persistenceTimeoutMs,
+      1_000,
+      "persistenceTimeoutMs",
+    );
     this.#retentionMs = positiveLimit(options.retentionMs, 24 * 60 * 60 * 1000, "retentionMs");
     const recoverableResultBytes = this.#maxInventoryBytes - INVENTORY_ENVELOPE_RESERVE_BYTES;
     if (recoverableResultBytes <= 0) {
@@ -233,7 +248,8 @@ export class WorkerRuntime {
 
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
-    const records = await this.#attemptStore.list(this.#workerId);
+    this.#assertAttemptPersistenceAvailable();
+    const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
     for (const record of records) this.#acceptRevision(record.revision);
     const activeRecords = records.filter((record) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
@@ -413,7 +429,13 @@ export class WorkerRuntime {
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
     if (await this.#rejectUnavailableAttemptStore(session, message.messageId, request)) return;
-    await this.#pruneAcknowledged();
+    try {
+      await this.#pruneAcknowledged();
+    } catch (error) {
+      if (!(error instanceof AttemptPersistenceUnavailableError)) throw error;
+      await this.#rejectUnavailableAttemptStore(session, message.messageId, request);
+      return;
+    }
     if (await this.#rejectUnavailableAttemptStore(session, message.messageId, request)) return;
     const existing = this.#attempts.get(key);
     if (existing !== undefined) {
@@ -446,7 +468,16 @@ export class WorkerRuntime {
       }
       return;
     }
-    const persisted = await this.#attemptStore.load(request.taskId, request.attemptId);
+    let persisted: RemoteAttemptRecord | undefined;
+    try {
+      persisted = await this.#storeOperation(
+        this.#attemptStore.load(request.taskId, request.attemptId),
+      );
+    } catch (error) {
+      if (!(error instanceof AttemptPersistenceUnavailableError)) throw error;
+      await this.#rejectUnavailableAttemptStore(session, message.messageId, request);
+      return;
+    }
     if (persisted !== undefined) this.#acceptRevision(persisted.revision);
     if (persisted?.state === "expired") {
       await this.#sendRejected(
@@ -503,6 +534,7 @@ export class WorkerRuntime {
     try {
       await this.#create(attempt);
     } catch {
+      this.#attemptPersistenceAvailable = false;
       await this.#sendRejected(
         session,
         message.messageId,
@@ -661,15 +693,23 @@ export class WorkerRuntime {
         attempt.reservedBytes = 0;
       });
     } catch (error) {
-      if (!isRemoteAttemptRevisionError(error)) throw error;
-      this.#attemptPersistenceAvailable = false;
+      if (
+        !isRemoteAttemptRevisionError(error) &&
+        !(error instanceof AttemptPersistenceUnavailableError) &&
+        this.#attemptPersistenceAvailable
+      ) {
+        throw error;
+      }
+      if (isRemoteAttemptRevisionError(error)) this.#attemptPersistenceAvailable = false;
       this.#terminalVolatile(
         attempt,
         this.#result(
           attempt.request,
           "failed",
           "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
-          "Worker attempt persistence returned an invalid revision",
+          isRemoteAttemptRevisionError(error)
+            ? "Worker attempt persistence returned an invalid revision"
+            : "Worker attempt persistence is unavailable",
         ),
       );
     }
@@ -790,7 +830,10 @@ export class WorkerRuntime {
     if (retained !== undefined) {
       const attempt = this.#attempts.get(attemptKey(request.taskId, request.attemptId));
       if (attempt !== undefined) {
-        if (!this.#attemptPersistenceAvailable) return;
+        if (!this.#attemptPersistenceAvailable) {
+          this.#failAttemptPersistence(attempt, "Worker attempt persistence is unavailable");
+          return;
+        }
         await this.#transition(attempt, async () => {
           if (attempt.acknowledgedAt === undefined) {
             attempt.acknowledgedAt = this.#clock.now().getTime();
@@ -945,9 +988,11 @@ export class WorkerRuntime {
   }
 
   async #create(attempt: WorkerAttempt): Promise<void> {
-    const committed = await this.#attemptStore.commit(this.#record(attempt), {
-      expectedRevision: null,
-    });
+    const committed = await this.#storeOperation(
+      this.#attemptStore.commit(this.#record(attempt), {
+        expectedRevision: null,
+      }),
+    );
     if (committed === undefined) {
       throw new Error("Remote attempt was concurrently admitted by another Worker session");
     }
@@ -962,19 +1007,27 @@ export class WorkerRuntime {
     let failures = 0;
     while (true) {
       try {
-        const committed = await this.#attemptStore.commit(this.#record(attempt, state, result), {
+        const record = this.#record(attempt, state, result);
+        const condition = {
           expectedRevision: attempt.revision,
           expectedEpoch: attempt.epoch,
-        });
+        };
+        const timeout = this.#watchPersistence(attempt);
+        let committed: RemoteAttemptRecord | undefined;
+        try {
+          committed = await this.#attemptStore.commit(record, condition);
+        } finally {
+          timeout.abort("worker-persistence-completed");
+        }
+        if (!this.#attemptPersistenceAvailable) return;
         if (committed !== undefined) {
           attempt.revision = this.#acceptRevision(committed.revision);
           attempt.state = state;
           if (result !== undefined) attempt.result = result;
           return;
         }
-        const latest = await this.#attemptStore.load(
-          attempt.request.taskId,
-          attempt.request.attemptId,
+        const latest = await this.#storeOperation(
+          this.#attemptStore.load(attempt.request.taskId, attempt.request.attemptId),
         );
         if (latest === undefined) {
           throw new Error("Worker attempt disappeared during a conditional commit");
@@ -993,7 +1046,18 @@ export class WorkerRuntime {
         }
         throw new Error("Worker attempt transition lost epoch or revision authority");
       } catch (error) {
-        if (isRemoteAttemptRevisionError(error)) throw error;
+        if (isRemoteAttemptRevisionError(error)) {
+          this.#failAttemptPersistence(
+            attempt,
+            "Worker attempt persistence returned an invalid revision",
+          );
+          throw error;
+        }
+        if (!this.#attemptPersistenceAvailable) {
+          this.#failAttemptPersistence(attempt, "Worker attempt persistence is unavailable");
+          throw new AttemptPersistenceUnavailableError("Worker attempt persistence is unavailable");
+        }
+        if (error instanceof AttemptPersistenceUnavailableError) throw error;
         if (
           error instanceof Error &&
           /lost epoch or revision authority|disappeared/iu.test(error.message)
@@ -1001,6 +1065,15 @@ export class WorkerRuntime {
           throw error;
         }
         failures += 1;
+        if (failures >= MAX_PERSISTENCE_ATTEMPTS) {
+          this.#failAttemptPersistence(
+            attempt,
+            "Worker attempt persistence remained unavailable after bounded retries",
+          );
+          throw new AttemptPersistenceUnavailableError(
+            "Worker attempt persistence remained unavailable after bounded retries",
+          );
+        }
         if (failures < 3) {
           await Promise.resolve();
         } else {
@@ -1017,6 +1090,59 @@ export class WorkerRuntime {
       () => undefined,
     );
     return transitioned;
+  }
+
+  async #storeOperation<T>(operation: Promise<T>): Promise<T> {
+    const timeout = new AbortController();
+    try {
+      return await Promise.race([
+        operation,
+        this.#clock.sleep(this.#persistenceTimeoutMs, timeout.signal).then<T>(() => {
+          this.#attemptPersistenceAvailable = false;
+          throw new AttemptPersistenceUnavailableError(
+            "Worker attempt persistence operation timed out",
+          );
+        }),
+      ]);
+    } catch (error) {
+      this.#attemptPersistenceAvailable = false;
+      if (error instanceof AttemptPersistenceUnavailableError) throw error;
+      throw new AttemptPersistenceUnavailableError(
+        error instanceof Error
+          ? `Worker attempt persistence failed: ${error.message}`
+          : "Worker attempt persistence failed",
+      );
+    } finally {
+      timeout.abort("worker-persistence-completed");
+    }
+  }
+
+  #assertAttemptPersistenceAvailable(): void {
+    if (this.#attemptPersistenceAvailable) return;
+    throw new AttemptPersistenceUnavailableError("Worker attempt persistence is unavailable");
+  }
+
+  #watchPersistence(attempt: WorkerAttempt): AbortController {
+    const timeout = new AbortController();
+    this.#background(
+      this.#clock.sleep(this.#persistenceTimeoutMs, timeout.signal).then(() => {
+        this.#failAttemptPersistence(attempt, "Worker attempt persistence operation timed out");
+      }),
+    );
+    return timeout;
+  }
+
+  #failAttemptPersistence(attempt: WorkerAttempt, message: string): void {
+    this.#attemptPersistenceAvailable = false;
+    if (attempt.state === "terminal") return;
+    const failure = this.#result(
+      attempt.request,
+      "failed",
+      "EXECUTOR_REMOTE_STATE_UNAVAILABLE",
+      message,
+    );
+    this.#terminalVolatile(attempt, failure);
+    this.#background(this.#publish(failure));
   }
 
   async #markCancelled(attempt: WorkerAttempt): Promise<void> {
@@ -1036,16 +1162,18 @@ export class WorkerRuntime {
         attempt.acknowledgedAt !== undefined &&
         attempt.acknowledgedAt <= cutoff
       ) {
-        const expired = await this.#attemptStore.commit(
-          {
-            ...this.#record(attempt),
-            state: "expired",
-            updatedAt: this.#clock.now().toISOString(),
-          },
-          {
-            expectedRevision: attempt.revision,
-            expectedEpoch: attempt.epoch,
-          },
+        const expired = await this.#storeOperation(
+          this.#attemptStore.commit(
+            {
+              ...this.#record(attempt),
+              state: "expired",
+              updatedAt: this.#clock.now().toISOString(),
+            },
+            {
+              expectedRevision: attempt.revision,
+              expectedEpoch: attempt.epoch,
+            },
+          ),
         );
         if (expired === undefined) continue;
         this.#acceptRevision(expired.revision);
