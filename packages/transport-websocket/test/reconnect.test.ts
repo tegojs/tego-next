@@ -1510,6 +1510,69 @@ test("permanent orphan persistence failure settles locally and degrades durabili
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("a non-settling terminal commit cannot block orphan settlement", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let terminalCalls = 0;
+  const store: RemoteAttemptStore = {
+    save: async (record) => backing.save(record),
+    commit: async (record, condition) => {
+      if (record.state === "terminal") {
+        terminalCalls += 1;
+        return new Promise<RemoteAttemptRecord | undefined>(() => undefined);
+      }
+      return backing.commit(record, condition);
+    },
+    delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+    load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+    list: async (id) => backing.list(id),
+  };
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    orphanTimeoutMs: 100,
+    attemptStore: store,
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  const [main, worker] = memorySessionPair("1");
+  await runtime.attach(worker);
+  await remote.attach(main);
+  const request = executionRequest(
+    { mode: "wait" },
+    "non-settling-terminal-store",
+    "finish-and-buffer",
+  );
+  const handle = await remote.submit(request);
+  main.close();
+  await eventually(async () => {
+    assert.equal((await backing.load(request.taskId, request.attemptId))?.state, "unknown");
+  });
+  clock.advanceBy(101);
+  await flush();
+  clock.advanceBy(1_000);
+  for (let index = 0; index < 20; index += 1) await flush();
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  await flush();
+
+  assert.equal(settled, true);
+  assert.equal((await handle.result).status, "failed");
+  assert.equal(terminalCalls, 1);
+  assert.equal((await backing.load(request.taskId, request.attemptId))?.state, "unknown");
+  assert.equal((await remote.health()).active, 0);
+  assert.equal((await remote.health()).status, "degraded");
+  await remote.drain({});
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("aggregate byte reservation prevents a second valid result from wedging both attempts", async () => {
   const clock = new FakeClock(new Date(0));
   const remote = new RemoteExecutor({
@@ -1777,6 +1840,59 @@ test("WorkerRuntime rejects invalid revisions returned by external store list, l
   assert.match(commitResult.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
   assert.equal(commitLocal.executions, 0);
   await Promise.all([commitRemote.close(), commitRuntime.close()]);
+});
+
+test("WorkerRuntime does not retry a malformed external revision forever", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backing = new MemoryRemoteAttemptStore();
+  let malformedCommits = 0;
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "worker-malformed-revision-remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: {
+      save: async (record) => backing.save(record),
+      commit: async (record, condition) => {
+        if (condition.expectedRevision === null) return backing.commit(record, condition);
+        malformedCommits += 1;
+        return {
+          ...record,
+          revision: "01",
+        };
+      },
+      delete: async (taskId, attemptId) => backing.delete(taskId, attemptId),
+      load: async (taskId, attemptId) => backing.load(taskId, attemptId),
+      list: async (id) => backing.list(id),
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "1");
+  const handle = await remote.submit(executionRequest(null, "worker-malformed-revision"));
+  for (let index = 0; index < 20; index += 1) {
+    clock.advanceBy(25);
+    await flush();
+  }
+  let settled = false;
+  void handle.result.then(() => {
+    settled = true;
+  });
+  await flush();
+
+  assert.equal(settled, true);
+  assert.equal((await handle.result).status, "failed");
+  assert.match(
+    (await handle.result).diagnostic?.code ?? "",
+    /STATE_UNAVAILABLE|PERSISTENCE_FAILED/iu,
+  );
+  assert.ok(malformedCommits <= 2);
+  assert.equal(local.executions, 1);
+  await Promise.all([remote.close(), runtime.close()]);
 });
 
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {
