@@ -228,10 +228,7 @@ export class ComponentHost {
     try {
       if (!Array.isArray(attachmentInput))
         throw this.#protocolError("Component host attachments must be an array");
-      if (command.type !== "run" && attachmentInput.length > 0) {
-        throw this.#protocolError("Component host attachments are only valid for run commands");
-      }
-      attachments = this.#attachments(attachmentInput);
+      attachments = this.#attachments(attachmentInput, command.type === "run");
     } catch (error) {
       return this.#failure(command.commandId, command.type, error);
     }
@@ -789,12 +786,31 @@ export class ComponentHost {
     });
   }
 
-  #attachments(input: readonly ArrayBuffer[]): RunAttachmentLease {
-    const count = input.length;
+  #attachments(
+    input: readonly ArrayBuffer[],
+    allowAttachments = true,
+  ): RunAttachmentLease {
+    let rawCount: unknown;
+    try {
+      rawCount = Reflect.get(input, "length");
+    } catch {
+      throw this.#protocolError("Component host attachment count is invalid");
+    }
+    if (
+      typeof rawCount !== "number" ||
+      !Number.isSafeInteger(rawCount) ||
+      rawCount < 0
+    ) {
+      throw this.#protocolError("Component host attachment count is invalid");
+    }
+    const count = rawCount;
     if (count > COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT) {
       throw this.#protocolError(
         `Component host attachments exceed the count limit of ${COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT}`,
       );
+    }
+    if (!allowAttachments && count > 0) {
+      throw this.#protocolError("Component host attachments are only valid for run commands");
     }
     let totalBytes = 0;
     const validated: { readonly buffer: ArrayBuffer; readonly byteLength: number }[] = [];
