@@ -69,9 +69,9 @@
 
 ## 9. Remote Worker and WebSocket Transport
 
-- [ ] 9.1 Write message-codec tests and implement the versioned, sequenced, correlated Worker envelope
-- [ ] 9.2 Write authentication and handshake tests and implement Worker-initiated and Main-initiated sessions
-- [ ] 9.3 Write liveness tests and implement registration, capability advertisement, heartbeat, expiry, and session replacement
+- [x] 9.1 Write message-codec tests and implement the versioned, sequenced, correlated Worker envelope
+- [x] 9.2 Write authentication and handshake tests and implement Worker-initiated and Main-initiated sessions
+- [x] 9.3 Write liveness tests and implement registration, capability advertisement, heartbeat, expiry, and session replacement
 - [ ] 9.4 Write remote executor conformance tests and implement assignment acknowledgement, progress, result, cancellation, and backpressure
 - [ ] 9.5 Write disconnect tests and implement unknown-state handling plus `cancel`, `finish-and-buffer`, and `finish-and-persist` orphan policies
 - [ ] 9.6 Write reconnect tests and implement running-attempt and buffered-result reconciliation with deduplication

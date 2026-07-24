@@ -735,7 +735,7 @@ Commit: `git add packages/executor-node && git commit -m "feat: add certified th
 - Produces: `workerSessionConformance(mainFactory, workerFactory)`.
 - Produces: direction-neutral Main and Worker endpoint APIs.
 
-- [ ] **Step 1: Write and commit failing protocol/session tests**
+- [x] **Step 1: Write and commit failing protocol/session tests**
 
 Cover invalid credential, unsupported version, sequence replay, message
 deduplication, correlation, Worker-initiated connection, Main-initiated
@@ -747,19 +747,19 @@ Expected: FAIL because session factories do not exist.
 
 Commit: `git add packages/testkit packages/transport-websocket && git commit -m "test: define Worker session protocol"`
 
-- [ ] **Step 2: Implement codec, authentication, and negotiation**
+- [x] **Step 2: Implement codec, authentication, and negotiation**
 
 Use JSON control frames and correlated binary frames. Authenticate before
 registration. Bound message bytes, pending correlations, binary buffer bytes,
 and sequence gaps.
 
-- [ ] **Step 3: Implement liveness and direction-neutral endpoints**
+- [x] **Step 3: Implement liveness and direction-neutral endpoints**
 
 Both endpoints adapt an accepted or initiated WebSocket into the same
 `WorkerSession`. Heartbeat expiry marks unavailable and stops assignments before
 closing the transport.
 
-- [ ] **Step 4: Run conformance and commit**
+- [x] **Step 4: Run conformance and commit**
 
 Run: `npm run build -w @tegojs/testkit -w @tegojs/transport-websocket && node --test packages/transport-websocket/dist/test/session.test.js`
 
