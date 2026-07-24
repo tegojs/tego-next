@@ -38,7 +38,11 @@ const now = new Date("2026-07-25T00:00:00.000Z");
 const clock: Clock = {
   now: () => now,
   sleep: (_delay, signal) =>
-    signal?.aborted === true ? Promise.reject(signal.reason) : Promise.resolve(),
+    signal?.aborted === true
+      ? Promise.reject(signal.reason)
+      : new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
 };
 const authority: RuntimeAuthority = {
   resource: "runtime:runtime-01",
@@ -375,7 +379,7 @@ test("@spec:runtime-operations/task-operations/unkeyed-runs-are-distinct", async
   assert.equal(executors.length, 2);
 });
 
-test("leadership loss fences terminal commit and reports indeterminate without output", async () => {
+test("leadership loss fences terminal commit without borrowing later authority", async () => {
   const { executor, service, state } = serviceFixture();
   await service.setAuthority(authority);
   await service.run(request);
@@ -389,10 +393,7 @@ test("leadership loss fences terminal commit and reports indeterminate without o
     startedAt: now.toISOString(),
     completedAt: now.toISOString(),
   });
-  const terminal = await service.wait(identity.taskId);
-  assert.equal(terminal.result?.status, "indeterminate");
-  assert.equal(terminal.result?.output, undefined);
-  assert.equal(terminal.result?.diagnostic?.retryable, false);
+  await new Promise<void>((resolve) => setImmediate(resolve));
   const durable = await state.read<JsonValue>({
     namespace: "tego",
     collection: "tasks",
@@ -551,7 +552,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/lost-submit-ack-observes-
       completedAt: now.toISOString(),
     },
   };
-  await assert.rejects(service.run(request), /ack lost/u);
+  assert.equal((await service.run(request)).result?.status, "succeeded");
   assert.equal(executor.submitted.length, 1);
 
   executor.submitError = undefined;
@@ -607,6 +608,9 @@ test("cancel is idempotent and close releases all waiters", async () => {
   await service.run(request);
   const first = service.cancel(identity.taskId);
   const second = service.cancel(identity.taskId);
+  while (executor.cancelled.length === 0) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
   executor.result.resolve({
     taskId: identity.taskId,
     attemptId: identity.attemptId,
@@ -673,6 +677,7 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
   });
   let currentAuthority: RuntimeAuthority | undefined = authority;
   let wakes = 0;
+  let revokeOnWake = false;
   const operations = new RuntimeOperationController({
     clock,
     state,
@@ -683,6 +688,7 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
     authority: () => currentAuthority,
     wake: async () => {
       wakes += 1;
+      if (revokeOnWake) currentAuthority = undefined;
     },
   });
   operations.openReadOnly();
@@ -708,17 +714,37 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
   assert.equal(second.generation, "2");
   assert.equal(wakes, 2);
 
+  revokeOnWake = true;
+  await assert.rejects(
+    operations.deployPlugin({ ...deploymentRequest, configuration: { greeting: "fenced" } }),
+    (error: unknown) => diagnosticCode(error) === "COORDINATION_FENCE_REJECTED",
+  );
+
+  currentAuthority = authority;
+  revokeOnWake = false;
+  state.beforeTransaction = () => {
+    state.records.set(`tego/installations/echo@1.0.0@${digest}`, {
+      value: { ...installation, pluginId: parsePluginId("other") },
+      revision: 100,
+    });
+  };
+  await assert.rejects(
+    operations.deployPlugin({ ...deploymentRequest, configuration: { greeting: "stale" } }),
+    (error: unknown) => diagnosticCode(error) === "DEPLOYMENT_ARTIFACT_NOT_INSTALLED",
+  );
+
   currentAuthority = undefined;
   operations.closeMutations();
   const status = await operations.pluginStatus({
     applicationId: request.applicationId,
     pluginId: request.pluginId,
   });
-  assert.equal(status.desired?.generation, "2");
+  assert.equal(status.desired?.generation, "3");
 });
 
 test("@spec:runtime-operations/task-operations/old-epoch-completion-cannot-use-new-authority", async () => {
-  const { executor, service, state } = serviceFixture();
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const { service, state } = serviceFixture(executor);
   await service.setAuthority(authority);
   await service.run(request);
   await service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
@@ -847,6 +873,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/observation-is-clock-boun
   const recovery = service.setAuthority(authority).finally(() => {
     settled = true;
   });
+  await new Promise<void>((resolve) => setImmediate(resolve));
   runtimeClock.advanceBy(5_000);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(settled, true);

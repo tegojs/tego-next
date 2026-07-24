@@ -6,6 +6,7 @@ import {
   parseFencingEpoch,
   parseNodeId,
   parseRuntimeId,
+  parseTaskId,
   type parseRevision,
   runtimeDiagnostic,
   type ArtifactDigest,
@@ -27,6 +28,7 @@ import {
   type RuntimeDiagnostic,
   type RuntimeTaskLifecycle,
   type RuntimeWorkerDirectory,
+  type RunTaskRequest,
   type ScannedState,
   type SecretProvider,
   type StateChange,
@@ -35,6 +37,8 @@ import {
   type StateStore,
   type StateTransaction,
   type StateTransactionOptions,
+  type TaskId,
+  type TaskRecord,
   type Versioned,
 } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
@@ -299,6 +303,23 @@ class ControlledTasks implements RuntimeTaskLifecycle {
   async close(): Promise<void> {
     this.log.push("tasks.close");
   }
+
+  run(_request: RunTaskRequest): Promise<TaskRecord> {
+    return Promise.reject(new Error("not used"));
+  }
+
+  status(_taskId: TaskId): Promise<TaskRecord | undefined> {
+    this.log.push("tasks.status");
+    return Promise.resolve(undefined);
+  }
+
+  wait(_taskId: TaskId): Promise<TaskRecord> {
+    return Promise.reject(new Error("not used"));
+  }
+
+  cancel(_taskId: TaskId): Promise<TaskRecord> {
+    return Promise.reject(new Error("not used"));
+  }
 }
 
 class ControlledWorkers implements RuntimeWorkerDirectory {
@@ -448,6 +469,15 @@ test("@spec:coordination-provider/fenced-leadership/follower-remains-operable", 
   assert.equal(value.services.reconcilerAuthorities.length, 0);
   assert.equal(status.counts.tasks, 4);
   assert.equal(status.counts.workers, 2);
+  await runtime.stop();
+});
+
+test("@spec:runtime-operations/task-operations/runtime-host-uses-one-canonical-task-service", async () => {
+  const value = fixture();
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+  assert.equal(await runtime.operations.taskStatus(parseTaskId("task-missing")), undefined);
+  assert.equal(value.log.includes("tasks.status"), true);
   await runtime.stop();
 });
 
