@@ -56,6 +56,10 @@ export class MainEndpoint {
     this.#options = options;
   }
 
+  get activeSessionCount(): number {
+    return this.#sessions.size;
+  }
+
   attach(socket: unknown): WorkerSession {
     if (this.#closed) {
       throw new Error("Main Worker endpoint is closed");
@@ -75,6 +79,9 @@ export class MainEndpoint {
         : { heartbeatTimeoutMs: this.#options.heartbeatTimeoutMs }),
       onRegister: (registeredSession, registration) =>
         this.#register(registeredSession, registration),
+      onClosed: (closedSession) => {
+        this.#sessions.delete(closedSession);
+      },
     });
     this.#sessions.add(session);
     return session;

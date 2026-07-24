@@ -94,6 +94,7 @@ export interface WorkerSessionOptions {
   readonly worker?: WorkerRegistration;
   readonly onRegister?: (session: WorkerSession, registration: WorkerRegistration) => string;
   readonly onUnavailable?: (session: WorkerSession) => void;
+  readonly onClosed?: (session: WorkerSession) => void;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -285,6 +286,7 @@ export class WorkerSession {
   readonly #worker: WorkerRegistration | undefined;
   readonly #onRegister: WorkerSessionOptions["onRegister"] | undefined;
   readonly #onUnavailable: WorkerSessionOptions["onUnavailable"] | undefined;
+  readonly #onClosed: WorkerSessionOptions["onClosed"] | undefined;
   readonly #nonce = createAuthenticationNonce();
   readonly #abort = new AbortController();
   readonly #listeners = new Set<(message: WorkerSessionMessage) => void>();
@@ -309,6 +311,7 @@ export class WorkerSession {
   #lastHeartbeatAt = 0;
   #pendingBinaryBytes = 0;
   #detached = false;
+  #closedNotified = false;
 
   readonly #messageListener: SocketListener = (...arguments_) => {
     this.#receive(arguments_);
@@ -340,6 +343,7 @@ export class WorkerSession {
     this.#worker = options.worker === undefined ? undefined : normalizeRegistration(options.worker);
     this.#onRegister = options.onRegister;
     this.#onUnavailable = options.onUnavailable;
+    this.#onClosed = options.onClosed;
     this.#sessionId = parseSessionId(`session-${randomUUID()}`);
     this.ready = this.#readyDeferred.promise;
     void this.ready.catch(() => undefined);
@@ -992,5 +996,9 @@ export class WorkerSession {
     this.#socket.off("close", this.#closeListener);
     this.#socket.off("error", this.#errorListener);
     this.#listeners.clear();
+    if (!this.#closedNotified) {
+      this.#closedNotified = true;
+      this.#onClosed?.(this);
+    }
   }
 }
