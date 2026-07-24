@@ -395,6 +395,24 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
   ]);
 });
 
+test("follower rejects mutation before reading artifact bytes", async () => {
+  const { drivers } = controlledDrivers();
+  let artifactReads = 0;
+  drivers.artifacts.read = (_digest) => {
+    artifactReads += 1;
+    return emptyAsyncIterable();
+  };
+  const runtime = createRuntime({ ...configuration, mode: "single-main" }, drivers);
+
+  await assert.rejects(
+    runtime.operations.installPlugin({
+      digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }),
+    (error: unknown) => diagnosticCode(error) === "COORDINATION_NOT_LEADER",
+  );
+  assert.equal(artifactReads, 0);
+});
+
 test("driver open failure closes previously opened drivers in reverse order", async () => {
   const { coordination, drivers, log, state } = controlledDrivers();
   coordination.failOpen = true;
