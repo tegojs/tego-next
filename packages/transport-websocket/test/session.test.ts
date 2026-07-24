@@ -350,3 +350,49 @@ test("authentication failures never expose either credential in diagnostics or c
   assert.doesNotMatch(observable, /main-private-value|worker-private-value/u);
   await Promise.all([main.close(), worker.close()]);
 });
+
+test("endpoints retain only authoritative live sessions across failed reconnects and replacement", async () => {
+  const clock = new FakeClock();
+  const main = createMainEndpoint({ clock, credential: "shared-secret" });
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const rejectedWorker = createWorkerEndpoint({
+      clock,
+      credential: "wrong-secret",
+      workerId: "retained-worker" as WorkerId,
+    });
+    const [mainSocket, workerSocket] = directSocketPair();
+    const mainSession = main.attach(mainSocket);
+    const workerSession = rejectedWorker.attach(workerSocket);
+    await assert.rejects(Promise.all([mainSession.ready, workerSession.ready]));
+    await rejectedWorker.close();
+  }
+  assert.equal(main.activeSessionCount, 0);
+
+  const firstWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: "retained-worker" as WorkerId,
+  });
+  const firstSockets = directSocketPair();
+  const firstMainSession = main.attach(firstSockets[0]);
+  const firstWorkerSession = firstWorker.attach(firstSockets[1]);
+  await Promise.all([firstMainSession.ready, firstWorkerSession.ready]);
+
+  const replacementWorker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: "retained-worker" as WorkerId,
+  });
+  const replacementSockets = directSocketPair();
+  const replacementMainSession = main.attach(replacementSockets[0]);
+  const replacementWorkerSession = replacementWorker.attach(replacementSockets[1]);
+  await Promise.all([replacementMainSession.ready, replacementWorkerSession.ready]);
+  assert.equal(main.activeSessionCount, 1);
+  assert.equal(firstWorker.activeSessionCount, 0);
+  assert.equal(replacementWorker.activeSessionCount, 1);
+
+  await Promise.all([main.close(), firstWorker.close(), replacementWorker.close()]);
+  assert.equal(main.activeSessionCount, 0);
+  assert.equal(replacementWorker.activeSessionCount, 0);
+});
