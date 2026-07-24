@@ -457,3 +457,33 @@ test("the default Worker clock removes abort listeners after completed sleeps", 
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   }
 });
+
+test("a peer hello arriving first cannot move authenticate before the local hello", async () => {
+  const clock = new FakeClock();
+  const main = createMainEndpoint({ clock, credential: "shared-secret" });
+  const [mainSocket] = directSocketPair();
+  const session = main.attach(mainSocket);
+  const codec = createWorkerCodec();
+  mainSocket.inject(
+    codec.encodeControl({
+      protocol: "1.0",
+      messageId: "peer-hello",
+      sessionId: "peer-session",
+      sequence: "0",
+      type: "hello",
+      sentAt: clock.now().toISOString(),
+      payload: {
+        role: "worker",
+        nonce: "0123456789abcdefghijklmn",
+      },
+    }),
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const sentTypes = mainSocket.sent
+    .filter((frame): frame is string => typeof frame === "string")
+    .map((frame) => JSON.parse(frame) as { type: string })
+    .map((envelope) => envelope.type);
+  assert.deepEqual(sentTypes.slice(0, 2), ["hello", "authenticate"]);
+  await main.close();
+  await assert.rejects(session.ready);
+});
