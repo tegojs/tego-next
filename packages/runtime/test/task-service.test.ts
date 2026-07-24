@@ -13,6 +13,7 @@ import {
   parseArtifactDigest,
   parsePluginInstallation,
   parseOperationId,
+  parseTaskRecord,
   type Clock,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -30,11 +31,7 @@ import {
   type StateWriteOptions,
   type Versioned,
 } from "@tegojs/contracts";
-import {
-  RuntimeOperationController,
-  TaskService,
-  type TaskIdentity,
-} from "../src/index.js";
+import { RuntimeOperationController, TaskService, type TaskIdentity } from "../src/index.js";
 
 const now = new Date("2026-07-25T00:00:00.000Z");
 const clock: Clock = {
@@ -55,6 +52,7 @@ class TransactionalState implements StateStore {
   readonly scope = "shared" as const;
   readonly records = new Map<string, { value: JsonValue; revision: number }>();
   readonly writes: string[] = [];
+  readonly accepted = Promise.withResolvers<void>();
   #revision = 0;
   #tail = Promise.resolve();
 
@@ -114,7 +112,10 @@ class TransactionalState implements StateStore {
         }
         this.#revision += 1;
         this.records.set(storageKey, { value: clone(item.value), revision: this.#revision });
-        this.writes.push(`${item.key.collection}:${String((item.value as { state?: unknown }).state)}`);
+        this.writes.push(
+          `${item.key.collection}:${String((item.value as { state?: unknown }).state)}`,
+        );
+        if ((item.value as { state?: unknown }).state === "accepted") this.accepted.resolve();
       }
       return clone(result);
     });
@@ -179,12 +180,19 @@ class TransactionalState implements StateStore {
 }
 
 class ControlledExecutor implements Executor {
-  readonly id = "executor-01";
-  readonly type = "process" as const;
+  readonly id: string;
+  readonly type: "process" | "remote" | "thread";
   readonly submitted: ExecutionRequest[] = [];
   readonly cancelled: string[] = [];
   readonly result = Promise.withResolvers<ExecutionResult>();
   submitGate: Promise<void> = Promise.resolve();
+  observed: Awaited<ReturnType<Executor["observe"]>> = undefined;
+  submitError: Error | undefined;
+
+  constructor(type: "process" | "remote" | "thread" = "process", id = "executor-01") {
+    this.type = type;
+    this.id = id;
+  }
 
   probe() {
     return Promise.resolve({
@@ -199,10 +207,11 @@ class ControlledExecutor implements Executor {
   async submit(request: ExecutionRequest): Promise<ExecutionHandle> {
     await this.submitGate;
     this.submitted.push(structuredClone(request));
+    if (this.submitError !== undefined) throw this.submitError;
     return { taskId: request.taskId, attemptId: request.attemptId, result: this.result.promise };
   }
   observe() {
-    return Promise.resolve(undefined);
+    return Promise.resolve(this.observed);
   }
   cancel(taskId: ExecutionRequest["taskId"], attemptId: ExecutionRequest["attemptId"]) {
     this.cancelled.push(`${taskId}/${attemptId}`);
@@ -241,9 +250,8 @@ const request = {
   orphanPolicy: "cancel" as const,
 };
 
-function serviceFixture() {
+function serviceFixture(executor = new ControlledExecutor()) {
   const state = new TransactionalState();
-  const executor = new ControlledExecutor();
   const service = new TaskService({
     state,
     clock,
@@ -285,8 +293,7 @@ test("@spec:runtime-operations/task-operations/idempotent-run-replay", async () 
   const replayable = { ...request, operationId: parseOperationId("run-01") };
 
   const first = service.run(replayable);
-  await Promise.resolve();
-  await Promise.resolve();
+  await state.accepted.promise;
   const durable = await state.read<JsonValue>({
     namespace: "tego",
     collection: "tasks",
@@ -297,6 +304,12 @@ test("@spec:runtime-operations/task-operations/idempotent-run-replay", async () 
       ? (durable.value as { readonly state?: JsonValue }).state
       : undefined,
     "accepted",
+  );
+  assert.deepEqual(
+    typeof durable?.value === "object" && durable.value !== null && !Array.isArray(durable.value)
+      ? (durable.value as { readonly executor?: JsonValue }).executor
+      : undefined,
+    { id: executor.id, type: executor.type },
   );
   const duplicate = service.run(structuredClone(replayable));
   gate.resolve();
@@ -362,6 +375,135 @@ test("leadership loss fences terminal commit and reports indeterminate without o
   assert.equal(terminal.result?.status, "indeterminate");
   assert.equal(terminal.result?.output, undefined);
   assert.equal(terminal.result?.diagnostic?.retryable, false);
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/tasks-recover-before-dispatch", async () => {
+  const { executor, service, state } = serviceFixture();
+  const accepted = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "accepted",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    authority,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
+
+  await service.recover();
+  assert.equal(service.count(), 1);
+  assert.equal(executor.submitted.length, 0);
+  await service.setAuthority(authority);
+  assert.equal(executor.submitted.length, 1);
+  assert.equal((await service.status(identity.taskId))?.state, "running");
+});
+
+test("recovery commits a locally observed terminal attempt without redispatch", async () => {
+  const { executor, service, state } = serviceFixture();
+  const running = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "running",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    executor: { id: executor.id, type: executor.type },
+    authority,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
+  executor.observed = {
+    state: "terminal",
+    result: {
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      executor: { kind: "process" },
+      status: "succeeded",
+      output: { recovered: true },
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  };
+
+  await service.recover();
+  await service.setAuthority(authority);
+  assert.equal(executor.submitted.length, 0);
+  assert.equal((await service.status(identity.taskId))?.result?.status, "succeeded");
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/accepted-remote-unknown-is-not-redispatched", async () => {
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const { service, state } = serviceFixture(executor);
+  const accepted = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "accepted",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    executor: { id: executor.id, type: executor.type },
+    authority,
+  });
+  state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
+
+  await service.recover();
+  await service.setAuthority(authority);
+  assert.equal(executor.submitted.length, 0);
+  assert.equal((await service.status(identity.taskId))?.state, "accepted");
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/lost-submit-ack-observes-before-retry", async () => {
+  const executor = new ControlledExecutor();
+  const { service, state } = serviceFixture(executor);
+  await service.setAuthority(authority);
+  executor.submitError = new Error("ack lost");
+  executor.observed = {
+    state: "terminal",
+    result: {
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      executor: { kind: "process" },
+      status: "succeeded",
+      output: { executed: true },
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  };
+  await assert.rejects(service.run(request), /ack lost/u);
+  assert.equal(executor.submitted.length, 1);
+
+  executor.submitError = undefined;
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => executor,
+    createIdentity: () => identity,
+  });
+  await restarted.recover();
+  await restarted.setAuthority(authority);
+  assert.equal(executor.submitted.length, 1);
+  assert.equal((await restarted.status(identity.taskId))?.result?.status, "succeeded");
+});
+
+test("malformed executor completion becomes one durable indeterminate result for all waiters", async () => {
+  const { executor, service } = serviceFixture();
+  await service.setAuthority(authority);
+  await service.run(request);
+  const first = service.wait(identity.taskId);
+  const second = service.wait(identity.taskId);
+  executor.result.resolve({
+    taskId: parseTaskId("wrong-task"),
+    attemptId: identity.attemptId,
+    executor: { kind: "process" },
+    status: "succeeded",
+    output: { mustNotLeak: true },
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  });
+  const [left, right] = await Promise.all([first, second]);
+  assert.deepEqual(left, right);
+  assert.equal(left.result?.status, "indeterminate");
+  assert.equal(left.result?.output, undefined);
+  assert.deepEqual(await service.status(identity.taskId), left);
 });
 
 test("cancel is idempotent and close releases all waiters", async () => {
