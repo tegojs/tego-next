@@ -1688,6 +1688,10 @@ test("a live Worker terminal commit timeout fails closed and retains evidence", 
   assert.equal((await remote.health()).status, "degraded");
   assert.equal((await remote.health()).accepting, false);
   assert.equal((await remote.probe()).available, false);
+  await reconnect(remote, runtime, "2");
+  assert.equal((await remote.health()).status, "degraded");
+  assert.equal((await remote.health()).accepting, false);
+  assert.equal((await remote.probe()).available, false);
   const recoveredLocal = new TestLocalExecutor();
   const recoveredRuntime = new WorkerRuntime({
     workerId,
@@ -1695,7 +1699,7 @@ test("a live Worker terminal commit timeout fails closed and retains evidence", 
     attemptStore: new MemoryRemoteAttemptStore(),
     selectExecutor: () => recoveredLocal,
   });
-  await reconnect(remote, recoveredRuntime, "2");
+  await reconnect(remote, recoveredRuntime, "3");
   assert.equal((await remote.health()).status, "healthy");
   assert.equal((await remote.probe()).available, true);
   const recovered = await (

@@ -514,6 +514,26 @@ test("indeterminate execution is a non-retryable terminal observation", () => {
   };
 
   assert.deepEqual(roundTrip(indeterminate, parseExecutionResult), indeterminate);
+
+  for (const invalid of [
+    { ...base, status: "indeterminate" },
+    {
+      ...base,
+      status: "indeterminate",
+      diagnostic: validDiagnostic,
+    },
+    {
+      ...base,
+      status: "indeterminate",
+      output: { message: "unproven" },
+      diagnostic: { ...validDiagnostic, retryable: false },
+    },
+  ]) {
+    assert.throws(
+      () => parseExecutionResult(invalid),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_RESULT_INVALID",
+    );
+  }
 });
 
 test("runtime boundary validators reject malformed health, authority, status, and events", () => {
