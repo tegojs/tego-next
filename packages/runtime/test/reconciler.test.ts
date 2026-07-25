@@ -2217,6 +2217,25 @@ test("one wake converges immediately available lifecycle effects to quiescence",
   await reconciler.stop();
 });
 
+test("wake fails closed when immediate lifecycle work exceeds its pass budget", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 1,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await assert.rejects(reconciler.start(), /did not converge within 1 pass/u);
+  assert.equal(reconciler.kernelRunning, false);
+  assert.equal(effects.live.size, 0);
+});
+
 test("deployment observations distinguish unavailable, inconsistent, and degraded states", async () => {
   for (const [expected, instances, installations] of [
     ["unavailable", [], []],
