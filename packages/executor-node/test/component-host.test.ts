@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
@@ -40,10 +41,15 @@ async function artifactFixture(
   options: {
     readonly componentId?: string;
     readonly entrypoint?: string;
+    readonly isolated?: boolean;
     readonly permissions?: PluginManifest["permissions"];
   } = {},
 ): Promise<ArtifactFixture> {
-  const directory = await mkdtemp(join(process.cwd(), ".tego-component-host-"));
+  const directory = await mkdtemp(
+    options.isolated
+      ? join(tmpdir(), "tego-component-host-")
+      : join(process.cwd(), ".tego-component-host-"),
+  );
   t.after(() => rm(directory, { force: true, recursive: true }));
   const entrypoint = options.entrypoint ?? "components/component.js";
   const path = join(directory, ...entrypoint.split("/"));
@@ -302,6 +308,50 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
   });
   assert.throws(() => parseComponentHostCommand(accessor), /data propert/u);
   assert.equal(calls, 0);
+});
+
+test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sdk", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      import { defineComponent } from "@tegojs/plugin-sdk";
+      export default defineComponent({
+        kind: "task",
+        run: async (_context, input) => input,
+      });
+    `,
+    { isolated: true },
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+
+  assert.equal((await host.handle(prepareCommand(fixture))).ok, true);
+  assert.equal(
+    (await host.handle(command("import", "isolated-import", { artifactDigest: digest }))).ok,
+    true,
+  );
+  assert.equal(
+    (await host.handle(command("start", "isolated-start", { artifactDigest: digest }))).ok,
+    true,
+  );
+  const input = { isolated: true };
+  const result = await host.handle(
+    command("run", "isolated-run", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("isolated-task"),
+        attemptId: parseAttemptId("isolated-attempt"),
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        input,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.deepEqual((result.value as { readonly output?: JsonValue }).output, input);
 });
 
 test("component host rejects excessive attachment count before plugin execution", async (t) => {
