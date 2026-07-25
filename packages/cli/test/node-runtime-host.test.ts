@@ -4,6 +4,8 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { parseWorkerId } from "@tegojs/contracts";
+import { connectWorker, createWorkerEndpoint } from "@tegojs/transport-websocket";
 import { createNodeRuntimeHost } from "../src/runtime/create-node-runtime-host.js";
 import { runNodeMainProcess } from "../src/runtime/main-process.js";
 
@@ -90,6 +92,49 @@ test("a readiness failure after Worker bind rolls the listener back", async () =
     assert.equal(typeof workerUrl, "string");
     await assertPort(workerUrl as string, "closed");
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SQLite-backed Worker epochs advance across Main restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-node-listener-epoch-"));
+  const worker = createWorkerEndpoint({
+    credential: "worker-secret",
+    workerId: parseWorkerId("worker-listener"),
+    handshakeTimeoutMs: 1_000,
+  });
+  let first: Awaited<ReturnType<typeof createNodeRuntimeHost>> | undefined =
+    await createNodeRuntimeHost(options(directory));
+  let second: Awaited<ReturnType<typeof createNodeRuntimeHost>> | undefined;
+  try {
+    await first.runtime.start();
+    const firstUrl = await first.startWorkerListener();
+    const firstSession = await connectWorker({
+      endpoint: worker,
+      url: new URL(firstUrl as string),
+      signal: AbortSignal.timeout(1_000),
+    });
+    await firstSession.ready;
+    const firstEpoch = BigInt(firstSession.epoch);
+
+    await first.runtime.stop();
+    first = undefined;
+
+    second = await createNodeRuntimeHost(options(directory));
+    await second.runtime.start();
+    const secondUrl = await second.startWorkerListener();
+    const secondSession = await connectWorker({
+      endpoint: worker,
+      url: new URL(secondUrl as string),
+      signal: AbortSignal.timeout(1_000),
+    });
+    await secondSession.ready;
+    assert.equal(BigInt(secondSession.epoch) > firstEpoch, true);
+    await secondSession.close();
+  } finally {
+    await second?.runtime.stop().catch(() => undefined);
+    await first?.runtime.stop().catch(() => undefined);
+    await worker.close().catch(() => undefined);
     await rm(directory, { recursive: true, force: true });
   }
 });
