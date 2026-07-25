@@ -7,11 +7,13 @@ import {
   parseApplicationId,
   parseArtifactDigest,
   parseNodeId,
+  parsePermissionSet,
   parsePluginDeployment,
   parsePluginInstallation,
   parseRuntimeId,
   parseWorkerId,
   type Runtime,
+  type RuntimeAuthority,
   type RuntimeConfiguration,
   type RuntimeDrivers,
   runtimeDiagnostic,
@@ -21,8 +23,10 @@ import { createPostgresDrivers } from "@tegojs/drivers-postgres";
 import {
   ArtifactService,
   ComponentEffects,
+  type ComponentLifecycleHost,
   ComponentRegistry,
   createRuntimeHost,
+  type PlacementWorker,
   PreparedArtifactCache,
   Reconciler,
   TaskService,
@@ -30,7 +34,9 @@ import {
 import {
   createMainEndpoint,
   listenForMain,
+  RemoteExecutor,
   StateWorkerEpochAllocator,
+  type WorkerSession,
 } from "@tegojs/transport-websocket";
 import type { LocalArtifactIngress } from "../control/server.js";
 import {
@@ -39,6 +45,11 @@ import {
   LocalComponentSessionHost,
 } from "./local-component-session-host.js";
 import { LocalComponentSessionRegistry } from "./local-component-session-registry.js";
+import { StateRemoteAttemptStore } from "./remote-attempt-store.js";
+import {
+  RemoteComponentSessionHost,
+  remoteComponentExecutorId,
+} from "./remote-component-session-host.js";
 
 export interface NodeWorkerListenerOptions {
   readonly credential: string;
@@ -184,6 +195,28 @@ export async function createNodeRuntimeHost(
     secretProvider: drivers.secrets,
     registry: sessionRegistry,
   });
+  const configuredWorkerId =
+    options.worker === undefined ? undefined : parseWorkerId(options.worker.workerId);
+  let remoteExecutor: RemoteExecutor | undefined;
+  const remoteComponentHost = new RemoteComponentSessionHost({
+    registry: sessionRegistry,
+    resolveExecutor: (workerId) => (workerId === configuredWorkerId ? remoteExecutor : undefined),
+    runtimeId: options.runtimeId,
+  });
+  const lifecycleHost: ComponentLifecycleHost = {
+    start: (binding) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.start(binding)
+        : componentHost.start(binding),
+    drain: (binding) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.drain(binding)
+        : componentHost.drain(binding),
+    stop: (binding) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.stop(binding)
+        : componentHost.stop(binding),
+  };
   const tasks = new TaskService({
     state: drivers.state,
     clock: drivers.clock,
@@ -203,16 +236,208 @@ export async function createNodeRuntimeHost(
       };
     },
   });
-  const epochAllocator = new StateWorkerEpochAllocator({ state: drivers.state });
+  let activeWorkerAuthority: RuntimeAuthority | undefined;
+  let requestedWorkerAuthority: RuntimeAuthority | undefined;
+  let authorityGeneration = 0;
+  let allocatedWorkerAuthorityGeneration: number | undefined;
   const mainEndpoint =
     options.worker === undefined
       ? undefined
       : createMainEndpoint({
           credential: options.worker.credential,
           workerId: parseWorkerId(options.worker.workerId),
-          epochAllocator,
+          epochAllocator: {
+            next: async (workerId) => {
+              const authority = activeWorkerAuthority;
+              const generation = authorityGeneration;
+              if (authority === undefined || !sameAuthority(authority, requestedWorkerAuthority)) {
+                throw new Error("Only the authoritative Main can register a Worker session");
+              }
+              const epoch = await new StateWorkerEpochAllocator({
+                state: drivers.state,
+                fencing: authority,
+              }).next(workerId);
+              if (
+                generation !== authorityGeneration ||
+                !sameAuthority(authority, activeWorkerAuthority) ||
+                !sameAuthority(authority, requestedWorkerAuthority)
+              ) {
+                throw new Error("Main authority changed during Worker session registration");
+              }
+              allocatedWorkerAuthorityGeneration = generation;
+              return epoch;
+            },
+          },
+          assertRegistrationPublishable: () => {
+            if (
+              activeWorkerAuthority === undefined ||
+              allocatedWorkerAuthorityGeneration !== authorityGeneration ||
+              !sameAuthority(activeWorkerAuthority, requestedWorkerAuthority)
+            ) {
+              throw new Error("Main authority changed before Worker session publication");
+            }
+            allocatedWorkerAuthorityGeneration = undefined;
+          },
           clock: drivers.clock,
         });
+  const placementWorkers: PlacementWorker[] = [];
+  let attachedWorkerSession: WorkerSession | undefined;
+  let attachedWorkerUnsubscribe: (() => void) | undefined;
+  let attachmentGeneration = 0;
+  let workerLifecycleTail = Promise.resolve();
+  let activeReconciler: Reconciler | undefined;
+  let reportReconcilerBackgroundError: ((error: unknown) => void) | undefined;
+  const enqueueWorkerLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
+    const execution = workerLifecycleTail.then(operation, operation);
+    workerLifecycleTail = execution.then(
+      () => undefined,
+      () => undefined,
+    );
+    return execution;
+  };
+  const sameAuthority = (
+    left: RuntimeAuthority | undefined,
+    right: RuntimeAuthority | undefined,
+  ): boolean =>
+    left?.resource === right?.resource &&
+    left?.epoch === right?.epoch &&
+    (left !== undefined) === (right !== undefined);
+  const removePlacement = (session: WorkerSession): void => {
+    if (attachedWorkerSession !== session) return;
+    attachmentGeneration += 1;
+    attachedWorkerSession = undefined;
+    attachedWorkerUnsubscribe?.();
+    attachedWorkerUnsubscribe = undefined;
+    placementWorkers.splice(0);
+    const reconciler = activeReconciler;
+    if (reconciler !== undefined && activeWorkerAuthority !== undefined) {
+      void reconciler.wake().catch((error: unknown) => reportReconcilerBackgroundError?.(error));
+    }
+  };
+  const attachWorkerSession = (session: WorkerSession): Promise<void> =>
+    enqueueWorkerLifecycle(async () => {
+      const executor = remoteExecutor;
+      const authority = activeWorkerAuthority;
+      const currentAuthorityGeneration = authorityGeneration;
+      if (
+        mainEndpoint === undefined ||
+        configuredWorkerId === undefined ||
+        executor === undefined ||
+        authority === undefined ||
+        !sameAuthority(authority, requestedWorkerAuthority)
+      ) {
+        throw new Error("Remote Worker runtime is not owned by this Main");
+      }
+      const registration = mainEndpoint.registration(configuredWorkerId);
+      if (
+        registration === undefined ||
+        registration.workerId !== configuredWorkerId ||
+        mainEndpoint.current(configuredWorkerId) !== session
+      ) {
+        throw new Error("Remote Worker registration is unavailable");
+      }
+      const generation = ++attachmentGeneration;
+      const unsubscribe = session.onStateChange((state) => {
+        if (state !== "ready") {
+          void enqueueWorkerLifecycle(async () => removePlacement(session)).catch(
+            (error: unknown) => reportReconcilerBackgroundError?.(error),
+          );
+        }
+      });
+      const workerPermission = parsePermissionSet([
+        {
+          kind: "worker",
+          labels: registration.labels,
+          resources: registration.resources,
+        },
+      ])[0];
+      if (workerPermission?.kind !== "worker") {
+        throw new Error("Remote Worker registration resources are invalid");
+      }
+      await executor.attach(session);
+      if (!(await executor.probe()).available) {
+        throw new Error("Remote Worker executor is unavailable after session attachment");
+      }
+      const executors = registration.executors.filter(
+        (executor): executor is "process" | "thread" =>
+          executor === "process" || executor === "thread",
+      );
+      if (
+        generation !== attachmentGeneration ||
+        currentAuthorityGeneration !== authorityGeneration ||
+        !sameAuthority(authority, activeWorkerAuthority) ||
+        !sameAuthority(authority, requestedWorkerAuthority) ||
+        remoteExecutor !== executor ||
+        mainEndpoint.current(configuredWorkerId) !== session ||
+        session.state !== "ready" ||
+        !session.available
+      ) {
+        unsubscribe();
+        throw new Error("Remote Worker session was replaced during attachment");
+      }
+      attachedWorkerUnsubscribe?.();
+      attachedWorkerUnsubscribe = unsubscribe;
+      attachedWorkerSession = session;
+      placementWorkers.splice(0, placementWorkers.length, {
+        workerId: configuredWorkerId,
+        labels: workerPermission.labels,
+        resources: workerPermission.resources,
+        executors,
+        preparedArtifacts: registration.preparedArtifacts,
+      });
+      const reconciler = activeReconciler;
+      if (reconciler !== undefined) {
+        void (async () => {
+          await reconciler.wake();
+          if (
+            generation === attachmentGeneration &&
+            attachedWorkerSession === session &&
+            session.state === "ready" &&
+            session.available &&
+            sameAuthority(authority, activeWorkerAuthority) &&
+            remoteExecutor === executor
+          ) {
+            await tasks.recoverRemoteWorker(configuredWorkerId);
+          }
+        })().catch((error: unknown) => reportReconcilerBackgroundError?.(error));
+      }
+    });
+  const setWorkerAuthority = (authority: RuntimeAuthority | undefined): Promise<void> => {
+    const requested = authority === undefined ? undefined : structuredClone(authority);
+    const generation = ++authorityGeneration;
+    requestedWorkerAuthority = requested;
+    return enqueueWorkerLifecycle(async () => {
+      if (generation !== authorityGeneration) return;
+      if (configuredWorkerId === undefined) {
+        activeWorkerAuthority = requested;
+        return;
+      }
+      if (sameAuthority(activeWorkerAuthority, requested)) return;
+      const previousSession = attachedWorkerSession;
+      const previousExecutor = remoteExecutor;
+      activeWorkerAuthority = undefined;
+      attachmentGeneration += 1;
+      attachedWorkerSession = undefined;
+      attachedWorkerUnsubscribe?.();
+      attachedWorkerUnsubscribe = undefined;
+      placementWorkers.splice(0);
+      remoteExecutor = undefined;
+      previousExecutor?.revokeAuthority();
+      await previousSession?.close().catch(() => undefined);
+      if (requested === undefined || generation !== authorityGeneration) return;
+      remoteExecutor = new RemoteExecutor({
+        id: remoteComponentExecutorId(configuredWorkerId),
+        workerId: configuredWorkerId,
+        clock: drivers.clock,
+        attemptStore: new StateRemoteAttemptStore({
+          state: drivers.state,
+          workerId: configuredWorkerId,
+          fencing: requested,
+        }),
+      });
+      activeWorkerAuthority = requested;
+    });
+  };
   const listenerOwner =
     options.worker === undefined || mainEndpoint === undefined
       ? undefined
@@ -222,21 +447,32 @@ export async function createNodeRuntimeHost(
             host: options.worker?.host ?? "127.0.0.1",
             port: options.worker?.port ?? 0,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
+            onSession: attachWorkerSession,
           }),
         );
   const workers = {
-    count: () => mainEndpoint?.activeSessionCount ?? 0,
-    placements: () => [],
+    count: () => placementWorkers.length,
+    placements: () => structuredClone(placementWorkers),
+    setAuthority: setWorkerAuthority,
     close: async () => {
-      const results = await Promise.allSettled([
-        sessionRegistry.close(),
-        preparedArtifacts.close(),
-        listenerOwner?.close(),
-        mainEndpoint?.close(),
-      ]);
-      const errors = results
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-        .map((result) => result.reason);
+      const errors: unknown[] = [];
+      try {
+        await setWorkerAuthority(undefined);
+      } catch (error) {
+        errors.push(error);
+      }
+      for (const close of [
+        () => sessionRegistry.close(),
+        () => listenerOwner?.close(),
+        () => mainEndpoint?.close(),
+        () => preparedArtifacts.close(),
+      ]) {
+        try {
+          await close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
       if (errors.length === 1) throw errors[0];
       if (errors.length > 1) throw new AggregateError(errors, "Worker listener cleanup failed");
     },
@@ -245,16 +481,20 @@ export async function createNodeRuntimeHost(
     artifactService,
     tasks,
     workers,
-    createReconciler: (authority, context) =>
-      new Reconciler({
+    createReconciler: (authority, context) => {
+      reportReconcilerBackgroundError = context.onBackgroundError;
+      activeReconciler = new Reconciler({
         artifactGate: localArtifactGate,
         authority,
         clock: drivers.clock,
         effects: new ComponentEffects({
           artifacts: preparedArtifacts,
           registry: componentRegistry,
-          supportedExecutors: ["process", "thread"],
-          host: componentHost,
+          supportedExecutors:
+            configuredWorkerId === undefined
+              ? ["process", "thread"]
+              : ["process", "thread", "remote"],
+          host: lifecycleHost,
           authority: context.currentAuthority,
           resolveDeployment: async (effect) => {
             const durableDeployment = await drivers.state.read({
@@ -298,9 +538,11 @@ export async function createNodeRuntimeHost(
           },
         }),
         state: drivers.state,
-        workers: [],
+        workers: placementWorkers,
         onBackgroundError: context.onBackgroundError,
-      }),
+      });
+      return activeReconciler;
+    },
   });
   const artifactIngress: LocalArtifactIngress = {
     putPath: async (artifactPath) => {

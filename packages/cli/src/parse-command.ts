@@ -8,6 +8,7 @@ import {
   DiagnosticError,
   type JsonValue,
   parseDeployPluginRequest,
+  parsePermissionSet,
   parsePluginDeploymentIdentity,
   parseRunTaskRequest,
   parseTaskId,
@@ -119,7 +120,9 @@ interface WorkerStartCommandBase {
   readonly credential: string;
   readonly dataDirectory: string;
   readonly json: boolean;
+  readonly labels: Readonly<Record<string, string>>;
   readonly prepare: readonly string[];
+  readonly resources: import("@tegojs/contracts").WorkerResourceCeilings;
   readonly workerId: string;
 }
 
@@ -581,8 +584,10 @@ function parseWorker(arguments_: readonly string[]): WorkerStartCommand {
         credential: { type: "string" },
         "data-dir": { type: "string" },
         json: { type: "boolean", default: false },
+        labels: { type: "string" },
         listen: { type: "string" },
         prepare: { type: "string", multiple: true },
+        resources: { type: "string" },
         "worker-id": { type: "string" },
       },
       strict: true,
@@ -601,6 +606,19 @@ function parseWorker(arguments_: readonly string[]): WorkerStartCommand {
       throw commandError("Worker start requires --worker-id");
     }
     const workerId = parseWorkerId(configuredWorkerId);
+    const workerPermission = parsePermissionSet([
+      {
+        kind: "worker",
+        labels: parseJson(parsed.values.labels ?? "{}", "Worker labels"),
+        resources: parseJson(
+          parsed.values.resources ?? '{"cpuMillis":0,"memoryBytes":0,"storageBytes":0}',
+          "Worker resources",
+        ),
+      },
+    ])[0];
+    if (workerPermission?.kind !== "worker") {
+      throw commandError("Worker labels and resources are invalid");
+    }
     const base = {
       kind: "worker.start" as const,
       credential,
@@ -608,7 +626,9 @@ function parseWorker(arguments_: readonly string[]): WorkerStartCommand {
         parsed.values["data-dir"] ?? join(defaultDataDirectory(), "workers", workerId),
       ),
       json: parsed.values.json ?? false,
+      labels: workerPermission.labels,
       prepare: (parsed.values.prepare ?? []).map((path) => resolve(path)),
+      resources: workerPermission.resources,
       workerId,
     };
     if (connect !== undefined) {

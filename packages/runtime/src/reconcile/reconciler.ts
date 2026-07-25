@@ -40,7 +40,7 @@ import {
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
 import type { PlacementWorker } from "./placement.js";
-import { planPlacement } from "./placement.js";
+import { placementIsEligible } from "./placement.js";
 import {
   type ArtifactDeploymentGate,
   type ComponentInstance,
@@ -497,7 +497,7 @@ export class Reconciler {
       this.#loadInstances(),
     ]);
     if (!this.#running) return false;
-    await this.#restorePersistedComponents(deployments, loadedInstances);
+    await this.#restorePersistedComponents(deployments, installations, loadedInstances);
     if (!this.#running) return false;
     loadedInstances = await this.#loadInstances();
     this.#deferRetries(loadedInstances);
@@ -755,11 +755,13 @@ export class Reconciler {
 
   async #restorePersistedComponents(
     loadedDeployments?: readonly PluginDeployment[],
+    loadedInstallations?: readonly PluginInstallation[],
     loadedInstances?: readonly LoadedComponentInstance[],
   ): Promise<void> {
     if (this.#componentLifecycle === undefined) return;
-    const [deployments, instances] = await Promise.all([
+    const [deployments, installations, instances] = await Promise.all([
       loadedDeployments ?? this.#loadDeployments(),
+      loadedInstallations ?? this.#loadInstallations(),
       loadedInstances ?? this.#loadInstances(),
     ]);
     const now = this.#options.clock.now().toISOString();
@@ -770,7 +772,9 @@ export class Reconciler {
         (instance) =>
           (instance.lifecycle === "preparing" || instance.lifecycle === "ready") &&
           (instance.retryAt === undefined || instance.retryAt <= now) &&
-          instance.workerId === undefined &&
+          (instance.workerId === undefined ||
+            this.#options.workers?.some((worker) => worker.workerId === instance.workerId) ===
+              true) &&
           instance.artifactDigest !== undefined &&
           this.#options.effects.supportedExecutors.includes(instance.executor) &&
           deployments.some(
@@ -786,6 +790,12 @@ export class Reconciler {
         left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
       );
     for (const instance of restorable) {
+      if (
+        instance.executor === "remote" &&
+        !(await this.#isPersistedRemotePlacementEligible(instance, deployments, installations))
+      ) {
+        continue;
+      }
       if (
         instance.lifecycle === "ready" &&
         this.#componentLifecycle.isLive(instance, this.#options.authority)
@@ -806,6 +816,57 @@ export class Reconciler {
         await this.#recordRestorationFailure(instance, error);
       }
     }
+  }
+
+  async #isPersistedRemotePlacementEligible(
+    instance: ComponentInstance,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+  ): Promise<boolean> {
+    if (instance.workerId === undefined || instance.artifactDigest === undefined) return false;
+    const deployment = deployments.find(
+      (candidate) =>
+        candidate.state === "active" &&
+        candidate.applicationId === instance.applicationId &&
+        candidate.pluginId === instance.pluginId &&
+        candidate.generation === instance.deploymentGeneration &&
+        candidate.artifactDigest === instance.artifactDigest,
+    );
+    if (deployment === undefined) return false;
+    const installation = installations.find(
+      (candidate) =>
+        candidate.pluginId === deployment.pluginId &&
+        candidate.version === deployment.version &&
+        candidate.digest === deployment.artifactDigest,
+    );
+    if (installation === undefined) return false;
+    let artifact: ValidatedPluginArtifact;
+    try {
+      artifact = await this.#options.artifactGate.validate({
+        digest: deployment.artifactDigest,
+      });
+    } catch {
+      return false;
+    }
+    const component = artifact.manifest.components.find(
+      (candidate) => candidate.componentId === instance.componentId,
+    );
+    if (component === undefined) return false;
+    const permissionDecision = validatePermissionGrant(
+      artifact.manifest.permissions,
+      deployment.permissionGrants,
+    );
+    if (!permissionDecision.allowed) return false;
+    return placementIsEligible(
+      {
+        artifactDigest: deployment.artifactDigest,
+        component,
+        grantedPermissions: permissionDecision.granted ?? [],
+        supportedExecutors: this.#options.effects.supportedExecutors,
+        ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+      },
+      { executor: "remote", workerId: instance.workerId },
+    );
   }
 
   async #recordRestorationFailure(instance: ComponentInstance, error: unknown): Promise<void> {
@@ -1432,18 +1493,20 @@ export class Reconciler {
         return;
       }
       if (component !== undefined) {
-        const placement = planPlacement({
-          component,
-          grantedPermissions: currentGate.permissionDecision.granted ?? [],
-          supportedExecutors: this.#options.effects.supportedExecutors,
-          ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
-        });
-        if (
-          !placement.ok ||
-          placement.placement === undefined ||
-          placement.placement.executor !== effect.executor ||
-          placement.placement.workerId !== effect.workerId
-        ) {
+        const eligible = placementIsEligible(
+          {
+            artifactDigest: effect.artifactDigest,
+            component,
+            grantedPermissions: currentGate.permissionDecision.granted ?? [],
+            supportedExecutors: this.#options.effects.supportedExecutors,
+            ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+          },
+          {
+            executor: effect.executor,
+            ...(effect.workerId === undefined ? {} : { workerId: effect.workerId }),
+          },
+        );
+        if (!eligible) {
           this.#replanCount += 1;
           await this.#retryClaim(claim);
           return;

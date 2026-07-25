@@ -1,4 +1,5 @@
 import type {
+  ArtifactDigest,
   ExecutorKind,
   JsonObject,
   Permission,
@@ -11,6 +12,8 @@ export interface PlacementWorker extends JsonObject {
   readonly workerId: string;
   readonly labels: Readonly<Record<string, string>>;
   readonly resources: WorkerResourceCeilings;
+  readonly executors: readonly Extract<ExecutorKind, "process" | "thread">[];
+  readonly preparedArtifacts: readonly ArtifactDigest[];
 }
 
 export interface ComponentPlacement extends JsonObject {
@@ -25,6 +28,7 @@ export interface PlacementDiagnostic extends JsonObject {
 }
 
 export interface PlacementInput {
+  readonly artifactDigest: ArtifactDigest;
   readonly component: PluginComponent;
   readonly grantedPermissions: readonly Permission[];
   readonly supportedExecutors: readonly ExecutorKind[];
@@ -60,6 +64,16 @@ export function planPlacement(input: PlacementInput): PlacementDecision {
       left.workerId < right.workerId ? -1 : left.workerId > right.workerId ? 1 : 0,
     )) {
       if (
+        !Array.isArray(worker.preparedArtifacts) ||
+        !Array.isArray(worker.executors) ||
+        !worker.preparedArtifacts.includes(input.artifactDigest) ||
+        !worker.executors.some((workerExecutor) =>
+          input.component.executors.includes(workerExecutor),
+        )
+      ) {
+        continue;
+      }
+      if (
         gatePermission(input.grantedPermissions, {
           kind: "worker",
           labels: worker.labels,
@@ -88,4 +102,22 @@ export function planPlacement(input: PlacementInput): PlacementDecision {
       },
     ],
   };
+}
+
+export function placementIsEligible(input: PlacementInput, expected: ComponentPlacement): boolean {
+  if (!input.supportedExecutors.includes(expected.executor)) return false;
+  const placement = planPlacement({
+    ...input,
+    supportedExecutors: [expected.executor],
+    ...(expected.executor === "remote"
+      ? {
+          workers: (input.workers ?? []).filter((worker) => worker.workerId === expected.workerId),
+        }
+      : {}),
+  });
+  return (
+    placement.ok &&
+    placement.placement?.executor === expected.executor &&
+    placement.placement.workerId === expected.workerId
+  );
 }

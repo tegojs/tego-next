@@ -1,8 +1,8 @@
 import type { ApplicationId, FencingEpoch, NodeId, RuntimeId } from "./identity.js";
 import type { JsonObject } from "./json.js";
+import type { RuntimeOperations } from "./operations.js";
 import type { WorkerResourceCeilings } from "./permission.js";
 import type { DriverHealth } from "./state.js";
-import type { RuntimeOperations } from "./operations.js";
 
 export type RuntimeMode = "multi-main" | "single-main";
 
@@ -64,6 +64,7 @@ export interface RuntimeTaskLifecycle {
 }
 
 export interface RuntimeWorkerDirectory {
+  setAuthority(authority: RuntimeAuthority | undefined): Promise<void>;
   count(): number;
   placements(): readonly RuntimePlacementWorker[];
   close(): Promise<void>;

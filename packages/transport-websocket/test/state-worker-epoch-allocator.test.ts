@@ -7,6 +7,7 @@ import {
   parseWorkerId,
   type StateStore,
   type StateTransaction,
+  type StateTransactionOptions,
   type Versioned,
 } from "@tegojs/contracts";
 import { StateWorkerEpochAllocator } from "../src/index.js";
@@ -50,4 +51,31 @@ test("persistent Worker epochs fail without mutating state after the protocol li
       (error as { diagnostic: { code: string } }).diagnostic.code === "WORKER_EPOCH_LIMIT_EXCEEDED",
   );
   assert.equal(writes, 0);
+});
+
+test("persistent Worker epoch allocation carries the owning runtime fence", async () => {
+  const workerId = parseWorkerId("worker-fenced");
+  let observedOptions: StateTransactionOptions | undefined;
+  const transaction = {
+    get: async () => undefined,
+    put: async () => undefined,
+  } as unknown as StateTransaction;
+  const state = {
+    scope: "shared",
+    transact: async <T extends JsonValue>(
+      options: StateTransactionOptions,
+      work: (active: StateTransaction) => Promise<T>,
+    ): Promise<T> => {
+      observedOptions = structuredClone(options);
+      return work(transaction);
+    },
+  } as StateStore;
+  const fencing = {
+    resource: "runtime:runtime-fenced",
+    epoch: parseFencingEpoch("7"),
+  };
+  const allocator = new StateWorkerEpochAllocator({ state, fencing });
+
+  assert.equal(await allocator.next(workerId), "1");
+  assert.deepEqual(observedOptions, { fencing });
 });

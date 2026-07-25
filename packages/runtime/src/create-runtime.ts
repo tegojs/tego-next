@@ -396,6 +396,7 @@ class TegoRuntime implements Runtime {
     }
 
     this.#reconcilerCurrentAuthority = structuredClone(authority);
+    await this.#services.workers.setAuthority(authority);
     let reconciler!: Reconciler;
     reconciler = this.#services.createReconciler(authority, {
       currentAuthority: () =>
@@ -430,6 +431,11 @@ class TegoRuntime implements Runtime {
     const errors: unknown[] = [];
     try {
       await this.#services.tasks.setAuthority(undefined);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await this.#services.workers.setAuthority(undefined);
     } catch (error) {
       errors.push(error);
     }

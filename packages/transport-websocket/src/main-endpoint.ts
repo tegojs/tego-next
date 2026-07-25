@@ -1,17 +1,17 @@
 import {
-  parseFencingEpoch,
-  parseWorkerId,
   type ArtifactDigest,
   type Clock,
   type ExecutorKind,
   type FencingEpoch,
   type JsonObject,
+  parseFencingEpoch,
+  parseWorkerId,
   type WorkerId,
   type WorkerProtocolVersion,
 } from "@tegojs/contracts";
-import { assertWorkerProtocolVersion, type WorkerProtocolLimitOverrides } from "./codec.js";
 import { systemWorkerClock } from "./clock.js";
-import { compareWorkerEpoch, WorkerSession, type WorkerRegistration } from "./session.js";
+import { assertWorkerProtocolVersion, type WorkerProtocolLimitOverrides } from "./codec.js";
+import { compareWorkerEpoch, type WorkerRegistration, WorkerSession } from "./session.js";
 
 export interface WorkerRegistrationInput {
   readonly labels: JsonObject;
@@ -35,6 +35,8 @@ export interface MainEndpointOptions extends WorkerSessionEndpointOptions {
   readonly workerId?: WorkerId;
   readonly credentials?: Readonly<Record<string, string>>;
   readonly epochAllocator: WorkerEpochAllocator;
+  /** Must synchronously throw when the allocated registration may no longer be published. */
+  readonly assertRegistrationPublishable?: (workerId: WorkerId, session: WorkerSession) => void;
 }
 
 export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
@@ -180,6 +182,7 @@ export class MainEndpoint {
     this.#assertRegistrationCandidate(session);
     const nextEpoch = await this.#allocateEpoch(workerId, session);
     this.#assertRegistrationCandidate(session);
+    this.#options.assertRegistrationPublishable?.(workerId, session);
     const predecessor = this.#current.get(workerId);
     this.#current.set(workerId, session);
     this.#registrations.set(workerId, registration);

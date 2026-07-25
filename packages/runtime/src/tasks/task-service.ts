@@ -27,6 +27,7 @@ import {
   type TaskId,
   type TaskExecutionTarget,
   type TaskRecord,
+  type WorkerId,
 } from "@tegojs/contracts";
 
 const namespace = "tego";
@@ -40,6 +41,10 @@ export interface TaskIdentity {
 export interface TaskExecutorSelection {
   readonly target: TaskExecutionTarget;
   readonly executor: Executor;
+}
+
+interface ResumableExecutor extends Executor {
+  resume(taskId: TaskId, attemptId: AttemptId): Promise<ExecutionHandle | undefined>;
 }
 
 export interface TaskServiceOptions {
@@ -149,6 +154,7 @@ export class TaskService implements RuntimeTaskLifecycle {
   readonly #executors = new Map<TaskId, ExecutorRegistration>();
   readonly #dispatches = new Map<TaskId, Promise<TaskRecord>>();
   readonly #cancellations = new Map<TaskId, Promise<TaskRecord>>();
+  readonly #remoteCompletions = new Map<TaskId, Promise<void>>();
   readonly #waiters = new Map<TaskId, Set<DeferredWaiter>>();
   readonly #ephemeralTerminal = new Map<TaskId, TaskRecord>();
   readonly #observationControllers = new Set<AbortController>();
@@ -198,15 +204,22 @@ export class TaskService implements RuntimeTaskLifecycle {
     const pending = [...this.#records.values()]
       .map((entry) => entry.record)
       .filter((record) => record.state !== "terminal");
-    await Promise.all(
-      pending.map((record) =>
-        this.#recoverRecord(record, authority).catch(async (error) => {
-          if (record.target?.executor.type !== "remote") {
-            await this.#settleUncertain(record, error, authority, true);
-          }
-        }),
-      ),
-    );
+    await this.#recoverPending(pending, authority);
+  }
+
+  async recoverRemoteWorker(workerIdValue: WorkerId | string): Promise<void> {
+    this.#assertOpen();
+    const authority = this.#requireAuthority();
+    const workerId = parseWorkerId(workerIdValue);
+    const pending = [...this.#records.values()]
+      .map((entry) => entry.record)
+      .filter(
+        (record) =>
+          record.state !== "terminal" &&
+          record.target?.executor.type === "remote" &&
+          record.target.executor.workerId === workerId,
+      );
+    await this.#recoverPending(pending, authority);
   }
 
   async run(input: RunTaskRequest): Promise<TaskRecord> {
@@ -664,6 +677,66 @@ export class TaskService implements RuntimeTaskLifecycle {
     } else if (observed === undefined) {
       await this.#markUnknown(record, authority, "EXECUTOR_OBSERVATION_UNKNOWN");
     }
+    if (
+      observed !== undefined &&
+      observed.state !== "terminal" &&
+      record.target.executor.type === "remote"
+    ) {
+      await this.#resumeRemoteCompletion(record, executor, authority, registration);
+    }
+  }
+
+  async #recoverPending(
+    pending: readonly TaskRecord[],
+    authority: RuntimeAuthority,
+  ): Promise<void> {
+    await Promise.all(
+      pending.map((record) =>
+        this.#recoverRecord(record, authority).catch(async (error) => {
+          if (record.target?.executor.type !== "remote") {
+            await this.#settleUncertain(record, error, authority, true);
+          }
+        }),
+      ),
+    );
+  }
+
+  async #resumeRemoteCompletion(
+    record: TaskRecord,
+    executor: Executor,
+    authority: RuntimeAuthority,
+    registration: ExecutorRegistration,
+  ): Promise<void> {
+    if (
+      this.#remoteCompletions.has(record.taskId) ||
+      !("resume" in executor) ||
+      typeof (executor as Partial<ResumableExecutor>).resume !== "function"
+    ) {
+      return;
+    }
+    const handle = await (executor as ResumableExecutor).resume(record.taskId, record.attemptId);
+    if (handle === undefined) return;
+    if (handle.taskId !== record.taskId || handle.attemptId !== record.attemptId) {
+      await this.#settleUncertain(
+        record,
+        this.#invalidResult(record.taskId, "Recovered executor handle identity does not match"),
+        authority,
+        true,
+      );
+      return;
+    }
+    const completion = handle.result
+      .then(
+        (result) => this.#complete(record, result, authority, registration),
+        (error: unknown) => this.#settleUncertain(record, error, authority, true),
+      )
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.#remoteCompletions.get(record.taskId) === completion) {
+          this.#remoteCompletions.delete(record.taskId);
+        }
+      });
+    this.#remoteCompletions.set(record.taskId, completion);
   }
 
   async #resolveExecutor(record: TaskRecord, authority: RuntimeAuthority): Promise<Executor> {

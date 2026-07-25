@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const scriptUrl = new URL("../../scripts/commitlint-ci.mjs", import.meta.url);
@@ -67,7 +67,7 @@ test("TypeScript workspaces reference every internal build dependency", async ()
   }
 });
 
-test("GitHub CI declares quality and PostgreSQL integration gates", async () => {
+test("GitHub CI declares quality, PostgreSQL integration, and process E2E gates", async () => {
   assert.equal(existsSync(workflowUrl), true, "CI workflow must exist");
   const workflow = await readFile(workflowUrl, "utf8");
 
@@ -78,8 +78,11 @@ test("GitHub CI declares quality and PostgreSQL integration gates", async () => 
     "contents: read",
     "quality:",
     "postgres-integration:",
+    "process-e2e:",
+    "timeout-minutes:",
     "actions/checkout@v6",
     "actions/setup-node@v6",
+    "actions/upload-artifact@v7",
     "node-version-file: .node-version",
     "npm run commitlint:ci",
     "npm run format:check",
@@ -89,7 +92,11 @@ test("GitHub CI declares quality and PostgreSQL integration gates", async () => 
     "npm run build",
     "postgres:16.14-alpine",
     "TEGO_POSTGRES_URL:",
+    "TEGO_TEST_ARTIFACTS_DIR:",
     "npm run test:integration",
+    "npm run test:e2e",
+    "if: always()",
+    "if-no-files-found: ignore",
   ]) {
     assert.match(workflow, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   }
@@ -99,7 +106,37 @@ test("GitHub CI declares quality and PostgreSQL integration gates", async () => 
     "clean CI must build workspace dependencies before typechecking their consumers",
   );
 
-  const integrationJob = workflow.slice(workflow.indexOf("postgres-integration:"));
+  const qualityJob = workflow.slice(
+    workflow.indexOf("quality:"),
+    workflow.indexOf("postgres-integration:"),
+  );
+  const integrationJob = workflow.slice(
+    workflow.indexOf("postgres-integration:"),
+    workflow.indexOf("process-e2e:"),
+  );
+  const processE2eJob = workflow.slice(workflow.indexOf("process-e2e:"));
+  for (const [name, job] of [
+    ["quality", qualityJob],
+    ["PostgreSQL integration", integrationJob],
+    ["process E2E", processE2eJob],
+  ]) {
+    assert.match(job, /timeout-minutes: 15/u, `${name} CI must have a bounded job timeout`);
+  }
+  for (const [name, job] of [
+    ["PostgreSQL integration", integrationJob],
+    ["process E2E", processE2eJob],
+  ]) {
+    assert.match(
+      job,
+      /uses: actions\/upload-artifact@v7/u,
+      `${name} CI must upload process diagnostics`,
+    );
+    assert.match(
+      job,
+      /TEGO_TEST_ARTIFACTS_DIR:/u,
+      `${name} CI must retain process diagnostics for upload`,
+    );
+  }
   const integrationBuild = integrationJob.indexOf("run: npm run build");
   const integrationTests = integrationJob.indexOf("run: npm run test:integration");
   assert.notEqual(integrationBuild, -1, "PostgreSQL CI must build workspace packages");

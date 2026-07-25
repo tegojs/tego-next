@@ -1,7 +1,4 @@
 import {
-  parseAttemptId,
-  parseExecutionResult,
-  parseTaskId,
   type AttemptId,
   type AttemptStatus,
   type Clock,
@@ -13,10 +10,24 @@ import {
   type ExecutorCapabilities,
   type ExecutorHealth,
   type JsonValue,
+  parseAttemptId,
+  parseExecutionResult,
+  parseTaskExecutionTarget,
+  parseTaskId,
+  type TaskExecutionTarget,
   type TaskId,
   type WorkerId,
 } from "@tegojs/contracts";
 import {
+  asObject,
+  attemptKey,
+  cloneJson,
+  isRemoteAttemptRevisionError,
+  jsonBytes,
+  jsonFingerprint,
+  parseAttemptRevision,
+  parseRemoteRequest,
+  positiveLimit,
   REMOTE_ACK,
   REMOTE_ASSIGN,
   REMOTE_CANCEL,
@@ -24,21 +35,12 @@ import {
   REMOTE_INVENTORY,
   REMOTE_RESULT,
   REMOTE_RESULT_ACK,
-  asObject,
-  attemptKey,
-  cloneJson,
-  jsonFingerprint,
-  jsonBytes,
-  isRemoteAttemptRevisionError,
-  parseAttemptRevision,
-  parseRemoteRequest,
-  positiveLimit,
-  remoteError,
-  requestFingerprint,
   type RemoteAttemptRecord,
   type RemoteAttemptStore,
   type RemoteSession,
   type RemoteSessionMessage,
+  remoteError,
+  requestFingerprint,
 } from "./remote-protocol.js";
 
 const DEFAULT_MAX_ASSIGNMENTS = 256;
@@ -121,6 +123,7 @@ export class RemoteExecutor implements Executor {
   #orphanRecovery = new AbortController();
   #persistenceDegraded = false;
   #workerUnavailableEpoch: string | undefined;
+  #authorityRevoked = false;
 
   constructor(options: RemoteExecutorOptions) {
     if (options.id.length === 0) throw new TypeError("RemoteExecutor id must not be empty");
@@ -165,6 +168,9 @@ export class RemoteExecutor implements Executor {
   }
 
   attach(session: RemoteSession): Promise<void> {
+    if (this.#authorityRevoked) {
+      return Promise.reject(new Error("RemoteExecutor authority has been revoked"));
+    }
     const attached = this.#attachChain.then(async () => this.#attach(session));
     this.#attachChain = attached.catch(() => undefined);
     return attached;
@@ -200,6 +206,14 @@ export class RemoteExecutor implements Executor {
   }
 
   async #submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
+    if (this.#authorityRevoked) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_AUTHORITY_REVOKED",
+        "RemoteExecutor authority has been revoked",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     const request = parseRemoteRequest(requestValue);
     this.#assertTarget(request);
     this.#assertPersistenceAvailable();
@@ -261,6 +275,7 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
+    const admittedSession = this.#session;
     if (
       this.#attempts.size >= this.#maxAssignments ||
       this.#activeCount() >= this.#maxConcurrency ||
@@ -288,14 +303,71 @@ export class RemoteExecutor implements Executor {
       revision: "0",
       transition: Promise.resolve(),
       state: "assigned",
-      epoch: this.#session.epoch,
+      epoch: admittedSession.epoch,
       settled: false,
     };
     await this.#create(attempt);
+    if (this.#authorityRevoked) {
+      this.#attempts.set(key, attempt);
+      attempt.terminal = this.#failure(
+        attempt.request,
+        "indeterminate",
+        "EXECUTOR_REMOTE_AUTHORITY_REVOKED",
+        "RemoteExecutor authority was revoked while the assignment was being persisted",
+      );
+      attempt.state = "terminal";
+      attempt.terminalAt = this.#clock.now().getTime();
+      attempt.deadline.abort("remote-authority-revoked");
+      this.#settle(attempt);
+      throw remoteError(
+        "EXECUTOR_REMOTE_AUTHORITY_REVOKED",
+        "RemoteExecutor authority was revoked before assignment publication",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     this.#attempts.set(key, attempt);
-    this.#background(this.#assign(attempt, this.#session));
     this.#background(this.#watchDeadline(attempt));
+    await this.#publishCreatedAttempt(attempt, admittedSession);
     return handle;
+  }
+
+  async #publishCreatedAttempt(
+    attempt: RemoteAttempt,
+    admittedSession: RemoteSession,
+  ): Promise<void> {
+    let session = this.#session;
+    while (
+      session !== undefined &&
+      session.state === "ready" &&
+      session.acceptingAssignments &&
+      !this.#authorityRevoked
+    ) {
+      const candidate = session;
+      if (attempt.epoch !== candidate.epoch) {
+        await this.#transition(attempt, async () => {
+          if (attempt.state !== "terminal" && attempt.epoch !== candidate.epoch) {
+            await this.#commit(attempt, "assigned", undefined, candidate.epoch);
+          }
+        });
+      }
+      if (this.#session === candidate) {
+        this.#background(this.#assign(attempt, candidate));
+        return;
+      }
+      session = this.#session;
+    }
+    if (this.#authorityRevoked) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_AUTHORITY_REVOKED",
+        "RemoteExecutor authority was revoked before assignment publication",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    if (this.#session === admittedSession) {
+      this.#background(this.#assign(attempt, admittedSession));
+    }
   }
 
   #assertTarget(request: ExecutionRequest): void {
@@ -320,6 +392,58 @@ export class RemoteExecutor implements Executor {
       state:
         attempt.state === "assigned" || attempt.state === "acknowledged" ? "accepted" : "running",
     };
+  }
+
+  async resumeTarget(
+    targetValue: TaskExecutionTarget,
+    taskId: TaskId,
+    attemptId: AttemptId,
+  ): Promise<ExecutionHandle | undefined> {
+    const target = parseTaskExecutionTarget(targetValue);
+    const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
+    if (attempt === undefined) return undefined;
+    const actual = attempt.request.target;
+    if (
+      actual.instanceId !== target.instanceId ||
+      actual.deploymentGeneration !== target.deploymentGeneration ||
+      actual.artifactDigest !== target.artifactDigest ||
+      actual.executor.id !== target.executor.id ||
+      actual.executor.type !== target.executor.type ||
+      actual.executor.workerId !== target.executor.workerId
+    ) {
+      throw remoteError(
+        "PROTOCOL_EXECUTION_TARGET_INVALID",
+        "Recovered execution target does not match this RemoteExecutor attempt",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    return attempt.handle;
+  }
+
+  revokeAuthority(): void {
+    if (this.#authorityRevoked) return;
+    this.#authorityRevoked = true;
+    this.#accepting = false;
+    this.#orphanRecovery.abort("remote-authority-revoked");
+    this.#detachSession();
+    this.#settleRevokedAttempts();
+  }
+
+  #settleRevokedAttempts(): void {
+    for (const attempt of this.#attempts.values()) {
+      if (attempt.state === "terminal") continue;
+      attempt.deadline.abort("remote-authority-revoked");
+      attempt.terminal = this.#failure(
+        attempt.request,
+        "indeterminate",
+        "EXECUTOR_REMOTE_AUTHORITY_REVOKED",
+        "RemoteExecutor authority was revoked before the attempt reached a terminal result",
+      );
+      attempt.state = "terminal";
+      attempt.terminalAt = this.#clock.now().getTime();
+      this.#settle(attempt);
+    }
   }
 
   async cancel(taskId: TaskId, attemptId: AttemptId): Promise<void> {
@@ -372,6 +496,42 @@ export class RemoteExecutor implements Executor {
     return this.#drainPromise;
   }
 
+  async drainTarget(targetValue: TaskExecutionTarget, options: DrainOptions = {}): Promise<void> {
+    const target = parseTaskExecutionTarget(targetValue);
+    const deadline = options.deadline === undefined ? undefined : Date.parse(options.deadline);
+    if (deadline !== undefined && Number.isNaN(deadline)) {
+      throw new TypeError("drain deadline must be an ISO date");
+    }
+    await this.#submitChain;
+    const active = [...this.#attempts.values()].filter(
+      (attempt) =>
+        attempt.state !== "terminal" &&
+        attempt.request.target.instanceId === target.instanceId &&
+        attempt.request.target.deploymentGeneration === target.deploymentGeneration &&
+        attempt.request.target.artifactDigest === target.artifactDigest &&
+        attempt.request.target.executor.id === target.executor.id &&
+        attempt.request.target.executor.type === target.executor.type &&
+        attempt.request.target.executor.workerId === target.executor.workerId,
+    );
+    const controller = new AbortController();
+    if (deadline !== undefined) {
+      void this.#waitUntil(deadline, controller.signal)
+        .then(async () =>
+          Promise.all(
+            active.map(async (attempt) =>
+              this.cancel(attempt.request.taskId, attempt.request.attemptId),
+            ),
+          ),
+        )
+        .catch(() => undefined);
+    }
+    try {
+      await Promise.all(active.map(async (attempt) => attempt.handle.result));
+    } finally {
+      controller.abort("remote-target-drained");
+    }
+  }
+
   async health(): Promise<ExecutorHealth> {
     const active = this.#activeCount();
     const accepting =
@@ -402,11 +562,18 @@ export class RemoteExecutor implements Executor {
   }
 
   async #attach(session: RemoteSession): Promise<void> {
+    if (this.#authorityRevoked) {
+      throw new Error("RemoteExecutor authority has been revoked");
+    }
     if (this.#closed) throw new Error("RemoteExecutor is closed");
     if (session.state !== "ready" || !session.available) {
       throw new Error("Remote Worker session must be ready before attaching execution");
     }
     await this.#hydrate();
+    if (this.#authorityRevoked) {
+      this.#settleRevokedAttempts();
+      throw new Error("RemoteExecutor authority has been revoked");
+    }
     if (this.#persistenceDegraded) {
       throw remoteError(
         "EXECUTOR_REMOTE_STATE_UNAVAILABLE",

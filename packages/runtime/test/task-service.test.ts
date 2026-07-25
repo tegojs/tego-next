@@ -1534,6 +1534,71 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-unavailable
   assert.doesNotMatch(JSON.stringify(pending), /private scheduler state/u);
 });
 
+test("@spec:runtime-bootstrap/durable-restart-recovery/remote-worker-availability-reobserves-pending-attempts", async () => {
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const target = executorSelection(executor).target;
+  const state = new TransactionalState();
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "running",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      target,
+      authority,
+    }),
+    revision: 1,
+  });
+  let available = false;
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      if (!available) throw new Error("Worker is reconnecting");
+      return { target, executor };
+    },
+  });
+  await restarted.recover();
+  await restarted.setAuthority(authority);
+  assert.equal((await restarted.status(identity.taskId))?.state, "running");
+  assert.equal(
+    (await restarted.status(identity.taskId))?.diagnostic?.code,
+    "EXECUTOR_TARGET_UNAVAILABLE",
+  );
+
+  const recoveredResult: ExecutionResult = {
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    executor: { kind: "remote", workerId: parseWorkerId("worker-01") },
+    status: "succeeded",
+    output: { recovered: true },
+    startedAt: now.toISOString(),
+    completedAt: now.toISOString(),
+  };
+  executor.observed = { state: "running" };
+  const recoveredHandle = Promise.withResolvers<ExecutionResult>();
+  Object.assign(executor, {
+    resume: async () => ({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      result: recoveredHandle.promise,
+    }),
+  });
+  available = true;
+  await restarted.recoverRemoteWorker(parseWorkerId("worker-01"));
+  recoveredHandle.resolve(recoveredResult);
+  await eventually(async () => {
+    assert.equal((await restarted.status(identity.taskId))?.state, "terminal");
+  });
+
+  const recovered = await restarted.status(identity.taskId);
+  assert.equal(recovered?.state, "terminal");
+  assert.equal(recovered?.result?.status, "succeeded");
+  assert.deepEqual(recovered?.result?.output, { recovered: true });
+});
+
 test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-unavailable-preserves-safe-cause", async () => {
   const state = new TransactionalState();
   state.records.set(`tego/tasks/${identity.taskId}`, {

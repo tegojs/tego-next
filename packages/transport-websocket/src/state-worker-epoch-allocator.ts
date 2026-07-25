@@ -5,6 +5,7 @@ import {
   parseFencingEpoch,
   parseWorkerId,
   runtimeDiagnostic,
+  type StateFencing,
   type StateKey,
   type StateStore,
   type WorkerId,
@@ -19,6 +20,7 @@ interface WorkerEpochRecord extends JsonObject {
 }
 
 export interface StateWorkerEpochAllocatorOptions {
+  readonly fencing?: StateFencing;
   readonly state: StateStore;
 }
 
@@ -57,14 +59,17 @@ function exhaustedEpochs(workerId: WorkerId): DiagnosticError {
 
 export class StateWorkerEpochAllocator implements WorkerEpochAllocator {
   readonly #state: StateStore;
+  readonly #transactionOptions: { readonly fencing?: StateFencing };
 
   constructor(options: StateWorkerEpochAllocatorOptions) {
     this.#state = options.state;
+    this.#transactionOptions =
+      options.fencing === undefined ? {} : { fencing: structuredClone(options.fencing) };
   }
 
   next(workerIdValue: WorkerId): Promise<FencingEpoch> {
     const workerId = parseWorkerId(workerIdValue);
-    return this.#state.transact({}, async (transaction) => {
+    return this.#state.transact(this.#transactionOptions, async (transaction) => {
       const key = epochKey(workerId);
       const current = await transaction.get(key);
       let previous = 0n;

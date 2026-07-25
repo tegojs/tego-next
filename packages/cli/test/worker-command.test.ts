@@ -8,13 +8,18 @@ import { test } from "node:test";
 import {
   type ArtifactDigest,
   type ExecutionRequest,
+  type JsonValue,
   parseArtifactDigest,
   parseComponentInstanceId,
+  parseFencingEpoch,
   parseGeneration,
   parsePluginManifest,
   parseWorkerId,
+  type StateFencing,
+  type StateTransaction,
+  type StateTransactionOptions,
 } from "@tegojs/contracts";
-import { SqliteStateStore } from "@tegojs/drivers-local";
+import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
 import type { PreparedArtifact } from "@tegojs/runtime";
 import {
   connectMain,
@@ -113,6 +118,10 @@ test("@spec:worker-protocol/independent-worker-command/parses-both-connection-di
       "./worker-data",
       "--worker-id",
       "worker-connect",
+      "--labels",
+      '{"region":"lab"}',
+      "--resources",
+      '{"cpuMillis":1000,"memoryBytes":268435456,"storageBytes":268435456}',
       "--prepare",
       "./first.tego",
       "--prepare",
@@ -125,7 +134,13 @@ test("@spec:worker-protocol/independent-worker-command/parses-both-connection-di
       dataDirectory: resolve("./worker-data"),
       direction: "connect",
       json: true,
+      labels: { region: "lab" },
       prepare: [resolve("./first.tego"), resolve("./second.tego")],
+      resources: {
+        cpuMillis: 1_000,
+        memoryBytes: 256 * 1024 * 1024,
+        storageBytes: 256 * 1024 * 1024,
+      },
       url: "ws://127.0.0.1:8080/worker",
       workerId: "worker-connect",
     },
@@ -148,8 +163,10 @@ test("@spec:worker-protocol/independent-worker-command/parses-both-connection-di
       direction: "listen",
       host: "127.0.0.1",
       json: false,
+      labels: {},
       port: 0,
       prepare: [],
+      resources: { cpuMillis: 0, memoryBytes: 0, storageBytes: 0 },
       workerId: "worker-listen",
     },
   );
@@ -450,7 +467,7 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
     workerId,
     request,
     fingerprint: requestFingerprint(request),
-    state: "acknowledged" as const,
+    state: "assigned" as const,
     epoch: "1",
     updatedAt: new Date(0).toISOString(),
     revision: "0",
@@ -470,16 +487,16 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
     assert.equal(reopened?.revision, "1");
     assert.equal(reopened?.fingerprint, initial.fingerprint);
 
-    const running = {
+    const unknown = {
       ...(reopened ?? initial),
-      state: "running" as const,
+      state: "unknown" as const,
       updatedAt: new Date(1).toISOString(),
     };
-    const committed = await store.commit(running, { expectedRevision: "1", expectedEpoch: "1" });
+    const committed = await store.commit(unknown, { expectedRevision: "1", expectedEpoch: "1" });
     assert.equal(committed?.revision, "2");
     assert.equal(
       await store.commit(
-        { ...running, updatedAt: new Date(2).toISOString() },
+        { ...unknown, updatedAt: new Date(2).toISOString() },
         { expectedRevision: "1", expectedEpoch: "1" },
       ),
       undefined,
@@ -491,6 +508,66 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
   } finally {
     await state.close().catch(() => undefined);
     await rm(directory, { force: true, recursive: true });
+  }
+});
+
+class CapturingMemoryStateStore extends MemoryStateStore {
+  readonly transactionOptions: StateTransactionOptions[] = [];
+
+  override transact<T extends JsonValue>(
+    options: StateTransactionOptions,
+    work: (transaction: StateTransaction) => Promise<T>,
+  ): Promise<T> {
+    this.transactionOptions.push(structuredClone(options));
+    return super.transact(options, work);
+  }
+}
+
+test("@spec:worker-protocol/durable-worker-attempts/fences-every-mutation-when-configured", async () => {
+  const workerId = parseWorkerId("worker-fenced-attempts");
+  const request = assignment("org.example.fenced-attempts", {
+    id: "remote-fenced",
+    workerId,
+  });
+  const initial: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "assigned",
+    epoch: "1",
+    updatedAt: new Date(0).toISOString(),
+    revision: "0",
+  };
+  const fencing: StateFencing = {
+    resource: "runtime:main-01",
+    epoch: parseFencingEpoch("7"),
+  };
+
+  for (const configuredFencing of [fencing, undefined] as const) {
+    const state = new CapturingMemoryStateStore();
+    await state.open();
+    try {
+      const store = new StateRemoteAttemptStore({
+        state,
+        workerId,
+        ...(configuredFencing === undefined ? {} : { fencing: configuredFencing }),
+      });
+      await store.save(initial);
+      const committed = await store.commit(initial, { expectedRevision: "0" });
+      assert.equal(committed?.revision, "1");
+      await store.delete(request.taskId, request.attemptId);
+      await store.load(request.taskId, request.attemptId);
+      await store.list(workerId);
+
+      assert.deepEqual(
+        state.transactionOptions,
+        Array.from({ length: 3 }, () =>
+          configuredFencing === undefined ? {} : { fencing: configuredFencing },
+        ),
+      );
+    } finally {
+      await state.close();
+    }
   }
 });
 

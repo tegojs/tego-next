@@ -110,6 +110,30 @@ async function assertPortClosed(workerUrl) {
 async function prepareEchoPlugin(directory) {
   const pluginDirectory = join(directory, "echo-plugin");
   await cp(examplePlugin, pluginDirectory, { recursive: true });
+  await writeFile(
+    join(pluginDirectory, "src", "component.ts"),
+    `import { defineComponent } from "@tegojs/plugin-sdk";
+
+const marker = Symbol.for("tego.example.echo.loaded");
+const globals = globalThis as Record<PropertyKey, unknown>;
+globals[marker] = (typeof globals[marker] === "number" ? globals[marker] : 0) + 1;
+
+export default defineComponent({
+  kind: "task",
+  async run(_context, input) {
+    const requestedDelay =
+      typeof input === "object" && input !== null && "delayMs" in input
+        ? Reflect.get(input, "delayMs")
+        : undefined;
+    if (typeof requestedDelay === "number" && Number.isFinite(requestedDelay)) {
+      const delayMs = Math.max(0, Math.min(requestedDelay, 10_000));
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+    return input;
+  },
+});
+`,
+  );
   const manifestPath = join(pluginDirectory, "manifest.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   manifest.contractRange = ">=0.0.0 <1.0.0";
@@ -165,29 +189,30 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
 }
 
 async function runTask({ endpoint, operationId, value }) {
-  const accepted = await runCli([
-    "task",
-    "run",
-    "org.example.echo/echo",
-    "--input",
-    JSON.stringify(value),
-    "--operation-id",
-    operationId,
-    "--no-wait",
-    "--endpoint",
-    endpoint,
-    "--json",
-  ]);
-  const completed = await runCli([
-    "task",
-    "wait",
-    accepted.taskId,
-    "--timeout-ms",
-    String(processDeadlineMs),
-    "--endpoint",
-    endpoint,
-    "--json",
-  ]);
+  const accepted = await startTask({ endpoint, operationId, value });
+  let completed;
+  try {
+    completed = await runCli([
+      "task",
+      "wait",
+      accepted.taskId,
+      "--timeout-ms",
+      String(processDeadlineMs),
+      "--endpoint",
+      endpoint,
+      "--json",
+    ]);
+  } catch (error) {
+    const pending = await runCli([
+      "task",
+      "status",
+      accepted.taskId,
+      "--endpoint",
+      endpoint,
+      "--json",
+    ]).catch(() => undefined);
+    throw new Error(`TASK_WAIT_FAILED:${JSON.stringify(pending)}`, { cause: error });
+  }
   const status = await runCli([
     "task",
     "status",
@@ -202,8 +227,41 @@ async function runTask({ endpoint, operationId, value }) {
   return completed;
 }
 
+async function startTask({ endpoint, operationId, orphanPolicy = "cancel", value }) {
+  return runCli([
+    "task",
+    "run",
+    "org.example.echo/echo",
+    "--input",
+    JSON.stringify(value),
+    "--operation-id",
+    operationId,
+    "--orphan-policy",
+    orphanPolicy,
+    "--no-wait",
+    "--endpoint",
+    endpoint,
+    "--json",
+  ]);
+}
+
 async function runtimeSnapshot(endpoint) {
   return runCli(["runtime", "snapshot", "--endpoint", endpoint, "--json"]);
+}
+
+async function runtimeStatus(endpoint) {
+  return runCli(["runtime", "status", "--endpoint", endpoint, "--json"]);
+}
+
+function onlySnapshotValue(page, section) {
+  assert.equal(page.items.length, 1, `${section} must contain exactly one record`);
+  return page.items[0].value;
+}
+
+function matchingSnapshotValue(page, section, predicate) {
+  const matches = page.items.map((item) => item.value).filter(predicate);
+  assert.equal(matches.length, 1, `${section} must contain exactly one matching record`);
+  return matches[0];
 }
 
 async function stopProcess(processHandle) {
@@ -218,6 +276,7 @@ async function runSystemFlow(runIndex) {
   const dataDirectory = join(directory, "main");
   const workerDataDirectory = join(directory, "worker");
   const endpoint = join(directory, "control", "control.sock");
+  const restartedEndpoint = join(directory, "control-restart", "control.sock");
   const artifactPath = join(directory, "echo.tego");
   const credential = `worker-credential-${runIndex}`;
   const workerId = `worker-system-${runIndex}`;
@@ -266,7 +325,9 @@ async function runSystemFlow(runIndex) {
           dataDirectory: workerDataDirectory,
           direction: "connect",
           json: true,
-          prepare: [],
+          labels: {},
+          prepare: [artifactPath],
+          resources: workerResources,
           url: workerUrl,
           workerId,
         }),
@@ -301,19 +362,41 @@ async function runSystemFlow(runIndex) {
       );
     }
     const beforeRestart = await runtimeSnapshot(endpoint);
-    assert.equal(beforeRestart.installation.digest, installation.digest);
-    assert.equal(beforeRestart.deployment.generation, "3");
-    assert.equal(beforeRestart.instance.lifecycle, "ready");
-    assert.equal(beforeRestart.worker.workerId, workerId);
-    assert.equal(beforeRestart.worker.preparedArtifacts.includes(installation.digest), true);
-    const epochBeforeRestart = BigInt(beforeRestart.worker.epoch);
+    const beforeInstallation = onlySnapshotValue(beforeRestart.installations, "installations");
+    const beforeDeployment = onlySnapshotValue(beforeRestart.deployments, "deployments");
+    const beforeInstance = matchingSnapshotValue(
+      beforeRestart.instances,
+      "instances",
+      (instance) => instance.deploymentGeneration === "3",
+    );
+    assert.equal(beforeInstallation.digest, installation.digest);
+    assert.equal(beforeDeployment.generation, "3");
+    assert.equal(beforeInstance.lifecycle, "ready");
+    assert.equal(
+      (await runCli(["runtime", "status", "--endpoint", endpoint, "--json"])).counts.workers,
+      1,
+    );
 
-    await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]);
+    const interruptedRemoteInput = {
+      delayMs: 5_000,
+      executor: "remote",
+      phase: "main-crash",
+      runIndex,
+    };
+    const interruptedRemote = await startTask({
+      endpoint,
+      operationId: `system-remote-main-crash-${runIndex}`,
+      orphanPolicy: "finish-and-buffer",
+      value: interruptedRemoteInput,
+    });
+    assert.equal(interruptedRemote.state, "running");
+
+    process.kill(main.pid, "SIGKILL");
     await main.assertClean();
     main = undefined;
-    assert.equal(await exists(endpoint), false);
     await assertPortClosed(workerUrl);
     const workerPort = Number(new URL(workerUrl).port);
+    await mkdir(dirname(restartedEndpoint), { mode: 0o700, recursive: true });
 
     restartedMain = await spawnManagedProcess({
       artifacts,
@@ -323,7 +406,7 @@ async function runSystemFlow(runIndex) {
         TEGO_TEST_MAIN_OPTIONS: JSON.stringify({
           applicationId: "application-default",
           dataDirectory,
-          endpoint,
+          endpoint: restartedEndpoint,
           mode: "single-main",
           nodeId: `node-system-${runIndex}`,
           runtimeId: `runtime-system-${runIndex}`,
@@ -336,23 +419,63 @@ async function runSystemFlow(runIndex) {
       timeoutMs: processDeadlineMs,
     });
     assert.equal(new URL(restartedMainReady.workerUrl).href, workerUrl);
-    await waitForDeployment(endpoint, "3");
-    const afterRestart = await eventually(async () => {
-      const snapshot = await runtimeSnapshot(endpoint);
-      return BigInt(snapshot.worker.epoch) > epochBeforeRestart ? snapshot : undefined;
-    }, "durable Worker epoch advancement after Main restart");
-    assert.deepEqual(afterRestart.installation, beforeRestart.installation);
-    assert.deepEqual(afterRestart.deployment, beforeRestart.deployment);
-    assert.deepEqual(afterRestart.instance, beforeRestart.instance);
-    assert.equal(afterRestart.worker.workerId, workerId);
-    assert.equal(afterRestart.worker.preparedArtifacts.includes(installation.digest), true);
+    await waitForDeployment(restartedEndpoint, "3");
+    await eventually(async () => {
+      const status = await runCli(["runtime", "status", "--endpoint", restartedEndpoint, "--json"]);
+      return status.counts.workers === 1 ? status : undefined;
+    }, "Worker reconnection after Main restart");
+    let recoveredRemote;
+    try {
+      recoveredRemote = await runCli([
+        "task",
+        "wait",
+        interruptedRemote.taskId,
+        "--timeout-ms",
+        "10000",
+        "--endpoint",
+        restartedEndpoint,
+        "--json",
+      ]);
+    } catch (error) {
+      const pending = await runCli([
+        "task",
+        "status",
+        interruptedRemote.taskId,
+        "--endpoint",
+        restartedEndpoint,
+        "--json",
+      ]).catch(() => undefined);
+      throw new Error(`REMOTE_TASK_RECOVERY_FAILED:${JSON.stringify(pending)}`, { cause: error });
+    }
+    assert.equal(recoveredRemote.state, "terminal");
+    assert.equal(
+      recoveredRemote.result.status,
+      "succeeded",
+      `recovered remote task failed: ${JSON.stringify(recoveredRemote)}`,
+    );
+    assert.deepEqual(recoveredRemote.result.output, interruptedRemoteInput);
+
+    const afterRestart = await runtimeSnapshot(restartedEndpoint);
+    assert.deepEqual(
+      onlySnapshotValue(afterRestart.installations, "installations"),
+      beforeInstallation,
+    );
+    assert.deepEqual(onlySnapshotValue(afterRestart.deployments, "deployments"), beforeDeployment);
+    assert.deepEqual(
+      matchingSnapshotValue(
+        afterRestart.instances,
+        "instances",
+        (instance) => instance.deploymentGeneration === "3",
+      ),
+      beforeInstance,
+    );
     for (const task of tasks) {
       const status = await runCli([
         "task",
         "status",
         task.taskId,
         "--endpoint",
-        endpoint,
+        restartedEndpoint,
         "--json",
       ]);
       assert.equal(status.taskId, task.taskId);
@@ -360,7 +483,7 @@ async function runSystemFlow(runIndex) {
       assert.deepEqual(status.result.output, task.result.output);
     }
     const postRestartRemote = await runTask({
-      endpoint,
+      endpoint: restartedEndpoint,
       operationId: `system-remote-after-restart-${runIndex}`,
       value: { executor: "remote", phase: "after-restart", runIndex },
     });
@@ -370,19 +493,23 @@ async function runSystemFlow(runIndex) {
       runIndex,
     });
 
-    return { directory, endpoint, workerUrl };
+    return { directory, endpoint: restartedEndpoint, workerUrl };
   } finally {
     try {
       await stopProcess(worker);
       if (restartedMain !== undefined) {
-        await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
+        await runCli(["runtime", "stop", "--endpoint", restartedEndpoint, "--json"]).catch(
+          () => undefined,
+        );
         await stopProcess(restartedMain);
       }
       if (main !== undefined) {
         await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
         await stopProcess(main);
       }
+      await rm(endpoint, { force: true });
       assert.equal(await exists(endpoint), false);
+      assert.equal(await exists(restartedEndpoint), false);
       if (workerUrl !== undefined) await assertPortClosed(workerUrl);
       for (const name of ["main", "worker", "main-restart"]) {
         const cleanupPath = artifacts.cleanup(name);
@@ -404,4 +531,223 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/real-single-ma
   const second = await runSystemFlow(2);
   assert.notEqual(first.directory, second.directory);
   assert.notEqual(first.workerUrl, second.workerUrl);
+});
+
+const postgresUrl = process.env.TEGO_POSTGRES_URL;
+
+test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worker-failover", {
+  skip:
+    postgresUrl === undefined || postgresUrl.trim().length === 0
+      ? "TEGO_POSTGRES_URL is required"
+      : false,
+}, async () => {
+  assert.notEqual(postgresUrl, undefined);
+  const uniqueRun = `${Date.now()}-${process.pid}`;
+  const directory = await mkdtemp(join(tmpdir(), "tego-two-main-postgres-"));
+  const artifacts = await createRunArtifacts("two-main-postgres");
+  const runtimeId = `runtime-postgres-${uniqueRun}`;
+  const credential = `worker-credential-${uniqueRun}`;
+  const workerId = `worker-postgres-${uniqueRun}`;
+  const artifactPath = join(directory, "echo.tego");
+  const pluginWorkspace = await mkdtemp(join(root, ".tego-system-plugin-"));
+  const mainConfigurations = [
+    {
+      dataDirectory: join(directory, "main-a"),
+      endpoint: join(directory, "control-a", "control.sock"),
+      name: "main-a",
+      nodeId: `node-postgres-a-${uniqueRun}`,
+    },
+    {
+      dataDirectory: join(directory, "main-b"),
+      endpoint: join(directory, "control-b", "control.sock"),
+      name: "main-b",
+      nodeId: `node-postgres-b-${uniqueRun}`,
+    },
+  ];
+  const mains = [];
+  let worker;
+  let restartedWorker;
+  let killedLeader;
+  try {
+    const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
+    await runCli(["plugin", "pack", pluginDirectory, "--output", artifactPath, "--json"]);
+    for (const configuration of mainConfigurations) {
+      await mkdir(dirname(configuration.endpoint), { mode: 0o700, recursive: true });
+      const handle = await spawnManagedProcess({
+        artifacts,
+        command: process.execPath,
+        args: [mainFixture],
+        env: {
+          TEGO_TEST_MAIN_OPTIONS: JSON.stringify({
+            applicationId: "application-default",
+            dataDirectory: configuration.dataDirectory,
+            endpoint: configuration.endpoint,
+            mode: "multi-main",
+            nodeId: configuration.nodeId,
+            postgresUrl,
+            runtimeId,
+            worker: { credential, host: "127.0.0.1", port: 0, workerId },
+          }),
+        },
+        name: configuration.name,
+      });
+      const ready = await handle.ready((event) => event.type === "main.ready", {
+        timeoutMs: processDeadlineMs,
+      });
+      assert.equal(ready.pid, handle.pid);
+      assert.equal(typeof ready.workerUrl, "string");
+      mains.push({ configuration, handle, workerUrl: new URL(ready.workerUrl).href });
+    }
+
+    const elected = await eventually(async () => {
+      const statuses = await Promise.all(
+        mains.map(async (candidate) => ({
+          candidate,
+          status: await runtimeStatus(candidate.configuration.endpoint),
+        })),
+      );
+      const leaders = statuses.filter(({ status }) => status.authority !== undefined);
+      return leaders.length === 1
+        ? {
+            leader: leaders[0],
+            follower: statuses.find(({ status }) => status.authority === undefined),
+          }
+        : undefined;
+    }, "one PostgreSQL Main becomes leader");
+    assert.notEqual(elected.leader, undefined);
+    assert.notEqual(elected.follower, undefined);
+    const leader = elected.leader;
+    const follower = elected.follower;
+    assert.equal(BigInt(leader.status.authority.epoch) > 0n, true);
+    assert.equal(follower.status.counts.workers, 0);
+
+    worker = await spawnManagedProcess({
+      artifacts,
+      command: process.execPath,
+      args: [workerFixture],
+      env: {
+        TEGO_TEST_WORKER_COMMAND: JSON.stringify({
+          kind: "worker.start",
+          credential,
+          dataDirectory: join(directory, "worker"),
+          direction: "connect",
+          json: true,
+          labels: {},
+          prepare: [artifactPath],
+          resources: workerResources,
+          url: leader.candidate.workerUrl,
+          workerId,
+        }),
+      },
+      name: "worker-leader",
+    });
+    await worker.ready((event) => event.type === "worker.ready", {
+      timeoutMs: processDeadlineMs,
+    });
+    await eventually(async () => {
+      const [leaderStatus, followerStatus] = await Promise.all([
+        runtimeStatus(leader.candidate.configuration.endpoint),
+        runtimeStatus(follower.candidate.configuration.endpoint),
+      ]);
+      return leaderStatus.counts.workers === 1 && followerStatus.counts.workers === 0
+        ? { followerStatus, leaderStatus }
+        : undefined;
+    }, "Worker placement exists only on PostgreSQL leader");
+
+    const installation = await runCli([
+      "plugin",
+      "install",
+      artifactPath,
+      "--endpoint",
+      leader.candidate.configuration.endpoint,
+      "--json",
+    ]);
+    const beforeFailover = await deployAndRun({
+      endpoint: leader.candidate.configuration.endpoint,
+      executor: "remote",
+      generation: "1",
+      input: {
+        digest: installation.digest,
+        value: { executor: "remote", phase: "before-leader-failover", uniqueRun },
+      },
+    });
+
+    killedLeader = leader.candidate.handle;
+    process.kill(killedLeader.pid, "SIGKILL");
+    await killedLeader.assertClean();
+    const oldEpoch = BigInt(leader.status.authority.epoch);
+    const promoted = await eventually(async () => {
+      const status = await runtimeStatus(follower.candidate.configuration.endpoint);
+      return status.authority !== undefined && BigInt(status.authority.epoch) > oldEpoch
+        ? status
+        : undefined;
+    }, "PostgreSQL follower promotion with a newer authority epoch");
+
+    await stopProcess(worker);
+    worker = undefined;
+    restartedWorker = await spawnManagedProcess({
+      artifacts,
+      command: process.execPath,
+      args: [workerFixture],
+      env: {
+        TEGO_TEST_WORKER_COMMAND: JSON.stringify({
+          kind: "worker.start",
+          credential,
+          dataDirectory: join(directory, "worker"),
+          direction: "connect",
+          json: true,
+          labels: {},
+          prepare: [artifactPath],
+          resources: workerResources,
+          url: follower.candidate.workerUrl,
+          workerId,
+        }),
+      },
+      name: "worker-follower",
+    });
+    await restartedWorker.ready((event) => event.type === "worker.ready", {
+      timeoutMs: processDeadlineMs,
+    });
+    await eventually(async () => {
+      const status = await runtimeStatus(follower.candidate.configuration.endpoint);
+      return status.counts.workers === 1 && status.authority?.epoch === promoted.authority.epoch
+        ? status
+        : undefined;
+    }, "Worker placement moves to the promoted PostgreSQL Main");
+    await waitForDeployment(follower.candidate.configuration.endpoint, "1");
+
+    const afterFailover = await runTask({
+      endpoint: follower.candidate.configuration.endpoint,
+      operationId: `system-remote-after-leader-failover-${uniqueRun}`,
+      value: { executor: "remote", phase: "after-leader-failover", uniqueRun },
+    });
+    const snapshot = await runtimeSnapshot(follower.candidate.configuration.endpoint);
+    const taskRecords = snapshot.tasks.items.map((item) => item.value);
+    assert.equal(taskRecords.length, 2);
+    assert.equal(new Set(taskRecords.map((task) => task.taskId)).size, 2);
+    assert.deepEqual(
+      new Set(taskRecords.map((task) => task.taskId)),
+      new Set([beforeFailover.taskId, afterFailover.taskId]),
+    );
+    for (const task of taskRecords) {
+      assert.equal(task.state, "terminal");
+      assert.equal(task.result.status, "succeeded");
+    }
+  } finally {
+    await stopProcess(restartedWorker).catch(() => undefined);
+    await stopProcess(worker).catch(() => undefined);
+    for (const main of mains) {
+      if (main.handle === killedLeader) continue;
+      await runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]).catch(
+        () => undefined,
+      );
+      await stopProcess(main.handle).catch(() => undefined);
+    }
+    for (const configuration of mainConfigurations) {
+      await rm(configuration.endpoint, { force: true });
+    }
+    await removeTreeWithReadOnlyDirectories(directory);
+    await rm(pluginWorkspace, { force: true, recursive: true });
+    await artifacts.dispose();
+  }
 });

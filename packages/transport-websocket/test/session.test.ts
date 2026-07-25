@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  parseFencingEpoch,
-  parseArtifactDigest,
-  parseMessageId,
-  parseSequence,
-  parseSessionId,
   type ExecutorKind,
   type FencingEpoch,
   type JsonValue,
+  parseArtifactDigest,
+  parseFencingEpoch,
+  parseMessageId,
+  parseSequence,
+  parseSessionId,
   type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
@@ -16,23 +16,23 @@ import {
 import {
   eventually,
   FakeClock,
+  type WorkerConformanceFixture,
   workerConformance,
   workerSessionConformance,
-  type WorkerConformanceFixture,
 } from "@tegojs/testkit";
 import {
   createMainEndpoint,
   createWorkerCodec,
   createWorkerEndpoint,
+  type MainEndpoint,
   MemoryRemoteAttemptStore,
   MemoryWorkerEpochAllocator,
   RemoteExecutor,
   systemWorkerClock,
-  WorkerRuntime,
-  type MainEndpoint,
-  type WorkerEpochAllocator,
   type WorkerControlEnvelope,
   type WorkerEndpoint,
+  type WorkerEpochAllocator,
+  WorkerRuntime,
   type WorkerSession,
 } from "../src/index.js";
 import { executionRequest, flush, TestLocalExecutor } from "./remote-test-support.js";
@@ -197,6 +197,50 @@ test("a closed replacement cannot claim authority after delayed epoch allocation
   assert.equal(firstWorkerSession.state, "ready");
   assert.equal(main.activeSessionCount, 1);
   await Promise.all([main.close(), firstWorker.close()]);
+});
+
+test("a registration rejected by the publish guard cannot replace the authoritative session", async () => {
+  const workerId = "publish-guard-worker" as WorkerId;
+  let allocationCount = 0;
+  let publishAllowed = true;
+  const epochAllocator: WorkerEpochAllocator = {
+    next: async () => {
+      allocationCount += 1;
+      if (allocationCount === 2) {
+        publishAllowed = false;
+      }
+      return parseFencingEpoch(allocationCount.toString());
+    },
+  };
+  const options = {
+    credential: "shared-secret",
+    workerId,
+    epochAllocator,
+    assertRegistrationPublishable: () => {
+      if (!publishAllowed) {
+        throw new Error("Main authority changed before Worker session publication");
+      }
+    },
+  };
+  const main = createMainEndpoint(options);
+  const firstWorker = createWorkerEndpoint({ credential: "shared-secret", workerId });
+  const [firstMainSocket, firstWorkerSocket] = directSocketPair();
+  const firstMainSession = main.attach(firstMainSocket);
+  const firstWorkerSession = firstWorker.attach(firstWorkerSocket);
+  await Promise.all([firstMainSession.ready, firstWorkerSession.ready]);
+
+  const replacementWorker = createWorkerEndpoint({ credential: "shared-secret", workerId });
+  const [replacementMainSocket, replacementWorkerSocket] = directSocketPair();
+  const replacementMainSession = main.attach(replacementMainSocket);
+  const replacementWorkerSession = replacementWorker.attach(replacementWorkerSocket);
+  await assert.rejects(Promise.all([replacementMainSession.ready, replacementWorkerSession.ready]));
+  await flush();
+
+  assert.equal(main.current(workerId), firstMainSession);
+  assert.equal(firstMainSession.state, "ready");
+  assert.equal(firstWorkerSession.state, "ready");
+  assert.equal(main.activeSessionCount, 1);
+  await Promise.all([main.close(), firstWorker.close(), replacementWorker.close()]);
 });
 
 test("a timed-out epoch allocation cannot starve a later Worker registration", async () => {

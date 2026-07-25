@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   parseApplicationId,
+  parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseExecutionRequest,
   parseFencingEpoch,
+  parseGeneration,
   parsePluginId,
-  parseRunTaskRequest,
   parseTaskId,
 } from "@tegojs/contracts";
 import { MemoryStateStore } from "@tegojs/drivers-local";
@@ -42,12 +45,23 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
     deadline: "2026-07-25T00:05:00.000Z",
     orphanPolicy: "cancel",
   };
+  const executionBase = {
+    taskId: parseTaskId("task-real-process-envelope"),
+    attemptId: parseAttemptId("attempt-real-process-envelope"),
+    target: {
+      instanceId: parseComponentInstanceId("application-01.echo.echo.g1"),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: parseArtifactDigest(`sha256:${"a".repeat(64)}`),
+      executor: { id: executor.id, type: executor.type },
+    },
+    ...base,
+  };
   let low = 0;
   let high = 1_048_576;
   while (low + 1 < high) {
     const middle = Math.floor((low + high) / 2);
     try {
-      parseRunTaskRequest({ ...base, input: "x".repeat(middle) });
+      parseExecutionRequest({ ...executionBase, input: "x".repeat(middle) });
       low = middle;
     } catch {
       high = middle;
@@ -55,11 +69,7 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
   }
   let realRejection;
   await assert.rejects(
-    executor.submit({
-      taskId: parseTaskId("task-real-process-envelope"),
-      attemptId: parseAttemptId("attempt-real-process-envelope"),
-      ...parseRunTaskRequest({ ...base, input: "x".repeat(low) }),
-    }),
+    executor.submit(parseExecutionRequest({ ...executionBase, input: "x".repeat(low) })),
     (error) => {
       realRejection = error;
       return error?.diagnostic?.code === "EXECUTOR_INPUT_LIMIT_EXCEEDED";
@@ -81,7 +91,10 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
   const service = new TaskService({
     state,
     clock,
-    selectExecutor: async () => rejectingExecutor,
+    selectExecutor: async () => ({
+      executor: rejectingExecutor,
+      target: executionBase.target,
+    }),
     createIdentity: () => ({
       taskId: parseTaskId("task-process-envelope"),
       attemptId: parseAttemptId("attempt-process-envelope"),

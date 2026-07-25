@@ -43,6 +43,7 @@ import {
   type ComponentEffectExecutor,
   type ComponentInstance,
   deterministicRetryDelay,
+  type PlacementWorker,
   planReconcile,
   type ReconcileEffect,
   type ReconcileEffectKind,
@@ -404,6 +405,76 @@ test("one unavailable component placement blocks every step for the deployment",
   assert.equal(result.blocked, true);
   assert.deepEqual(result.steps, []);
   assert.equal(result.diagnostics[0]?.code, "DEPLOYMENT_EXECUTOR_UNAVAILABLE");
+});
+
+test("remote placement requires the target artifact and a compatible Worker-local executor", () => {
+  const remoteInstallation = {
+    ...installation(),
+    manifest: {
+      ...manifest("1.0.0", digestOne, ["remote", "thread"]),
+      permissions: [
+        { kind: "executor" as const, executors: ["remote" as const] },
+        {
+          kind: "worker" as const,
+          labels: {},
+          resources: { cpuMillis: 1_000, memoryBytes: 1_024, storageBytes: 1_024 },
+        },
+      ],
+    },
+  };
+  const base = {
+    ...snapshot(deployment(), [], remoteInstallation),
+    supportedExecutors: ["remote" as const],
+  };
+  const worker = {
+    workerId: "worker-placement",
+    labels: {},
+    resources: { cpuMillis: 1_000, memoryBytes: 1_024, storageBytes: 1_024 },
+  };
+
+  for (const unavailable of [
+    worker,
+    {
+      ...worker,
+      executors: ["thread" as const],
+    },
+    {
+      ...worker,
+      preparedArtifacts: [digestOne],
+    },
+    {
+      ...worker,
+      executors: ["thread" as const],
+      preparedArtifacts: [digestTwo],
+    },
+    {
+      ...worker,
+      executors: ["process" as const],
+      preparedArtifacts: [digestOne],
+    },
+  ]) {
+    const result = planReconcile({
+      ...base,
+      workers: [unavailable as PlacementWorker],
+    });
+    assert.equal(result.blocked, true);
+    assert.deepEqual(result.steps, []);
+    assert.equal(result.diagnostics[0]?.code, "DEPLOYMENT_EXECUTOR_UNAVAILABLE");
+  }
+
+  const available = planReconcile({
+    ...base,
+    workers: [
+      {
+        ...worker,
+        executors: ["thread"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+  });
+  assert.equal(available.blocked, false);
+  assert.equal(available.steps[0]?.effect.executor, "remote");
+  assert.equal(available.steps[0]?.effect.workerId, worker.workerId);
 });
 
 test("stable instance identities cannot collide when identity segments contain dots", () => {
@@ -1452,7 +1523,7 @@ test("claimed remote effects require the current worker placement to match exact
         componentId,
         kind: "service",
         entrypoint: "components/echo.js",
-        executors: ["remote"],
+        executors: ["remote", "process"],
       },
     ],
     permissions: [{ kind: "executor", executors: ["remote"] }, workerPermission],
@@ -1476,7 +1547,15 @@ test("claimed remote effects require the current worker placement to match exact
     instances: [],
     now: "2026-07-23T00:00:00.000Z",
     supportedExecutors: ["remote"],
-    workers: [{ workerId: "worker-a", labels: { zone: "edge" }, resources }],
+    workers: [
+      {
+        workerId: "worker-a",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["process"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
   }).steps[0]?.effect;
   assert.ok(planned);
   const plannedWorkerId = planned.workerId;
@@ -1526,7 +1605,15 @@ test("claimed remote effects require the current worker placement to match exact
     clock,
     effects,
     state,
-    workers: [{ workerId: "worker-b", labels: { zone: "edge" }, resources }],
+    workers: [
+      {
+        workerId: "worker-b",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["process"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
     loadDeployments: async () => [desired],
     loadInstallations: async () => [
       {
@@ -1792,6 +1879,127 @@ test("restores persisted ready local sessions before reconciliation and requires
     "LIFECYCLE_RESTORE_FAILED",
   );
   await reconciler.stop();
+});
+
+test("remote restoration requires the persisted Worker to remain placement-eligible", async () => {
+  const resources = { cpuMillis: 1_000, memoryBytes: 1_000_000, storageBytes: 1_000_000 };
+  const workerPermission = {
+    kind: "worker" as const,
+    labels: { zone: "edge" },
+    resources,
+  };
+  const remoteManifest: PluginManifest = {
+    ...manifest("1.0.0", digestOne, ["remote", "thread"]),
+    permissions: [{ kind: "executor", executors: ["remote"] }, workerPermission],
+  };
+  const remoteInstallation: PluginInstallation = {
+    ...installation(),
+    manifest: remoteManifest,
+  };
+  const desired = deployment("1", {
+    permissionGrants: [{ kind: "executor", executors: ["remote"] }, workerPermission],
+  });
+  const planned = planReconcile({
+    deployment: desired,
+    gate: {
+      ...gate(remoteInstallation),
+      permissionDecision: {
+        allowed: true,
+        diagnostics: [],
+        granted: desired.permissionGrants,
+        requested: remoteManifest.permissions,
+      },
+    },
+    instances: [],
+    now: "2026-07-23T00:00:00.000Z",
+    supportedExecutors: ["remote"],
+    workers: [
+      {
+        workerId: "worker-restore",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["thread"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+  }).steps[0]?.effect;
+  assert.ok(planned);
+
+  for (const workers of [
+    [
+      {
+        workerId: "worker-other",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["thread" as const],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+    [
+      {
+        workerId: "worker-restore",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["thread" as const],
+        preparedArtifacts: [digestTwo],
+      },
+    ],
+    [
+      {
+        workerId: "worker-restore",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["process" as const],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+  ]) {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: planned.instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: digestOne,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: "remote",
+          instanceId: planned.instanceId,
+          lifecycle: "ready",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+          workerId: "worker-restore",
+        },
+        { expectedRevision: "absent" },
+      );
+      return null;
+    });
+    const effects = new RecordingEffects();
+    effects.supportedExecutors = ["remote"];
+    const restored: string[] = [];
+    effects.restore = async (instance) => {
+      restored.push(instance.instanceId);
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate(remoteInstallation).artifact },
+      clock,
+      effects,
+      state,
+      workers,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [remoteInstallation],
+    });
+
+    await reconciler.start();
+
+    assert.deepEqual(restored, []);
+    await reconciler.stop();
+  }
 });
 
 test("persisted local restoration failures are isolated and durably retryable", async () => {

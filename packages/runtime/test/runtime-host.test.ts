@@ -292,6 +292,7 @@ class EmptySecrets implements SecretProvider {
 class ControlledTasks implements RuntimeTaskLifecycle {
   readonly log: string[];
   taskCount = 4;
+  authorityFailures = 0;
 
   constructor(log: string[]) {
     this.log = log;
@@ -303,6 +304,10 @@ class ControlledTasks implements RuntimeTaskLifecycle {
 
   async setAuthority(authority: RuntimeAuthority | undefined): Promise<void> {
     this.log.push(`tasks.authority:${authority?.epoch ?? "none"}`);
+    if (authority !== undefined && this.authorityFailures > 0) {
+      this.authorityFailures -= 1;
+      throw new Error("task authority failed");
+    }
   }
 
   count(): number {
@@ -334,9 +339,18 @@ class ControlledTasks implements RuntimeTaskLifecycle {
 class ControlledWorkers implements RuntimeWorkerDirectory {
   readonly log: string[];
   workerCount = 2;
+  authorityFailures = 0;
 
   constructor(log: string[]) {
     this.log = log;
+  }
+
+  async setAuthority(authority: RuntimeAuthority | undefined): Promise<void> {
+    this.log.push(`workers.authority:${authority?.epoch ?? "none"}`);
+    if (authority !== undefined && this.authorityFailures > 0) {
+      this.authorityFailures -= 1;
+      throw new Error("worker authority failed");
+    }
   }
 
   count(): number {
@@ -558,6 +572,10 @@ test("leadership loss closes mutation admission before task authority and reconc
   assert.equal((await runtime.status()).acceptingOperations, false);
   assert.equal((await runtime.status()).authority, undefined);
   assert.ok(value.log.indexOf("tasks.authority:none") < value.log.indexOf("reconciler.stop:7"));
+  assert.ok(
+    value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
+  );
+  assert.ok(value.log.indexOf("workers.authority:none") < value.log.indexOf("reconciler.stop:7"));
 
   await eventually(() =>
     assert.equal(value.log.filter((entry) => entry === "coordination.campaign").length, 2),
@@ -581,8 +599,9 @@ test("stop is idempotent and closes admission, leader services, tasks, workers, 
   assert.equal(first, second);
   await first;
 
-  assert.deepEqual(value.log.slice(-10), [
+  assert.deepEqual(value.log.slice(-11), [
     "tasks.authority:none",
+    "workers.authority:none",
     "reconciler.stop:11",
     "coordination.release:11",
     "tasks.close",
@@ -616,7 +635,8 @@ test("single-main start waits for authority and initial reconciliation", async (
   await starting;
   assert.equal((await runtime.status()).authority?.epoch, "1");
   assert.equal((await runtime.status()).acceptingOperations, true);
-  assert.ok(value.log.indexOf("tasks.recover") < value.log.indexOf("reconciler.start:1"));
+  assert.ok(value.log.indexOf("tasks.recover") < value.log.indexOf("workers.authority:1"));
+  assert.ok(value.log.indexOf("workers.authority:1") < value.log.indexOf("reconciler.start:1"));
   assert.ok(value.log.indexOf("reconciler.start:1") < value.log.indexOf("tasks.authority:1"));
   await runtime.stop();
 });
@@ -765,5 +785,33 @@ test("multi-main activation failure preserves the diagnostic receiver and backs 
   );
   await Promise.resolve();
   assert.equal(value.log.filter((entry) => entry === "coordination.campaign").length, 1);
+  assert.ok(value.log.indexOf("workers.authority:15") < value.log.indexOf("reconciler.start:15"));
+  assert.ok(value.log.indexOf("reconciler.start:15") < value.log.indexOf("workers.authority:none"));
+  await runtime.stop();
+});
+
+test("task authority activation failure rolls back workers before stopping reconciliation", async () => {
+  const runtimeClock = new FakeClock(now);
+  const value = fixture("multi-main", runtimeClock);
+  value.services.tasks.authorityFailures = 1;
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+  value.coordination.acquire("17");
+
+  await eventually(() =>
+    assert.equal(
+      value.services.diagnostics.some(
+        (diagnostic) => diagnostic.code === "COORDINATION_LEADERSHIP_CALLBACK_FAILED",
+      ),
+      true,
+    ),
+  );
+  await eventually(() => assert.equal(value.services.activeReconcilers, 0));
+  assert.ok(value.log.indexOf("workers.authority:17") < value.log.indexOf("reconciler.start:17"));
+  assert.ok(value.log.indexOf("reconciler.start:17") < value.log.indexOf("tasks.authority:17"));
+  assert.ok(
+    value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
+  );
+  assert.ok(value.log.indexOf("workers.authority:none") < value.log.indexOf("reconciler.stop:17"));
   await runtime.stop();
 });

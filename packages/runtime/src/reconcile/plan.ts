@@ -362,6 +362,7 @@ export function planReconcile(snapshot: ReconcileSnapshot): ReconcilePlan {
       left.componentId < right.componentId ? -1 : left.componentId > right.componentId ? 1 : 0,
     )) {
       const placement = planPlacement({
+        artifactDigest: snapshot.deployment.artifactDigest,
         component,
         grantedPermissions: snapshot.gate.permissionDecision.granted ?? [],
         supportedExecutors: snapshot.supportedExecutors,

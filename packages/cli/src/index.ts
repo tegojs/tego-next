@@ -17,17 +17,17 @@ export {
   startControlServer,
 } from "./control/server.js";
 export {
+  type DefaultControlEndpointOptions,
   defaultControlEndpoint,
   defaultDataDirectory,
-  type DefaultControlEndpointOptions,
   type ParsedCommand,
-  parseCommand,
   type PluginDeployCommand,
   type PluginInspectCommand,
   type PluginInstallCommand,
   type PluginPackCommand,
   type PluginStatusCommand,
   type PluginValidateCommand,
+  parseCommand,
   type RuntimeStartCommand,
   type RuntimeStatusCommand,
   type RuntimeStopCommand,
@@ -49,27 +49,35 @@ export {
 } from "./plugin/sign-plugin.js";
 export { type CliRunOptions, runCli } from "./run-cli.js";
 export {
-  createPreparedArtifactSelection,
-  runWorkerProcess,
-  StateRemoteAttemptStore,
-  type WorkerProcessOptions,
-  type WorkerReadiness,
-} from "./worker/worker-process.js";
-export {
   type CreateNodeRuntimeHostOptions,
   createNodeRuntimeHost,
-  type NodeWorkerListenerOptions,
   type NodeRuntimeHost,
+  type NodeWorkerListenerOptions,
 } from "./runtime/create-node-runtime-host.js";
 export {
-  LocalComponentSessionRegistry,
   type LocalComponentSessionRegistration,
+  LocalComponentSessionRegistry,
   localComponentSessionTargetKey,
 } from "./runtime/local-component-session-registry.js";
 export {
   type MainProcessOptions,
-  type NodeMainProcessReadiness,
   type NodeMainProcessOptions,
+  type NodeMainProcessReadiness,
   runMainProcess,
   runNodeMainProcess,
 } from "./runtime/main-process.js";
+export {
+  StateRemoteAttemptStore,
+  type StateRemoteAttemptStoreOptions,
+} from "./runtime/remote-attempt-store.js";
+export {
+  RemoteComponentSessionHost,
+  type RemoteComponentSessionHostOptions,
+  remoteComponentExecutorId,
+} from "./runtime/remote-component-session-host.js";
+export {
+  createPreparedArtifactSelection,
+  runWorkerProcess,
+  type WorkerProcessOptions,
+  type WorkerReadiness,
+} from "./worker/worker-process.js";
