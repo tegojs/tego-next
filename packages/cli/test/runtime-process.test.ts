@@ -204,6 +204,7 @@ test("@spec:runtime-operations/local-runtime-operations/control-stop-response-pr
   const endpoint = join(directory, "control.sock");
   const stopStarted = Promise.withResolvers<void>();
   const stopCompletion = Promise.withResolvers<void>();
+  const ready = Promise.withResolvers<void>();
   let stopCalls = 0;
   let stopPromise: Promise<void> | undefined;
   const controller = new AbortController();
@@ -230,10 +231,11 @@ test("@spec:runtime-operations/local-runtime-operations/control-stop-response-pr
     endpoint,
     runtime,
     onBackgroundError: failOnBackgroundError,
+    onReady: () => ready.resolve(),
     signal: controller.signal,
   });
   try {
-    await waitForPath(endpoint, directory);
+    await ready.promise;
     const response = requestControl({
       endpoint,
       operation: "runtime.stop",
