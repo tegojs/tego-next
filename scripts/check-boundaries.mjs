@@ -283,6 +283,15 @@ function javascriptTokens(source) {
 // Template and computed dynamic imports fail closed instead of being evaluated.
 function analyzeImports(source) {
   const specifiers = new Set();
+  const specifierCounts = new Map();
+  const staticImportCounts = new Map();
+  const addSpecifier = (specifier, isStaticImport = false) => {
+    specifiers.add(specifier);
+    specifierCounts.set(specifier, (specifierCounts.get(specifier) ?? 0) + 1);
+    if (isStaticImport) {
+      staticImportCounts.set(specifier, (staticImportCounts.get(specifier) ?? 0) + 1);
+    }
+  };
   const tokens = javascriptTokens(source);
   const scopeDepths = [];
   let scopeDepth = 0;
@@ -343,7 +352,7 @@ function analyzeImports(source) {
       if (next.escaped) {
         unsupportedSpecifier = true;
       } else {
-        specifiers.add(next.value);
+        addSpecifier(next.value, true);
       }
       continue;
     }
@@ -366,7 +375,7 @@ function analyzeImports(source) {
       const argument = tokens[index + 2];
       const delimiter = tokens[index + 3]?.value;
       if (argument?.type === "string" && !argument.escaped && [")", ","].includes(delimiter)) {
-        specifiers.add(argument.value);
+        addSpecifier(argument.value);
       } else if (
         argument?.type === "identifier" &&
         argument.value === "pathToFileURL" &&
@@ -401,7 +410,7 @@ function analyzeImports(source) {
         if (tokens[cursor + 1].escaped) {
           unsupportedSpecifier = true;
         } else {
-          specifiers.add(tokens[cursor + 1].value);
+          addSpecifier(tokens[cursor + 1].value, token.value === "import");
         }
         break;
       }
@@ -412,7 +421,9 @@ function analyzeImports(source) {
     directFileUrlSpecifierDepths,
     hasPathToFileUrlImport,
     pathToFileUrlReferences,
+    specifierCounts,
     specifiers,
+    staticImportCounts,
     unsupportedSpecifier,
   };
 }
@@ -426,6 +437,17 @@ function isConfinedComponentFileUrlImport(workspace, file, imports) {
     imports.directFileUrlSpecifierDepths.length === 1 &&
     imports.directFileUrlSpecifierDepths[0].depth === 1 &&
     imports.directFileUrlSpecifierDepths[0].inComponentLoader
+  );
+}
+
+function isConfinedWebSocketHttpImport(workspace, file, imports, specifier, targetSpecifier) {
+  return (
+    workspace.manifest.name === "@tegojs/transport-websocket" &&
+    file.pathname.endsWith("/packages/transport-websocket/dist/src/network.js") &&
+    specifier === "node:http" &&
+    targetSpecifier === "node:http" &&
+    imports.specifierCounts.get("node:http") === 1 &&
+    imports.staticImportCounts.get("node:http") === 1
   );
 }
 
@@ -583,7 +605,8 @@ export async function checkWorkspaceBoundaries(root) {
         )) {
           if (
             workspace.kind === "first-layer" &&
-            containsForbiddenBoundary(workspace, [specifier, targetSpecifier], workspaces, file)
+            containsForbiddenBoundary(workspace, [specifier, targetSpecifier], workspaces, file) &&
+            !isConfinedWebSocketHttpImport(workspace, file, imports, specifier, targetSpecifier)
           ) {
             violations.add(`${workspace.manifest.name} -> ${targetSpecifier}`);
           }
