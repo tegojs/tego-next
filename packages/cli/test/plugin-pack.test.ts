@@ -133,6 +133,83 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-pack-resolves-the-publ
   }
 });
 
+test("@spec:plugin-deployment/sdk-runtime-import/rejects-delayed-sdk-imports", async () => {
+  const directory = await temporaryFixture();
+  try {
+    await writeFile(
+      join(directory, "src/component.ts"),
+      `
+        import { defineComponent } from "@tegojs/plugin-sdk";
+        export default defineComponent({
+          kind: "task",
+          run: async (_context, input) => {
+            await import("@tegojs/plugin-sdk");
+            return input;
+          },
+        });
+      `,
+    );
+    await assert.rejects(
+      () =>
+        packPlugin({
+          artifactPath: join(directory, "dynamic-sdk.tego"),
+          pluginDirectory: directory,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_IMPORT_UNSUPPORTED");
+        return true;
+      },
+    );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("plugin-local declarations are checked even when host SDK declarations are isolated", async () => {
+  const directory = await temporaryFixture();
+  try {
+    await writeFile(
+      join(directory, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          declaration: false,
+          erasableSyntaxOnly: true,
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          outDir: "build/components",
+          rootDir: "src",
+          sourceMap: false,
+          strict: true,
+          target: "ES2024",
+        },
+        include: ["src/**/*"],
+      }),
+    );
+    await writeFile(
+      join(directory, "src/broken.d.ts"),
+      "export interface BrokenPluginDeclaration { value: MissingPluginLocalType }\n",
+    );
+    await assert.rejects(
+      () =>
+        buildPlugin({
+          pluginDirectory: directory,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_BUILD_FAILED");
+        return true;
+      },
+    );
+    assert.deepEqual(
+      (await readdir(directory)).filter((name) => name.startsWith(".tego-build-")),
+      [],
+    );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
 test("rejects undeclared TypeScript build outputs and source maps", async () => {
   const directory = await temporaryFixture();
   try {
