@@ -48,6 +48,7 @@ export interface TaskServiceOptions {
   readonly selectExecutor: (
     request: RunTaskRequest,
     target?: TaskExecutionTarget,
+    signal?: AbortSignal,
   ) => TaskExecutorSelection | Promise<TaskExecutorSelection>;
   readonly createIdentity?: (request: RunTaskRequest) => TaskIdentity;
 }
@@ -112,14 +113,23 @@ function defaultIdentity(): TaskIdentity {
 }
 
 function sameTarget(left: TaskExecutionTarget, right: TaskExecutionTarget): boolean {
-  return (
-    left.instanceId === right.instanceId &&
-    left.deploymentGeneration === right.deploymentGeneration &&
-    left.artifactDigest === right.artifactDigest &&
-    left.executor.id === right.executor.id &&
-    left.executor.type === right.executor.type &&
-    left.executor.workerId === right.executor.workerId
-  );
+  return targetMismatchedFields(left, right).length === 0;
+}
+
+function targetMismatchedFields(
+  expected: TaskExecutionTarget,
+  selected: TaskExecutionTarget,
+): string[] {
+  const fields: string[] = [];
+  if (expected.artifactDigest !== selected.artifactDigest) fields.push("artifactDigest");
+  if (expected.deploymentGeneration !== selected.deploymentGeneration) {
+    fields.push("deploymentGeneration");
+  }
+  if (expected.executor.id !== selected.executor.id) fields.push("executor.id");
+  if (expected.executor.type !== selected.executor.type) fields.push("executor.type");
+  if (expected.executor.workerId !== selected.executor.workerId) fields.push("executor.workerId");
+  if (expected.instanceId !== selected.instanceId) fields.push("instanceId");
+  return fields;
 }
 
 function resultExecutor(record: TaskRecord): ExecutionExecutor {
@@ -212,8 +222,13 @@ export class TaskService implements RuntimeTaskLifecycle {
       await this.#recoverRecord(replay);
       return structuredClone((await this.status(replay.taskId)) ?? replay);
     }
-    const selected = await this.#selectExecutor(request);
     const proposed = this.#createIdentity(request);
+    const selected = await this.#selectExecutorBounded(
+      request,
+      authority,
+      proposed.taskId,
+      undefined,
+    );
     this.#validateSelection(selected, proposed.taskId);
     this.#assertAuthority(authority);
     const admitted = await this.#admit(request, fingerprint, proposed, selected, authority);
@@ -584,6 +599,19 @@ export class TaskService implements RuntimeTaskLifecycle {
     try {
       executor = await this.#resolveExecutor(record, authority);
     } catch (error) {
+      const code = diagnosticCode(error);
+      if (code === "EXECUTOR_TARGET_MISMATCH") {
+        await this.#settleUncertain(record, error, authority, true);
+        return;
+      }
+      if (
+        code === "EXECUTOR_TARGET_UNAVAILABLE" &&
+        record.target.executor.type === "remote" &&
+        error instanceof DiagnosticError
+      ) {
+        await this.#markTargetUnavailable(record, authority, error);
+        return;
+      }
       if (record.target.executor.type === "remote") {
         await this.#markUnknown(record, authority, "EXECUTOR_OBSERVATION_UNKNOWN");
         return;
@@ -653,26 +681,30 @@ export class TaskService implements RuntimeTaskLifecycle {
     ) {
       return retained;
     }
-    const resolved = await this.#selectExactTarget(record, authority);
+    const resolved = await this.#selectExecutorBounded(
+      record.request,
+      authority,
+      record.taskId,
+      target,
+    );
     this.#validateSelection(resolved, record.taskId);
-    if (!sameTarget(resolved.target, target)) {
-      throw this.#targetMismatch(record.taskId, target.executor.id, resolved.target.executor.id);
+    const mismatchedFields = targetMismatchedFields(target, resolved.target);
+    if (mismatchedFields.length > 0) {
+      throw this.#targetMismatch(record.taskId, mismatchedFields);
     }
     return resolved.executor;
   }
 
-  async #selectExactTarget(
-    record: TaskRecord & { readonly target?: TaskExecutionTarget },
+  async #selectExecutorBounded(
+    request: RunTaskRequest,
     authority: RuntimeAuthority,
+    taskId: TaskId,
+    target: TaskExecutionTarget | undefined,
   ): Promise<TaskExecutorSelection> {
-    const target = record.target;
-    if (target === undefined) {
-      throw this.#targetUnavailable(record.taskId, undefined, undefined);
-    }
     const controller = new AbortController();
     this.#observationControllers.add(controller);
     const selection = Promise.resolve()
-      .then(() => this.#selectExecutor(record.request, target))
+      .then(() => this.#selectExecutor(request, target, controller.signal))
       .then(
         (value) => ({ kind: "selected" as const, value }),
         (error: unknown) => ({ kind: "failed" as const, error }),
@@ -698,9 +730,9 @@ export class TaskService implements RuntimeTaskLifecycle {
       ) {
         throw outcome.error;
       }
-      throw this.#targetUnavailable(record.taskId, target.executor.id, outcome.error);
+      throw this.#targetUnavailable(taskId, target?.executor.id, outcome.error);
     }
-    throw this.#targetUnavailable(record.taskId, target.executor.id, undefined);
+    throw this.#targetUnavailable(taskId, target?.executor.id, undefined);
   }
 
   #validateSelection(selection: TaskExecutorSelection, taskId: TaskId): void {
@@ -708,7 +740,14 @@ export class TaskService implements RuntimeTaskLifecycle {
       selection.executor.id !== selection.target.executor.id ||
       selection.executor.type !== selection.target.executor.type
     ) {
-      throw this.#targetMismatch(taskId, selection.target.executor.id, selection.executor.id);
+      const mismatchedFields: string[] = [];
+      if (selection.executor.id !== selection.target.executor.id) {
+        mismatchedFields.push("executor.id");
+      }
+      if (selection.executor.type !== selection.target.executor.type) {
+        mismatchedFields.push("executor.type");
+      }
+      throw this.#targetMismatch(taskId, mismatchedFields);
     }
   }
 
@@ -777,7 +816,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       _error instanceof DiagnosticError &&
       (_error.diagnostic.code === "EXECUTOR_TARGET_MISMATCH" ||
         _error.diagnostic.code === "EXECUTOR_TARGET_UNAVAILABLE")
-        ? _error.diagnostic
+        ? { ..._error.diagnostic, retryable: false, observedAt: timestamp }
         : undefined;
     const indeterminate = parseTaskRecord({
       ...record,
@@ -861,6 +900,19 @@ export class TaskService implements RuntimeTaskLifecycle {
         retryable: true,
         observedAt: this.#clock.now().toISOString(),
       }),
+      updatedAt: this.#clock.now().toISOString(),
+    }));
+  }
+
+  async #markTargetUnavailable(
+    record: TaskRecord,
+    authority: RuntimeAuthority,
+    error: DiagnosticError,
+  ): Promise<void> {
+    await this.#transition(record.taskId, authority, (current) => ({
+      ...current,
+      authority,
+      diagnostic: error.diagnostic,
       updatedAt: this.#clock.now().toISOString(),
     }));
   }
@@ -1062,18 +1114,14 @@ export class TaskService implements RuntimeTaskLifecycle {
     );
   }
 
-  #targetMismatch(
-    taskId: TaskId,
-    expectedExecutorId: string,
-    selectedExecutorId: string,
-  ): DiagnosticError {
+  #targetMismatch(taskId: TaskId, mismatchedFields: readonly string[]): DiagnosticError {
     return new DiagnosticError(
       runtimeDiagnostic({
         code: "EXECUTOR_TARGET_MISMATCH",
         message: "Selected executor does not match the immutable execution target",
         source: { kind: "executor", id: taskId },
         retryable: false,
-        details: { expectedExecutorId, selectedExecutorId },
+        details: { mismatchedFields: [...mismatchedFields] },
         observedAt: this.#clock.now().toISOString(),
       }),
     );
@@ -1091,7 +1139,7 @@ export class TaskService implements RuntimeTaskLifecycle {
         code: "EXECUTOR_TARGET_UNAVAILABLE",
         message: "The immutable execution target is unavailable",
         source: { kind: "executor", id: taskId },
-        retryable: false,
+        retryable: true,
         details: {
           ...(causeCode === undefined ? {} : { causeCode }),
           ...(causeDetails === undefined ? {} : { causeDetails }),

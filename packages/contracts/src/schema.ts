@@ -33,7 +33,7 @@ export interface SchemaIssue {
 
 const IDENTITY_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 const EXECUTOR_ID_PATTERN =
-  "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9])?$";
+  "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9._-])?$";
 const DECIMAL_PATTERN = "^(?:0|[1-9]\\d*)$";
 const SEMVER_PATTERN =
   "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$";

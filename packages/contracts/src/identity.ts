@@ -24,7 +24,7 @@ export type FencingEpoch = Brand<string, "FencingEpoch">;
 
 const IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const EXECUTOR_ID_PATTERN =
-  /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9])?$/u;
+  /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9._-])?$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9]\d*)$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const UINT64_MAX = "18446744073709551615";
