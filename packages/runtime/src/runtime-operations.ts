@@ -1,5 +1,7 @@
 import {
   type Clock,
+  createRuntimeSnapshotOperationCursor,
+  createRuntimeSnapshotStateCursor,
   type DeployPluginRequest,
   DiagnosticError,
   diagnosticCode,
@@ -18,6 +20,7 @@ import {
   parsePluginDeploymentStatus,
   parsePluginInstallation,
   parseRunTaskRequest,
+  parseRuntimeSnapshotCursor,
   parseRuntimeSnapshotRequest,
   parseRuntimeSnapshotResponse,
   parseTaskId,
@@ -29,6 +32,7 @@ import {
   type RuntimeSnapshotOperationRecord,
   type RuntimeSnapshotRequest,
   type RuntimeSnapshotResponse,
+  type RuntimeSnapshotSection,
   type RuntimeSnapshotStatePage,
   type RuntimeSnapshotStateRecord,
   runtimeDiagnostic,
@@ -124,39 +128,34 @@ function snapshotObject(value: JsonValue, name: string): JsonObject {
   return cloned as JsonObject;
 }
 
-function stripVolatileAuthority(value: JsonValue): JsonValue {
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((entry) => stripVolatileAuthority(entry));
-  const stripped: Record<string, JsonValue> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (key === "authority" || key === "epoch" || key === "session" || key === "sessionId") {
-      continue;
-    }
-    stripped[key] = stripVolatileAuthority(entry);
-  }
-  return stripped;
-}
-
 function projectInstallation(value: JsonValue): JsonObject {
   const installation = snapshotObject(value, "installation");
   const { manifest: _manifest, ...projected } = installation;
-  return snapshotObject(stripVolatileAuthority(projected), "installation projection");
+  return snapshotObject(projected, "installation projection");
 }
 
 function projectDeployment(value: JsonValue, includeConfiguration: boolean): JsonObject {
   const deployment = snapshotObject(value, "deployment");
   const { configuration, ...projected } = deployment;
   return snapshotObject(
-    stripVolatileAuthority({
+    {
       ...projected,
       ...(includeConfiguration && configuration !== undefined ? { configuration } : {}),
-    }),
+    },
     "deployment projection",
   );
 }
 
 function projectInstance(value: JsonValue): JsonObject {
-  return snapshotObject(stripVolatileAuthority(value), "instance projection");
+  const instance = snapshotObject(value, "instance");
+  const {
+    authority: _authority,
+    epoch: _epoch,
+    session: _session,
+    sessionId: _sessionId,
+    ...projected
+  } = instance;
+  return snapshotObject(projected, "instance projection");
 }
 
 function projectTask(
@@ -197,12 +196,12 @@ function projectTask(
             : { requestedAt: cancellationValue.requestedAt };
         })();
   return snapshotObject(
-    stripVolatileAuthority({
+    {
       ...projected,
       ...(taskRequest === undefined ? {} : { request: taskRequest }),
       ...(taskResult === undefined ? {} : { result: taskResult }),
       ...(safeCancellation === undefined ? {} : { cancellation: safeCancellation }),
-    }),
+    },
     "task projection",
   );
 }
@@ -459,11 +458,14 @@ export class RuntimeOperationController implements RuntimeOperations {
     const request = parseRuntimeSnapshotRequest(input);
     const limit = request.limit ?? runtimeSnapshotDefaultLimit;
     const loadStatePage = async (
+      section: Exclude<RuntimeSnapshotSection, "operations">,
       collection: string,
-      afterId: string | undefined,
+      cursor: string | undefined,
       project: (value: JsonValue) => JsonObject,
     ): Promise<RuntimeSnapshotStatePage> => {
       const items: RuntimeSnapshotStateRecord[] = [];
+      const afterId =
+        cursor === undefined ? undefined : parseRuntimeSnapshotCursor(cursor, section).afterId;
       for await (const stored of state.scan<JsonValue>({
         namespace: "tego",
         collection,
@@ -478,29 +480,38 @@ export class RuntimeOperationController implements RuntimeOperations {
       }
       const lastItem = items.at(-1);
       return items.length === limit && lastItem !== undefined
-        ? { items, nextCursor: lastItem.id }
+        ? { items, nextCursor: createRuntimeSnapshotStateCursor(section, lastItem.id) }
         : { items };
     };
 
     const installations = await loadStatePage(
       "installations",
+      "installations",
       request.cursors?.installations,
       projectInstallation,
     );
-    const deployments = await loadStatePage("deployments", request.cursors?.deployments, (value) =>
-      projectDeployment(value, request.projection?.deploymentConfiguration === true),
+    const deployments = await loadStatePage(
+      "deployments",
+      "deployments",
+      request.cursors?.deployments,
+      (value) => projectDeployment(value, request.projection?.deploymentConfiguration === true),
     );
     const instances = await loadStatePage(
+      "instances",
       "component-instances",
       request.cursors?.instances,
       projectInstance,
     );
-    const tasks = await loadStatePage("tasks", request.cursors?.tasks, (value) =>
+    const tasks = await loadStatePage("tasks", "tasks", request.cursors?.tasks, (value) =>
       projectTask(value, request.projection),
     );
     const operationItems: RuntimeSnapshotOperationRecord[] = [];
-    for await (const entry of state.scanOperations({
-      ...(request.cursors?.operations === undefined ? {} : { after: request.cursors.operations }),
+    const operationCursor =
+      request.cursors?.operations === undefined
+        ? undefined
+        : parseRuntimeSnapshotCursor(request.cursors.operations, "operations").after;
+    for await (const entry of state.scanOperationHistory({
+      ...(operationCursor === undefined ? {} : { after: operationCursor }),
       limit,
     })) {
       operationItems.push({
@@ -516,10 +527,10 @@ export class RuntimeOperationController implements RuntimeOperations {
       items: operationItems,
       ...(operationItems.length === limit && lastOperation !== undefined
         ? {
-            nextCursor: {
-              revision: lastOperation.revision,
-              operationId: lastOperation.operationId,
-            },
+            nextCursor: createRuntimeSnapshotOperationCursor(
+              lastOperation.revision,
+              lastOperation.operationId,
+            ),
           }
         : {}),
     };

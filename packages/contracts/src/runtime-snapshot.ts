@@ -6,16 +6,18 @@ export const runtimeSnapshotDefaultLimit = 25;
 export const runtimeSnapshotMaxLimit = 100;
 export const runtimeSnapshotMaxBytes = 768 * 1_024;
 
-export interface RuntimeSnapshotOperationCursor extends JsonObject {
-  readonly revision: Revision;
-  readonly operationId: OperationId;
-}
+export type RuntimeSnapshotSection =
+  | "deployments"
+  | "installations"
+  | "instances"
+  | "operations"
+  | "tasks";
 
 export interface RuntimeSnapshotCursors extends JsonObject {
   readonly deployments?: string;
   readonly installations?: string;
   readonly instances?: string;
-  readonly operations?: RuntimeSnapshotOperationCursor;
+  readonly operations?: string;
   readonly tasks?: string;
 }
 
@@ -52,7 +54,7 @@ export interface RuntimeSnapshotStatePage extends JsonObject {
 
 export interface RuntimeSnapshotOperationPage extends JsonObject {
   readonly items: readonly RuntimeSnapshotOperationRecord[];
-  readonly nextCursor?: RuntimeSnapshotOperationCursor;
+  readonly nextCursor?: string;
 }
 
 export interface RuntimeSnapshotResponse extends JsonObject {
@@ -99,20 +101,116 @@ function exactKeys(
   }
 }
 
-function optionalCursor(value: unknown, name: string): string | undefined {
+function optionalCursor(
+  value: unknown,
+  name: string,
+  section: RuntimeSnapshotSection,
+): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.length === 0) {
     throw snapshotError(`${name} must be a non-empty string`);
   }
+  parseRuntimeSnapshotCursor(value, section);
   return value;
 }
 
-function operationCursor(value: unknown): RuntimeSnapshotOperationCursor {
-  const cursor = objectValue(value, "operations cursor");
-  exactKeys(cursor, ["revision", "operationId"]);
+const snapshotCursorPrefix = "tego.snapshot.v1.";
+
+export interface ParsedRuntimeSnapshotStateCursor {
+  readonly section: Exclude<RuntimeSnapshotSection, "operations">;
+  readonly afterId: string;
+}
+
+export interface ParsedRuntimeSnapshotOperationCursor {
+  readonly section: "operations";
+  readonly after: {
+    readonly revision: Revision;
+    readonly operationId: OperationId;
+  };
+}
+
+export type ParsedRuntimeSnapshotCursor =
+  | ParsedRuntimeSnapshotOperationCursor
+  | ParsedRuntimeSnapshotStateCursor;
+
+function cursorToken(section: RuntimeSnapshotSection, position: JsonObject): string {
+  const payload = JSON.stringify({ version: 1, section, position });
+  return `${snapshotCursorPrefix}${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+export function createRuntimeSnapshotStateCursor(
+  section: Exclude<RuntimeSnapshotSection, "operations">,
+  afterId: string,
+): string {
+  if (afterId.length === 0) throw snapshotError("Runtime snapshot cursor ID must not be empty");
+  return cursorToken(section, { id: afterId });
+}
+
+export function createRuntimeSnapshotOperationCursor(
+  revision: Revision,
+  operationId: OperationId,
+): string {
+  return cursorToken("operations", { revision, operationId });
+}
+
+export function parseRuntimeSnapshotCursor(
+  token: string,
+  expectedSection: Exclude<RuntimeSnapshotSection, "operations">,
+): ParsedRuntimeSnapshotStateCursor;
+export function parseRuntimeSnapshotCursor(
+  token: string,
+  expectedSection: "operations",
+): ParsedRuntimeSnapshotOperationCursor;
+export function parseRuntimeSnapshotCursor(
+  token: string,
+  expectedSection: RuntimeSnapshotSection,
+): ParsedRuntimeSnapshotCursor;
+export function parseRuntimeSnapshotCursor(
+  token: string,
+  expectedSection: RuntimeSnapshotSection,
+): ParsedRuntimeSnapshotCursor {
+  if (!token.startsWith(snapshotCursorPrefix) || token.length > 8_192) {
+    throw snapshotError("Runtime snapshot cursor is invalid");
+  }
+  const encoded = token.slice(snapshotCursorPrefix.length);
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, "base64url").toString("utf8");
+  } catch {
+    throw snapshotError("Runtime snapshot cursor is invalid");
+  }
+  if (Buffer.from(decoded, "utf8").toString("base64url") !== encoded) {
+    throw snapshotError("Runtime snapshot cursor is invalid");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded);
+  } catch {
+    throw snapshotError("Runtime snapshot cursor is invalid");
+  }
+  const value = objectValue(parsed, "Runtime snapshot cursor");
+  exactKeys(value, ["version", "section", "position"]);
+  if (value.version !== 1 || value.section !== expectedSection) {
+    throw snapshotError("Runtime snapshot cursor does not match its section");
+  }
+  const position = objectValue(value.position, "Runtime snapshot cursor position");
+  if (expectedSection === "operations") {
+    exactKeys(position, ["revision", "operationId"]);
+    return {
+      section: "operations",
+      after: {
+        revision: parseRevision(position.revision),
+        operationId: parseOperationId(position.operationId),
+      },
+    };
+  }
+  exactKeys(position, ["id"]);
+  if (typeof position.id !== "string" || position.id.length === 0) {
+    throw snapshotError("Runtime snapshot cursor ID must not be empty");
+  }
   return {
-    revision: parseRevision(cursor.revision),
-    operationId: parseOperationId(cursor.operationId),
+    section: expectedSection,
+    afterId: position.id,
   };
 }
 
@@ -143,19 +241,30 @@ export function parseRuntimeSnapshotRequest(input: unknown): RuntimeSnapshotRequ
             deployments?: string;
             installations?: string;
             instances?: string;
-            operations?: RuntimeSnapshotOperationCursor;
+            operations?: string;
             tasks?: string;
           } = {};
-          const deployments = optionalCursor(inputCursors.deployments, "deployments cursor");
-          const installations = optionalCursor(inputCursors.installations, "installations cursor");
-          const instances = optionalCursor(inputCursors.instances, "instances cursor");
-          const tasks = optionalCursor(inputCursors.tasks, "tasks cursor");
+          const deployments = optionalCursor(
+            inputCursors.deployments,
+            "deployments cursor",
+            "deployments",
+          );
+          const installations = optionalCursor(
+            inputCursors.installations,
+            "installations cursor",
+            "installations",
+          );
+          const instances = optionalCursor(inputCursors.instances, "instances cursor", "instances");
+          const operations = optionalCursor(
+            inputCursors.operations,
+            "operations cursor",
+            "operations",
+          );
+          const tasks = optionalCursor(inputCursors.tasks, "tasks cursor", "tasks");
           if (deployments !== undefined) parsed.deployments = deployments;
           if (installations !== undefined) parsed.installations = installations;
           if (instances !== undefined) parsed.instances = instances;
-          if (inputCursors.operations !== undefined) {
-            parsed.operations = operationCursor(inputCursors.operations);
-          }
+          if (operations !== undefined) parsed.operations = operations;
           if (tasks !== undefined) parsed.tasks = tasks;
           return parsed;
         })();
@@ -219,13 +328,16 @@ function operationRecord(value: unknown): RuntimeSnapshotOperationRecord {
   };
 }
 
-function statePage(value: unknown): RuntimeSnapshotStatePage {
+function statePage(
+  value: unknown,
+  section: Exclude<RuntimeSnapshotSection, "operations">,
+): RuntimeSnapshotStatePage {
   const page = objectValue(value, "Runtime snapshot state page");
   exactKeys(page, ["items"], ["nextCursor"]);
   if (!Array.isArray(page.items))
     throw snapshotError("Runtime snapshot page items must be an array");
   const items = page.items.map((item) => stateRecord(item));
-  const nextCursor = optionalCursor(page.nextCursor, "next cursor");
+  const nextCursor = optionalCursor(page.nextCursor, "next cursor", section);
   return nextCursor === undefined ? { items } : { items, nextCursor };
 }
 
@@ -234,10 +346,9 @@ function operationsPage(value: unknown): RuntimeSnapshotOperationPage {
   exactKeys(page, ["items"], ["nextCursor"]);
   if (!Array.isArray(page.items))
     throw snapshotError("Runtime snapshot page items must be an array");
-  return {
-    items: page.items.map((item) => operationRecord(item)),
-    ...(page.nextCursor === undefined ? {} : { nextCursor: operationCursor(page.nextCursor) }),
-  };
+  const items = page.items.map((item) => operationRecord(item));
+  const nextCursor = optionalCursor(page.nextCursor, "next cursor", "operations");
+  return nextCursor === undefined ? { items } : { items, nextCursor };
 }
 
 export function parseRuntimeSnapshotResponse(input: unknown): RuntimeSnapshotResponse {
@@ -248,10 +359,10 @@ export function parseRuntimeSnapshotResponse(input: unknown): RuntimeSnapshotRes
   const value = objectValue(serialized, "Runtime snapshot response");
   exactKeys(value, ["installations", "deployments", "instances", "operations", "tasks"]);
   return {
-    installations: statePage(value.installations),
-    deployments: statePage(value.deployments),
-    instances: statePage(value.instances),
+    installations: statePage(value.installations, "installations"),
+    deployments: statePage(value.deployments, "deployments"),
+    instances: statePage(value.instances, "instances"),
     operations: operationsPage(value.operations),
-    tasks: statePage(value.tasks),
+    tasks: statePage(value.tasks, "tasks"),
   };
 }
