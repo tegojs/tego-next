@@ -36,6 +36,7 @@ export interface PluginControlRequest {
 
 interface PathIdentity {
   readonly canonicalPath: string;
+  readonly collisionKey: string;
   readonly device?: bigint;
   readonly inode?: bigint;
 }
@@ -91,16 +92,18 @@ async function canonicalPotentialPath(path: string): Promise<string> {
 
 async function pathIdentity(path: string): Promise<PathIdentity> {
   const canonicalPath = await canonicalPotentialPath(path);
+  const collisionKey = canonicalPath.normalize("NFC").toLowerCase();
   try {
     const metadata = await stat(path, { bigint: true });
     return {
       canonicalPath,
+      collisionKey,
       device: metadata.dev,
       inode: metadata.ino,
     };
   } catch (error) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-      return { canonicalPath };
+      return { canonicalPath, collisionKey };
     }
     throw error;
   }
@@ -118,6 +121,7 @@ async function assertPackPathsDistinct(command: PluginPackCommand): Promise<void
     for (const second of identities.slice(index + 1)) {
       if (
         first.canonicalPath === second.canonicalPath ||
+        first.collisionKey === second.collisionKey ||
         (first.device !== undefined &&
           first.inode !== undefined &&
           first.device === second.device &&

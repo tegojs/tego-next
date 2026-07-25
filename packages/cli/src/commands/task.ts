@@ -1,9 +1,9 @@
-import { isDeepStrictEqual } from "node:util";
 import {
   DiagnosticError,
   type JsonValue,
   parseTaskRecord,
   runtimeDiagnostic,
+  serializeWireValue,
 } from "@tegojs/contracts";
 import { DEFAULT_CONTROL_TIMEOUT_MS, type RuntimeOperationName } from "../control/protocol.js";
 import type { TaskRecordCommand, TaskRunCommand } from "../parse-command.js";
@@ -51,6 +51,10 @@ function taskRecord(result: JsonValue) {
   return parseTaskRecord(result);
 }
 
+function sameWireValue(left: JsonValue, right: JsonValue): boolean {
+  return JSON.stringify(serializeWireValue(left)) === JSON.stringify(serializeWireValue(right));
+}
+
 export async function executeTaskCommand(
   command: TaskCommand,
   request: TaskControlRequest,
@@ -65,7 +69,7 @@ export async function executeTaskCommand(
         Math.min(command.timeoutMs, DEFAULT_CONTROL_TIMEOUT_MS),
       ),
     );
-    if (!isDeepStrictEqual(accepted.request, command.input)) {
+    if (!sameWireValue(accepted.request, command.input)) {
       throw requestMismatch("Task run response request does not match the submitted request");
     }
     if (!command.wait || accepted.state === "terminal") return accepted;
@@ -78,7 +82,7 @@ export async function executeTaskCommand(
     if (
       completed.taskId !== accepted.taskId ||
       completed.attemptId !== accepted.attemptId ||
-      !isDeepStrictEqual(completed.request, accepted.request)
+      !sameWireValue(completed.request, accepted.request)
     ) {
       throw requestMismatch("Task wait response identity does not match the accepted task");
     }
