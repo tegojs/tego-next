@@ -40,22 +40,28 @@ deployment, artifact, task, and attempt identities.
 - `123c59d` — `fix: harden plugin and task cli boundaries`
 - `9157c27` — `test: expose portable cli identity aliases`
 - `0aee6f2` — `fix: normalize cli correlation identities`
+- `d9bbbbc` — `test: expose sanitized task request mismatch`
+- `a0ed254` — `fix: correlate sanitized task requests`
 
 Every behavioral test commit was observed failing against the unsupported or
 incomplete command behavior before the production implementation passed it.
 The review-fix RED suite produced ten deterministic failures, followed by two
 additional portable-identity failures, before their respective GREEN commits.
+The final request-correlation RED proved that both direct injection and a real
+control socket rejected diagnostic-shaped business input after response
+sanitization; its GREEN compares both sides after the same sanitization and JSON
+wire normalization.
 
 ## Verification
 
 - `npm run test:unit --workspace @tegojs/cli`
-  - 101 tests: 100 passed, 1 Windows-only skip, 0 failed.
+  - 102 tests: 101 passed, 1 Windows-only skip, 0 failed.
 - `npm run build`
   - all workspaces passed.
 - `npm run typecheck`
   - all workspaces passed.
 - `npm test`
-  - 642 tests: 641 passed, 1 Windows-only skip, 0 failed.
+  - 643 tests: 642 passed, 1 Windows-only skip, 0 failed.
 - `npm run format:check`
   - 195 files checked, no changes required.
 - `npm run lint`
@@ -70,7 +76,9 @@ The CLI suite also proves identical typed JSON output through an injected
 control call and a real local control socket, rejects success frames with a
 missing `result`, preserves explicit `null`, sanitizes nested diagnostics, uses
 one monotonic run/wait timeout budget, and accepts requests that are equivalent
-on the JSON wire.
+on the JSON wire. Diagnostic-shaped business input is correlated after the same
+sanitization through both direct and socket run/wait paths, while task,
+component, and attempt mismatches remain rejected.
 
 ## Deliberate bounds
 
