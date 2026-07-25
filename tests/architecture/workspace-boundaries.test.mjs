@@ -275,6 +275,73 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
   });
 });
 
+test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-static-http-import-in-network-adapter", async (t) => {
+  const workspaces = {
+    "packages/contracts": { name: "@tegojs/contracts" },
+    "packages/transport-websocket": {
+      name: "@tegojs/transport-websocket",
+      dependencies: { "@tegojs/contracts": "0.0.0" },
+    },
+  };
+
+  await t.test("accepts the unique static import in the emitted network adapter", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("network.js", outputDirectory),
+        'import { createServer } from "node:http";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), []);
+    });
+  });
+
+  await t.test("rejects a second static import in the emitted network adapter", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("network.js", outputDirectory),
+        ['import { createServer } from "node:http";', 'import { request } from "node:http";'].join(
+          "\n",
+        ),
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/transport-websocket -> node:http",
+      ]);
+    });
+  });
+
+  await t.test("rejects the same import from another emitted file", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("session.js", outputDirectory),
+        'import { createServer } from "node:http";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/transport-websocket -> node:http",
+      ]);
+    });
+  });
+
+  await t.test("rejects a dynamic import from the emitted network adapter", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(new URL("network.js", outputDirectory), 'await import("node:http");');
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/transport-websocket -> node:http",
+      ]);
+    });
+  });
+});
+
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-import-after-postfix-division", async () => {
   await withWorkspace(
     {
