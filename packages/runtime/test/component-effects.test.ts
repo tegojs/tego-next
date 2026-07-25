@@ -83,7 +83,7 @@ function effect(kind: ReconcileEffectKind): ReconcileEffect {
   };
 }
 
-function readyInstance(): ComponentInstance {
+function readyInstance(overrides: Partial<ComponentInstance> = {}): ComponentInstance {
   return {
     applicationId,
     artifactDigest,
@@ -95,6 +95,7 @@ function readyInstance(): ComponentInstance {
     observedGeneration: generation,
     pluginId,
     revision: parseRevision("1"),
+    ...overrides,
   };
 }
 
@@ -108,10 +109,12 @@ class ControlledCache implements Pick<PreparedArtifactCache, "close" | "prepare"
   releases = 0;
   failRelease = false;
   failReleases = 0;
+  prepareGate: Promise<void> | undefined;
   result: PreparedArtifact = this.prepared;
 
   async prepare(): Promise<PreparedArtifact> {
     this.prepares += 1;
+    await this.prepareGate;
     return this.result;
   }
   async release(): Promise<void> {
@@ -137,6 +140,7 @@ function harness(
   const calls: string[] = [];
   let failStops = 0;
   let failStarts = 0;
+  let failDrains = 0;
   let authority = options.authority;
   let startGate: Promise<void> | undefined;
   let stopGate: Promise<void> | undefined;
@@ -164,6 +168,7 @@ function harness(
       },
       drain: async (binding) => {
         calls.push(`drain:${binding.instanceId}`);
+        if (failDrains-- > 0) throw new Error("host drain failed");
       },
       stop: async (binding) => {
         calls.push(`stop:${binding.instanceId}`);
@@ -183,11 +188,17 @@ function harness(
     setFailStarts(value: number) {
       failStarts = value;
     },
+    setFailDrains(value: number) {
+      failDrains = value;
+    },
     setFailStops(value: number) {
       failStops = value;
     },
     setStartGate(value: Promise<void> | undefined) {
       startGate = value;
+    },
+    setPrepareGate(value: Promise<void> | undefined) {
+      cache.prepareGate = value;
     },
     setStopGate(value: Promise<void> | undefined) {
       stopGate = value;
@@ -234,7 +245,7 @@ test("restores one exact persisted ready session idempotently and closes it with
   assert.equal(lifecycle.isLive(instance), false);
   assert.equal(registry.get(instanceId), undefined);
   assert.equal(cache.releases, 1);
-  assert.deepEqual(calls, [`start:${instanceId}`, `stop:${instanceId}`]);
+  assert.deepEqual(calls, [`start:${instanceId}`, `drain:${instanceId}`, `stop:${instanceId}`]);
 });
 
 test("bulk close releases only sessions owned by the exact authority", async () => {
@@ -255,7 +266,101 @@ test("bulk close releases only sessions owned by the exact authority", async () 
   await lifecycle.close(first);
   assert.equal(registry.get(instanceId), undefined);
   assert.equal(cache.releases, 1);
-  assert.deepEqual(calls, [`start:${instanceId}`, `stop:${instanceId}`]);
+  assert.deepEqual(calls, [`start:${instanceId}`, `drain:${instanceId}`, `stop:${instanceId}`]);
+});
+
+test("restoration identities remain valid for maximum-length instance identifiers", async () => {
+  const { effects } = harness();
+  const longInstance = readyInstance({ instanceId: "i".repeat(128) });
+
+  await effects.restore(longInstance);
+
+  assert.equal(effects.isLive(longInstance), true);
+  await effects.close();
+});
+
+test("concurrent restoration shares one attempt and evicts a failed attempt for retry", async () => {
+  const prepareGate = deferred();
+  const {
+    cache,
+    calls,
+    effects,
+    registry,
+    setFailStarts,
+    setPrepareGate,
+  } = harness();
+  const instance = readyInstance();
+  setPrepareGate(prepareGate.promise);
+  setFailStarts(1);
+
+  const first = effects.restore(instance);
+  await Promise.resolve();
+  const second = effects.restore(instance);
+  await Promise.resolve();
+  assert.equal(cache.prepares, 1);
+  prepareGate.resolve();
+
+  const failed = await Promise.allSettled([first, second]);
+  assert.deepEqual(
+    failed.map((result) => result.status),
+    ["rejected", "rejected"],
+  );
+  assert.equal(cache.prepares, 1);
+  assert.deepEqual(calls, [`start:${instanceId}`]);
+  assert.equal(registry.require(instanceId).state, "prepared");
+
+  setPrepareGate(undefined);
+  await effects.restore(instance);
+  assert.equal(cache.prepares, 1);
+  assert.deepEqual(calls, [`start:${instanceId}`, `start:${instanceId}`]);
+  assert.equal(effects.isLive(instance), true);
+  await effects.close();
+});
+
+test("bulk close drains, stops, and releases every exact-authority entry despite failures", async () => {
+  const authority = { resource: "runtime:app", epoch: parseFencingEpoch("3") };
+  const {
+    cache,
+    calls,
+    effects,
+    setFailDrains,
+    setFailStops,
+  } = harness({ authority });
+  const secondInstanceId = "app.echo.other-task.g1";
+  await effects.restore(readyInstance());
+  await effects.restore(
+    readyInstance({
+      componentId: otherComponentId,
+      instanceId: secondInstanceId,
+    }),
+  );
+  setFailDrains(2);
+  setFailStops(2);
+  cache.failReleases = 2;
+
+  await assert.rejects(
+    effects.close(authority),
+    (error: unknown) => {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("diagnostic" in error)
+      ) {
+        return false;
+      }
+      const diagnostic = (error as {
+        diagnostic: { details?: { causes?: readonly unknown[] } };
+      }).diagnostic;
+      return diagnostic.details?.causes?.length === 6;
+    },
+  );
+  assert.deepEqual(calls.filter((call) => !call.startsWith("start:")), [
+    `drain:${instanceId}`,
+    `stop:${instanceId}`,
+    `drain:${secondInstanceId}`,
+    `stop:${secondInstanceId}`,
+  ]);
+  assert.equal(cache.releases, 2);
 });
 
 test("operation identity replay is idempotent and conflicting payloads are rejected", async () => {

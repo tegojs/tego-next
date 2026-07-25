@@ -724,6 +724,7 @@ class RecordingEffects implements ComponentEffectExecutor {
   readonly performed: ReconcileEffect[] = [];
   readonly uniqueOperations = new Set<string>();
   readonly calls: ReconcileEffect[] = [];
+  readonly live = new Set<string>();
   failStart = false;
 
   async perform(effect: ReconcileEffect): Promise<void> {
@@ -734,6 +735,20 @@ class RecordingEffects implements ComponentEffectExecutor {
     if (effect.kind === "start" && this.failStart) {
       throw new Error("component start failed");
     }
+    if (effect.kind === "start") this.live.add(effect.instanceId);
+    if (effect.kind === "stop") this.live.delete(effect.instanceId);
+  }
+
+  async restore(instance: ComponentInstance): Promise<void> {
+    this.live.add(instance.instanceId);
+  }
+
+  isLive(instance: ComponentInstance): boolean {
+    return this.live.has(instance.instanceId);
+  }
+
+  async close(): Promise<void> {
+    this.live.clear();
   }
 }
 
@@ -1678,6 +1693,130 @@ test("restores persisted ready local sessions before reconciliation and requires
   await reconciler.stop();
 });
 
+test("persisted ready state is not live when the executor has no lifecycle capability", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects: ComponentEffectExecutor = {
+    supportedExecutors: ["process"],
+    perform: async () => {},
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.equal(reconciler.applicationReady(), false);
+  await reconciler.stop();
+});
+
+test("component lifecycle methods are accepted only as one complete capability", async () => {
+  const lifecycleMethods = {
+    restore: async (_instance: ComponentInstance) => {},
+    isLive: (_instance: ComponentInstance) => false,
+    close: async () => {},
+  };
+  for (let mask = 1; mask < 7; mask += 1) {
+    const effects = {
+      supportedExecutors: ["process"] as const,
+      perform: async (_effect: ReconcileEffect) => {},
+      ...(mask & 1 ? { restore: lifecycleMethods.restore } : {}),
+      ...(mask & 2 ? { isLive: lifecycleMethods.isLive } : {}),
+      ...(mask & 4 ? { close: lifecycleMethods.close } : {}),
+    };
+    assert.throws(
+      () =>
+        new Reconciler({
+          artifactGate: { validate: async () => gate().artifact },
+          clock: new ManualClock(),
+          effects,
+          state: new TestStateStore(new ManualClock()),
+        }),
+      /restore|isLive|close|lifecycle|capability/iu,
+      `partial lifecycle mask ${mask} must be rejected`,
+    );
+  }
+});
+
+test("restoration skips ready instances whose observed generation is stale", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("2"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects = new RecordingEffects();
+  const restored: string[] = [];
+  effects.restore = async (instance) => {
+    restored.push(instance.instanceId);
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(restored, []);
+  assert.equal(reconciler.applicationReady(), false);
+  await reconciler.stop();
+});
+
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();
@@ -1972,7 +2111,7 @@ test("stale desired state invalidates a planned effect before it is journaled", 
     state,
     loadDeployments: async () => {
       loads += 1;
-      return [deployment(loads === 1 ? "1" : "2")];
+      return [deployment(loads <= 2 ? "1" : "2")];
     },
     loadInstallations: async () => [installation()],
   });
