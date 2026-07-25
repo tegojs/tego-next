@@ -3,7 +3,10 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { parseRuntimeStatus, type RuntimeStatus } from "@tegojs/contracts";
 import type { ControlResponse } from "../src/control/protocol.js";
-import { parseCommand } from "../src/parse-command.js";
+import {
+  defaultControlEndpoint,
+  parseCommand,
+} from "../src/parse-command.js";
 import { runCli } from "../src/run-cli.js";
 
 function runningStatus(): RuntimeStatus {
@@ -208,4 +211,73 @@ test("@spec:runtime-operations/local-runtime-operations/graceful-idempotent-stop
   assert.deepEqual(JSON.parse(firstStdout.read()), { stopped: true });
   assert.deepEqual(JSON.parse(secondStdout.read()), { alreadyStopped: true, stopped: true });
   assert.equal(stderr.read(), "");
+});
+
+test("@spec:runtime-operations/local-runtime-operations/cli-diagnostics-redact-host-secrets", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const secret =
+    "postgresql://user:hunter2@localhost/database?token=raw /Users/alice/private";
+  const error = new Error(secret);
+  error.stack = `Error: ${secret}\n at /Users/alice/private/file.js:1:1`;
+  const exitCode = await runCli({
+    argv: ["runtime", "status", "--json"],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: () => Promise.reject(error),
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(stdout.read(), "");
+  assert.doesNotMatch(
+    stderr.read(),
+    /hunter2|token=raw|\/Users\/alice|postgresql:\/\/user/u,
+  );
+});
+
+test("@spec:runtime-operations/local-runtime-operations/windows-pipe-uses-complete-scoped-path-hash", () => {
+  type EndpointOptions = {
+    readonly platform: NodeJS.Platform;
+    readonly runtimeScope: string;
+    readonly userScope: string;
+  };
+  const deriveEndpoint = defaultControlEndpoint as (
+    dataDirectory: string,
+    options: EndpointOptions,
+  ) => string;
+  const options = {
+    platform: "win32",
+    runtimeScope: "runtime-main",
+    userScope: "user-1000",
+  } satisfies EndpointOptions;
+  const first = deriveEndpoint("C:\\first\\shared\\suffix", options);
+  const second = deriveEndpoint("D:\\second\\shared\\suffix", options);
+  const normalized = deriveEndpoint("C:\\first\\nested\\..\\shared\\suffix", options);
+
+  assert.match(first, /^\\\\\.\\pipe\\tego-[a-f0-9]{64}$/u);
+  assert.notEqual(first, second);
+  assert.equal(first, normalized);
+  assert.notEqual(
+    first,
+    deriveEndpoint("C:\\first\\shared\\suffix", {
+      ...options,
+      userScope: "user-2000",
+    }),
+  );
+  assert.notEqual(
+    first,
+    deriveEndpoint("C:\\first\\shared\\suffix", {
+      ...options,
+      runtimeScope: "runtime-worker",
+    }),
+  );
+});
+
+test("@spec:runtime-operations/local-runtime-operations/windows-pipe-access-cleanup-contract", async (context) => {
+  if (process.platform !== "win32") {
+    context.skip("Windows named-pipe contract runs on Windows");
+    return;
+  }
+  const endpoint = defaultControlEndpoint(process.cwd());
+  assert.match(endpoint, /^\\\\\.\\pipe\\/u);
 });
