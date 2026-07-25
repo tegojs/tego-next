@@ -54,6 +54,8 @@ interface OwnedWorkerListener {
   close(): Promise<void>;
 }
 
+class WorkerListenerRollbackError extends AggregateError {}
+
 export class NodeWorkerListenerOwner {
   readonly #bind: () => Promise<OwnedWorkerListener>;
   readonly #closedDuringBind = new Error("Worker listener owner closed during bind");
@@ -72,7 +74,7 @@ export class NodeWorkerListenerOwner {
         try {
           await candidate.close();
         } catch (error) {
-          throw new AggregateError([error], "Worker listener rollback failed");
+          throw new WorkerListenerRollbackError([error], "Worker listener rollback failed");
         }
         throw this.#closedDuringBind;
       }
@@ -92,8 +94,7 @@ export class NodeWorkerListenerOwner {
     try {
       await this.#listenerStart;
     } catch (error) {
-      if (error === this.#closedDuringBind) return;
-      throw error;
+      if (error instanceof WorkerListenerRollbackError) throw error;
     }
   }
 }
@@ -165,7 +166,15 @@ export async function createNodeRuntimeHost(
   const tasks = new TaskService({
     state: drivers.state,
     clock: drivers.clock,
-    selectExecutor: () => executor,
+    selectExecutor: () => {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "LIFECYCLE_INSTANCE_MISSING",
+          message: "No active component execution target is available",
+          source: { kind: "runtime", id: options.runtimeId },
+        }),
+      );
+    },
   });
   const epochAllocator = new StateWorkerEpochAllocator({ state: drivers.state });
   const mainEndpoint =
