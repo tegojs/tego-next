@@ -58,10 +58,12 @@ export {
 export {
   type CreateNodeRuntimeHostOptions,
   createNodeRuntimeHost,
+  type NodeWorkerListenerOptions,
   type NodeRuntimeHost,
 } from "./runtime/create-node-runtime-host.js";
 export {
   type MainProcessOptions,
+  type NodeMainProcessReadiness,
   type NodeMainProcessOptions,
   runMainProcess,
   runNodeMainProcess,

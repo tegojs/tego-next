@@ -162,9 +162,15 @@ export async function runMainProcess(options: MainProcessOptions): Promise<void>
 
 export interface NodeMainProcessOptions extends CreateNodeRuntimeHostOptions {
   readonly endpoint: string;
-  readonly signal?: AbortSignal;
-  readonly onReady?: (status: RuntimeStatus) => void | Promise<void>;
+  readonly onReady?: (
+    status: RuntimeStatus,
+    readiness: NodeMainProcessReadiness,
+  ) => void | Promise<void>;
   readonly onBackgroundError?: (error: Error) => void;
+}
+
+export interface NodeMainProcessReadiness {
+  readonly workerUrl?: string;
 }
 
 export async function runNodeMainProcess(options: NodeMainProcessOptions): Promise<void> {
@@ -179,7 +185,14 @@ export async function runNodeMainProcess(options: NodeMainProcessOptions): Promi
       }),
     artifactIngress: host.artifactIngress,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
-    ...(options.onReady === undefined ? {} : { onReady: options.onReady }),
+    ...(options.onReady === undefined
+      ? {}
+      : {
+          onReady: (status: RuntimeStatus) =>
+            options.onReady?.(status, {
+              ...(host.workerUrl === undefined ? {} : { workerUrl: host.workerUrl }),
+            }),
+        }),
   });
 }
 

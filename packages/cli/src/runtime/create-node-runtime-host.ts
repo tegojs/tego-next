@@ -8,6 +8,7 @@ import {
   parseArtifactDigest,
   parseNodeId,
   parseRuntimeId,
+  parseWorkerId,
   type Runtime,
   type RuntimeConfiguration,
   type RuntimeDrivers,
@@ -17,8 +18,18 @@ import { createLocalDrivers } from "@tegojs/drivers-local";
 import { createPostgresDrivers } from "@tegojs/drivers-postgres";
 import { ThreadExecutor } from "@tegojs/executor-node";
 import { ArtifactService, createRuntimeHost, Reconciler, TaskService } from "@tegojs/runtime";
-import { MemoryWorkerEpochAllocator } from "@tegojs/transport-websocket";
+import {
+  createMainEndpoint,
+  listenForMain,
+} from "@tegojs/transport-websocket";
 import type { LocalArtifactIngress } from "../control/server.js";
+
+export interface NodeWorkerListenerOptions {
+  readonly credential: string;
+  readonly host: string;
+  readonly port: number;
+  readonly workerId: string;
+}
 
 export interface CreateNodeRuntimeHostOptions {
   readonly applicationId: string;
@@ -27,11 +38,14 @@ export interface CreateNodeRuntimeHostOptions {
   readonly nodeId: string;
   readonly runtimeId: string;
   readonly postgresUrl?: string;
+  readonly signal?: AbortSignal;
+  readonly worker?: NodeWorkerListenerOptions;
 }
 
 export interface NodeRuntimeHost {
   readonly runtime: Runtime;
   readonly artifactIngress: LocalArtifactIngress;
+  readonly workerUrl?: string;
 }
 
 async function digestFile(path: string): Promise<ReturnType<typeof parseArtifactDigest>> {
@@ -96,13 +110,42 @@ export async function createNodeRuntimeHost(
     clock: drivers.clock,
     selectExecutor: () => executor,
   });
-  const epochAllocator = new MemoryWorkerEpochAllocator();
+  const epochAllocator = {
+    next: (workerId: ReturnType<typeof parseWorkerId>) =>
+      drivers.coordination.nextEpoch(`worker-session:${workerId}`),
+  };
+  const mainEndpoint =
+    options.worker === undefined
+      ? undefined
+      : createMainEndpoint({
+          credential: options.worker.credential,
+          workerId: parseWorkerId(options.worker.workerId),
+          epochAllocator,
+          clock: drivers.clock,
+        });
+  const listener =
+    options.worker === undefined || mainEndpoint === undefined
+      ? undefined
+      : await listenForMain({
+          endpoint: mainEndpoint,
+          host: options.worker.host,
+          port: options.worker.port,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
   const workers = {
-    count: () => 0,
+    count: () => mainEndpoint?.activeSessionCount ?? 0,
     placements: () => [],
     close: async () => {
-      await executor.close();
-      void epochAllocator;
+      const results = await Promise.allSettled([
+        executor.close(),
+        listener?.close(),
+        mainEndpoint?.close(),
+      ]);
+      const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, "Worker listener cleanup failed");
     },
   };
   const runtime = createRuntimeHost(configuration, drivers, {
@@ -148,5 +191,9 @@ export async function createNodeRuntimeHost(
       return digest;
     },
   };
-  return { runtime, artifactIngress };
+  return {
+    runtime,
+    artifactIngress,
+    ...(listener === undefined ? {} : { workerUrl: listener.url.href }),
+  };
 }
