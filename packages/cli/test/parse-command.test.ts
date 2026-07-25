@@ -75,6 +75,36 @@ test("@spec:runtime-operations/local-runtime-operations/json-status", async () =
   assert.deepEqual(requests, ["runtime.status"]);
 });
 
+test("@spec:runtime-operations/local-runtime-operations/json-snapshot", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const requests: ControlClientOptions[] = [];
+  const snapshot = {
+    installations: { items: [] },
+    deployments: { items: [] },
+    instances: { items: [] },
+    operations: { items: [] },
+    tasks: { items: [] },
+  };
+  const exitCode = await runCli({
+    argv: ["runtime", "snapshot", "--endpoint", "control.sock", "--json"],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async (request) => {
+      requests.push(request);
+      return response(snapshot, request.requestId);
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(JSON.parse(stdout.read()), snapshot);
+  assert.equal(stderr.read(), "");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.endpoint, "control.sock");
+  assert.equal(requests[0]?.operation, "runtime.snapshot");
+  assert.deepEqual(requests[0]?.input, {});
+});
+
 test("@spec:runtime-operations/local-runtime-operations/structured-command-diagnostic", async () => {
   const stdout = capture();
   const stderr = capture();
