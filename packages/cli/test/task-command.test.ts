@@ -452,10 +452,7 @@ test("@spec:runtime-operations/task-operations/diagnostic-shaped-business-input-
       stderr: socketStderr.stream,
     });
 
-    assert.deepEqual(
-      { directExitCode, socketExitCode },
-      { directExitCode: 0, socketExitCode: 0 },
-    );
+    assert.deepEqual({ directExitCode, socketExitCode }, { directExitCode: 0, socketExitCode: 0 });
     assert.equal(directStderr.read(), "");
     assert.equal(socketStderr.read(), "");
     assert.deepEqual(JSON.parse(directStdout.read()), JSON.parse(socketStdout.read()));

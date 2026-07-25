@@ -5,7 +5,11 @@ import {
   runtimeDiagnostic,
   serializeWireValue,
 } from "@tegojs/contracts";
-import { DEFAULT_CONTROL_TIMEOUT_MS, type RuntimeOperationName } from "../control/protocol.js";
+import {
+  DEFAULT_CONTROL_TIMEOUT_MS,
+  type RuntimeOperationName,
+  sanitizeControlValue,
+} from "../control/protocol.js";
 import type { TaskRecordCommand, TaskRunCommand } from "../parse-command.js";
 
 export type TaskCommand = TaskRecordCommand | TaskRunCommand;
@@ -52,7 +56,9 @@ function taskRecord(result: JsonValue) {
 }
 
 function sameWireValue(left: JsonValue, right: JsonValue): boolean {
-  return JSON.stringify(serializeWireValue(left)) === JSON.stringify(serializeWireValue(right));
+  const normalize = (value: JsonValue) =>
+    serializeWireValue(sanitizeControlValue(serializeWireValue(value)));
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
 }
 
 export async function executeTaskCommand(
