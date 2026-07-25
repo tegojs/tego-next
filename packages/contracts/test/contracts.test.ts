@@ -28,6 +28,7 @@ import {
   parseComponentInstanceId,
   parseExecutionRequest,
   parseExecutionResult,
+  parseExecutorId,
   parseGeneration,
   parseDriverHealth,
   parseFencingEpoch,
@@ -47,6 +48,7 @@ import {
   parseSequence,
   parseSessionId,
   parseTaskId,
+  parseTaskRecord,
   parseTaskExecutionTarget,
   parseWorkerEnvelope,
   type RuntimeConfiguration,
@@ -415,6 +417,88 @@ test("task execution targets share one strict persisted and wire contract", () =
         instanceId: "x".repeat(129),
       }),
     (error: unknown) => diagnosticCode(error) === "PROTOCOL_IDENTITY_INVALID",
+  );
+});
+
+test("executor identifiers use one bounded wire-safe parser", () => {
+  const executorId = "node-01:thread/worker:process";
+
+  assert.equal(parseExecutorId(executorId), executorId);
+  assert.equal(
+    parseExecutionRequest({
+      ...validExecutionRequest,
+      target: {
+        ...validExecutionRequest.target,
+        executor: { ...validExecutionRequest.target.executor, id: executorId },
+      },
+    }).target.executor.id,
+    executorId,
+  );
+  for (const invalid of [
+    "",
+    "/absolute",
+    "trailing/",
+    "node/../process",
+    "node process",
+    `node-${"x".repeat(124)}`,
+  ]) {
+    assert.throws(() => parseExecutorId(invalid), { name: "DiagnosticError" });
+  }
+});
+
+test("deployment generations are bounded to uint64", () => {
+  assert.equal(parseGeneration("18446744073709551615"), "18446744073709551615");
+  assert.throws(() => parseGeneration("18446744073709551616"), {
+    name: "DiagnosticError",
+  });
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        target: {
+          ...validExecutionRequest.target,
+          deploymentGeneration: "18446744073709551616",
+        },
+      }),
+    { name: "DiagnosticError" },
+  );
+});
+
+test("task records reject inconsistent target and legacy executor bindings", () => {
+  const base = {
+    taskId: validExecutionRequest.taskId,
+    attemptId: validExecutionRequest.attemptId,
+    request: {
+      applicationId: validExecutionRequest.applicationId,
+      pluginId: validExecutionRequest.pluginId,
+      componentId: validExecutionRequest.componentId,
+      input: validExecutionRequest.input,
+      deadline: validExecutionRequest.deadline,
+      orphanPolicy: validExecutionRequest.orphanPolicy,
+    },
+    state: "accepted",
+    createdAt: validExecutionRequest.deadline,
+    updatedAt: validExecutionRequest.deadline,
+    target: validExecutionRequest.target,
+  } as const;
+
+  assert.deepEqual(
+    parseTaskRecord({
+      ...base,
+      executor: {
+        id: validExecutionRequest.target.executor.id,
+        type: validExecutionRequest.target.executor.type,
+      },
+    }).target,
+    validExecutionRequest.target,
+  );
+  assert.throws(
+    () =>
+      parseTaskRecord({
+        ...base,
+        executor: { id: "other:process", type: "process" },
+      }),
+    /legacy executor/u,
   );
 });
 
