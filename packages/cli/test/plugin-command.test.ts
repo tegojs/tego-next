@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -153,7 +153,7 @@ test("@spec:runtime-operations/plugin-development-operations/install-sends-canon
     assert.equal(stderr.read(), "");
     assert.equal(requests.length, 1);
     assert.equal(requests[0]?.operation, "plugin.install-path");
-    assert.deepEqual(requests[0]?.input, { artifactPath: resolve(artifactPath) });
+    assert.deepEqual(requests[0]?.input, { artifactPath: await realpath(artifactPath) });
     assert.equal(isAbsolute((requests[0]?.input as { artifactPath: string }).artifactPath), true);
     assert.equal(JSON.parse(stdout.read()).pluginId, "org.example.echo");
   } finally {

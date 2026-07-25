@@ -51,6 +51,7 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
   const stdout = capture();
   const stderr = capture();
   const requests: ControlClientOptions[] = [];
+  const deadline = new Date(Date.now() + 60_000).toISOString();
   const exitCode = await runCli({
     argv: [
       "task",
@@ -59,7 +60,7 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
       "--input",
       '{"message":"hi"}',
       "--deadline",
-      "2026-07-25T00:05:00.000Z",
+      deadline,
       "--json",
     ],
     stdout: stdout.stream,
@@ -95,7 +96,7 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
           pluginId: "org.example.echo",
           componentId: "echo",
           input: { message: "hi" },
-          deadline: "2026-07-25T00:05:00.000Z",
+          deadline,
           orphanPolicy: "cancel",
         },
       },
@@ -108,6 +109,7 @@ test("@spec:runtime-operations/task-operations/no-wait-returns-accepted-task", a
   const stdout = capture();
   const stderr = capture();
   const requests: ControlClientOptions[] = [];
+  const deadline = new Date(Date.now() + 60_000).toISOString();
   const exitCode = await runCli({
     argv: [
       "task",
@@ -116,7 +118,7 @@ test("@spec:runtime-operations/task-operations/no-wait-returns-accepted-task", a
       "--input",
       "null",
       "--deadline",
-      "2026-07-25T00:05:00.000Z",
+      deadline,
       "--no-wait",
       "--json",
     ],
@@ -301,6 +303,42 @@ test("@spec:runtime-operations/task-operations/reject-oversized-json-before-cont
     requestControl: async () => {
       requests += 1;
       return response(null);
+    },
+  });
+
+  assert.equal(exitCode, 2);
+  assert.equal(requests, 0);
+  assert.equal(stdout.read(), "");
+  assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_COMMAND_INVALID");
+});
+
+test("@spec:runtime-operations/task-operations/reject-timer-overflow-before-control", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  let requests = 0;
+  const exitCode = await runCli({
+    argv: [
+      "task",
+      "wait",
+      "task-cli-test",
+      "--timeout-ms",
+      "2147483648",
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async () => {
+      requests += 1;
+      return response(
+        taskRecord("terminal", {
+          taskId: "task-cli-test",
+          attemptId: "attempt-cli-test",
+          status: "succeeded",
+          executor: { kind: "thread" },
+          startedAt: "2026-07-25T00:00:00.000Z",
+          completedAt: "2026-07-25T00:00:01.000Z",
+        }),
+      );
     },
   });
 
