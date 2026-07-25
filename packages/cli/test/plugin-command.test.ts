@@ -415,6 +415,43 @@ test("@spec:runtime-operations/plugin-development-operations/rejects-lexical-out
   }
 });
 
+test("@spec:runtime-operations/plugin-development-operations/rejects-portable-output-collisions-before-write", async () => {
+  const fixture = await createPackFixture();
+  const artifactPath = join(fixture.directory, "Plugin-\u00e9.tego");
+  const signaturePath = join(fixture.directory, "plugin-e\u0301.tego");
+  const stdout = capture();
+  const stderr = capture();
+  try {
+    const exitCode = await runCli({
+      argv: [
+        "plugin",
+        "pack",
+        fixture.pluginDirectory,
+        "--no-build",
+        "--output",
+        artifactPath,
+        "--private-key",
+        fixture.privateKeyPath,
+        "--key-id",
+        "test-key",
+        "--signature-output",
+        signaturePath,
+        "--json",
+      ],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(stdout.read(), "");
+    assert.equal(await exists(artifactPath), false);
+    assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
+    assert.equal(JSON.parse(stderr.read()).diagnostic.code, "ARTIFACT_OUTPUT_PATH_CONFLICT");
+  } finally {
+    await rm(fixture.directory, { force: true, recursive: true });
+  }
+});
+
 test("@spec:runtime-operations/plugin-development-operations/rejects-hardlink-output-collision-before-write", async () => {
   const fixture = await createPackFixture();
   const artifactPath = join(fixture.directory, "artifact-alias.tego");

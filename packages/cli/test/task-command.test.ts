@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import { type JsonValue, parseTaskRecord, type RuntimeOperations } from "@tegojs/contracts";
+import {
+  type JsonValue,
+  parseTaskRecord,
+  type RunTaskRequest,
+  type RuntimeOperations,
+} from "@tegojs/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { startControlServer } from "../src/control/server.js";
@@ -454,6 +459,48 @@ test("@spec:runtime-operations/task-operations/run-and-wait-share-one-time-budge
   assert.equal(exitCode, 0);
   assert.equal(stderr.read(), "");
   assert.deepEqual(timeouts, [1_000, 350]);
+});
+
+test("@spec:runtime-operations/task-operations/correlates-canonical-wire-equivalent-requests", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const deadline = new Date(Date.now() + 60_000).toISOString();
+  const exitCode = await runCli({
+    argv: [
+      "task",
+      "run",
+      "org.example.echo/echo",
+      "--input",
+      '{"nested":{"b":1,"a":-0}}',
+      "--deadline",
+      deadline,
+      "--no-wait",
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async (request) => {
+      const submitted = request.input as unknown as RunTaskRequest;
+      return response(
+        {
+          ...(taskRecord("accepted") as Record<string, JsonValue>),
+          request: {
+            orphanPolicy: submitted.orphanPolicy,
+            deadline: submitted.deadline,
+            input: { nested: { a: 0, b: 1 } },
+            componentId: submitted.componentId,
+            pluginId: submitted.pluginId,
+            applicationId: submitted.applicationId,
+          },
+        },
+        request.requestId,
+      );
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(stderr.read(), "");
+  assert.equal(JSON.parse(stdout.read()).state, "accepted");
 });
 
 test("@spec:runtime-operations/task-operations/rejects-mismatched-task-identities", async () => {
