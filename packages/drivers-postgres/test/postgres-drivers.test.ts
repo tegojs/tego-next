@@ -120,6 +120,55 @@ test("PostgreSQL StateStore instances share state and revisions across reopen", 
   }
 });
 
+test("PostgreSQL operation scans preserve exact bigint cursors and code-unit ordering", async () => {
+  const stateNamespace = namespace("state_operation_cursor");
+  const store = new PostgresStateStore({
+    connectionString,
+    namespace: stateNamespace,
+  });
+  const pool = new Pool({ connectionString });
+  await store.open();
+  try {
+    await store.transact({}, async (transaction) => {
+      for (const operationId of ["operation-a", "operation-A", "operation-_"]) {
+        await transaction.appendOperation({
+          operationId: parseOperationId(operationId),
+          kind: "deploy",
+          status: "planned",
+          state: { operationId },
+          updatedAt: "2026-07-25T00:00:00.000Z",
+        });
+      }
+      return null;
+    });
+    await pool.query(
+      `
+        UPDATE tego_operations
+        SET revision = 9007199254740993
+        WHERE driver_namespace = $1
+      `,
+      [stateNamespace],
+    );
+
+    const entries = [];
+    for await (const entry of store.scanOperations({
+      after: {
+        revision: parseRevision("9007199254740993"),
+        operationId: parseOperationId("operation-A"),
+      },
+      limit: 2,
+    })) {
+      entries.push([entry.operationId, entry.revision]);
+    }
+    assert.deepEqual(entries, [
+      ["operation-_", parseRevision("9007199254740993")],
+      ["operation-a", parseRevision("9007199254740993")],
+    ]);
+  } finally {
+    await Promise.all([store.close(), pool.end()]);
+  }
+});
+
 test("concurrent idempotent transactions commit one durable state and outbox effect", async () => {
   const sharedNamespace = namespace("state_idempotent");
   const left = new PostgresStateStore({

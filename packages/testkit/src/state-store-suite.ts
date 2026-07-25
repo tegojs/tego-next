@@ -273,6 +273,99 @@ export function stateStoreConformance(
       });
     });
 
+    test("state keys and queries reject NUL and ill-formed Unicode consistently", async () => {
+      await withStore(factory, async (store) => {
+        const valid = key("portable-state", "valid");
+        const invalidStrings = ["nul\u0000value", "high-\uD800", "low-\uDC00"];
+
+        for (const invalid of invalidStrings) {
+          for (const invalidKey of [
+            { ...valid, namespace: invalid },
+            { ...valid, collection: invalid },
+            { ...valid, id: invalid },
+          ]) {
+            await assert.rejects(store.read(invalidKey), expectDiagnostic("STATE_QUERY_INVALID"));
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                await transaction.get(invalidKey);
+                return null;
+              }),
+              expectDiagnostic("STATE_QUERY_INVALID"),
+            );
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                await transaction.put(invalidKey, { label: "invalid" }, {});
+                return null;
+              }),
+              expectDiagnostic("STATE_DATA_INVALID"),
+            );
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                await transaction.delete(invalidKey, {});
+                return null;
+              }),
+              expectDiagnostic("STATE_DATA_INVALID"),
+            );
+          }
+
+          for (const invalidQuery of [
+            { namespace: invalid, collection: "examples" },
+            { namespace: "portable-state", collection: invalid },
+            { namespace: "portable-state", collection: "examples", idPrefix: invalid },
+            { namespace: "portable-state", collection: "examples", afterId: invalid },
+          ]) {
+            await assert.rejects(
+              scannedIds(store, invalidQuery),
+              expectDiagnostic("STATE_QUERY_INVALID"),
+            );
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                for await (const _entry of transaction.scan(invalidQuery)) {
+                  // Invalid queries must fail before yielding state.
+                }
+                return null;
+              }),
+              expectDiagnostic("STATE_QUERY_INVALID"),
+            );
+          }
+        }
+      });
+    });
+
+    test("state prefix and cursor pagination use exact ECMAScript UTF-16 order", async () => {
+      await withStore(factory, async (store) => {
+        const astral = "group-\u{10000}";
+        const privateUseBmp = "group-\uE000";
+        for (const id of [privateUseBmp, "group-A", "other", astral]) {
+          await store.transact({}, async (transaction) => {
+            await transaction.put(key("unicode-pagination", id), { label: id }, {});
+            return null;
+          });
+        }
+
+        const first = await scannedIds(store, {
+          namespace: "unicode-pagination",
+          collection: "examples",
+          idPrefix: "group-",
+          limit: 2,
+        });
+        const second = await scannedIds(store, {
+          namespace: "unicode-pagination",
+          collection: "examples",
+          idPrefix: "group-",
+          afterId: astral,
+          limit: 2,
+        });
+
+        assert.deepEqual(first, ["group-A", astral]);
+        assert.deepEqual(second, [privateUseBmp]);
+        assert.deepEqual(await store.read(key("unicode-pagination", astral)), {
+          revision: parseRevision("4"),
+          value: { label: astral },
+        });
+      });
+    });
+
     test("transaction state scans apply pagination after staged mutations", async () => {
       await withStore(factory, async (store) => {
         const first = key("transaction-pagination", "A");
