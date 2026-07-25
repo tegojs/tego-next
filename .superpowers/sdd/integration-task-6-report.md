@@ -579,3 +579,97 @@ volta run --node 26.5.0 npm test
 Targeted Biome checks passed for all four affected source/test files.
 `git diff --check` passed, and the focused real-process repetitions left no
 child process, endpoint, or temporary directory behind.
+
+## Findings 14–15 Shutdown Completion Addendum
+
+The final review found two shutdown edges: closing the control listener could
+truncate the successful `runtime.stop` response, and a late control-server
+factory result could fail cleanup without reaching any error boundary.
+
+### Commits
+
+- Stop-response RED: `2cfa6b1`
+  (`test: expose control stop response race`)
+- Late-cleanup RED: `cb64eed`
+  (`test: expose silent late cleanup failure`)
+- GREEN: `479869f`
+  (`fix: preserve stop responses during shutdown`)
+- Bounded regression hardening: `da8736b`
+  (`test: bound control shutdown regressions`)
+- Explicit readiness synchronization: `baf3e5b`
+  (`test: await control readiness before stop`)
+- Report addendum: the commit containing this update
+
+### RED Evidence
+
+The real control-socket regression used one idempotent runtime stop promise.
+The runtime emitted `stopped` before that promise completed, reproducing the
+shutdown overlap:
+
+```text
+PROTOCOL_CONTROL_CLOSED: response was not completed
+```
+
+The second controlled regression aborted a pending server factory, then
+resolved it with a server whose `close()` rejected with sensitive text. The
+unfixed process settled without calling the background error sink.
+
+### GREEN Behavior
+
+- Control shutdown now stops accepting connections immediately, destroys idle
+  sockets, and gives active dispatches and their response flushes up to two
+  seconds before destroying any remainder.
+- Response writes are awaited through the socket end callback, so the
+  `runtime.stop` success frame is flushed before shutdown completes.
+- Signal cleanup still initiates runtime stop and control close concurrently.
+  Lifecycle-driven cleanup awaits the stop settlement before closing control,
+  preserving the response path.
+- A synchronous runtime stop throw cannot skip control cleanup; both failures
+  remain available to the existing aggregation path.
+- `runMainProcess` requires a non-throwing background error sink. A late factory
+  result whose cleanup fails reports only
+  `LIFECYCLE_BACKGROUND_CLEANUP_FAILED`; raw rejection text and paths do not
+  cross the process boundary.
+- The default Node entrypoint converts a background cleanup failure into a
+  sanitized `runtime.failed` event and a nonzero exit code. Expected late
+  factory rejection after signal abort remains observed without being reported
+  as a failure.
+
+During stress verification, the test itself exposed a readiness race: a Unix
+socket pathname can exist before permission initialization and `onReady`
+complete. The regression now waits for the explicit `onReady` callback before
+requesting stop. Its `finally` path aborts Main and releases the controlled stop
+promise independently of request dispatch, so a failed request cannot deadlock
+the test. The shared path watcher was also made TOCTOU-safe and both regressions
+have explicit test deadlines.
+
+### GREEN and Stress Evidence
+
+```text
+for tego_stress_run in {1..100}; do
+  volta run --node 26.5.0 node --test --test-timeout=6000 \
+    --test-name-pattern='control-stop-response-precedes-server-close' \
+    packages/cli/dist/test/runtime-process.test.js
+done
+100/100 repetitions passed
+
+for tego_stress_run in {1..20}; do
+  volta run --node 26.5.0 node --test --test-timeout=6000 \
+    --test-name-pattern='control-stop-response|late-factory-close-failure|stop-failure-still-aggregates|pre-readiness-sigterm' \
+    packages/cli/dist/test/runtime-process.test.js
+done
+20/20 repetitions passed
+
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+70 tests: 69 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run typecheck
+exit 0
+
+volta run --node 26.5.0 npm test
+611 tests: 610 passed, 0 failed, 1 Windows-only skipped
+```
+
+Targeted Biome checks passed for the four affected source/test files.
+`git diff --check` passed, and no diagnostic report, debug instrumentation,
+child process, endpoint, or temporary runtime directory remained.
