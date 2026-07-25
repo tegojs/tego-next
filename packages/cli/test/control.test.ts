@@ -331,6 +331,77 @@ test("@spec:runtime-operations/local-runtime-operations/incomplete-frames-reserv
   });
 });
 
+test("@spec:runtime-operations/local-runtime-operations/disconnected-dispatch-retains-capacity", async () => {
+  await withEndpoint(async (endpoint) => {
+    const operation = Promise.withResolvers<ReturnType<typeof runtimeStatus>>();
+    const firstStarted = Promise.withResolvers<void>();
+    const secondStarted = Promise.withResolvers<void>();
+    let calls = 0;
+    const operations = fakeOperations();
+    const server = await startControlServer({
+      endpoint,
+      operations: {
+        ...operations,
+        status: () => {
+          calls += 1;
+          if (calls === 1) firstStarted.resolve();
+          if (calls === 2) secondStarted.resolve();
+          return operation.promise;
+        },
+      },
+      maxOutstandingRequests: 1,
+    });
+    const frame = `${JSON.stringify({
+      protocolVersion: "1.0",
+      requestId: "pending-dispatch",
+      operation: "runtime.status",
+      input: {},
+    })}\n`;
+    const first = await connect(endpoint);
+    try {
+      first.end(frame);
+      await firstStarted.promise;
+      if (!first.destroyed) {
+        const closed = new Promise<void>((resolve) => first.once("close", resolve));
+        first.destroy();
+        await closed;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const second = await connect(endpoint);
+      const secondResponse = readResponse(second);
+      second.end(frame);
+      const outcome = await Promise.race([
+        secondResponse.then((response) => ({ response })),
+        secondStarted.promise.then(() => ({ dispatched: true as const })),
+      ]);
+      operation.resolve(runtimeStatus());
+      if ("dispatched" in outcome) await secondResponse;
+      assert.ok("response" in outcome, "a disconnected pending dispatch released capacity");
+      assert.equal(outcome.response.diagnostic?.code, "PROTOCOL_CONTROL_CAPACITY_EXCEEDED");
+
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const holding = await connect(endpoint);
+      try {
+        const rejected = await sendRaw(endpoint, frame);
+        assert.equal(rejected.diagnostic?.code, "PROTOCOL_CONTROL_CAPACITY_EXCEEDED");
+      } finally {
+        const closed = new Promise<void>((resolve) => holding.once("close", resolve));
+        holding.destroy();
+        await closed;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const accepted = await sendRaw(endpoint, frame);
+      assert.equal(accepted.ok, true);
+      assert.equal(calls, 2);
+    } finally {
+      operation.resolve(runtimeStatus());
+      first.destroy();
+      await server.close();
+    }
+  });
+});
+
 test("@spec:runtime-operations/local-runtime-operations/fragmented-frames-copy-linearly", async () => {
   await withEndpoint(async (endpoint) => {
     const server = await startControlServer({ endpoint, operations: fakeOperations() });
