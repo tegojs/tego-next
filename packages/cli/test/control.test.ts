@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -129,6 +129,23 @@ async function connect(endpoint: string): Promise<Socket> {
     socket.once("error", reject);
   });
   return socket;
+}
+
+async function settlesBeforeDeadline(promise: PromiseLike<unknown>, timeoutMs = 100): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise).then(
+        () => true,
+        () => true,
+      ),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function readResponse(socket: Socket, timeoutMs = 1_000): Promise<ControlResponse> {
@@ -540,6 +557,61 @@ test("@spec:runtime-operations/local-runtime-operations/permission-init-rolls-ba
       await unexpected?.close();
     }
     await assert.rejects(connect(endpoint));
+  });
+});
+
+test("@spec:runtime-operations/local-runtime-operations/aborted-control-initialization-rolls-back", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket initialization rollback is exercised on Unix");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    type AbortableControlOptions = Parameters<typeof startControlServer>[0] & {
+      readonly signal: AbortSignal;
+    };
+    const startAbortable = startControlServer as (
+      options: AbortableControlOptions,
+    ) => ReturnType<typeof startControlServer>;
+
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const preAbortedOutcome = await startAbortable({
+      endpoint,
+      operations: fakeOperations(),
+      signal: preAborted.signal,
+    }).then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    if (preAbortedOutcome.ok) await preAbortedOutcome.server.close();
+    await assert.rejects(access(endpoint));
+
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionCompletion = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    const outcome = startAbortable({
+      endpoint,
+      operations: fakeOperations(),
+      signal: controller.signal,
+      setEndpointPermissions: () => {
+        permissionEntered.resolve();
+        return permissionCompletion.promise;
+      },
+    }).then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    await permissionEntered.promise;
+    controller.abort();
+    const settledBeforePermission = await settlesBeforeDeadline(outcome);
+    permissionCompletion.resolve();
+    const result = await outcome;
+    if (result.ok) await result.server.close();
+
+    assert.equal(preAbortedOutcome.ok, false);
+    assert.equal(settledBeforePermission, true);
+    assert.equal(result.ok, false);
+    await assert.rejects(access(endpoint));
   });
 });
 
