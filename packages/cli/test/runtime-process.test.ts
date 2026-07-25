@@ -179,6 +179,57 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
   assert.equal(closeAttempted, true);
 });
 
+test("@spec:runtime-operations/local-runtime-operations/control-stop-response-precedes-server-close", async () => {
+  const directory = await temporaryRuntimeDirectory("tego-control-stop-response-");
+  const endpoint = join(directory, "control.sock");
+  const stopStarted = Promise.withResolvers<void>();
+  const stopCompletion = Promise.withResolvers<void>();
+  let stopCalls = 0;
+  let stopPromise: Promise<void> | undefined;
+  const runtime: Runtime = {
+    start: async () => undefined,
+    status: async () => ({ lifecycle: "running" }) as RuntimeStatus,
+    stop: () => {
+      stopPromise ??= (async () => {
+        stopCalls += 1;
+        stopStarted.resolve();
+        await stopCompletion.promise;
+      })();
+      return stopPromise;
+    },
+    operations: {} as Runtime["operations"],
+    events: {
+      async *[Symbol.asyncIterator]() {
+        await stopStarted.promise;
+        yield { current: "stopped" };
+      },
+    } as Runtime["events"],
+  };
+  const running = runMainProcess({ endpoint, runtime });
+  try {
+    await waitForPath(endpoint, directory);
+    const response = requestControl({
+      endpoint,
+      operation: "runtime.stop",
+      input: {},
+      timeoutMs: 1_000,
+    });
+    await stopStarted.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    stopCompletion.resolve();
+
+    const result = await response;
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.result, { stopped: true });
+    assert.equal(stopCalls, 1);
+    await running;
+  } finally {
+    stopCompletion.resolve();
+    await running.catch(() => undefined);
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
 test("@spec:runtime-operations/local-runtime-operations/pending-start-abort-stops-before-control", async () => {
   const start = Promise.withResolvers<void>();
   const startCalled = Promise.withResolvers<void>();
