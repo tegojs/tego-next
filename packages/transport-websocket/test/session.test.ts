@@ -822,6 +822,28 @@ test("@spec:worker-protocol/reliable-pre-consumer-delivery/flushes-once-in-exact
   await cleanup(connection);
 });
 
+test("@spec:worker-protocol/reliable-pre-consumer-delivery/reentrant-arrival-preserves-backlog-order", async () => {
+  const connection = await directConnection();
+  const received: string[] = [];
+  await connection.mainSession.send("session.reconcile", { order: "first" });
+  await connection.mainSession.send("session.reconcile", { order: "second" });
+  await flush();
+
+  let third: Promise<string> | undefined;
+  connection.workerSession.onMessage((message) => {
+    const order = (message.payload as { order: string }).order;
+    received.push(order);
+    if (order === "first") {
+      third = connection.mainSession.send("session.reconcile", { order: "third" });
+    }
+  });
+  await third;
+  await flush();
+
+  assert.deepEqual(received, ["first", "second", "third"]);
+  await cleanup(connection);
+});
+
 test("@spec:worker-protocol/reliable-pre-consumer-delivery/bounds-buffered-message-bytes", {
   timeout: 2_000,
 }, async () => {
