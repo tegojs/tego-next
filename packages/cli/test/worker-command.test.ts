@@ -312,6 +312,70 @@ test("@spec:worker-protocol/independent-worker-command/requires-a-bounded-worker
   );
 });
 
+test("@spec:worker-protocol/independent-worker-command/requires-explicit-secret-and-stable-worker-id", () => {
+  const previousCredential = process.env.TEGO_WORKER_CREDENTIAL;
+  try {
+    delete process.env.TEGO_WORKER_CREDENTIAL;
+    assert.throws(
+      () =>
+        parseCommand([
+          "worker",
+          "start",
+          "--listen",
+          "127.0.0.1:0",
+          "--worker-id",
+          "worker-explicit-secret",
+        ]),
+      /credential|required/iu,
+    );
+
+    process.env.TEGO_WORKER_CREDENTIAL = "";
+    assert.throws(
+      () =>
+        parseCommand([
+          "worker",
+          "start",
+          "--listen",
+          "127.0.0.1:0",
+          "--worker-id",
+          "worker-empty-secret",
+        ]),
+      /credential|required|empty/iu,
+    );
+    assert.throws(
+      () =>
+        parseCommand([
+          "worker",
+          "start",
+          "--listen",
+          "127.0.0.1:0",
+          "--credential",
+          "",
+          "--worker-id",
+          "worker-empty-flag-secret",
+        ]),
+      /credential|required|empty/iu,
+    );
+
+    process.env.TEGO_WORKER_CREDENTIAL = "environment-worker-secret";
+    let missingIdentity: unknown;
+    try {
+      parseCommand(["worker", "start", "--listen", "127.0.0.1:0"]);
+    } catch (error) {
+      missingIdentity = error;
+    }
+    assert.ok(missingIdentity instanceof Error);
+    assert.match(missingIdentity.message, /worker.*id|required/iu);
+    assert.doesNotMatch(JSON.stringify(missingIdentity), /environment-worker-secret/u);
+  } finally {
+    if (previousCredential === undefined) {
+      delete process.env.TEGO_WORKER_CREDENTIAL;
+    } else {
+      process.env.TEGO_WORKER_CREDENTIAL = previousCredential;
+    }
+  }
+});
+
 test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-worker-attempt-store-"));
   const databasePath = join(directory, "state.sqlite");
