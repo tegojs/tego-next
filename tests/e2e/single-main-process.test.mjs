@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -42,6 +52,26 @@ async function exists(path) {
     if (error?.code === "ENOENT") return false;
     throw error;
   }
+}
+
+async function removeTreeWithReadOnlyDirectories(path) {
+  async function makeDirectoriesWritable(candidate) {
+    let identity;
+    try {
+      identity = await lstat(candidate);
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    if (identity.isSymbolicLink() || !identity.isDirectory()) return;
+    await chmod(candidate, 0o700);
+    for (const entry of await readdir(candidate)) {
+      await makeDirectoriesWritable(join(candidate, entry));
+    }
+  }
+
+  await makeDirectoriesWritable(path);
+  await rm(path, { force: true, recursive: true });
 }
 
 async function eventually(operation, description) {
@@ -362,7 +392,7 @@ async function runSystemFlow(runIndex) {
         assert.deepEqual(cleanup.processingErrors ?? [], []);
       }
     } finally {
-      await rm(directory, { force: true, recursive: true });
+      await removeTreeWithReadOnlyDirectories(directory);
       await rm(pluginWorkspace, { force: true, recursive: true });
       await artifacts.dispose();
     }
