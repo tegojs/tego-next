@@ -241,6 +241,13 @@ function currentInstanceStep(
   componentId: ComponentId,
   placement: ComponentPlacement,
 ): ReconcilePlanStep | undefined {
+  if (
+    instance?.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
+    instance.retryAt !== undefined &&
+    instance.retryAt > snapshot.now
+  ) {
+    return undefined;
+  }
   if (instance === undefined || instance.lifecycle === "stopped") {
     return step(snapshot.deployment, componentId, "prepare", placement, "absent", "created");
   }

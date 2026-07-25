@@ -2,8 +2,8 @@ import type {
   Runtime,
   RuntimeAuthority,
   RuntimeConfiguration,
-  RuntimeDrivers,
   RuntimeDiagnostic,
+  RuntimeDrivers,
   RuntimeTaskLifecycle,
   RuntimeWorkerDirectory,
 } from "@tegojs/contracts";
@@ -12,7 +12,13 @@ import type { Reconciler } from "./reconcile/reconciler.js";
 import type { RuntimeArtifactInstaller, RuntimeTaskOperations } from "./runtime-operations.js";
 
 export interface RuntimeHostServices {
-  readonly createReconciler: (authority: RuntimeAuthority) => Reconciler;
+  readonly createReconciler: (
+    authority: RuntimeAuthority,
+    context: {
+      readonly currentAuthority: () => RuntimeAuthority | undefined;
+      readonly onBackgroundError: (error: unknown) => void;
+    },
+  ) => Reconciler;
   readonly tasks: RuntimeTaskLifecycle & RuntimeTaskOperations;
   readonly workers: RuntimeWorkerDirectory;
   readonly artifactService?: RuntimeArtifactInstaller;

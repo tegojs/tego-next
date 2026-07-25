@@ -251,6 +251,41 @@ test("restores one exact persisted ready session idempotently and closes it with
   assert.deepEqual(calls, [`start:${instanceId}`, `drain:${instanceId}`, `stop:${instanceId}`]);
 });
 
+test("restores persisted preparing sessions without starting them twice", async () => {
+  const { cache, calls, effects, registry } = harness();
+  const preparing = readyInstance({ lifecycle: "preparing" });
+
+  await effects.restore(preparing);
+  await effects.restore(preparing);
+
+  assert.equal(registry.require(instanceId).state, "prepared");
+  assert.equal(cache.prepares, 1);
+  assert.deepEqual(calls, []);
+  await effects.close();
+});
+
+test("close fences concurrent restoration and concurrent close calls share cleanup", async () => {
+  const stopGate = deferred();
+  const { calls, effects, registry, setStopGate } = harness();
+  const instance = readyInstance();
+  await effects.restore(instance);
+  setStopGate(stopGate.promise);
+
+  const firstClose = effects.close();
+  await Promise.resolve();
+  const secondClose = effects.close();
+  await assert.rejects(effects.restore(instance), /closing|unavailable/iu);
+  stopGate.resolve();
+
+  const results = await Promise.allSettled([firstClose, secondClose]);
+  assert.deepEqual(
+    results.map((result) => result.status),
+    ["fulfilled", "fulfilled"],
+  );
+  assert.equal(registry.get(instanceId), undefined);
+  assert.deepEqual(calls, [`start:${instanceId}`, `drain:${instanceId}`, `stop:${instanceId}`]);
+});
+
 test("bulk close releases only sessions owned by the exact authority", async () => {
   const first = { resource: "runtime:app", epoch: parseFencingEpoch("1") };
   const second = { resource: "runtime:app", epoch: parseFencingEpoch("2") };

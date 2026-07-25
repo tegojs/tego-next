@@ -128,6 +128,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
   readonly #stoppedOperations: string[] = [];
   readonly #failedOperations: string[] = [];
   readonly #restorations = new Map<string, InFlightRestoration>();
+  readonly #closingAuthorities = new Set<string>();
+  readonly #closeAttempts = new Map<string, Promise<void>>();
 
   constructor(options: ComponentEffectsOptions) {
     this.#artifacts = options.artifacts;
@@ -140,6 +142,15 @@ export class ComponentEffects implements ComponentEffectExecutor {
 
   perform(effect: ReconcileEffect): Promise<void> {
     const authority = this.#authority();
+    if (this.#closingAuthorities.has(this.#restorationAuthorityPrefix(authority))) {
+      return Promise.reject(
+        effectError(
+          "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
+          "Component lifecycle authority is closing",
+          effect,
+        ),
+      );
+    }
     const fingerprint = effectFingerprint(effect);
     const known = this.#fingerprints.get(effect.operationId);
     if (known !== undefined && known.fingerprint !== fingerprint) {
@@ -205,9 +216,21 @@ export class ComponentEffects implements ComponentEffectExecutor {
   ): Promise<void> {
     let effect: ReconcileEffect;
     try {
-      effect = this.#restorationEffect(instance, "start");
+      effect = this.#restorationEffect(
+        instance,
+        instance.lifecycle === "preparing" ? "prepare" : "start",
+      );
     } catch (error) {
       return Promise.reject(error);
+    }
+    if (this.#closingAuthorities.has(this.#restorationAuthorityPrefix(authority))) {
+      return Promise.reject(
+        effectError(
+          "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
+          "Component restoration authority is closing",
+          effect,
+        ),
+      );
     }
     const key = this.#restorationKey(instance.instanceId, authority);
     const fingerprint = restorationFingerprint(instance, effect);
@@ -249,6 +272,10 @@ export class ComponentEffects implements ComponentEffectExecutor {
     authority: RuntimeAuthority | undefined,
   ): Promise<void> {
     this.#assertCurrentAuthority(effect, authority);
+    if (effect.kind === "prepare") {
+      await this.#prepare(effect, authority);
+      return;
+    }
     let entry = this.#registry.get(instance.instanceId);
     if (entry !== undefined) {
       this.#registry.assertMatches(effect, entry, authority);
@@ -287,8 +314,20 @@ export class ComponentEffects implements ComponentEffectExecutor {
     return this.#authorityMatches(authority) && this.#registry.matches(effect, entry, authority);
   }
 
-  async close(authority: RuntimeAuthority | undefined = this.#authority()): Promise<void> {
+  close(authority: RuntimeAuthority | undefined = this.#authority()): Promise<void> {
     const prefix = this.#restorationAuthorityPrefix(authority);
+    const existing = this.#closeAttempts.get(prefix);
+    if (existing !== undefined) return existing;
+    this.#closingAuthorities.add(prefix);
+    const attempt = this.#closeAuthority(authority, prefix);
+    this.#closeAttempts.set(prefix, attempt);
+    void attempt.catch(() => {
+      if (this.#closeAttempts.get(prefix) === attempt) this.#closeAttempts.delete(prefix);
+    });
+    return attempt;
+  }
+
+  async #closeAuthority(authority: RuntimeAuthority | undefined, prefix: string): Promise<void> {
     await Promise.allSettled(
       [...this.#restorations.entries()]
         .filter(([key]) => key.startsWith(prefix))
@@ -610,9 +649,17 @@ export class ComponentEffects implements ComponentEffectExecutor {
     return current?.resource === expected?.resource && current?.epoch === expected?.epoch;
   }
 
-  #restorationEffect(instance: ComponentInstance, kind: "start" | "stop"): ReconcileEffect {
-    if (instance.lifecycle !== "ready" || instance.artifactDigest === undefined) {
-      throw new TypeError("Only exact persisted ready component instances can be restored");
+  #restorationEffect(
+    instance: ComponentInstance,
+    kind: "prepare" | "start" | "stop",
+  ): ReconcileEffect {
+    if (
+      instance.artifactDigest === undefined ||
+      (kind === "prepare" ? instance.lifecycle !== "preparing" : instance.lifecycle !== "ready")
+    ) {
+      throw new TypeError(
+        "Only exact persisted preparing or ready component instances can be restored",
+      );
     }
     const digest = createHash("sha256").update(instance.instanceId).digest("hex");
     const identity = `restore.${kind}.${digest}`;

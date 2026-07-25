@@ -245,7 +245,7 @@ export async function createNodeRuntimeHost(
     artifactService,
     tasks,
     workers,
-    createReconciler: (authority) =>
+    createReconciler: (authority, context) =>
       new Reconciler({
         artifactGate: localArtifactGate,
         authority,
@@ -255,7 +255,7 @@ export async function createNodeRuntimeHost(
           registry: componentRegistry,
           supportedExecutors: ["process", "thread"],
           host: componentHost,
-          authority: () => authority,
+          authority: context.currentAuthority,
           resolveDeployment: async (effect) => {
             const durableDeployment = await drivers.state.read({
               namespace: "tego",
@@ -299,6 +299,7 @@ export async function createNodeRuntimeHost(
         }),
         state: drivers.state,
         workers: [],
+        onBackgroundError: context.onBackgroundError,
       }),
   });
   const artifactIngress: LocalArtifactIngress = {

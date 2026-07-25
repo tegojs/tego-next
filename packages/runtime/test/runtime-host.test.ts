@@ -386,6 +386,8 @@ class ControlledServices implements RuntimeHostServices {
   readonly tasks: ControlledTasks;
   readonly workers: ControlledWorkers;
   readonly reconcilerAuthorities: RuntimeAuthority[] = [];
+  readonly reconcilerBackgroundErrors: Array<(error: unknown) => void> = [];
+  readonly reconcilerCurrentAuthorities: Array<() => RuntimeAuthority | undefined> = [];
   readonly diagnostics: RuntimeDiagnostic[] = [];
   activeReconcilers = 0;
   reconcilerStartFailures = 0;
@@ -397,8 +399,16 @@ class ControlledServices implements RuntimeHostServices {
     this.workers = new ControlledWorkers(log);
   }
 
-  createReconciler = (authority: RuntimeAuthority): Reconciler => {
+  createReconciler = (
+    authority: RuntimeAuthority,
+    context: {
+      readonly currentAuthority: () => RuntimeAuthority | undefined;
+      readonly onBackgroundError: (error: unknown) => void;
+    },
+  ): Reconciler => {
     this.reconcilerAuthorities.push(authority);
+    this.reconcilerBackgroundErrors.push(context.onBackgroundError);
+    this.reconcilerCurrentAuthorities.push(context.currentAuthority);
     const reconciler = new ControlledReconciler(authority, this);
     if (this.reconcilerStartFailures > 0) {
       this.reconcilerStartFailures -= 1;
@@ -544,6 +554,7 @@ test("leadership loss closes mutation admission before task authority and reconc
 
   first.lose();
   await eventually(() => assert.equal(value.services.activeReconcilers, 0));
+  assert.equal(value.services.reconcilerCurrentAuthorities[0]?.(), undefined);
   assert.equal((await runtime.status()).acceptingOperations, false);
   assert.equal((await runtime.status()).authority, undefined);
   assert.ok(value.log.indexOf("tasks.authority:none") < value.log.indexOf("reconciler.stop:7"));
@@ -608,6 +619,30 @@ test("single-main start waits for authority and initial reconciliation", async (
   assert.ok(value.log.indexOf("tasks.recover") < value.log.indexOf("reconciler.start:1"));
   assert.ok(value.log.indexOf("reconciler.start:1") < value.log.indexOf("tasks.authority:1"));
   await runtime.stop();
+});
+
+test("background reconciliation failure closes authority and stops the runtime", async () => {
+  const value = fixture("single-main");
+  value.coordination.immediateEpoch = "1";
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+
+  assert.equal(value.services.reconcilerCurrentAuthorities[0]?.()?.epoch, "1");
+  value.services.reconcilerBackgroundErrors[0]?.(new Error("background reconcile failed"));
+  assert.equal(value.services.reconcilerCurrentAuthorities[0]?.(), undefined);
+  await eventually(async () => {
+    const status = await runtime.status();
+    assert.equal(status.lifecycle, "stopped");
+    assert.equal(status.authority, undefined);
+    assert.equal(status.acceptingOperations, false);
+  });
+
+  assert.equal(
+    value.services.diagnostics.some(
+      (diagnostic) => diagnostic.code === "LIFECYCLE_RECONCILE_BACKGROUND_FAILED",
+    ),
+    true,
+  );
 });
 
 test("single-main stop interrupts a pending initial campaign without resurrecting", async () => {

@@ -1,28 +1,28 @@
 import {
+  type Clock,
   DiagnosticError,
   parseRuntimeConfiguration,
   parseRuntimeEvent,
   parseRuntimeStatus,
-  runtimeDiagnostic,
-  serializeCause,
-  type Clock,
   type Runtime,
   type RuntimeAuthority,
   type RuntimeConfiguration,
+  type RuntimeDrivers,
   type RuntimeEvent,
   type RuntimeLifecycleState,
   type RuntimeStatus,
-  type RuntimeDrivers,
+  runtimeDiagnostic,
   type StopOptions,
+  serializeCause,
 } from "@tegojs/contracts";
 import { DriverSupervisor } from "./driver-supervisor.js";
 import { LeadershipController } from "./leadership-controller.js";
 import { isRuntimeReady } from "./readiness.js";
 import type { Reconciler } from "./reconcile/reconciler.js";
-import { recoverRuntimeState, type RuntimeRecoverySnapshot } from "./recovery.js";
+import { type RuntimeRecoverySnapshot, recoverRuntimeState } from "./recovery.js";
+import type { RuntimeHostServices } from "./runtime-host.js";
 import { RuntimeOperationController } from "./runtime-operations.js";
 import { transitionRuntimeState } from "./runtime-state.js";
-import type { RuntimeHostServices } from "./runtime-host.js";
 
 export async function wakeReconcilerForAuthority(
   expected: RuntimeAuthority,
@@ -146,6 +146,7 @@ class TegoRuntime implements Runtime {
   #leadershipController: LeadershipController | undefined;
   #reconciler: Reconciler | undefined;
   #reconcilerAuthority: RuntimeAuthority | undefined;
+  #reconcilerCurrentAuthority: RuntimeAuthority | undefined;
   #driverHealth: RuntimeStatus["drivers"] = [];
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
@@ -394,7 +395,15 @@ class TegoRuntime implements Runtime {
       return;
     }
 
-    const reconciler = this.#services.createReconciler(authority);
+    this.#reconcilerCurrentAuthority = structuredClone(authority);
+    let reconciler!: Reconciler;
+    reconciler = this.#services.createReconciler(authority, {
+      currentAuthority: () =>
+        this.#reconciler === reconciler ? this.#reconcilerCurrentAuthority : undefined,
+      onBackgroundError: (error) => {
+        this.#handleReconcilerBackgroundFailure(reconciler, authority, error);
+      },
+    });
     this.#reconciler = reconciler;
     this.#reconcilerAuthority = structuredClone(authority);
     await reconciler.start();
@@ -415,6 +424,7 @@ class TegoRuntime implements Runtime {
     }
     this.operations.closeMutations();
     this.#leadership = undefined;
+    this.#reconcilerCurrentAuthority = undefined;
     if (this.#services === undefined) return;
 
     const errors: unknown[] = [];
@@ -448,7 +458,45 @@ class TegoRuntime implements Runtime {
     if (this.#reconciler === reconciler) {
       this.#reconciler = undefined;
       this.#reconcilerAuthority = undefined;
+      this.#reconcilerCurrentAuthority = undefined;
     }
+  }
+
+  #handleReconcilerBackgroundFailure(
+    reconciler: Reconciler,
+    authority: RuntimeAuthority,
+    error: unknown,
+  ): void {
+    if (
+      this.#reconciler !== reconciler ||
+      this.#reconcilerAuthority?.resource !== authority.resource ||
+      this.#reconcilerAuthority.epoch !== authority.epoch
+    ) {
+      return;
+    }
+    this.operations.closeMutations();
+    this.#leadership = undefined;
+    this.#reconcilerCurrentAuthority = undefined;
+    const diagnostic = runtimeDiagnostic({
+      code: "LIFECYCLE_RECONCILE_BACKGROUND_FAILED",
+      message: "Leader-owned background reconciliation failed",
+      source: { kind: "runtime", id: this.#configuration.runtimeId },
+      cause: serializeCause(error),
+      observedAt: this.#drivers.clock.now().toISOString(),
+    });
+    try {
+      void Promise.resolve(this.#services?.onDiagnostic?.(diagnostic)).catch(() => undefined);
+    } catch {
+      // Runtime shutdown below remains authoritative even when the diagnostic sink fails.
+    }
+    if (
+      this.#lifecycle !== "failed" &&
+      this.#lifecycle !== "stopped" &&
+      this.#lifecycle !== "stopping"
+    ) {
+      this.#setLifecycle("failed");
+    }
+    void this.stop().catch(() => undefined);
   }
 
   async #closeServices(): Promise<readonly unknown[]> {
