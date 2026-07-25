@@ -124,6 +124,24 @@ test("Worker listener shutdown reports a failed close during a bind race", async
   assert.match(String(closeResult.reason.errors[0]), /listener close failed/iu);
 });
 
+test("Worker listener shutdown completes after a successful close during a bind race", async () => {
+  const binding = Promise.withResolvers<{
+    readonly url: URL;
+    close(): Promise<void>;
+  }>();
+  const owner = new NodeWorkerListenerOwner(() => binding.promise);
+  const starting = owner.start();
+  const closing = owner.close();
+  binding.resolve({
+    url: new URL("ws://127.0.0.1:12345/"),
+    close: async () => undefined,
+  });
+
+  const [startResult, closeResult] = await Promise.allSettled([starting, closing]);
+  assert.equal(startResult.status, "rejected");
+  assert.equal(closeResult.status, "fulfilled");
+});
+
 test("SQLite-backed Worker epochs advance across Main restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-node-listener-epoch-"));
   const worker = createWorkerEndpoint({
