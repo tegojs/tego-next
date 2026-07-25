@@ -69,6 +69,31 @@ function controlledRuntime(): Runtime {
   };
 }
 
+function detachedRuntimeCommand(
+  directory: string,
+  endpoint: string,
+  suffix: string,
+): RuntimeStartCommand {
+  const parsed = parseCommand([
+    "runtime",
+    "start",
+    "--detach",
+    "--json",
+    "--data-dir",
+    directory,
+    "--endpoint",
+    endpoint,
+    "--runtime-id",
+    `runtime-${suffix}`,
+    "--application-id",
+    `application-${suffix}`,
+    "--node-id",
+    `node-${suffix}`,
+  ]);
+  assert.equal(parsed.kind, "runtime.start");
+  return parsed as RuntimeStartCommand;
+}
+
 test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggregates-control-cleanup", async () => {
   let closeAttempted = false;
   type MainProcessWithFactory = MainProcessOptions & {
@@ -141,31 +166,12 @@ test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-clean
   }
 });
 
-test("@spec:runtime-operations/local-runtime-operations/detached-timeout-confirms-term-kill-exit", async () => {
+test("@spec:runtime-operations/local-runtime-operations/detached-failure-confirms-term-kill-exit", async () => {
   const directory = await temporaryRuntimeDirectory("tego-detached-timeout-");
   const endpoint = join(directory, "control.sock");
-  const parsed = parseCommand([
-    "runtime",
-    "start",
-    "--detach",
-    "--json",
-    "--data-dir",
-    directory,
-    "--endpoint",
-    endpoint,
-    "--runtime-id",
-    "runtime-detached-timeout",
-    "--application-id",
-    "application-detached-timeout",
-    "--node-id",
-    "node-detached-timeout",
-  ]);
-  assert.equal(parsed.kind, "runtime.start");
-  const command = parsed as RuntimeStartCommand;
+  const command = detachedRuntimeCommand(directory, endpoint, "detached-failure");
   type DetachedOptions = {
     readonly mainProcessPath: string;
-    readonly readinessGateMessageType: string;
-    readonly readinessGateTimeoutMs: number;
     readonly readinessTimeoutMs: number;
     readonly terminationTimeoutMs: number;
   };
@@ -178,12 +184,10 @@ test("@spec:runtime-operations/local-runtime-operations/detached-timeout-confirm
     await assert.rejects(
       configurableStart(command, {
         mainProcessPath: fileURLToPath(new URL("fixtures/stubborn-main.js", import.meta.url)),
-        readinessGateMessageType: "fixture.ready",
-        readinessGateTimeoutMs: deadlineMs,
-        readinessTimeoutMs: 1,
+        readinessTimeoutMs: deadlineMs,
         terminationTimeoutMs: 100,
       }),
-      /LIFECYCLE_DETACHED_START_TIMEOUT/u,
+      /LIFECYCLE_DETACHED_START_FAILED/u,
     );
     pid = Number(await readFile(join(directory, "stubborn.pid"), "utf8"));
     assert.throws(
@@ -205,6 +209,34 @@ test("@spec:runtime-operations/local-runtime-operations/detached-timeout-confirm
         timeoutMs: 500,
       });
     } catch {}
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/local-runtime-operations/detached-readiness-timeout-is-bounded", async () => {
+  const directory = await temporaryRuntimeDirectory("tego-detached-timeout-");
+  const endpoint = join(directory, "control.sock");
+  const command = detachedRuntimeCommand(directory, endpoint, "detached-timeout");
+  type DetachedOptions = {
+    readonly mainProcessPath: string;
+    readonly readinessTimeoutMs: number;
+    readonly terminationTimeoutMs: number;
+  };
+  const configurableStart = startRuntimeDetached as (
+    command: RuntimeStartCommand,
+    options: DetachedOptions,
+  ) => Promise<RuntimeStatus>;
+  try {
+    await assert.rejects(
+      configurableStart(command, {
+        mainProcessPath: fileURLToPath(new URL("fixtures/silent-main.js", import.meta.url)),
+        readinessTimeoutMs: 1,
+        terminationTimeoutMs: 100,
+      }),
+      /LIFECYCLE_DETACHED_START_TIMEOUT/u,
+    );
+    await assert.rejects(access(endpoint));
+  } finally {
     await rm(directory, { force: true, recursive: true });
   }
 });

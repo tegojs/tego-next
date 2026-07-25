@@ -32,8 +32,6 @@ export async function startRuntimeForeground(command: RuntimeStartCommand): Prom
 
 export interface DetachedRuntimeStartOptions {
   readonly mainProcessPath?: string;
-  readonly readinessGateMessageType?: string;
-  readonly readinessGateTimeoutMs?: number;
   readonly readinessTimeoutMs?: number;
   readonly terminationTimeoutMs?: number;
 }
@@ -86,26 +84,10 @@ export async function startRuntimeDetached(
   command: RuntimeStartCommand,
   options: DetachedRuntimeStartOptions = {},
 ): Promise<RuntimeStatus> {
-  if (options.readinessGateMessageType === "") {
-    throw new RangeError("readinessGateMessageType must not be empty");
-  }
-  if (
-    options.readinessGateMessageType === undefined &&
-    options.readinessGateTimeoutMs !== undefined
-  ) {
-    throw new RangeError("readinessGateTimeoutMs requires readinessGateMessageType");
-  }
   const readinessTimeoutMs = validDeadline(
     options.readinessTimeoutMs ?? DETACHED_START_TIMEOUT_MS,
     "readinessTimeoutMs",
   );
-  const readinessGateTimeoutMs =
-    options.readinessGateMessageType === undefined
-      ? undefined
-      : validDeadline(
-          options.readinessGateTimeoutMs ?? DETACHED_START_TIMEOUT_MS,
-          "readinessGateTimeoutMs",
-        );
   const terminationTimeoutMs = validDeadline(
     options.terminationTimeoutMs ?? DETACHED_TERMINATION_TIMEOUT_MS,
     "terminationTimeoutMs",
@@ -132,16 +114,6 @@ export async function startRuntimeDetached(
 
   try {
     const status = await new Promise<RuntimeStatus>((resolve, reject) => {
-      let gateSatisfied = options.readinessGateMessageType === undefined;
-      let timer: NodeJS.Timeout;
-      const armDeadline = (timeoutMs: number) => {
-        clearTimeout(timer);
-        timer = setTimeout(
-          () => finish({ error: new Error("LIFECYCLE_DETACHED_START_TIMEOUT") }),
-          timeoutMs,
-        );
-        timer.unref();
-      };
       const finish = (outcome: { readonly error: Error } | { readonly status: RuntimeStatus }) => {
         clearTimeout(timer);
         child.off("error", onError);
@@ -158,15 +130,16 @@ export async function startRuntimeDetached(
           finish({ status: message.status as RuntimeStatus });
         } else if (message.type === "runtime.failed") {
           finish({ error: new Error("LIFECYCLE_DETACHED_START_FAILED") });
-        } else if (!gateSatisfied && message.type === options.readinessGateMessageType) {
-          gateSatisfied = true;
-          armDeadline(readinessTimeoutMs);
         }
       };
+      const timer = setTimeout(
+        () => finish({ error: new Error("LIFECYCLE_DETACHED_START_TIMEOUT") }),
+        readinessTimeoutMs,
+      );
+      timer.unref();
       child.once("error", onError);
       child.once("exit", onExit);
       child.on("message", onMessage);
-      armDeadline(readinessGateTimeoutMs ?? readinessTimeoutMs);
     });
     if (child.connected) child.disconnect();
     child.unref();

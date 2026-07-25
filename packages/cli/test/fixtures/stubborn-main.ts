@@ -12,7 +12,7 @@ if (options.dataDirectory === undefined) {
 
 process.on("SIGTERM", () => undefined);
 await writeFile(join(options.dataDirectory, "stubborn.pid"), String(process.pid));
-process.send?.({ type: "fixture.ready" });
+process.send?.({ type: "runtime.failed" });
 
 const channel = new MessageChannel();
 channel.port1.on("message", () => undefined);
