@@ -556,6 +556,7 @@ interface TestComponentSession extends Executor {
 
 type CreateProcessComponentSession = (input: {
   readonly target: ExecutionRequest["target"];
+  readonly identity: Pick<ExecutionRequest, "applicationId" | "componentId" | "pluginId">;
   readonly component: Awaited<ReturnType<ProcessExecutorOptions["resolveComponent"]>>;
   readonly executorOptions: ProcessExecutorOptions;
 }) => Promise<TestComponentSession>;
@@ -2046,6 +2047,7 @@ test("process component session owns one child across same-target attempts and r
   const createSession = await loadProcessComponentSessionFactory();
   const session = await createSession({
     target: first.target,
+    identity: first,
     component: await executorOptions.resolveComponent(first),
     executorOptions,
   });
@@ -2055,6 +2057,16 @@ test("process component session owns one child across same-target attempts and r
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    await assert.rejects(
+      session.submit({
+        ...second,
+        target: {
+          ...second.target,
+          artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+        },
+      }),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
+    );
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
@@ -2089,12 +2101,13 @@ test("process component session refuses unhealthy activation before accepting a 
     await assert.rejects(
       createSession({
         target: execution.target,
+        identity: execution,
         component: await executorOptions.resolveComponent(execution),
         executorOptions,
       }),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMPONENT_UNHEALTHY",
     );
-    await eventually(() => assert.equal(processHost.activeProcessCount, 0));
+    assert.equal(processHost.activeProcessCount, 0);
   } finally {
     await processHost.close();
   }
@@ -2123,6 +2136,7 @@ test("process component session rejects service kind before spawning a child", a
     await assert.rejects(
       createSession({
         target: execution.target,
+        identity: execution,
         component: await executorOptions.resolveComponent(execution),
         executorOptions,
       }),

@@ -373,6 +373,7 @@ interface TestComponentSession extends Executor {
 
 type CreateThreadComponentSession = (input: {
   readonly target: ExecutionRequest["target"];
+  readonly identity: Pick<ExecutionRequest, "applicationId" | "componentId" | "pluginId">;
   readonly component: Awaited<ReturnType<ThreadExecutorOptions["resolveComponent"]>>;
   readonly executorOptions: ThreadExecutorOptions;
 }) => Promise<TestComponentSession>;
@@ -1359,6 +1360,7 @@ test("thread component session owns one Worker across same-target attempts and r
   const createSession = await loadThreadComponentSessionFactory();
   const session = await createSession({
     target: first.target,
+    identity: first,
     component: await executorOptions.resolveComponent(first),
     executorOptions,
   });
@@ -1368,6 +1370,16 @@ test("thread component session owns one Worker across same-target attempts and r
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    await assert.rejects(
+      session.submit({
+        ...second,
+        target: {
+          ...second.target,
+          deploymentGeneration: parseGeneration("2"),
+        },
+      }),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
+    );
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
@@ -1399,12 +1411,13 @@ test("thread component session refuses unhealthy activation before accepting a r
   await assert.rejects(
     createSession({
       target: execution.target,
+      identity: execution,
       component: await executorOptions.resolveComponent(execution),
       executorOptions,
     }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMPONENT_UNHEALTHY",
   );
-  await eventually(() => assert.equal(factory.active, 0));
+  assert.equal(factory.active, 0);
 });
 
 test("thread component session rejects service kind before creating a Worker", async () => {
@@ -1428,6 +1441,7 @@ test("thread component session rejects service kind before creating a Worker", a
   await assert.rejects(
     createSession({
       target: execution.target,
+      identity: execution,
       component: await executorOptions.resolveComponent(execution),
       executorOptions,
     }),
