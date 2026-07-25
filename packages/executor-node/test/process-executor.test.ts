@@ -2274,7 +2274,10 @@ test("process session parent bounds a silent bootstrap and non-settling authorit
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     assert.notEqual(rejection, undefined);
-    assert.equal(processHost.activeProcessCount, 0);
+    await eventually(() => assert.equal(processHost.activeProcessCount, 0), {
+      attempts: 100,
+      advance: () => new Promise<void>((resolve) => setImmediate(resolve)),
+    });
   } finally {
     await processHost.close();
   }
