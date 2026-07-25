@@ -184,79 +184,83 @@ const migrations = [
 export const sqliteSchemaVersion = migrations.length;
 
 export function applySqliteMigrations(database: DatabaseSync, now: Date): void {
-  database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA journal_mode = WAL");
-  database.exec("PRAGMA synchronous = FULL");
-  database.exec("PRAGMA busy_timeout = 0");
-
-  database.exec("BEGIN IMMEDIATE");
+  database.exec("PRAGMA busy_timeout = 5000");
   try {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      ) STRICT
-    `);
+    database.exec("PRAGMA foreign_keys = ON");
+    database.exec("PRAGMA journal_mode = WAL");
+    database.exec("PRAGMA synchronous = FULL");
 
-    const latest = database
-      .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-      .get()?.version;
-    if (typeof latest === "number" && latest > sqliteSchemaVersion) {
-      throw new Error(
-        `SQLite state schema ${String(latest)} is newer than supported version ${String(sqliteSchemaVersion)}`,
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        ) STRICT
+      `);
+
+      const latest = database
+        .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+        .get()?.version;
+      if (typeof latest === "number" && latest > sqliteSchemaVersion) {
+        throw new Error(
+          `SQLite state schema ${String(latest)} is newer than supported version ${String(sqliteSchemaVersion)}`,
+        );
+      }
+
+      const applied = database.prepare(
+        "SELECT 1 AS applied FROM schema_migrations WHERE version = ?",
       );
-    }
-
-    const applied = database.prepare(
-      "SELECT 1 AS applied FROM schema_migrations WHERE version = ?",
-    );
-    const record = database.prepare(
-      "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-    );
-    for (let index = 0; index < migrations.length; index += 1) {
-      const version = index + 1;
-      if (applied.get(version) !== undefined) {
-        continue;
+      const record = database.prepare(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+      );
+      for (let index = 0; index < migrations.length; index += 1) {
+        const version = index + 1;
+        if (applied.get(version) !== undefined) {
+          continue;
+        }
+        database.exec(migrations[index] ?? "");
+        record.run(version, now.toISOString());
       }
-      database.exec(migrations[index] ?? "");
-      record.run(version, now.toISOString());
-    }
 
-    const missingOrderKeys = database
-      .prepare(
+      const missingOrderKeys = database
+        .prepare(
+          `
+            SELECT namespace, collection_name, record_id
+            FROM records
+            WHERE record_id_order_key IS NULL
+          `,
+        )
+        .all();
+      const updateOrderKey = database.prepare(
         `
-          SELECT namespace, collection_name, record_id
-          FROM records
-          WHERE record_id_order_key IS NULL
+          UPDATE records
+          SET record_id_order_key = ?
+          WHERE namespace = ? AND collection_name = ? AND record_id = ?
         `,
-      )
-      .all();
-    const updateOrderKey = database.prepare(
-      `
-        UPDATE records
-        SET record_id_order_key = ?
-        WHERE namespace = ? AND collection_name = ? AND record_id = ?
-      `,
-    );
-    for (const row of missingOrderKeys) {
-      const namespace = row.namespace;
-      const collection = row.collection_name;
-      const id = row.record_id;
-      if (
-        typeof namespace !== "string" ||
-        typeof collection !== "string" ||
-        typeof id !== "string" ||
-        !isPortableStateString(namespace) ||
-        !isPortableStateString(collection) ||
-        !isPortableStateString(id)
-      ) {
-        throw new Error("SQLite state contains a non-portable state key");
+      );
+      for (const row of missingOrderKeys) {
+        const namespace = row.namespace;
+        const collection = row.collection_name;
+        const id = row.record_id;
+        if (
+          typeof namespace !== "string" ||
+          typeof collection !== "string" ||
+          typeof id !== "string" ||
+          !isPortableStateString(namespace) ||
+          !isPortableStateString(collection) ||
+          !isPortableStateString(id)
+        ) {
+          throw new Error("SQLite state contains a non-portable state key");
+        }
+        updateOrderKey.run(Buffer.from(stateStringOrderKey(id)), namespace, collection, id);
       }
-      updateOrderKey.run(Buffer.from(stateStringOrderKey(id)), namespace, collection, id);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
     }
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
+  } finally {
+    database.exec("PRAGMA busy_timeout = 0");
   }
 }

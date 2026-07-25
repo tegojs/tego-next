@@ -1,21 +1,21 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
-import { after, test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { after, test } from "node:test";
 import {
   diagnosticCode,
+  type JsonObject,
+  type OperationJournalEntry,
+  type PersistedOperationJournalEntry,
   parseFencingEpoch,
   parseMessageId,
   parseOperationId,
   parseRevision,
-  stateStringOrderKey,
-  type JsonObject,
-  type OperationJournalEntry,
-  type PersistedOperationJournalEntry,
   type StateKey,
+  stateStringOrderKey,
 } from "@tegojs/contracts";
 import { stateStoreConformance } from "@tegojs/testkit";
 import * as publicApi from "../src/index.js";
@@ -370,7 +370,12 @@ test("simultaneous processes migrate a v3 database without SQLITE_BUSY or lost s
         .prepare(
           "SELECT operation_id, status, state_json FROM operation_history ORDER BY revision, operation_id",
         )
-        .all(),
+        .all()
+        .map((row) => ({
+          operation_id: row.operation_id,
+          status: row.status,
+          state_json: row.state_json,
+        })),
       [
         {
           operation_id: "migration-operation",

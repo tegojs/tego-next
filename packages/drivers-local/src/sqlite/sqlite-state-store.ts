@@ -3,32 +3,30 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  DiagnosticError,
-  OUTBOX_PAYLOAD_MAX_BYTES,
-  OUTBOX_TOPIC_MAX_LENGTH,
-  STATE_QUERY_MAX_LIMIT,
-  isPortableStateString,
-  parseFencingEpoch,
-  parseMessageId,
-  parseOperationId,
-  parseRevision,
-  runtimeDiagnostic,
-  serializeWireValue,
-  stateStringOrderKey,
   type Clock,
+  DiagnosticError,
   type DriverHealth,
   type ExpectedRevision,
+  isPortableStateString,
   type JsonValue,
   type OperationJournalEntry,
   type OperationJournalQuery,
+  OUTBOX_PAYLOAD_MAX_BYTES,
+  OUTBOX_TOPIC_MAX_LENGTH,
   type OutboxAcknowledgement,
   type OutboxAcknowledgementRequest,
   type OutboxClaim,
   type OutboxClaimRequest,
   type OutboxMessage,
   type PersistedOperationJournalEntry,
+  parseFencingEpoch,
+  parseMessageId,
+  parseOperationId,
+  parseRevision,
   type Revision,
+  runtimeDiagnostic,
   type ScannedState,
+  STATE_QUERY_MAX_LIMIT,
   type StateChange,
   type StateKey,
   type StateQuery,
@@ -36,6 +34,8 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type StateWriteOptions,
+  serializeWireValue,
+  stateStringOrderKey,
   type Versioned,
 } from "@tegojs/contracts";
 import { applySqliteMigrations } from "./migrations.js";
@@ -366,7 +366,10 @@ function cloneChange(change: StateChange, clock: Clock): StateChange {
 
 class SqliteTransaction implements StateTransaction {
   readonly #readRecord: (key: StateKey<JsonValue>) => StoredRecord | undefined;
-  readonly #scanRecords: (query: StateQuery<JsonValue>) => readonly StoredRecord[];
+  readonly #scanRecords: (
+    query: StateQuery<JsonValue>,
+    limit: number | undefined,
+  ) => readonly StoredRecord[];
   readonly #clock: Clock;
   readonly #mutations = new Map<string, Mutation>();
   readonly #operations: OperationJournalEntry[] = [];
@@ -376,7 +379,10 @@ class SqliteTransaction implements StateTransaction {
 
   constructor(
     readRecord: (key: StateKey<JsonValue>) => StoredRecord | undefined,
-    scanRecords: (query: StateQuery<JsonValue>) => readonly StoredRecord[],
+    scanRecords: (
+      query: StateQuery<JsonValue>,
+      limit: number | undefined,
+    ) => readonly StoredRecord[],
     clock: Clock,
   ) {
     this.#readRecord = readRecord;
@@ -409,8 +415,9 @@ class SqliteTransaction implements StateTransaction {
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
     assertStateQuery(query, this.#clock);
+    const baseLimit = query.limit === undefined ? undefined : query.limit + this.#mutations.size;
     const records = new Map(
-      this.#scanRecords(query).map((record) => [serializedKey(record.key), record]),
+      this.#scanRecords(query, baseLimit).map((record) => [serializedKey(record.key), record]),
     );
     for (const [identifier, mutation] of this.#mutations) {
       if (
@@ -1182,28 +1189,52 @@ export class SqliteStateStore implements StateStore {
     identity: IdempotencyIdentity | undefined,
     work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
-    const snapshot = this.#snapshotRecords();
-    const transaction = new SqliteTransaction(
-      (key) => snapshot.get(serializedKey(key)),
-      (query) =>
-        [...snapshot.values()]
-          .filter(
-            (record) =>
-              record.key.namespace === query.namespace &&
-              record.key.collection === query.collection &&
-              (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
-          )
-          .sort((left, right) => compareCodeUnits(left.key.id, right.key.id)),
-      this.#clock,
-    );
+    let snapshotDatabase: DatabaseSync | undefined;
+    let transaction: SqliteTransaction;
+    if (this.#databasePath === ":memory:") {
+      const snapshot = this.#snapshotRecords();
+      transaction = new SqliteTransaction(
+        (key) => snapshot.get(serializedKey(key)),
+        (query, limit) => {
+          const matching = [...snapshot.values()]
+            .filter(
+              (record) =>
+                record.key.namespace === query.namespace &&
+                record.key.collection === query.collection &&
+                (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+                (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
+            )
+            .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
+          return limit === undefined ? matching : matching.slice(0, limit);
+        },
+        this.#clock,
+      );
+    } else {
+      const database = this.#openSnapshotDatabase();
+      snapshotDatabase = database;
+      transaction = new SqliteTransaction(
+        (key) => this.#readRecordFrom(database, key),
+        (query, limit) => this.#scanRecordsFrom(database, query, limit),
+        this.#clock,
+      );
+    }
     let result: T;
+    let staged: StagedTransaction;
     try {
       result = cloneJson(await work(transaction), this.#clock);
+      staged = transaction.finish();
     } catch (error) {
       transaction.abort();
       throw error;
+    } finally {
+      if (snapshotDatabase !== undefined) {
+        try {
+          snapshotDatabase.exec("ROLLBACK");
+        } finally {
+          snapshotDatabase.close();
+        }
+      }
     }
-    const staged = transaction.finish();
     return this.#enqueueCommit(() => this.#commit(options, identity, staged, result));
   }
 
@@ -1539,7 +1570,24 @@ export class SqliteStateStore implements StateStore {
   }
 
   #readRecord(key: StateKey<JsonValue>): StoredRecord | undefined {
-    const row = this.#database()
+    return this.#readRecordFrom(this.#database(), key);
+  }
+
+  #openSnapshotDatabase(): DatabaseSync {
+    const database = new DatabaseSync(this.#databaseIdentity, { readOnly: true });
+    try {
+      database.exec("PRAGMA query_only = ON");
+      database.exec("BEGIN");
+      database.prepare("SELECT MAX(revision) FROM revisions").get();
+      return database;
+    } catch (error) {
+      database.close();
+      throw error;
+    }
+  }
+
+  #readRecordFrom(database: DatabaseSync, key: StateKey<JsonValue>): StoredRecord | undefined {
+    const row = database
       .prepare(
         `
           SELECT namespace, collection_name, record_id, value_json, revision
@@ -1554,6 +1602,14 @@ export class SqliteStateStore implements StateStore {
 
   #scanRecords(query: StateQuery<JsonValue>): readonly StoredRecord[] {
     assertStateQuery(query, this.#clock);
+    return this.#scanRecordsFrom(this.#database(), query, query.limit);
+  }
+
+  #scanRecordsFrom(
+    database: DatabaseSync,
+    query: StateQuery<JsonValue>,
+    limit: number | undefined,
+  ): readonly StoredRecord[] {
     const predicates = ["namespace = ?", "collection_name = ?"];
     const parameters: SQLInputValue[] = [query.namespace, query.collection];
     if (query.idPrefix !== undefined) {
@@ -1564,11 +1620,11 @@ export class SqliteStateStore implements StateStore {
       predicates.push("record_id_order_key > ?");
       parameters.push(Buffer.from(stateStringOrderKey(query.afterId)));
     }
-    const limitClause = query.limit === undefined ? "" : "LIMIT ?";
-    if (query.limit !== undefined) {
-      parameters.push(query.limit);
+    const limitClause = limit === undefined ? "" : "LIMIT ?";
+    if (limit !== undefined) {
+      parameters.push(limit);
     }
-    return this.#database()
+    return database
       .prepare(
         `
           SELECT namespace, collection_name, record_id, value_json, revision
