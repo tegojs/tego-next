@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type JsonValue,
   parseFencingEpoch,
   parseRevision,
   parseWorkerId,
-  type JsonValue,
   type StateStore,
   type StateTransaction,
   type Versioned,
@@ -47,8 +47,7 @@ test("persistent Worker epochs fail without mutating state after the protocol li
     (error: unknown) =>
       error instanceof Error &&
       "diagnostic" in error &&
-      (error as { diagnostic: { code: string } }).diagnostic.code ===
-        "WORKER_EPOCH_LIMIT_EXCEEDED",
+      (error as { diagnostic: { code: string } }).diagnostic.code === "WORKER_EPOCH_LIMIT_EXCEEDED",
   );
   assert.equal(writes, 0);
 });

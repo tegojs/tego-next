@@ -1,10 +1,10 @@
 import {
   DiagnosticError,
+  type FencingEpoch,
+  type JsonObject,
   parseFencingEpoch,
   parseWorkerId,
   runtimeDiagnostic,
-  type FencingEpoch,
-  type JsonObject,
   type StateKey,
   type StateStore,
   type WorkerId,
