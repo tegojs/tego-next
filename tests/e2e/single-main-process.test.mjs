@@ -364,6 +364,7 @@ async function runSystemFlow(runIndex) {
     } finally {
       await rm(directory, { force: true, recursive: true });
       await rm(pluginWorkspace, { force: true, recursive: true });
+      await rm(artifacts.directory, { force: true, recursive: true });
     }
   }
 }
