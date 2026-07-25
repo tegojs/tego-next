@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   compareOperationJournalCursors,
+  createRuntimeSnapshotStateCursor,
   DiagnosticError,
   type JsonObject,
   type JsonValue,
   type PersistedOperationJournalEntry,
   parseOperationId,
   parseRevision,
+  parseRuntimeSnapshotCursor,
+  parseRuntimeSnapshotResponse,
   type RuntimeOperations,
   type ScannedState,
   type StateQuery,
@@ -53,6 +56,13 @@ function snapshotOperation(
       snapshot(request: SnapshotRequest): Promise<SnapshotResponse>;
     }
   ).snapshot.bind(controller);
+}
+
+const cursorPrefix = "tego.snapshot.v1.";
+
+function cursorFromJson(json: string, padded = false): string {
+  const encoded = Buffer.from(json, "utf8").toString("base64url");
+  return `${cursorPrefix}${encoded}${padded ? "=" : ""}`;
 }
 
 function record(id: string, value: JsonObject, revision: string): ScannedState<JsonObject> {
@@ -386,6 +396,67 @@ test("runtime snapshot rejects malformed and cross-section cursor tokens", async
       },
     );
   }
+});
+
+test("runtime snapshot rejects every non-canonical cursor encoding in requests and responses", async () => {
+  const fixture = stateStore();
+  const controller = new RuntimeOperationController({
+    clock: new FakeClock(new Date("2026-07-25T00:00:00.000Z")),
+    state: fixture.state,
+  });
+  controller.openReadOnly();
+  const canonical = createRuntimeSnapshotStateCursor("installations", "installation-a");
+  const nonCanonical = [
+    cursorFromJson(
+      '{"section":"installations","version":1,"position":{"id":"installation-a"}}',
+    ),
+    cursorFromJson(
+      '{"version":1, "section":"installations","position":{"id":"installation-a"}}',
+    ),
+    cursorFromJson(
+      String.raw`{"version":1,"section":"installations","position":{"id":"installation-\u0061"}}`,
+    ),
+    cursorFromJson(
+      '{"version":1.0,"section":"installations","position":{"id":"installation-a"}}',
+    ),
+    `${canonical}=`,
+  ];
+
+  for (const cursor of nonCanonical) {
+    await assert.rejects(snapshotOperation(controller)({ cursors: { installations: cursor } }));
+    assert.throws(() =>
+      parseRuntimeSnapshotResponse({
+        installations: { items: [], nextCursor: cursor },
+        deployments: { items: [] },
+        instances: { items: [] },
+        operations: { items: [] },
+        tasks: { items: [] },
+      }),
+    );
+  }
+});
+
+test("runtime snapshot cursor factory round-trips a 7000-character durable state ID", () => {
+  const id = "record-".padEnd(7_000, "x");
+  const cursor = createRuntimeSnapshotStateCursor("instances", id);
+  assert.ok(cursor.length > 8_192);
+  assert.deepEqual(parseRuntimeSnapshotCursor(cursor, "instances"), {
+    section: "instances",
+    afterId: id,
+  });
+
+  const response = {
+    installations: { items: [] },
+    deployments: { items: [] },
+    instances: {
+      items: [{ id, revision: parseRevision("1"), value: { instanceId: id } }],
+      nextCursor: cursor,
+    },
+    operations: { items: [] },
+    tasks: { items: [] },
+  };
+  assert.ok(Buffer.byteLength(JSON.stringify(response), "utf8") < 768 * 1_024);
+  assert.deepEqual(parseRuntimeSnapshotResponse(response), response);
 });
 
 test("runtime snapshot pages immutable operation versions across a concurrent status update", async () => {
