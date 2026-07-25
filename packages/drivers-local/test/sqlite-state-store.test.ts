@@ -285,6 +285,105 @@ test("migrations are idempotent and configure WAL mode", async () => {
   }
 });
 
+test("simultaneous processes migrate a v3 database without SQLITE_BUSY or lost state", async () => {
+  const databasePath = await temporaryDatabase("concurrent-migration");
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO schema_migrations(version, applied_at)
+      VALUES (1, '2026-07-25T00:00:00.000Z'),
+             (2, '2026-07-25T00:00:00.000Z'),
+             (3, '2026-07-25T00:00:00.000Z');
+    CREATE TABLE revisions (
+      revision INTEGER PRIMARY KEY AUTOINCREMENT
+    ) STRICT;
+    INSERT INTO revisions(revision) VALUES (1);
+    CREATE TABLE records (
+      namespace TEXT NOT NULL,
+      collection_name TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      revision INTEGER NOT NULL REFERENCES revisions(revision),
+      PRIMARY KEY (namespace, collection_name, record_id)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE operations (
+      operation_id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      state_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      revision INTEGER NOT NULL REFERENCES revisions(revision)
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO operations(
+      operation_id, kind, status, state_json, updated_at, revision
+    ) VALUES (
+      'migration-operation',
+      'deploy',
+      'planned',
+      '{"step":"preserved"}',
+      '2026-07-25T00:00:00.000Z',
+      1
+    );
+  `);
+  const insert = database.prepare(
+    `
+      INSERT INTO records(namespace, collection_name, record_id, value_json, revision)
+      VALUES ('migration', 'examples', ?, ?, 1)
+    `,
+  );
+  for (let index = 0; index < 2_000; index += 1) {
+    insert.run(`record-${String(index).padStart(4, "0")}`, `{"index":${String(index)}}`);
+  }
+  database.close();
+
+  const moduleUrl = new URL("../src/index.js", import.meta.url).href;
+  const startsAt = String(Date.now() + 1_000);
+  const childScript = `
+    import { setTimeout as delay } from "node:timers/promises";
+    const [{ SqliteStateStore }] = await Promise.all([import(process.argv[2])]);
+    while (Date.now() < Number(process.argv[3])) await delay(1);
+    const store = new SqliteStateStore({ databasePath: process.argv[1] });
+    await store.open();
+    await store.close();
+  `;
+  await Promise.all([
+    runChild(childScript, [databasePath, moduleUrl, startsAt]),
+    runChild(childScript, [databasePath, moduleUrl, startsAt]),
+  ]);
+
+  const migrated = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assert.deepEqual(
+      migrated
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all()
+        .map((row) => row.version),
+      [1, 2, 3, 4, 5],
+    );
+    assert.equal(migrated.prepare("SELECT COUNT(*) AS count FROM records").get()?.count, 2_000);
+    assert.deepEqual(
+      migrated
+        .prepare(
+          "SELECT operation_id, status, state_json FROM operation_history ORDER BY revision, operation_id",
+        )
+        .all(),
+      [
+        {
+          operation_id: "migration-operation",
+          status: "planned",
+          state_json: '{"step":"preserved"}',
+        },
+      ],
+    );
+  } finally {
+    migrated.close();
+  }
+});
+
 test("idempotency results and fingerprints survive restart", async () => {
   const databasePath = await temporaryDatabase("idempotency");
   const options = {
@@ -452,6 +551,66 @@ test("transaction reads use one immutable SQLite snapshot", async () => {
       return null;
     });
     assert.equal(await transaction.get(recordKey), undefined);
+    return null;
+  });
+
+  await first.close();
+  await second.close();
+});
+
+test("transaction scans decode only their SQL page and keep one immutable snapshot", async () => {
+  const databasePath = await temporaryDatabase("scan-snapshot");
+  const first = await openStore(databasePath);
+  const second = await openStore(databasePath);
+  await first.transact({}, async (transaction) => {
+    await transaction.put(key("scan-snapshot", "B"), { label: "initial" }, {});
+    return null;
+  });
+
+  const database = new DatabaseSync(databasePath);
+  database.prepare("INSERT INTO revisions DEFAULT VALUES").run();
+  database
+    .prepare(
+      `
+        INSERT INTO records(
+          namespace,
+          collection_name,
+          record_id,
+          record_id_order_key,
+          value_json,
+          revision
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `,
+    )
+    .run(
+      "unrelated-invalid",
+      "examples",
+      "broken",
+      Buffer.from(stateStringOrderKey("broken")),
+      '{"not":',
+      2,
+    );
+  database.close();
+
+  await first.transact({}, async (transaction) => {
+    const scan = async () => {
+      const labels = [];
+      for await (const entry of transaction.scan<ExampleRecord>({
+        namespace: "scan-snapshot",
+        collection: "examples",
+        limit: 1,
+      })) {
+        labels.push(entry.value.label);
+      }
+      return labels;
+    };
+
+    assert.deepEqual(await scan(), ["initial"]);
+    await second.transact({}, async (otherTransaction) => {
+      await otherTransaction.put(key("scan-snapshot", "A"), { label: "concurrent" }, {});
+      return null;
+    });
+    assert.deepEqual(await scan(), ["initial"]);
     return null;
   });
 
