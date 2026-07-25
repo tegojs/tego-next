@@ -40,12 +40,19 @@ interface SdkResolutionState {
 const globals = globalThis as typeof globalThis & {
   [SDK_RESOLUTION_STATE]?: SdkResolutionState;
 };
-const sdkResolutionState =
-  globals[SDK_RESOLUTION_STATE] ??
-  (globals[SDK_RESOLUTION_STATE] = {
+function sharedSdkResolutionState(): SdkResolutionState {
+  const existing = globals[SDK_RESOLUTION_STATE];
+  if (existing !== undefined) {
+    return existing;
+  }
+  const created = {
     installed: false,
     activeRoots: new Map<string, number>(),
-  });
+  };
+  globals[SDK_RESOLUTION_STATE] = created;
+  return created;
+}
+const sdkResolutionState = sharedSdkResolutionState();
 
 function isBoundArtifactParent(parentURL: string | undefined): boolean {
   if (parentURL === undefined || !parentURL.startsWith("file:")) {
