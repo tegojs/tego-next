@@ -17,6 +17,7 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DiagnosticError } from "@tegojs/contracts";
+import { readPluginArtifact } from "@tegojs/runtime";
 import { buildPlugin } from "../src/plugin/build-plugin.js";
 import { auditJavaScriptModules } from "../src/plugin/module-audit.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
@@ -104,7 +105,29 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-pack-resolves-the-publ
     const artifactPath = join(directory, "sdk.tego");
     await packPlugin({ artifactPath, pluginDirectory: directory });
     const bytes = await readFile(artifactPath);
-    assert.ok(bytes.includes(Buffer.from('"runtimeImports":["@tegojs/plugin-sdk"]')));
+    const entries = new Map<string, Buffer[]>();
+    await readPluginArtifact(
+      (async function* () {
+        yield bytes;
+      })(),
+      {},
+      {
+        async open(entry) {
+          const chunks: Buffer[] = [];
+          entries.set(entry.path, chunks);
+          return {
+            async write(chunk) {
+              chunks.push(Buffer.from(chunk));
+            },
+            async close() {},
+          };
+        },
+      },
+    );
+    const sbom = JSON.parse(
+      Buffer.concat(entries.get("metadata/sbom.json") ?? []).toString("utf8"),
+    ) as { readonly runtimeImports?: readonly string[] };
+    assert.deepEqual(sbom.runtimeImports, ["@tegojs/plugin-sdk"]);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

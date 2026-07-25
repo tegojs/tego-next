@@ -9,6 +9,8 @@ const DEPENDENCY_FIELDS = [
 
 const CONTRACTS_PACKAGE = "@tegojs/contracts";
 const CLI_PACKAGE = "@tegojs/cli";
+const EXECUTOR_NODE_PACKAGE = "@tegojs/executor-node";
+const PLUGIN_SDK_PACKAGE = "@tegojs/plugin-sdk";
 const TESTKIT_PACKAGE = "@tegojs/testkit";
 
 const FIRST_LAYER_FORBIDDEN_FRAGMENTS = [
@@ -517,6 +519,22 @@ function isTestkitConformanceEdge(source, target, edge) {
   return edge.importingFile.href.startsWith(testOutputDirectory.href);
 }
 
+function isPluginSdkRuntimeEdge(source, target, specifier, edge) {
+  if (
+    source.manifest.name !== EXECUTOR_NODE_PACKAGE ||
+    target.manifest.name !== PLUGIN_SDK_PACKAGE ||
+    specifier !== PLUGIN_SDK_PACKAGE
+  ) {
+    return false;
+  }
+
+  if (edge.kind === "manifest") {
+    return edge.dependencyField === "dependencies";
+  }
+
+  return edge.importingFile.pathname.endsWith("/dist/src/host/component-loader.js");
+}
+
 function addEdgeViolation(violations, source, specifier, workspaces, edge) {
   const target = referencedWorkspace(specifier, workspaces, edge.importingFile);
   if (!target) {
@@ -531,7 +549,8 @@ function addEdgeViolation(violations, source, specifier, workspaces, edge) {
     source.kind === "first-layer" &&
     (source.manifest.name === CONTRACTS_PACKAGE ||
       (target.manifest.name !== CONTRACTS_PACKAGE &&
-        !isTestkitConformanceEdge(source, target, edge)))
+        !isTestkitConformanceEdge(source, target, edge) &&
+        !isPluginSdkRuntimeEdge(source, target, specifier, edge)))
   ) {
     violations.add(`${source.manifest.name} -> ${specifier}`);
   }

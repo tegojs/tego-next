@@ -6,5 +6,5 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "references": [{ "path": "../contracts" }, { "path": "../testkit" }]
+  "references": [{ "path": "../contracts" }, { "path": "../plugin-sdk" }, { "path": "../testkit" }]
 }

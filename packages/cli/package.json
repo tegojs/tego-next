@@ -25,6 +25,7 @@
     "@tegojs/drivers-local": "0.0.0",
     "@tegojs/drivers-postgres": "0.0.0",
     "@tegojs/executor-node": "0.0.0",
+    "@tegojs/plugin-sdk": "0.0.0",
     "@tegojs/runtime": "0.0.0",
     "@tegojs/transport-websocket": "0.0.0",
     "typescript": "7.0.2"

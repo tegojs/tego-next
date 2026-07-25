@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { chmod, lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
 
 export interface BuildPluginOptions {
@@ -129,12 +130,29 @@ async function runCompiler(
 ): Promise<void> {
   const require = createRequire(import.meta.url);
   const compilerPath = join(dirname(require.resolve("typescript/package.json")), "bin", "tsc");
+  const compilerConfiguration = join(temporaryRoot, "tsconfig.json");
+  const sdkTypesPath = fileURLToPath(import.meta.resolve("@tegojs/plugin-sdk")).replace(
+    /\.js$/u,
+    ".d.ts",
+  );
+  await writeFile(
+    compilerConfiguration,
+    JSON.stringify({
+      extends: tsconfigPath,
+      compilerOptions: {
+        paths: {
+          "@tegojs/plugin-sdk": [sdkTypesPath],
+        },
+        skipLibCheck: true,
+      },
+    }),
+  );
   const child = spawn(
     process.execPath,
     [
       compilerPath,
       "-p",
-      tsconfigPath,
+      compilerConfiguration,
       "--rootDir",
       sourceRoot,
       "--outDir",
@@ -194,6 +212,7 @@ async function runCompiler(
       }),
     );
   });
+  await rm(compilerConfiguration, { force: true });
 
   if (exitCode !== 0) {
     throw new DiagnosticError(

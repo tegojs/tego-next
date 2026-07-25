@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm exec --offline -- tsc -p tsconfig.json",
-    "test:unit": "npm run build && node --test test/*.test.ts",
+    "build": "node scripts/build.mjs",
+    "test:unit": "node scripts/build.mjs --test",
     "typecheck": "tsc -p tsconfig.json --noEmit --pretty false && tsc --ignoreConfig --noEmit --pretty false --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --verbatimModuleSyntax --skipLibCheck test/component.test.ts"
   },
   "dependencies": {

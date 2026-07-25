@@ -11,6 +11,7 @@
     { "path": "../drivers-local" },
     { "path": "../drivers-postgres" },
     { "path": "../executor-node" },
+    { "path": "../plugin-sdk" },
     { "path": "../runtime" },
     { "path": "../transport-websocket" }
   ]

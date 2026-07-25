@@ -9,7 +9,9 @@ test("echo is executor-neutral and loading only records the fixture marker", asy
   const globals = globalThis as Record<PropertyKey, unknown>;
   const beforeKeys = new Set(Reflect.ownKeys(globalThis));
   const beforeMarker = typeof globals[marker] === "number" ? globals[marker] : 0;
-  const component = (await import(`../build/components/component.js?test=${Date.now()}`))
+  const componentUrl = process.env.TEGO_ECHO_COMPONENT_URL;
+  assert.ok(componentUrl, "test runner must provide the temporary compiled component URL");
+  const component = (await import(`${componentUrl}?test=${Date.now()}`))
     .default as typeof echoComponent;
 
   const addedKeys = Reflect.ownKeys(globalThis).filter((key) => !beforeKeys.has(key));
@@ -27,10 +29,7 @@ test("echo is executor-neutral and loading only records the fixture marker", asy
   assert.strictEqual(await run(undefined as never, input), input);
 
   const source = await readFile(new URL("../src/component.ts", import.meta.url), "utf8");
-  assert.match(
-    source,
-    /import\s*\{\s*defineComponent\s*\}\s*from\s*["']@tegojs\/plugin-sdk["']/u,
-  );
+  assert.match(source, /import\s*\{\s*defineComponent\s*\}\s*from\s*["']@tegojs\/plugin-sdk["']/u);
   assert.doesNotMatch(source, /@tegojs\/(?:executor|transport)/u);
 
   const manifest = JSON.parse(
