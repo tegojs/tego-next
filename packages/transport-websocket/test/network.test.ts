@@ -267,6 +267,44 @@ test("@spec:worker-protocol/real-process-transport-acceptance/listen-abort-regis
   }
 });
 
+test("@spec:worker-protocol/real-process-transport-acceptance/listener-errors-use-bounded-sink", async () => {
+  const firstWorkerId = parseWorkerId("worker-listener-error-first");
+  const secondWorkerId = parseWorkerId("worker-listener-error-second");
+  const firstMain = createMainEndpoint({
+    credential: "first-secret",
+    workerId: firstWorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const secondMain = createMainEndpoint({
+    credential: "second-secret",
+    workerId: secondWorkerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const listener = await listenForMain({
+    endpoint: firstMain,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const errors: Error[] = [];
+
+  try {
+    const outcome = await listenForMain({
+      endpoint: secondMain,
+      host: "127.0.0.1",
+      port: Number(listener.url.port),
+      onError: (error: Error) => errors.push(error),
+    }).then(
+      () => "listening" as const,
+      () => "failed" as const,
+    );
+    assert.equal(outcome, "failed");
+    assert.equal(errors.length, 1);
+    assert.equal((errors[0] as NodeJS.ErrnoException).code, "EADDRINUSE");
+  } finally {
+    await Promise.all([listener.close(), firstMain.close(), secondMain.close()]);
+  }
+});
+
 test("@spec:worker-protocol/prepared-artifact-admission/rejects-before-ack-and-persistence", async () => {
   for (const reason of ["missing", "ambiguous"] as const) {
     const workerId = parseWorkerId(`worker-artifact-${reason}`);
