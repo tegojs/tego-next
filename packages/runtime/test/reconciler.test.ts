@@ -1605,6 +1605,79 @@ test("canonical instance values stored under non-canonical keys remain inconsist
   await reconciler.stop();
 });
 
+test("restores persisted ready local sessions before reconciliation and requires them to be live", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const instanceBefore = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  const restored: ComponentInstance[] = [];
+  const effects = new RecordingEffects() as RecordingEffects & {
+    restore(instance: ComponentInstance): Promise<void>;
+    isLive(instance: ComponentInstance): boolean;
+  };
+  effects.restore = async (instance) => {
+    restored.push(instance);
+  };
+  effects.isLive = () => false;
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    authority: { resource: "runtime:app", epoch: parseFencingEpoch("9") },
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    restored.map((instance) => instance.instanceId),
+    [planned.instanceId],
+  );
+  assert.equal(reconciler.applicationReady(), false);
+  assert.equal(state.operations.size, 0);
+  assert.equal(
+    (
+      await state.read({
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      })
+    )?.revision,
+    instanceBefore?.revision,
+  );
+  await reconciler.stop();
+});
+
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();

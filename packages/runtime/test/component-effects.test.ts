@@ -9,6 +9,7 @@ import {
   parseMessageId,
   parseOperationId,
   parsePluginId,
+  parseRevision,
   type PluginDeployment,
   type RuntimeAuthority,
 } from "@tegojs/contracts";
@@ -19,6 +20,7 @@ import type {
 import { ComponentEffects } from "../src/components/component-effects.js";
 import { ComponentRegistry } from "../src/components/component-registry.js";
 import type { ReconcileEffect, ReconcileEffectKind } from "../src/reconcile/plan.js";
+import type { ComponentInstance } from "../src/reconcile/plan.js";
 
 const artifactDigest = parseArtifactDigest(`sha256:${"1".repeat(64)}`);
 const applicationId = parseApplicationId("app");
@@ -78,6 +80,21 @@ function effect(kind: ReconcileEffectKind): ReconcileEffect {
     deploymentGeneration: generation,
     artifactDigest,
     executor: "thread",
+  };
+}
+
+function readyInstance(): ComponentInstance {
+  return {
+    applicationId,
+    artifactDigest,
+    componentId,
+    deploymentGeneration: generation,
+    executor: "thread",
+    instanceId,
+    lifecycle: "ready",
+    observedGeneration: generation,
+    pluginId,
+    revision: parseRevision("1"),
   };
 }
 
@@ -192,6 +209,53 @@ test("@spec:plugin-deployment/idempotent-reconciliation/component-effects", asyn
   assert.equal(cache.prepares, 1);
   assert.equal(cache.releases, 1);
   assert.deepEqual(calls, [`start:${instanceId}`, `drain:${instanceId}`, `stop:${instanceId}`]);
+});
+
+test("restores one exact persisted ready session idempotently and closes it without durable effects", async () => {
+  const { cache, calls, effects, registry } = harness();
+  const lifecycle = effects as ComponentEffects & {
+    restore(instance: ComponentInstance): Promise<void>;
+    isLive(instance: ComponentInstance): boolean;
+    close(): Promise<void>;
+  };
+  const instance = readyInstance();
+
+  await lifecycle.restore(instance);
+  await lifecycle.restore(instance);
+
+  assert.equal(lifecycle.isLive(instance), true);
+  assert.equal(registry.require(instanceId).state, "active");
+  assert.equal(cache.prepares, 1);
+  assert.deepEqual(calls, [`start:${instanceId}`]);
+
+  await lifecycle.close();
+  await lifecycle.close();
+
+  assert.equal(lifecycle.isLive(instance), false);
+  assert.equal(registry.get(instanceId), undefined);
+  assert.equal(cache.releases, 1);
+  assert.deepEqual(calls, [`start:${instanceId}`, `stop:${instanceId}`]);
+});
+
+test("bulk close releases only sessions owned by the exact authority", async () => {
+  const first = { resource: "runtime:app", epoch: parseFencingEpoch("1") };
+  const second = { resource: "runtime:app", epoch: parseFencingEpoch("2") };
+  const { cache, calls, effects, registry, setAuthority } = harness({ authority: first });
+  const lifecycle = effects as ComponentEffects & {
+    restore(instance: ComponentInstance): Promise<void>;
+    close(authority?: RuntimeAuthority): Promise<void>;
+  };
+
+  await lifecycle.restore(readyInstance());
+  setAuthority(second);
+  await lifecycle.close(second);
+  assert.equal(registry.require(instanceId).state, "active");
+  assert.equal(cache.releases, 0);
+
+  await lifecycle.close(first);
+  assert.equal(registry.get(instanceId), undefined);
+  assert.equal(cache.releases, 1);
+  assert.deepEqual(calls, [`start:${instanceId}`, `stop:${instanceId}`]);
 });
 
 test("operation identity replay is idempotent and conflicting payloads are rejected", async () => {

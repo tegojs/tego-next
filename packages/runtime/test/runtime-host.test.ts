@@ -606,6 +606,7 @@ test("single-main start waits for authority and initial reconciliation", async (
   assert.equal((await runtime.status()).authority?.epoch, "1");
   assert.equal((await runtime.status()).acceptingOperations, true);
   assert.ok(value.log.indexOf("tasks.recover") < value.log.indexOf("reconciler.start:1"));
+  assert.ok(value.log.indexOf("reconciler.start:1") < value.log.indexOf("tasks.authority:1"));
   await runtime.stop();
 });
 
