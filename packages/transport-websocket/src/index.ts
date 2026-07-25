@@ -2,6 +2,7 @@ export * from "./authentication.js";
 export * from "./clock.js";
 export * from "./codec.js";
 export * from "./main-endpoint.js";
+export * from "./network.js";
 export * from "./remote-executor.js";
 export * from "./remote-protocol.js";
 export * from "./result-buffer.js";

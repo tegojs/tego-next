@@ -23,6 +23,29 @@ import {
 
 const deadlineMs = 2_000;
 
+async function eventuallyWithIo<T>(assertion: () => Promise<T> | T): Promise<T> {
+  return await eventually(assertion, {
+    attempts: 100,
+    advance: async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    },
+  });
+}
+
+async function beforeDeadline<T>(promise: Promise<T>, label: string): Promise<T> {
+  const signal = AbortSignal.timeout(deadlineMs);
+  return await Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new Error(`Timed out waiting for ${label}`, { cause: signal.reason })),
+        { once: true },
+      );
+    }),
+  ]);
+}
+
 async function waitForSessionState(
   session: WorkerSession,
   predicate: (state: WorkerSession["state"]) => boolean,
@@ -112,7 +135,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/main-initiated-loo
 
   try {
     await session.ready;
-    assert.equal(worker.current?.available, true);
+    await eventuallyWithIo(() => assert.equal(worker.current?.available, true));
   } finally {
     await Promise.all([session.close(), listener.close(), main.close(), worker.close()]);
   }
@@ -145,9 +168,17 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
     credential: "recovery-secret",
     workerId,
   });
+  let mainAttached = Promise.withResolvers<void>();
   const attachMain = async (session: WorkerSession): Promise<void> => {
-    await session.ready;
-    await remote.attach(session);
+    const attached = mainAttached;
+    try {
+      await session.ready;
+      await remote.attach(session);
+      attached.resolve();
+    } catch (error) {
+      attached.reject(error);
+      throw error;
+    }
   };
   let listener = await listenForMain({
     endpoint: main,
@@ -160,7 +191,8 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
   try {
     await workerSession.ready;
     await runtime.attach(workerSession);
-    await eventually(async () => assert.equal((await remote.probe()).available, true));
+    await beforeDeadline(mainAttached.promise, "initial Main execution attachment");
+    assert.equal((await remote.probe()).available, true);
     const firstEpoch = workerSession.epoch;
     const request = executionRequest(
       { mode: "wait" },
@@ -172,7 +204,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
     void handle.result.then(() => {
       terminalResults += 1;
     });
-    await eventually(() => assert.equal(local.executions, 1));
+    await eventuallyWithIo(() => assert.equal(local.executions, 1));
     const localAttempt = [...local.attempts.values()][0];
     assert.ok(localAttempt);
 
@@ -180,8 +212,9 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
     await listener.close();
     await closed;
     local.complete(localAttempt, "succeeded", "reconciled");
-    await eventually(() => assert.equal(runtime.bufferedResultCount, 1));
+    await eventuallyWithIo(() => assert.equal(runtime.bufferedResultCount, 1));
 
+    mainAttached = Promise.withResolvers<void>();
     listener = await listenForMain({
       endpoint: main,
       host: "127.0.0.1",
@@ -191,10 +224,11 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
     workerSession = await connectWorker({ endpoint: worker, url: listener.url });
     await workerSession.ready;
     await runtime.attach(workerSession);
+    await beforeDeadline(mainAttached.promise, "reconnected Main execution attachment");
 
     assert.ok(BigInt(workerSession.epoch) > BigInt(firstEpoch));
     assert.equal((await handle.result).output, "reconciled");
-    await eventually(() => assert.equal(runtime.bufferedResultCount, 0));
+    await eventuallyWithIo(() => assert.equal(runtime.bufferedResultCount, 0));
     assert.equal(terminalResults, 1);
     assert.equal(local.executions, 1);
   } finally {

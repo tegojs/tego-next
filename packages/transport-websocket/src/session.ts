@@ -353,6 +353,7 @@ export class WorkerSession {
   readonly #handshakeAbort = new AbortController();
   readonly #listeners = new Set<(message: WorkerSessionMessage) => void>();
   readonly #stateListeners = new Set<(state: WorkerSessionState) => void>();
+  readonly #pendingMessages: WorkerSessionMessage[] = [];
   readonly #receivedIds = new Set<string>();
   readonly #receivedIdOrder: string[] = [];
   readonly #pendingBinary = new Map<string, PendingBinary>();
@@ -377,6 +378,7 @@ export class WorkerSession {
   #registrationPending = false;
   #lastHeartbeatAt = 0;
   #pendingBinaryBytes = 0;
+  #pendingMessageBytes = 0;
   #detached = false;
   #closedNotified = false;
 
@@ -479,6 +481,15 @@ export class WorkerSession {
 
   onMessage(listener: (message: WorkerSessionMessage) => void): () => void {
     this.#listeners.add(listener);
+    const pending = this.#pendingMessages.splice(0);
+    this.#pendingMessageBytes = 0;
+    for (const message of pending) {
+      try {
+        listener(message);
+      } catch {
+        // Consumer callbacks do not participate in the authenticated protocol state machine.
+      }
+    }
     return () => this.#listeners.delete(listener);
   }
 
@@ -778,6 +789,34 @@ export class WorkerSession {
       this.#pendingRequests.delete(envelope.correlationId as string);
       request.timeout.abort();
       request.resolve(message);
+      return;
+    }
+    if (this.#listeners.size === 0) {
+      const bytes =
+        Buffer.byteLength(
+          JSON.stringify({
+            messageId: message.messageId,
+            ...(message.correlationId === undefined
+              ? {}
+              : { correlationId: message.correlationId }),
+            type: message.type,
+            payload: message.payload,
+          }),
+          "utf8",
+        ) + (message.binary?.byteLength ?? 0);
+      const maxPendingMessageBytes =
+        this.#codec.limits.maxBinaryBytes + this.#codec.limits.maxFrameBytes;
+      if (
+        this.#pendingMessages.length >= this.#codec.limits.maxInflightMessages ||
+        this.#pendingMessageBytes + bytes > maxPendingMessageBytes
+      ) {
+        throw diagnosticError(
+          "PROTOCOL_INFLIGHT_LIMIT_EXCEEDED",
+          "Worker session pending application message limit was reached",
+        );
+      }
+      this.#pendingMessages.push(message);
+      this.#pendingMessageBytes += bytes;
       return;
     }
     for (const listener of this.#listeners) {
@@ -1203,6 +1242,8 @@ export class WorkerSession {
     this.#socket.off("error", this.#errorListener);
     this.#listeners.clear();
     this.#stateListeners.clear();
+    this.#pendingMessages.length = 0;
+    this.#pendingMessageBytes = 0;
     if (!this.#closedNotified) {
       this.#closedNotified = true;
       this.#onClosed?.(this);

@@ -43,6 +43,11 @@ const DEFAULT_MAX_INVENTORY = 512;
 const INVENTORY_ENVELOPE_RESERVE_BYTES = 4 * 1024;
 const MAX_PERSISTENCE_ATTEMPTS = 8;
 
+export interface WorkerAssignmentRejection {
+  readonly code: RuntimeDiagnostic["code"];
+  readonly message: string;
+}
+
 class AttemptPersistenceUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -56,6 +61,9 @@ export interface WorkerRuntimeOptions {
   readonly attemptStore: RemoteAttemptStore;
   readonly resultStore?: RemoteResultStore;
   readonly selectExecutor: (request: ExecutionRequest) => Executor | Promise<Executor>;
+  readonly validateAssignment?: (
+    request: ExecutionRequest,
+  ) => Promise<WorkerAssignmentRejection | undefined> | WorkerAssignmentRejection | undefined;
   readonly preparedArtifacts?: () => readonly string[] | Promise<readonly string[]>;
   readonly maxAssignments?: number;
   readonly maxAssignmentBytes?: number;
@@ -88,6 +96,7 @@ export class WorkerRuntime {
   readonly #attemptStore: RemoteAttemptStore;
   readonly #resultStore: RemoteResultStore | undefined;
   readonly #selectExecutor: WorkerRuntimeOptions["selectExecutor"];
+  readonly #validateAssignment: WorkerRuntimeOptions["validateAssignment"];
   readonly #preparedArtifacts: WorkerRuntimeOptions["preparedArtifacts"];
   readonly #maxAssignments: number;
   readonly #maxAssignmentBytes: number;
@@ -119,6 +128,7 @@ export class WorkerRuntime {
     this.#attemptStore = options.attemptStore;
     this.#resultStore = options.resultStore;
     this.#selectExecutor = options.selectExecutor;
+    this.#validateAssignment = options.validateAssignment;
     this.#preparedArtifacts = options.preparedArtifacts;
     this.#maxAssignments = positiveLimit(
       options.maxAssignments,
@@ -426,6 +436,17 @@ export class WorkerRuntime {
       throw new Error("Remote assignment exceeds maxAssignmentBytes");
     }
     const request = parseRemoteRequest(payload.request);
+    const rejection = await this.#validateAssignment?.(request);
+    if (rejection !== undefined) {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        rejection.code,
+        rejection.message,
+      );
+      return;
+    }
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
     if (await this.#rejectUnavailableAttemptStore(session, message.messageId, request)) return;

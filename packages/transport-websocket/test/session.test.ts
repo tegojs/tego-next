@@ -417,6 +417,7 @@ interface DirectConnection {
 }
 
 async function directConnection(options?: {
+  readonly maxBinaryBytes?: number;
   readonly maxFrameBytes?: number;
   readonly maxPendingCorrelations?: number;
   readonly maxInflightMessages?: number;
@@ -425,6 +426,7 @@ async function directConnection(options?: {
 }): Promise<DirectConnection> {
   const clock = new FakeClock();
   const limits = {
+    ...(options?.maxBinaryBytes === undefined ? {} : { maxBinaryBytes: options.maxBinaryBytes }),
     ...(options?.maxFrameBytes === undefined ? {} : { maxFrameBytes: options.maxFrameBytes }),
     ...(options?.maxPendingCorrelations === undefined
       ? {}
@@ -825,6 +827,7 @@ test(
   { timeout: 2_000 },
   async () => {
     const connection = await directConnection({
+      maxBinaryBytes: 64,
       maxFrameBytes: 512,
       maxInflightMessages: 10,
     });
@@ -833,8 +836,10 @@ test(
       if (state === "closed") closed.resolve();
     });
     await connection.mainSession.send("session.reconcile", { value: "x".repeat(180) });
-    await connection.mainSession.send("session.reconcile", { value: "y".repeat(180) });
-    await connection.mainSession.send("session.reconcile", { value: "z".repeat(180) });
+    await assert.rejects(async () => {
+      await connection.mainSession.send("session.reconcile", { value: "y".repeat(180) });
+      await connection.mainSession.send("session.reconcile", { value: "z".repeat(180) });
+    }, /closed|available/iu);
 
     await closed.promise;
     assert.equal(
