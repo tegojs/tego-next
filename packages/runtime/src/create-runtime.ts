@@ -394,11 +394,11 @@ class TegoRuntime implements Runtime {
       return;
     }
 
-    await this.#services.tasks.setAuthority(authority);
     const reconciler = this.#services.createReconciler(authority);
     this.#reconciler = reconciler;
     this.#reconcilerAuthority = structuredClone(authority);
     await reconciler.start();
+    await this.#services.tasks.setAuthority(authority);
     this.#leadership = structuredClone(authority);
     if (this.#lifecycle === "running" && !this.#stopRequested) {
       this.operations.openMutations();

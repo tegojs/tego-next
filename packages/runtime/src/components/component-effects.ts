@@ -1,5 +1,8 @@
 import {
   DiagnosticError,
+  parseMessageId,
+  parseOperationId,
+  parseRevision,
   parseWorkerId,
   runtimeDiagnostic,
   serializeCause,
@@ -10,7 +13,7 @@ import {
 import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { PreparedArtifactCache } from "../artifacts/prepared-artifact-cache.js";
 import type { ComponentEffectExecutor } from "../reconcile/reconciler.js";
-import type { ReconcileEffect } from "../reconcile/plan.js";
+import type { ComponentInstance, ReconcileEffect } from "../reconcile/plan.js";
 import type {
   ComponentRegistry,
   ComponentBinding,
@@ -178,6 +181,85 @@ export class ComponentEffects implements ComponentEffectExecutor {
       },
     );
     return result;
+  }
+
+  async restore(
+    instance: ComponentInstance,
+    authority: RuntimeAuthority | undefined = this.#authority(),
+  ): Promise<void> {
+    const effect = this.#restorationEffect(instance, "start");
+    this.#assertCurrentAuthority(effect, authority);
+    let entry = this.#registry.get(instance.instanceId);
+    if (entry !== undefined) {
+      this.#registry.assertMatches(effect, entry, authority);
+      if (entry.state === "active") return;
+      if (entry.state !== "prepared") {
+        throw effectError(
+          "LIFECYCLE_TRANSITION_INVALID",
+          "Only a prepared component binding can be restored",
+          effect,
+        );
+      }
+    } else {
+      await this.#prepare(effect, authority);
+      entry = this.#registry.require(instance.instanceId);
+    }
+    await this.#host.start(entry.binding);
+    if (!this.#authorityMatches(authority)) {
+      await this.#cleanupAfterAuthorityLoss(effect, entry, authority);
+      throw effectError(
+        "LIFECYCLE_AUTHORITY_LOST",
+        "Leadership authority changed while the component was being restored",
+        effect,
+      );
+    }
+    this.#registry.transition(effect, "prepared", "active", authority);
+  }
+
+  isLive(
+    instance: ComponentInstance,
+    authority: RuntimeAuthority | undefined = this.#authority(),
+  ): boolean {
+    if (instance.artifactDigest === undefined) return false;
+    const entry = this.#registry.get(instance.instanceId);
+    if (entry === undefined || entry.state !== "active") return false;
+    const effect = this.#restorationEffect(instance, "start");
+    return this.#authorityMatches(authority) && this.#registry.matches(effect, entry, authority);
+  }
+
+  async close(authority: RuntimeAuthority | undefined = this.#authority()): Promise<void> {
+    const failures: unknown[] = [];
+    for (const entry of this.#registry.entries()) {
+      if (!sameAuthority(entry.binding.authority, authority)) continue;
+      const instance: ComponentInstance = {
+        applicationId: entry.binding.deployment.applicationId,
+        artifactDigest: entry.binding.artifact.digest,
+        componentId: entry.binding.component.componentId,
+        deploymentGeneration: entry.binding.deployment.generation,
+        executor: entry.binding.executor,
+        instanceId: entry.binding.instanceId,
+        lifecycle: "ready",
+        observedGeneration: entry.binding.deployment.generation,
+        pluginId: entry.binding.deployment.pluginId,
+        revision: parseRevision("0"),
+        ...(entry.binding.workerId === undefined ? {} : { workerId: entry.binding.workerId }),
+      };
+      try {
+        await this.#stop(this.#restorationEffect(instance, "stop"), entry, authority);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "LIFECYCLE_CLOSE_FAILED",
+          message: "Component lifecycle cleanup completed with failures",
+          source: { kind: "runtime", id: authority?.resource ?? "components" },
+          details: { causes: failures.map((failure) => serializeCause(failure)) },
+        }),
+      );
+    }
   }
 
   async #perform(effect: ReconcileEffect, authority: RuntimeAuthority | undefined): Promise<void> {
@@ -421,6 +503,26 @@ export class ComponentEffects implements ComponentEffectExecutor {
   #authorityMatches(expected: RuntimeAuthority | undefined): boolean {
     const current = this.#authority();
     return current?.resource === expected?.resource && current?.epoch === expected?.epoch;
+  }
+
+  #restorationEffect(instance: ComponentInstance, kind: "start" | "stop"): ReconcileEffect {
+    if (instance.lifecycle !== "ready" || instance.artifactDigest === undefined) {
+      throw new TypeError("Only exact persisted ready component instances can be restored");
+    }
+    const identity = `restore.${instance.instanceId}.${kind}`;
+    return {
+      kind,
+      operationId: parseOperationId(identity),
+      messageId: parseMessageId(identity),
+      instanceId: instance.instanceId,
+      applicationId: instance.applicationId,
+      pluginId: instance.pluginId,
+      componentId: instance.componentId,
+      deploymentGeneration: instance.deploymentGeneration,
+      artifactDigest: instance.artifactDigest,
+      executor: instance.executor,
+      ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
+    };
   }
 
   #forgetInstanceOperations(instanceId: string, retainedOperationId: string): void {

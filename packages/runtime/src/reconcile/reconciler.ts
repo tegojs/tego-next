@@ -58,6 +58,9 @@ const claimLeaseMs = 30_000;
 export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
   perform(effect: ReconcileEffect): Promise<void>;
+  restore?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  isLive?(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
+  close?(authority?: RuntimeAuthority): Promise<void>;
 }
 
 export interface ReconcileArtifactGate {
@@ -304,7 +307,18 @@ export class Reconciler {
   async start(): Promise<void> {
     if (this.#running) return;
     this.#running = true;
-    await this.wake();
+    try {
+      await this.#restoreReadyComponents();
+      await this.wake();
+    } catch (error) {
+      this.#running = false;
+      try {
+        await this.#options.effects.close?.(this.#options.authority);
+      } catch (closeError) {
+        throw new AggregateError([error, closeError], "Reconciler startup cleanup failed");
+      }
+      throw error;
+    }
   }
 
   wake(): Promise<void> {
@@ -317,6 +331,7 @@ export class Reconciler {
   async stop(): Promise<void> {
     this.#running = false;
     await this.#tail;
+    await this.#options.effects.close?.(this.#options.authority);
   }
 
   diagnostics(): readonly RuntimeDiagnostic[] {
@@ -547,6 +562,45 @@ export class Reconciler {
     return instances;
   }
 
+  async #restoreReadyComponents(): Promise<void> {
+    if (this.#options.effects.restore === undefined) return;
+    const [deployments, loadedInstances] = await Promise.all([
+      this.#loadDeployments(),
+      this.#loadInstances(),
+    ]);
+    const restorable = loadedInstances
+      .filter((record) => isCanonicalInstance(record))
+      .map((record) => record.value)
+      .filter(
+        (instance) =>
+          instance.lifecycle === "ready" &&
+          instance.workerId === undefined &&
+          instance.artifactDigest !== undefined &&
+          this.#options.effects.supportedExecutors.includes(instance.executor) &&
+          deployments.some(
+            (deployment) =>
+              deployment.state === "active" &&
+              deployment.applicationId === instance.applicationId &&
+              deployment.pluginId === instance.pluginId &&
+              deployment.generation === instance.deploymentGeneration &&
+              deployment.artifactDigest === instance.artifactDigest,
+          ),
+      )
+      .sort((left, right) =>
+        left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
+      );
+    for (const instance of restorable) {
+      await this.#options.effects.restore(instance, this.#options.authority);
+    }
+  }
+
+  #isReadyAndLive(instance: ComponentInstance): boolean {
+    return (
+      instance.lifecycle === "ready" &&
+      (this.#options.effects.isLive?.(instance, this.#options.authority) ?? true)
+    );
+  }
+
   async #gateDeployment(
     deployment: PluginDeployment,
     deployments: readonly PluginDeployment[],
@@ -678,7 +732,7 @@ export class Reconciler {
           candidateInstallation.manifest.components.every((component) =>
             candidateInstances.some(
               (instance) =>
-                instance.componentId === component.componentId && instance.lifecycle === "ready",
+                instance.componentId === component.componentId && this.#isReadyAndLive(instance),
             ),
           ),
         provides: candidateInstallation.manifest.capabilities.provides,
@@ -1333,7 +1387,7 @@ export class Reconciler {
       const ready = installation.manifest.components.every((component) =>
         deploymentInstances.some(
           (instance) =>
-            instance.componentId === component.componentId && instance.lifecycle === "ready",
+            instance.componentId === component.componentId && this.#isReadyAndLive(instance),
         ),
       );
       if (ready) {

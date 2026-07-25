@@ -69,6 +69,10 @@ function cloneFrozen<T extends JsonValue>(value: T): T {
 export class ComponentRegistry {
   readonly #entries = new Map<string, RegisteredComponent>();
 
+  entries(): readonly RegisteredComponent[] {
+    return [...this.#entries.values()];
+  }
+
   get(instanceId: string): RegisteredComponent | undefined {
     return this.#entries.get(instanceId);
   }
@@ -244,16 +248,23 @@ export class ComponentRegistry {
     entry: RegisteredComponent,
     authority?: RuntimeAuthority,
   ): void {
-    if (
-      !this.#matchesIdentity(effect, entry) ||
-      !sameAuthority(entry.binding.authority, authority)
-    ) {
+    if (!this.matches(effect, entry, authority)) {
       throw lifecycleError(
         "LIFECYCLE_INSTANCE_IDENTITY_MISMATCH",
         "Component effect identity does not match the registered immutable binding",
         effect,
       );
     }
+  }
+
+  matches(
+    effect: ReconcileEffect,
+    entry: RegisteredComponent,
+    authority?: RuntimeAuthority,
+  ): boolean {
+    return (
+      this.#matchesIdentity(effect, entry) && sameAuthority(entry.binding.authority, authority)
+    );
   }
 
   #matchesIdentity(effect: ReconcileEffect, entry: RegisteredComponent): boolean {
