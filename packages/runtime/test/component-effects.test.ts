@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type PluginDeployment,
   parseApplicationId,
   parseArtifactDigest,
   parseComponentId,
@@ -10,7 +11,6 @@ import {
   parseOperationId,
   parsePluginId,
   parseRevision,
-  type PluginDeployment,
   type RuntimeAuthority,
 } from "@tegojs/contracts";
 import type {
@@ -19,8 +19,11 @@ import type {
 } from "../src/artifacts/prepared-artifact-cache.js";
 import { ComponentEffects } from "../src/components/component-effects.js";
 import { ComponentRegistry } from "../src/components/component-registry.js";
-import type { ReconcileEffect, ReconcileEffectKind } from "../src/reconcile/plan.js";
-import type { ComponentInstance } from "../src/reconcile/plan.js";
+import type {
+  ComponentInstance,
+  ReconcileEffect,
+  ReconcileEffectKind,
+} from "../src/reconcile/plan.js";
 
 const artifactDigest = parseArtifactDigest(`sha256:${"1".repeat(64)}`);
 const applicationId = parseApplicationId("app");

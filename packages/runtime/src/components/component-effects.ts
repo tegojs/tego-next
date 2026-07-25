@@ -1,23 +1,23 @@
 import { createHash } from "node:crypto";
 import {
   DiagnosticError,
+  type ExecutorKind,
+  type PluginDeployment,
   parseMessageId,
   parseOperationId,
   parseRevision,
   parseWorkerId,
+  type RuntimeAuthority,
   runtimeDiagnostic,
   serializeCause,
-  type ExecutorKind,
-  type PluginDeployment,
-  type RuntimeAuthority,
 } from "@tegojs/contracts";
 import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { PreparedArtifactCache } from "../artifacts/prepared-artifact-cache.js";
-import type { ComponentEffectExecutor } from "../reconcile/reconciler.js";
 import type { ComponentInstance, ReconcileEffect } from "../reconcile/plan.js";
+import type { ComponentEffectExecutor } from "../reconcile/reconciler.js";
 import type {
-  ComponentRegistry,
   ComponentBinding,
+  ComponentRegistry,
   RegisteredComponent,
 } from "./component-registry.js";
 
