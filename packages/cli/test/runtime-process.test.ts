@@ -117,13 +117,13 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
     options: MainProcessWithFactory,
   ) => ReturnType<typeof runMainProcess>;
   const controller = new AbortController();
-  controller.abort();
 
   await assert.rejects(
     runWithFactory({
       endpoint: "",
       runtime: controlledRuntime(),
       signal: controller.signal,
+      onReady: () => controller.abort(),
       controlServerFactory: async () => ({
         endpoint: "in-memory",
         close: async () => {

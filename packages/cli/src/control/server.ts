@@ -254,6 +254,12 @@ export async function startControlServer(options: ControlServerOptions): Promise
     const frame = Buffer.allocUnsafe(maxLineBytes);
     let bytes = 0;
     let handled = false;
+    let reservationOwner: "dispatch" | "released" | "socket" = "socket";
+    const releaseReservation = (owner: "dispatch" | "socket") => {
+      if (reservationOwner !== owner) return;
+      reservationOwner = "released";
+      reservations -= 1;
+    };
     const readTimer = setTimeout(() => {
       if (handled) return;
       handled = true;
@@ -271,7 +277,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
     readTimer.unref();
     socket.once("close", () => {
       clearTimeout(readTimer);
-      reservations -= 1;
+      releaseReservation("socket");
     });
     socket.on("data", (chunk: Buffer) => {
       if (handled || closing) return;
@@ -310,6 +316,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
         return;
       }
       let requestId = UNKNOWN_CONTROL_REQUEST_ID;
+      reservationOwner = "dispatch";
       void (async () => {
         try {
           const decoded = JSON.parse(frame.subarray(0, bytes).toString("utf8"));
@@ -331,6 +338,8 @@ export async function startControlServer(options: ControlServerOptions): Promise
                 )
               : operationDiagnostic(error);
           writeResponse(socket, diagnosticResponse(requestId, diagnostic));
+        } finally {
+          releaseReservation("dispatch");
         }
       })();
     });

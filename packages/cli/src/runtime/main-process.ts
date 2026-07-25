@@ -32,20 +32,38 @@ async function waitForStop(runtime: Runtime, signal?: AbortSignal): Promise<void
   }
 }
 
+async function startUntilAbort(runtime: Runtime, signal?: AbortSignal): Promise<boolean> {
+  if (signal === undefined) {
+    await runtime.start();
+    return true;
+  }
+  if (signal.aborted) return false;
+  const aborted = Promise.withResolvers<false>();
+  const onAbort = () => aborted.resolve(false);
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([runtime.start().then(() => true), aborted.promise]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function runMainProcess(options: MainProcessOptions): Promise<void> {
   let server: Awaited<ReturnType<typeof startControlServer>> | undefined;
   const errors: unknown[] = [];
   try {
-    await options.runtime.start();
-    server = await (options.controlServerFactory ?? startControlServer)({
-      endpoint: options.endpoint,
-      operations: options.runtime,
-      ...(options.artifactIngress === undefined
-        ? {}
-        : { artifactIngress: options.artifactIngress }),
-    });
-    await options.onReady?.(await options.runtime.status());
-    await waitForStop(options.runtime, options.signal);
+    const started = await startUntilAbort(options.runtime, options.signal);
+    if (started && options.signal?.aborted !== true) {
+      server = await (options.controlServerFactory ?? startControlServer)({
+        endpoint: options.endpoint,
+        operations: options.runtime,
+        ...(options.artifactIngress === undefined
+          ? {}
+          : { artifactIngress: options.artifactIngress }),
+      });
+      await options.onReady?.(await options.runtime.status());
+      await waitForStop(options.runtime, options.signal);
+    }
   } catch (error) {
     errors.push(error);
   } finally {
