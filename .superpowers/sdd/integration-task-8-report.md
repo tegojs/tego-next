@@ -28,6 +28,30 @@ The transport implementation was added in:
 
 - `0d3c65f feat: add real websocket adapters`
 
+Independent review findings were locked with additional focused tests before
+their fixes:
+
+- `54805da test: require worker reconnect recovery`
+- `50a5ff5 test: require explicit worker identity`
+- `feacd80 test: preserve websocket backlog order`
+- `fb35375 test: reject corrupt worker attempts`
+- `7f13f74 test: bound websocket listener handshakes`
+- `4d1f373 test: execute process-only worker artifacts`
+
+The corresponding hardening changes:
+
+- reconnect a connector-direction Worker with bounded exponential backoff while
+  reusing its endpoint, runtime, durable attempt store, and prepared artifacts;
+- fail closed when a credential or stable Worker ID is absent;
+- preserve FIFO delivery when messages arrive reentrantly during backlog
+  flushing;
+- parse persisted attempts exactly and run hydration before any listener or
+  readiness advertisement;
+- bound raw TCP, incomplete HTTP upgrade, and WebSocket connections under one
+  listener capacity and handshake timeout;
+- surface asynchronous session-handler failures through the bounded listener
+  error sink.
+
 The final Worker composition tests cover:
 
 - parsing mutually exclusive `--connect` and `--listen` modes;
@@ -38,6 +62,14 @@ The final Worker composition tests cover:
 - real listener-direction handshake, inventory advertisement, assignment, and
   thread execution;
 - real connector-direction attachment before readiness;
+- offline `finish-and-buffer` completion followed by automatic reconnect, a new
+  epoch, and exactly-once result publication;
+- immediate abort during connection retry and no retry for authentication or
+  persistence failures;
+- invalid epoch, Worker identity, request/key identity, and request fingerprint
+  rejection at the SQLite boundary;
+- process-only artifact execution through a real child process;
+- slow pre-upgrade connection expiration and capacity enforcement;
 - bounded Worker identity and complete shutdown cleanup.
 
 ## Verification
@@ -46,18 +78,12 @@ Run with Node.js 26.5.0:
 
 ```text
 npm run test:unit --workspace @tegojs/cli
-108 passed, 1 platform-specific skipped, 0 failed
-
-npm run test:unit --workspace @tegojs/cli
-108 passed, 1 platform-specific skipped, 0 failed
+116 passed, 1 platform-specific skipped, 0 failed
 
 npm run test:unit --workspace @tegojs/transport-websocket
-126 passed, 0 failed
+129 passed, 0 failed
 
-npm run typecheck --workspace @tegojs/cli
-passed
-
-npm run typecheck --workspace @tegojs/transport-websocket
+npm run typecheck
 passed
 
 npm run format:check
