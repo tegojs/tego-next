@@ -214,6 +214,9 @@ export interface StateStore {
   ): Promise<T>;
   read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined>;
   scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>>;
+  scanOperationHistory(
+    query?: OperationJournalQuery,
+  ): AsyncIterable<PersistedOperationJournalEntry>;
   scanOperations(query?: OperationJournalQuery): AsyncIterable<PersistedOperationJournalEntry>;
   scanRecoverableOperations(
     query?: OperationJournalQuery,

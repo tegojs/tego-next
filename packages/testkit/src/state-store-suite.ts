@@ -78,6 +78,17 @@ async function operations(
   return entries;
 }
 
+async function operationHistory(
+  store: StateStore,
+  query: Parameters<StateStore["scanOperationHistory"]>[0] = {},
+): Promise<readonly PersistedOperationJournalEntry[]> {
+  const entries = [];
+  for await (const entry of store.scanOperationHistory(query)) {
+    entries.push(entry);
+  }
+  return entries;
+}
+
 async function scannedIds(
   store: StateStore,
   query: Parameters<StateStore["scan"]>[0],
@@ -1195,6 +1206,29 @@ export function stateStoreConformance(
             status,
           ]),
           [["operation-executing", "executing"]],
+        );
+
+        const firstHistoryPage = await operationHistory(store, { limit: 3 });
+        const historyCursor = firstHistoryPage.at(-1);
+        assert.ok(historyCursor);
+        const secondHistoryPage = await operationHistory(store, {
+          after: {
+            revision: historyCursor.revision,
+            operationId: historyCursor.operationId,
+          },
+          limit: 3,
+        });
+        assert.deepEqual(
+          [...firstHistoryPage, ...secondHistoryPage].map(
+            ({ operationId, revision, status }) => [operationId, revision, status],
+          ),
+          [
+            ["operation-completed", parseRevision("1"), "completed"],
+            ["operation-executing", parseRevision("1"), "executing"],
+            ["operation-failed", parseRevision("1"), "failed"],
+            ["operation-transitioned", parseRevision("1"), "planned"],
+            ["operation-transitioned", parseRevision("2"), "completed"],
+          ],
         );
       });
     });
