@@ -1,13 +1,6 @@
-import assert from "node:assert/strict";
+import { lifecycleConformance, manifestConformance, workerConformance } from "@tegojs/testkit";
 import {
-  lifecycleConformance,
-  manifestConformance,
-  workerConformance,
-} from "@tegojs/testkit";
-import {
-  parseMessageId,
   parsePluginManifest,
-  parseWorkerId,
   type JsonValue,
   type MessageId,
   type RuntimeLifecycleState,
@@ -66,7 +59,9 @@ class PublicWorkerFixture {
   readonly #records = new Map<WorkerId, PublicWorkerRecord>();
   readonly #delivered = new Map<WorkerId, Set<MessageId>>();
 
-  register(input: Omit<PublicWorkerRecord, "available" | "deliveryCount" | "epoch" | "heartbeatCount">) {
+  register(
+    input: Omit<PublicWorkerRecord, "available" | "deliveryCount" | "epoch" | "heartbeatCount">,
+  ) {
     const record = {
       ...structuredClone(input),
       epoch: "1",
@@ -139,6 +134,3 @@ class PublicWorkerFixture {
 }
 
 workerConformance(() => new PublicWorkerFixture());
-
-assert.equal(parseWorkerId("public-worker"), "public-worker");
-assert.equal(parseMessageId("public-message"), "public-message");

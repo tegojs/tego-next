@@ -4,6 +4,7 @@ import type {
   Clock,
   JsonObject,
   JsonValue,
+  MessageId,
   RuntimeDiagnostic,
   SessionId,
   WorkerMessageType,
@@ -13,6 +14,110 @@ import type {
 import { FakeClock } from "./fake-clock.js";
 
 export type WorkerConnectionDirection = "main-initiated" | "worker-initiated";
+
+export interface WorkerConformanceRegistration {
+  readonly workerId: WorkerId;
+  readonly labels: Readonly<Record<string, JsonValue>>;
+  readonly resources: Readonly<Record<string, JsonValue>>;
+  readonly executors: readonly string[];
+  readonly preparedArtifacts: readonly string[];
+}
+
+export interface WorkerConformanceSnapshot extends WorkerConformanceRegistration {
+  readonly epoch: string;
+  readonly available: boolean;
+  readonly heartbeatCount: number;
+  readonly deliveryCount: number;
+}
+
+export interface WorkerConformanceFixture {
+  register(
+    registration: WorkerConformanceRegistration,
+  ): WorkerConformanceSnapshot | Promise<WorkerConformanceSnapshot>;
+  snapshot(
+    workerId: WorkerId,
+  ): WorkerConformanceSnapshot | undefined | Promise<WorkerConformanceSnapshot | undefined>;
+  heartbeat(workerId: WorkerId): WorkerConformanceSnapshot | Promise<WorkerConformanceSnapshot>;
+  disconnect(workerId: WorkerId): void | Promise<void>;
+  reconnect(workerId: WorkerId): WorkerConformanceSnapshot | Promise<WorkerConformanceSnapshot>;
+  deliver(workerId: WorkerId, messageId: MessageId, payload: JsonValue): boolean | Promise<boolean>;
+  close(): void | Promise<void>;
+}
+
+export type WorkerConformanceFactory = () =>
+  | WorkerConformanceFixture
+  | Promise<WorkerConformanceFixture>;
+
+const CONFORMANCE_WORKER = "conformance-worker" as WorkerId;
+const CONFORMANCE_REGISTRATION: WorkerConformanceRegistration = {
+  workerId: CONFORMANCE_WORKER,
+  labels: { region: "test" },
+  resources: { cpu: 2 },
+  executors: ["process", "thread", "remote"],
+  preparedArtifacts: [`sha256:${"0".repeat(64)}`],
+};
+
+async function withWorkerFixture<T>(
+  factory: WorkerConformanceFactory,
+  run: (fixture: WorkerConformanceFixture) => Promise<T>,
+): Promise<T> {
+  const fixture = await factory();
+  try {
+    return await run(fixture);
+  } finally {
+    await fixture.close();
+  }
+}
+
+export function workerConformance(factory: WorkerConformanceFactory): void {
+  describe("Worker directory conformance", () => {
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-registration", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        const registered = await fixture.register(CONFORMANCE_REGISTRATION);
+        assert.deepEqual(registered, {
+          ...CONFORMANCE_REGISTRATION,
+          epoch: "1",
+          available: true,
+          heartbeatCount: 0,
+          deliveryCount: 0,
+        });
+        assert.deepEqual(await fixture.snapshot(CONFORMANCE_WORKER), registered);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-heartbeat", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        await fixture.register(CONFORMANCE_REGISTRATION);
+        const heartbeat = await fixture.heartbeat(CONFORMANCE_WORKER);
+        assert.equal(heartbeat.available, true);
+        assert.equal(heartbeat.heartbeatCount, 1);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-reconnect", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        const first = await fixture.register(CONFORMANCE_REGISTRATION);
+        await fixture.disconnect(CONFORMANCE_WORKER);
+        assert.equal((await fixture.snapshot(CONFORMANCE_WORKER))?.available, false);
+        const reconnected = await fixture.reconnect(CONFORMANCE_WORKER);
+        assert.ok(BigInt(reconnected.epoch) > BigInt(first.epoch));
+        assert.equal(reconnected.available, true);
+        assert.deepEqual(reconnected.executors, CONFORMANCE_REGISTRATION.executors);
+        assert.deepEqual(reconnected.preparedArtifacts, CONFORMANCE_REGISTRATION.preparedArtifacts);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-message-deduplication", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        await fixture.register(CONFORMANCE_REGISTRATION);
+        const messageId = "conformance-message" as MessageId;
+        assert.equal(await fixture.deliver(CONFORMANCE_WORKER, messageId, { value: 1 }), true);
+        assert.equal(await fixture.deliver(CONFORMANCE_WORKER, messageId, { value: 1 }), false);
+        assert.equal((await fixture.snapshot(CONFORMANCE_WORKER))?.deliveryCount, 1);
+      });
+    });
+  });
+}
 
 export interface WorkerSocketMessage {
   readonly data: string | Uint8Array;
