@@ -220,7 +220,11 @@ test("@spec:worker-protocol/independent-worker-command/emits-exactly-one-structu
   assert.equal(stderr.read(), "");
 });
 
-function preparedArtifact(pluginId: string, digestSuffix: string): PreparedArtifact {
+function preparedArtifact(
+  pluginId: string,
+  digestSuffix: string,
+  executors: readonly ("process" | "thread")[] = ["process", "thread"],
+): PreparedArtifact {
   return {
     digest: parseArtifactDigest(`sha256:${digestSuffix.repeat(64)}`),
     root: `/prepared/${digestSuffix}`,
@@ -236,10 +240,10 @@ function preparedArtifact(pluginId: string, digestSuffix: string): PreparedArtif
           componentId: "echo",
           kind: "task",
           entrypoint: "components/echo.js",
-          executors: ["process", "thread"],
+          executors,
         },
       ],
-      permissions: [{ kind: "executor", executors: ["process", "thread"] }],
+      permissions: [{ kind: "executor", executors }],
       capabilities: { provides: [], requires: [] },
     }),
   };
@@ -268,6 +272,15 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
   assert.equal(exact.resolveComponent(exactRequest).artifactDigest, `sha256:${"a".repeat(64)}`);
   assert.deepEqual(exact.resolveComponent(exactRequest).permissionGrants, [
     { kind: "executor", executors: ["thread"] },
+  ]);
+  const processOnly = createPreparedArtifactSelection(
+    [preparedArtifact("org.example.process-only", "c", ["process"])],
+    "worker-runtime",
+  );
+  const processRequest = assignment("org.example.process-only");
+  assert.equal(processOnly.selectExecutorKind(processRequest), "process");
+  assert.deepEqual(processOnly.resolveComponent(processRequest).permissionGrants, [
+    { kind: "executor", executors: ["process"] },
   ]);
 
   const missing = exact.validateAssignment(assignment("org.example.missing"));
@@ -574,10 +587,18 @@ test("@spec:worker-protocol/durable-worker-attempts/listen-fails-before-readines
   }
 });
 
-async function createWorkerArtifact(directory: string): Promise<{
+async function createWorkerArtifact(
+  directory: string,
+  options: {
+    readonly executors?: readonly ("process" | "thread")[];
+    readonly pluginId?: string;
+  } = {},
+): Promise<{
   readonly artifactPath: string;
   readonly digest: string;
 }> {
+  const executors = options.executors ?? ["thread", "process"];
+  const pluginId = options.pluginId ?? "org.example.worker-echo";
   const pluginDirectory = join(directory, "plugin");
   const buildDirectory = join(pluginDirectory, "build");
   const artifactPath = join(directory, "echo.tego");
@@ -586,7 +607,7 @@ async function createWorkerArtifact(directory: string): Promise<{
     join(pluginDirectory, "manifest.json"),
     JSON.stringify({
       schemaVersion: "1.0",
-      pluginId: "org.example.worker-echo",
+      pluginId,
       version: "1.0.0",
       contractRange: ">=0.0.0",
       nodeRange: ">=24.0.0 <27.0.0",
@@ -596,10 +617,10 @@ async function createWorkerArtifact(directory: string): Promise<{
           componentId: "echo",
           kind: "task",
           entrypoint: "component.js",
-          executors: ["thread", "process"],
+          executors,
         },
       ],
-      permissions: [{ kind: "executor", executors: ["thread", "process"] }],
+      permissions: [{ kind: "executor", executors }],
       capabilities: { provides: [], requires: [] },
     }),
   );
@@ -683,6 +704,74 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
     controller.abort();
     await Promise.allSettled([session?.close(), remote.close(), main.close()]);
     await beforeDeadline(running, "listen Worker cleanup");
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/process-only-artifact-executes-in-a-child-process", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-process-only-"));
+  const pluginId = "org.example.worker-process-only";
+  const { artifactPath } = await createWorkerArtifact(directory, {
+    executors: ["process"],
+    pluginId,
+  });
+  const workerId = parseWorkerId("worker-process-only");
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--listen",
+    "127.0.0.1:0",
+    "--credential",
+    "process-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+    "--prepare",
+    artifactPath,
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness) => ready.resolve(readiness),
+  });
+  const main = createMainEndpoint({
+    credential: "process-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const remote = new RemoteExecutor({
+    id: "process-only-remote",
+    workerId,
+    clock: systemWorkerClock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  let session: WorkerSession | undefined;
+
+  try {
+    const readiness = await beforeDeadline(ready.promise, "process-only Worker readiness");
+    session = await connectMain({ endpoint: main, url: new URL(readiness.url) });
+    await session.ready;
+    await remote.attach(session);
+    const result = await beforeDeadline(
+      (
+        await remote.submit({
+          ...assignment(pluginId),
+          input: { processOnly: true },
+          deadline: new Date(Date.now() + 60_000).toISOString(),
+        })
+      ).result,
+      "process-only Worker result",
+    );
+
+    assert.equal(result.status, "succeeded", JSON.stringify(result));
+    assert.deepEqual(result.output, { processOnly: true });
+    assert.equal(result.executor.metadata?.localExecutorKind, "process");
+  } finally {
+    controller.abort();
+    await Promise.allSettled([session?.close(), remote.close(), main.close()]);
+    await beforeDeadline(running, "process-only Worker cleanup");
     await cleanupDirectory(directory);
   }
 });
