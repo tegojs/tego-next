@@ -41,6 +41,9 @@ try {
   await runMainProcess({
     endpoint: options.endpoint,
     runtime,
+    onBackgroundError: () => {
+      process.exitCode = 1;
+    },
     signal: controller.signal,
   });
 } finally {

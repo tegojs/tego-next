@@ -54,6 +54,8 @@ export interface ControlServer {
   close(): Promise<void>;
 }
 
+const CONTROL_CLOSE_DRAIN_TIMEOUT_MS = 2_000;
+
 function controlInitializationAbortError(): DOMException {
   return new DOMException("Control server initialization aborted", "AbortError");
 }
@@ -178,9 +180,19 @@ async function dispatch(
   }
 }
 
-function writeResponse(socket: Socket, response: ControlResponse): void {
+async function writeResponse(socket: Socket, response: ControlResponse): Promise<void> {
   if (socket.destroyed) return;
-  socket.end(`${JSON.stringify(response)}\n`);
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      socket.off("close", finish);
+      resolve();
+    };
+    socket.once("close", finish);
+    socket.end(`${JSON.stringify(response)}\n`, finish);
+  });
 }
 
 async function assertPrivateEndpointParent(endpoint: string): Promise<void> {
@@ -204,12 +216,36 @@ async function assertPrivateEndpointParent(endpoint: string): Promise<void> {
   }
 }
 
-async function closeListener(server: Server, sockets: ReadonlySet<Socket>): Promise<void> {
+async function closeListener(
+  server: Server,
+  sockets: ReadonlySet<Socket>,
+  activeDispatchSockets: ReadonlySet<Socket> = new Set(),
+  dispatches: ReadonlySet<Promise<void>> = new Set(),
+): Promise<void> {
+  for (const socket of sockets) {
+    if (!activeDispatchSockets.has(socket)) socket.destroy();
+  }
+  const closed = server.listening
+    ? new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error) => (error === undefined ? resolveClose() : rejectClose(error)));
+      })
+    : Promise.resolve();
+  if (dispatches.size > 0) {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([...dispatches]),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, CONTROL_CLOSE_DRAIN_TIMEOUT_MS);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   for (const socket of sockets) socket.destroy();
-  if (!server.listening) return;
-  await new Promise<void>((resolveClose, rejectClose) => {
-    server.close((error) => (error === undefined ? resolveClose() : rejectClose(error)));
-  });
+  await closed;
 }
 
 export async function removeOwnedControlEndpoint(endpoint: string): Promise<void> {
@@ -261,6 +297,8 @@ export async function startControlServer(options: ControlServerOptions): Promise
   assertControlInitializationActive(options.signal);
 
   const sockets = new Set<Socket>();
+  const activeDispatchSockets = new Set<Socket>();
+  const dispatches = new Set<Promise<void>>();
   let reservations = 0;
   let closing = false;
   let terminalError: Error | undefined;
@@ -269,7 +307,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
     socket.on("close", () => sockets.delete(socket));
     socket.on("error", () => undefined);
     if (closing || reservations >= maxOutstanding) {
-      writeResponse(
+      void writeResponse(
         socket,
         diagnosticResponse(
           UNKNOWN_CONTROL_REQUEST_ID,
@@ -295,7 +333,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
     const readTimer = setTimeout(() => {
       if (handled) return;
       handled = true;
-      writeResponse(
+      void writeResponse(
         socket,
         diagnosticResponse(
           UNKNOWN_CONTROL_REQUEST_ID,
@@ -317,7 +355,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
       const payloadBytes = newline === -1 ? chunk.byteLength : newline;
       if (bytes + payloadBytes > maxLineBytes) {
         handled = true;
-        writeResponse(
+        void writeResponse(
           socket,
           diagnosticResponse(
             UNKNOWN_CONTROL_REQUEST_ID,
@@ -335,7 +373,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
       handled = true;
       clearTimeout(readTimer);
       if (newline !== chunk.byteLength - 1) {
-        writeResponse(
+        void writeResponse(
           socket,
           diagnosticResponse(
             UNKNOWN_CONTROL_REQUEST_ID,
@@ -349,13 +387,14 @@ export async function startControlServer(options: ControlServerOptions): Promise
       }
       let requestId = UNKNOWN_CONTROL_REQUEST_ID;
       reservationOwner = "dispatch";
-      void (async () => {
+      activeDispatchSockets.add(socket);
+      const dispatchPromise = (async () => {
         try {
           const decoded = JSON.parse(frame.subarray(0, bytes).toString("utf8"));
           requestId = extractControlRequestId(decoded);
           const request = parseControlRequest(decoded);
           const result = await dispatch(request, options.operations, options.artifactIngress);
-          writeResponse(socket, {
+          await writeResponse(socket, {
             protocolVersion: CONTROL_PROTOCOL_VERSION,
             requestId,
             ok: true,
@@ -369,11 +408,22 @@ export async function startControlServer(options: ControlServerOptions): Promise
                   "Control request is not valid JSON",
                 )
               : operationDiagnostic(error);
-          writeResponse(socket, diagnosticResponse(requestId, diagnostic));
+          await writeResponse(socket, diagnosticResponse(requestId, diagnostic));
         } finally {
           releaseReservation("dispatch");
         }
       })();
+      dispatches.add(dispatchPromise);
+      void dispatchPromise.then(
+        () => {
+          dispatches.delete(dispatchPromise);
+          activeDispatchSockets.delete(socket);
+        },
+        () => {
+          dispatches.delete(dispatchPromise);
+          activeDispatchSockets.delete(socket);
+        },
+      );
     });
   });
 
@@ -429,7 +479,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
     assertControlInitializationActive(options.signal);
   } catch (error) {
     try {
-      await closeListener(server, sockets);
+      await closeListener(server, sockets, activeDispatchSockets, dispatches);
     } catch (closeError) {
       throw new AggregateError(
         [error, closeError],
@@ -445,7 +495,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
     close() {
       closePromise ??= (async () => {
         closing = true;
-        await closeListener(server, sockets);
+        await closeListener(server, sockets, activeDispatchSockets, dispatches);
         if (terminalError !== undefined) throw terminalError;
       })();
       return closePromise;

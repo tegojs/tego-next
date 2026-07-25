@@ -9,6 +9,8 @@ import {
 export interface MainProcessOptions {
   readonly endpoint: string;
   readonly runtime: Runtime;
+  /** Must report without throwing; a thrown sink marks the process failed. */
+  readonly onBackgroundError: (error: Error) => void;
   readonly artifactIngress?: LocalArtifactIngress;
   readonly signal?: AbortSignal;
   readonly onReady?: (status: RuntimeStatus) => void | Promise<void>;
@@ -36,10 +38,19 @@ type PreReadinessResult<T> =
   | { readonly aborted: true }
   | { readonly aborted: false; readonly value: T };
 
+function reportBackgroundCleanupFailure(sink: (error: Error) => void): void {
+  try {
+    sink(new Error("LIFECYCLE_BACKGROUND_CLEANUP_FAILED"));
+  } catch {
+    process.exitCode = 1;
+  }
+}
+
 async function runUntilAbort<T>(
   operation: () => T | PromiseLike<T>,
   signal?: AbortSignal,
   onLateValue?: (value: T) => void | Promise<void>,
+  onLateValueError?: (error: unknown) => void,
 ): Promise<PreReadinessResult<T>> {
   if (signal?.aborted === true) return { aborted: true };
   const operationPromise = Promise.resolve().then(() => {
@@ -61,7 +72,14 @@ async function runUntilAbort<T>(
       aborted.promise,
     ]);
     if (result.aborted && onLateValue !== undefined) {
-      void operationPromise.then(onLateValue).catch(() => undefined);
+      void operationPromise.then(
+        (value) => {
+          void Promise.resolve()
+            .then(() => onLateValue(value))
+            .catch((error: unknown) => onLateValueError?.(error));
+        },
+        () => undefined,
+      );
     }
     return result;
   } finally {
@@ -87,6 +105,7 @@ export async function runMainProcess(options: MainProcessOptions): Promise<void>
           }),
         options.signal,
         (lateServer) => lateServer.close(),
+        () => reportBackgroundCleanupFailure(options.onBackgroundError),
       );
       if (!created.aborted) {
         server = created.value;
@@ -100,12 +119,25 @@ export async function runMainProcess(options: MainProcessOptions): Promise<void>
   } catch (error) {
     errors.push(error);
   } finally {
-    const cleanup = await Promise.allSettled([
-      Promise.resolve().then(() => options.runtime.stop()),
-      Promise.resolve().then(() => server?.close()),
-    ]);
-    for (const result of cleanup) {
-      if (result.status === "rejected") errors.push(result.reason);
+    const cleanup = [() => options.runtime.stop(), () => server?.close()] as const;
+    if (options.signal?.aborted === true) {
+      const results = await Promise.allSettled(
+        cleanup.map((operation) => Promise.resolve().then(operation)),
+      );
+      for (const result of results) {
+        if (result.status === "rejected") errors.push(result.reason);
+      }
+    } else {
+      try {
+        await cleanup[0]();
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await cleanup[1]();
+      } catch (error) {
+        errors.push(error);
+      }
     }
   }
   if (errors.length === 1) throw errors[0];
@@ -118,6 +150,7 @@ export interface NodeMainProcessOptions extends CreateNodeRuntimeHostOptions {
   readonly endpoint: string;
   readonly signal?: AbortSignal;
   readonly onReady?: (status: RuntimeStatus) => void | Promise<void>;
+  readonly onBackgroundError?: (error: Error) => void;
 }
 
 export async function runNodeMainProcess(options: NodeMainProcessOptions): Promise<void> {
@@ -125,6 +158,11 @@ export async function runNodeMainProcess(options: NodeMainProcessOptions): Promi
   await runMainProcess({
     endpoint: options.endpoint,
     runtime: host.runtime,
+    onBackgroundError:
+      options.onBackgroundError ??
+      (() => {
+        process.exitCode = 1;
+      }),
     artifactIngress: host.artifactIngress,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(options.onReady === undefined ? {} : { onReady: options.onReady }),
@@ -145,6 +183,13 @@ async function runEntrypoint(): Promise<void> {
       signal: controller.signal,
       onReady: (status) => {
         process.send?.({ type: "runtime.ready", status });
+      },
+      onBackgroundError: () => {
+        process.send?.({
+          type: "runtime.failed",
+          message: "Runtime Main process failed",
+        });
+        process.exitCode = 1;
       },
     });
   } finally {

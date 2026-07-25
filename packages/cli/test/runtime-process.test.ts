@@ -75,7 +75,9 @@ function controlledRuntime(): Runtime {
   return {
     start: async () => undefined,
     status: async () => ({ lifecycle: "running" }) as RuntimeStatus,
-    stop: () => Promise.reject(new Error("runtime stop failed")),
+    stop: () => {
+      throw new Error("runtime stop failed");
+    },
     operations: {} as Runtime["operations"],
     events: {
       async *[Symbol.asyncIterator]() {},
@@ -118,6 +120,10 @@ async function settlesBeforeDeadline(
   }
 }
 
+function failOnBackgroundError(error: Error): never {
+  throw error;
+}
+
 function detachedRuntimeCommand(
   directory: string,
   endpoint: string,
@@ -157,6 +163,7 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
     runWithFactory({
       endpoint: "",
       runtime: controlledRuntime(),
+      onBackgroundError: failOnBackgroundError,
       signal: controller.signal,
       onReady: () => controller.abort(),
       controlServerFactory: async () => ({
@@ -205,7 +212,11 @@ test("@spec:runtime-operations/local-runtime-operations/control-stop-response-pr
       },
     } as Runtime["events"],
   };
-  const running = runMainProcess({ endpoint, runtime });
+  const running = runMainProcess({
+    endpoint,
+    runtime,
+    onBackgroundError: failOnBackgroundError,
+  });
   try {
     await waitForPath(endpoint, directory);
     const response = requestControl({
@@ -256,6 +267,7 @@ test("@spec:runtime-operations/local-runtime-operations/pending-start-abort-stop
   const running = runMainProcess({
     endpoint: "in-memory",
     runtime,
+    onBackgroundError: failOnBackgroundError,
     signal: controller.signal,
     controlServerFactory: async () => {
       serverCreated = true;
@@ -299,6 +311,7 @@ test("@spec:runtime-operations/local-runtime-operations/pending-status-abort-sup
   const controller = new AbortController();
   const running = runMainProcess({
     endpoint: "in-memory",
+    onBackgroundError: failOnBackgroundError,
     runtime: mainProcessRuntime({
       status: () => {
         statusCalled.resolve();
@@ -340,6 +353,7 @@ test("@spec:runtime-operations/local-runtime-operations/pending-on-ready-abort-d
   const controller = new AbortController();
   const running = runMainProcess({
     endpoint: "in-memory",
+    onBackgroundError: failOnBackgroundError,
     runtime: mainProcessRuntime({
       stop: async () => {
         stopCalled.resolve();
@@ -392,6 +406,7 @@ test("@spec:runtime-operations/local-runtime-operations/pending-control-factory-
   const runAbortAware = runMainProcess as (options: AbortAwareMainOptions) => Promise<void>;
   const running = runAbortAware({
     endpoint: "in-memory",
+    onBackgroundError: failOnBackgroundError,
     runtime: mainProcessRuntime({
       status: async () => {
         statusCalls += 1;
