@@ -472,3 +472,110 @@ exit 0
 Targeted Biome checks passed for the five affected source/test files.
 `git diff --check` also passed, and no real child process, endpoint, or
 temporary runtime directory remained.
+
+## Finding 13 Complete Pre-Readiness Cancellation Addendum
+
+Finding 13 extended the startup-abort requirement across every asynchronous
+pre-readiness boundary. The earlier fix covered pending `runtime.start()` but
+could still wait indefinitely in control-server creation, `runtime.status()`,
+or `onReady()`, and a late status could publish readiness after abort.
+
+### Commits
+
+- Pipeline RED: `a9e2280`
+  (`test: expose pre-readiness abort gaps`)
+- Control initialization RED: `bc288dc`
+  (`test: expose control initialization abort gap`)
+- GREEN: `72f8a8e`
+  (`fix: cancel the full main readiness pipeline`)
+- Report addendum: the commit containing this update
+
+### Pipeline RED
+
+Three controlled tests independently held status, readiness publication, and
+control-server factory promises pending:
+
+```text
+volta run --node 26.5.0 npm run build --workspace @tegojs/cli
+volta run --node 26.5.0 node --test \
+  --test-name-pattern='pending-status-abort|pending-on-ready-abort|pending-control-factory-abort' \
+  packages/cli/dist/test/runtime-process.test.js
+3 tests: 0 passed, 3 failed
+```
+
+The failures proved:
+
+- abort during pending status did not initiate stop/close before status settled;
+- a pending `onReady` callback blocked cleanup and Main settlement;
+- a pending control-server factory blocked Main settlement and received no
+  abort signal.
+
+The status RED resolved its late status only for deterministic cleanup and
+observed the incorrect readiness callback. The onReady RED rejected its
+callback after the abort deadline, allowing the unfixed process to settle while
+also proving the late rejection was the blocker.
+
+### Control Initialization RED
+
+The server contract test first passed an already-aborted signal, then aborted
+while the owner-permission initialization hook was explicitly pending:
+
+```text
+volta run --node 26.5.0 npm run build --workspace @tegojs/cli
+volta run --node 26.5.0 node --test \
+  --test-name-pattern='aborted-control-initialization-rolls-back' \
+  packages/cli/dist/test/control.test.js
+1 test: 0 passed, 1 failed
+```
+
+The unfixed server ignored the pre-aborted signal and returned a live listener.
+It also waited for the pending permission hook instead of settling the aborted
+initialization transaction.
+
+### GREEN Behavior
+
+- `ControlServerOptions` now accepts an `AbortSignal`.
+- Pre-aborted initialization performs no bind.
+- Listen and permission initialization observe abort as one transaction; abort
+  rejects only after listener/socket rollback, while late hook rejection remains
+  observed.
+- Main passes the signal into the control-server factory.
+- Start, factory creation, status, and onReady each use the same pre-readiness
+  abort race and check the signal before invoking the next stage.
+- Abort suppresses all later readiness publication.
+- A non-cooperative status or onReady promise no longer delays stop, server
+  close, or Main settlement; its late rejection is consumed.
+- A non-cooperative factory cannot block Main settlement. If it later returns a
+  server, that late server is immediately closed; late rejection is consumed.
+- Runtime stop and server close are initiated together and both results remain
+  available for shutdown error aggregation.
+
+The existing real `startup.entered` SIGTERM regression remains unchanged and
+continues to prove normal process exit, awaited stop, and endpoint absence.
+
+### GREEN and Stress Evidence
+
+```text
+for tego_stress_run in {1..20}; do
+  volta run --node 26.5.0 node --test \
+    --test-name-pattern='aborted-control-initialization-rolls-back' \
+    packages/cli/dist/test/control.test.js
+  volta run --node 26.5.0 node --test \
+    --test-name-pattern='pending-status-abort|pending-on-ready-abort|pending-control-factory-abort|pre-readiness-sigterm' \
+    packages/cli/dist/test/runtime-process.test.js
+done
+20/20 repetitions passed
+
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+68 tests: 67 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run typecheck --workspace @tegojs/cli
+exit 0
+
+volta run --node 26.5.0 npm test
+609 tests: 608 passed, 0 failed, 1 Windows-only skipped
+```
+
+Targeted Biome checks passed for all four affected source/test files.
+`git diff --check` passed, and the focused real-process repetitions left no
+child process, endpoint, or temporary directory behind.
