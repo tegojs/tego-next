@@ -379,6 +379,7 @@ export class WorkerSession {
   #lastHeartbeatAt = 0;
   #pendingBinaryBytes = 0;
   #pendingMessageBytes = 0;
+  #flushingPendingMessages = false;
   #detached = false;
   #closedNotified = false;
 
@@ -481,13 +482,23 @@ export class WorkerSession {
 
   onMessage(listener: (message: WorkerSessionMessage) => void): () => void {
     this.#listeners.add(listener);
-    const pending = this.#pendingMessages.splice(0);
-    this.#pendingMessageBytes = 0;
-    for (const message of pending) {
+    if (!this.#flushingPendingMessages && this.#pendingMessages.length > 0) {
+      this.#flushingPendingMessages = true;
       try {
-        listener(message);
-      } catch {
-        // Consumer callbacks do not participate in the authenticated protocol state machine.
+        while (this.#pendingMessages.length > 0) {
+          const message = this.#pendingMessages.shift() as WorkerSessionMessage;
+          this.#pendingMessageBytes = Math.max(
+            0,
+            this.#pendingMessageBytes - this.#applicationMessageBytes(message),
+          );
+          try {
+            listener(message);
+          } catch {
+            // Consumer callbacks do not participate in the authenticated protocol state machine.
+          }
+        }
+      } finally {
+        this.#flushingPendingMessages = false;
       }
     }
     return () => this.#listeners.delete(listener);
@@ -791,19 +802,8 @@ export class WorkerSession {
       request.resolve(message);
       return;
     }
-    if (this.#listeners.size === 0) {
-      const bytes =
-        Buffer.byteLength(
-          JSON.stringify({
-            messageId: message.messageId,
-            ...(message.correlationId === undefined
-              ? {}
-              : { correlationId: message.correlationId }),
-            type: message.type,
-            payload: message.payload,
-          }),
-          "utf8",
-        ) + (message.binary?.byteLength ?? 0);
+    if (this.#listeners.size === 0 || this.#flushingPendingMessages) {
+      const bytes = this.#applicationMessageBytes(message);
       const maxPendingMessageBytes =
         this.#codec.limits.maxBinaryBytes + this.#codec.limits.maxFrameBytes;
       if (
@@ -826,6 +826,20 @@ export class WorkerSession {
         // Consumer callbacks do not participate in the authenticated protocol state machine.
       }
     }
+  }
+
+  #applicationMessageBytes(message: WorkerSessionMessage): number {
+    return (
+      Buffer.byteLength(
+        JSON.stringify({
+          messageId: message.messageId,
+          ...(message.correlationId === undefined ? {} : { correlationId: message.correlationId }),
+          type: message.type,
+          payload: message.payload,
+        }),
+        "utf8",
+      ) + (message.binary?.byteLength ?? 0)
+    );
   }
 
   #receiveHello(envelope: WorkerControlEnvelope): void {
