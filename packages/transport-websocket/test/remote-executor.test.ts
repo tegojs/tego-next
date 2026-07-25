@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import {
-  parseWorkerId,
-  type ExecutionRequest,
-  type JsonValue,
-} from "@tegojs/contracts";
+import { parseWorkerId, type ExecutionRequest, type JsonValue } from "@tegojs/contracts";
 import {
   executorConformance,
   eventually,
@@ -45,7 +41,7 @@ async function connected(
   });
   await runtime.attach(workerSession);
   const remote = new RemoteExecutor({
-    id: "remote-worker",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -162,7 +158,7 @@ test("assignment is recorded before the Worker receives it", async () => {
   });
   await runtime.attach(workerSession);
   const remote = new RemoteExecutor({
-    id: "remote-order",
+    id: "remote",
     workerId,
     clock,
     attemptStore: store,
@@ -342,10 +338,7 @@ test("WorkerRuntime rejects non-bound immutable targets before persistence, ACK,
         request: { ...request, target: testCase.target },
       });
 
-      assert.equal(
-        (response.payload as { readonly accepted?: boolean }).accepted,
-        false,
-      );
+      assert.equal((response.payload as { readonly accepted?: boolean }).accepted, false);
       assert.equal(storeCalls, 0);
       assert.equal(selectorCalls, 0);
       assert.equal(local.executions, 0);
@@ -418,7 +411,7 @@ test("Worker attempt-store failure rejects before local execution instead of lea
   });
   await runtime.attach(workerSession);
   const remote = new RemoteExecutor({
-    id: "remote-store-failure",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),

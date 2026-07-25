@@ -157,7 +157,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
   const clock = new FakeClock(new Date(0));
   const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
-    id: "network-remote",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -209,6 +209,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/reconnect-reconcil
       { mode: "wait" },
       "real-network-recovery",
       "finish-and-buffer",
+      workerId,
     );
     const handle = await remote.submit(request);
     let terminalResults = 0;
@@ -426,7 +427,7 @@ test("@spec:worker-protocol/prepared-artifact-admission/rejects-before-ack-and-p
     const local = new TestLocalExecutor();
     const workerStore = new MemoryRemoteAttemptStore();
     const remote = new RemoteExecutor({
-      id: `remote-artifact-${reason}`,
+      id: "remote",
       workerId,
       clock,
       attemptStore: new MemoryRemoteAttemptStore(),
@@ -444,7 +445,12 @@ test("@spec:worker-protocol/prepared-artifact-admission/rejects-before-ack-and-p
     const [mainSession, workerSession] = memorySessionPair("1");
     await runtime.attach(workerSession);
     await remote.attach(mainSession);
-    const request = executionRequest({ mode: "echo", value: reason }, `artifact-${reason}`);
+    const request = executionRequest(
+      { mode: "echo", value: reason },
+      `artifact-${reason}`,
+      "cancel",
+      workerId,
+    );
 
     try {
       const result = await (await remote.submit(request)).result;

@@ -200,6 +200,8 @@ export class RemoteExecutor implements Executor {
   }
 
   async #submit(requestValue: ExecutionRequest): Promise<ExecutionHandle> {
+    const request = parseRemoteRequest(requestValue);
+    this.#assertTarget(request);
     this.#assertPersistenceAvailable();
     await this.#pruneTerminals();
     this.#assertPersistenceAvailable();
@@ -211,7 +213,6 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    const request = parseRemoteRequest(requestValue);
     const fingerprint = requestFingerprint(request);
     const key = attemptKey(request.taskId, request.attemptId);
     const existing = this.#attempts.get(key);
@@ -295,6 +296,18 @@ export class RemoteExecutor implements Executor {
     this.#background(this.#assign(attempt, this.#session));
     this.#background(this.#watchDeadline(attempt));
     return handle;
+  }
+
+  #assertTarget(request: ExecutionRequest): void {
+    const target = request.target.executor;
+    if (target.type !== this.type || target.id !== this.id || target.workerId !== this.#workerId) {
+      throw remoteError(
+        "PROTOCOL_EXECUTION_TARGET_INVALID",
+        "Execution request target does not match this RemoteExecutor",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
   }
 
   async observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {

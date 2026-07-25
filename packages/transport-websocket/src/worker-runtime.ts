@@ -447,6 +447,19 @@ export class WorkerRuntime {
       throw new Error("Remote assignment exceeds maxAssignmentBytes");
     }
     const request = parseRemoteRequest(payload.request);
+    if (
+      request.target.executor.type !== "remote" ||
+      request.target.executor.workerId !== this.#workerId
+    ) {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        "PROTOCOL_EXECUTION_TARGET_INVALID",
+        "Execution request target does not match this Worker",
+      );
+      return;
+    }
     const rejection = await this.#validateAssignment?.(request);
     if (rejection !== undefined) {
       await this.#sendRejected(

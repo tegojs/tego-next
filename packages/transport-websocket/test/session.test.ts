@@ -661,7 +661,7 @@ test("RemoteExecutor and WorkerRuntime survive timeout and reconnect over authen
   });
   const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
-    id: "remote-authenticated",
+    id: "remote",
     workerId,
     clock: first.clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -677,12 +677,24 @@ test("RemoteExecutor and WorkerRuntime survive timeout and reconnect over authen
     await runtime.attach(first.workerSession);
     await remote.attach(first.mainSession);
     const echoed = await (
-      await remote.submit(executionRequest({ mode: "echo", value: "secure" }, "real-session-echo"))
+      await remote.submit(
+        executionRequest(
+          { mode: "echo", value: "secure" },
+          "real-session-echo",
+          "cancel",
+          workerId,
+        ),
+      )
     ).result;
     assert.equal(echoed.output, "secure");
 
     first.mainSocket.holdControlType = "task.assign";
-    const request = executionRequest({ mode: "wait" }, "real-session-timeout-reconnect");
+    const request = executionRequest(
+      { mode: "wait" },
+      "real-session-timeout-reconnect",
+      "cancel",
+      workerId,
+    );
     const handle = await remote.submit(request);
     await eventually(() => assert.equal(first.mainSocket.held.length, 1));
     first.clock.advanceBy(101);
@@ -703,7 +715,12 @@ test("RemoteExecutor and WorkerRuntime survive timeout and reconnect over authen
 
     await assert.rejects(
       remote.submit(
-        executionRequest({ mode: "echo", value: "x".repeat(70 * 1024) }, "real-session-oversized"),
+        executionRequest(
+          { mode: "echo", value: "x".repeat(70 * 1024) },
+          "real-session-oversized",
+          "cancel",
+          workerId,
+        ),
       ),
       /assignment|maxAssignmentBytes/iu,
     );

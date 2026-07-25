@@ -1286,7 +1286,7 @@ test("failed cancellation delivery survives Main restart and replays until Worke
   await firstRemote.cancel(request.taskId, request.attemptId);
 
   const secondRemote = new RemoteExecutor({
-    id: "remote-restarted",
+    id: "remote",
     workerId,
     clock,
     attemptStore: mainStore,
@@ -1587,7 +1587,7 @@ test("a live Main terminal commit timeout fails closed and degrades health", asy
   const terminalGate = Promise.withResolvers<void>();
   let terminalCalls = 0;
   const remote = new RemoteExecutor({
-    id: "live-main-terminal-timeout",
+    id: "remote",
     workerId,
     clock,
     persistenceTimeoutMs: 50,
@@ -1654,7 +1654,7 @@ test("a live Worker terminal commit timeout fails closed and retains evidence", 
   let terminalCalls = 0;
   const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
-    id: "live-worker-terminal-timeout",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -1725,7 +1725,7 @@ test("Main attach bounds a non-settling attempt-store list", async () => {
   const clock = new FakeClock(new Date(0));
   let listCalls = 0;
   const remote = new RemoteExecutor({
-    id: "main-list-timeout",
+    id: "remote",
     workerId,
     clock,
     persistenceTimeoutMs: 50,
@@ -1760,7 +1760,7 @@ test("Main submit bounds a non-settling attempt-store load", async () => {
   const backing = new MemoryRemoteAttemptStore();
   let loadCalls = 0;
   const remote = new RemoteExecutor({
-    id: "main-load-timeout",
+    id: "remote",
     workerId,
     clock,
     persistenceTimeoutMs: 50,
@@ -1809,7 +1809,7 @@ test("Main submit bounds a non-settling attempt-store create", async () => {
   const backing = new MemoryRemoteAttemptStore();
   let createCalls = 0;
   const remote = new RemoteExecutor({
-    id: "main-create-timeout",
+    id: "remote",
     workerId,
     clock,
     persistenceTimeoutMs: 50,
@@ -1889,7 +1889,7 @@ test("Worker assignment bounds a non-settling attempt-store load", async () => {
   const local = new TestLocalExecutor();
   let loadCalls = 0;
   const remote = new RemoteExecutor({
-    id: "worker-load-timeout",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -1934,7 +1934,7 @@ test("Worker assignment bounds a non-settling attempt-store create", async () =>
   const local = new TestLocalExecutor();
   let createCalls = 0;
   const remote = new RemoteExecutor({
-    id: "worker-create-timeout",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -1976,7 +1976,7 @@ test("a live Worker running commit timeout fails closed", async () => {
   const local = new TestLocalExecutor();
   let runningCalls = 0;
   const remote = new RemoteExecutor({
-    id: "live-worker-running-timeout",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -2175,7 +2175,7 @@ test("RemoteExecutor rejects invalid revisions returned by external store list, 
   const clock = new FakeClock(new Date(0));
   const listed = invalidRevisionRecord("remote-invalid-list-revision");
   const listRemote = new RemoteExecutor({
-    id: "remote-list",
+    id: "remote",
     workerId,
     clock,
     attemptStore: externalStore({ listed }),
@@ -2194,7 +2194,7 @@ test("RemoteExecutor rejects invalid revisions returned by external store list, 
   const loaded = invalidRevisionRecord("remote-invalid-load-revision");
   const loadStore = externalStore({ loaded });
   const loadRemote = new RemoteExecutor({
-    id: "remote-load",
+    id: "remote",
     workerId,
     clock,
     attemptStore: loadStore,
@@ -2210,7 +2210,7 @@ test("RemoteExecutor rejects invalid revisions returned by external store list, 
   await Promise.all([loadRemote.close(), loadRuntime.close()]);
 
   const commitRemote = new RemoteExecutor({
-    id: "remote-commit",
+    id: "remote",
     workerId,
     clock,
     attemptStore: externalStore({ committed: "invalid" }),
@@ -2244,7 +2244,7 @@ test("WorkerRuntime rejects invalid revisions returned by external store list, l
   const loaded = invalidRevisionRecord("worker-invalid-load-revision");
   const loadLocal = new TestLocalExecutor();
   const loadRemote = new RemoteExecutor({
-    id: "worker-load-remote",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -2263,7 +2263,7 @@ test("WorkerRuntime rejects invalid revisions returned by external store list, l
 
   const commitLocal = new TestLocalExecutor();
   const commitRemote = new RemoteExecutor({
-    id: "worker-commit-remote",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -2289,7 +2289,7 @@ test("WorkerRuntime does not retry a malformed external revision forever", async
   let malformedCommits = 0;
   const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
-    id: "worker-malformed-revision-remote",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -2342,7 +2342,7 @@ test("WorkerRuntime latches invalid acknowledgement revisions and rejects later 
   let invalidAcknowledgements = 0;
   const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
-    id: "worker-invalid-ack-revision-remote",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
@@ -2408,7 +2408,7 @@ test("WorkerRuntime rejects before pruning after revision corruption is latched"
   let expiredCalls = 0;
   const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
-    id: "worker-latch-before-prune-remote",
+    id: "remote",
     workerId,
     clock,
     attemptStore: new MemoryRemoteAttemptStore(),
