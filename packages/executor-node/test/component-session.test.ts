@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type ExecutionRequest,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
@@ -9,7 +10,6 @@ import {
   parseGeneration,
   parsePluginId,
   parseTaskId,
-  type ExecutionRequest,
 } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import {
@@ -192,4 +192,55 @@ test("component session diagnostics do not expose raw transport error messages",
   assert.equal(result.status, "failed");
   assert.doesNotMatch(JSON.stringify(result.diagnostic), /raw-plugin-secret/u);
   await sandbox.close();
+});
+
+test("component session lifecycle drain retries after a rejection and caches success", async () => {
+  let drainCalls = 0;
+  const transport = {
+    executor: { kind: "thread" as const, metadata: { executorId: "thread-local" } },
+    async run() {
+      return { status: "succeeded" as const };
+    },
+    async cancel() {},
+    async health() {
+      return { status: "healthy" as const };
+    },
+    async drain() {
+      drainCalls += 1;
+      if (drainCalls === 1) throw new Error("transient drain failure");
+    },
+    async close() {},
+    async terminate() {},
+  };
+  const sandbox = session(transport);
+
+  await assert.rejects(sandbox.drainLifecycle({}), /transient drain failure/u);
+  const retry = sandbox.drainLifecycle({});
+  await retry;
+
+  assert.strictEqual(sandbox.drainLifecycle({}), retry);
+  assert.equal(drainCalls, 2);
+});
+
+test("component session exposes a recursively frozen target", () => {
+  const sandbox = session({
+    executor: { kind: "thread" as const, metadata: { executorId: "thread-local" } },
+    async run() {
+      return { status: "succeeded" as const };
+    },
+    async cancel() {},
+    async health() {
+      return { status: "healthy" as const };
+    },
+    async drain() {},
+    async close() {},
+    async terminate() {},
+  });
+
+  assert.equal(Object.isFrozen(sandbox.target), true);
+  assert.equal(Object.isFrozen(sandbox.target.executor), true);
+  assert.throws(() => {
+    (sandbox.target.executor as { id: string }).id = "mutated";
+  }, TypeError);
+  assert.equal(sandbox.target.executor.id, "thread-local");
 });

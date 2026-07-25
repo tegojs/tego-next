@@ -1,12 +1,8 @@
 import {
-  DiagnosticError,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parseTaskExecutionTarget,
-  runtimeDiagnostic,
   type AttemptId,
   type AttemptStatus,
   type Clock,
+  DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -15,7 +11,11 @@ import {
   type ExecutorCapabilities,
   type ExecutorHealth,
   type JsonValue,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parseTaskExecutionTarget,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type TaskExecutionTarget,
   type TaskId,
 } from "@tegojs/contracts";
@@ -168,7 +168,7 @@ export class ComponentSandboxSession implements Executor {
   constructor(options: ComponentSandboxSessionOptions) {
     this.id = options.id;
     this.type = options.type;
-    this.target = Object.freeze(structuredClone(parseTaskExecutionTarget(options.target)));
+    this.target = deepFreeze(structuredClone(parseTaskExecutionTarget(options.target)));
     this.#identity = Object.freeze({ ...options.identity });
     this.#transport = options.transport;
     this.#clock = options.clock;
@@ -313,10 +313,18 @@ export class ComponentSandboxSession implements Executor {
   }
 
   drainLifecycle(options: DrainOptions): Promise<void> {
-    this.#lifecycleDrainPromise ??= (async () => {
-      await this.drain(options);
-      await this.#transport.drain();
-    })();
+    if (this.#lifecycleDrainPromise === undefined) {
+      const lifecycleDrainPromise = (async () => {
+        await this.drain(options);
+        await this.#transport.drain();
+      })();
+      this.#lifecycleDrainPromise = lifecycleDrainPromise;
+      void lifecycleDrainPromise.catch(() => {
+        if (this.#lifecycleDrainPromise === lifecycleDrainPromise) {
+          this.#lifecycleDrainPromise = undefined;
+        }
+      });
+    }
     return this.#lifecycleDrainPromise;
   }
 
