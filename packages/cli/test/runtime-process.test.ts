@@ -83,6 +83,38 @@ function controlledRuntime(): Runtime {
   };
 }
 
+function mainProcessRuntime(
+  overrides: Partial<Pick<Runtime, "start" | "status" | "stop">>,
+): Runtime {
+  return {
+    start: async () => undefined,
+    status: async () => ({ lifecycle: "running" }) as RuntimeStatus,
+    stop: async () => undefined,
+    operations: {} as Runtime["operations"],
+    events: {
+      async *[Symbol.asyncIterator]() {},
+    },
+    ...overrides,
+  };
+}
+
+async function settlesBeforeDeadline(promise: PromiseLike<unknown>, timeoutMs = 100): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise).then(
+        () => true,
+        () => true,
+      ),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function detachedRuntimeCommand(
   directory: string,
   endpoint: string,
@@ -202,6 +234,144 @@ test("@spec:runtime-operations/local-runtime-operations/pending-start-abort-stop
 
   assert.equal(stopBeforeStartSettled, true);
   assert.equal(serverCreated, false);
+});
+
+test("@spec:runtime-operations/local-runtime-operations/pending-status-abort-suppresses-readiness", async () => {
+  const status = Promise.withResolvers<RuntimeStatus>();
+  const statusCalled = Promise.withResolvers<void>();
+  const stopCalled = Promise.withResolvers<void>();
+  const closeCalled = Promise.withResolvers<void>();
+  let readyCalls = 0;
+  const controller = new AbortController();
+  const running = runMainProcess({
+    endpoint: "in-memory",
+    runtime: mainProcessRuntime({
+      status: () => {
+        statusCalled.resolve();
+        return status.promise;
+      },
+      stop: async () => {
+        stopCalled.resolve();
+      },
+    }),
+    signal: controller.signal,
+    onReady: () => {
+      readyCalls += 1;
+    },
+    controlServerFactory: async () => ({
+      endpoint: "in-memory",
+      close: async () => {
+        closeCalled.resolve();
+      },
+    }),
+  });
+
+  await statusCalled.promise;
+  controller.abort();
+  const cleanedBeforeStatus = await settlesBeforeDeadline(
+    Promise.all([stopCalled.promise, closeCalled.promise]),
+  );
+  status.resolve({ lifecycle: "running" } as RuntimeStatus);
+  await running;
+
+  assert.equal(cleanedBeforeStatus, true);
+  assert.equal(readyCalls, 0);
+});
+
+test("@spec:runtime-operations/local-runtime-operations/pending-on-ready-abort-does-not-block-cleanup", async () => {
+  const ready = Promise.withResolvers<void>();
+  const readyCalled = Promise.withResolvers<void>();
+  const stopCalled = Promise.withResolvers<void>();
+  const closeCalled = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  const running = runMainProcess({
+    endpoint: "in-memory",
+    runtime: mainProcessRuntime({
+      stop: async () => {
+        stopCalled.resolve();
+      },
+    }),
+    signal: controller.signal,
+    onReady: () => {
+      readyCalled.resolve();
+      return ready.promise;
+    },
+    controlServerFactory: async () => ({
+      endpoint: "in-memory",
+      close: async () => {
+        closeCalled.resolve();
+      },
+    }),
+  });
+  const outcome = running.then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ error, ok: false as const }),
+  );
+
+  await readyCalled.promise;
+  controller.abort();
+  const settledBeforeCallback = await settlesBeforeDeadline(outcome);
+  const cleanupStarted = await settlesBeforeDeadline(
+    Promise.all([stopCalled.promise, closeCalled.promise]),
+  );
+  ready.reject(new Error("late readiness callback failure"));
+  const result = await outcome;
+
+  assert.equal(settledBeforeCallback, true);
+  assert.equal(cleanupStarted, true);
+  assert.equal(result.ok, true);
+});
+
+test("@spec:runtime-operations/local-runtime-operations/pending-control-factory-abort-closes-late-server", async () => {
+  const factory = Promise.withResolvers<ControlServer>();
+  const factoryCalled = Promise.withResolvers<void>();
+  const stopCalled = Promise.withResolvers<void>();
+  const lateCloseCalled = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  let factorySignal: AbortSignal | undefined;
+  let statusCalls = 0;
+  type AbortAwareMainOptions = Omit<MainProcessOptions, "controlServerFactory"> & {
+    readonly controlServerFactory: (options: {
+      readonly signal?: AbortSignal;
+    }) => Promise<ControlServer>;
+  };
+  const runAbortAware = runMainProcess as (options: AbortAwareMainOptions) => Promise<void>;
+  const running = runAbortAware({
+    endpoint: "in-memory",
+    runtime: mainProcessRuntime({
+      status: async () => {
+        statusCalls += 1;
+        return { lifecycle: "running" } as RuntimeStatus;
+      },
+      stop: async () => {
+        stopCalled.resolve();
+      },
+    }),
+    signal: controller.signal,
+    controlServerFactory: (options) => {
+      factorySignal = options.signal;
+      factoryCalled.resolve();
+      return factory.promise;
+    },
+  });
+
+  await factoryCalled.promise;
+  controller.abort();
+  const settledBeforeFactory = await settlesBeforeDeadline(running);
+  factory.resolve({
+    endpoint: "in-memory",
+    close: async () => {
+      lateCloseCalled.resolve();
+    },
+  });
+  const lateServerClosed = await settlesBeforeDeadline(lateCloseCalled.promise);
+  await running;
+
+  assert.equal(settledBeforeFactory, true);
+  assert.equal(lateServerClosed, true);
+  assert.equal(factorySignal, controller.signal);
+  assert.equal(statusCalls, 0);
+  await stopCalled.promise;
 });
 
 test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-cleans-endpoint", async () => {
