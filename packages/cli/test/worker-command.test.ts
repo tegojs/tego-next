@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { resolve } from "node:path";
 import { test } from "node:test";
@@ -8,16 +11,47 @@ import {
   parseWorkerId,
   type ExecutionRequest,
 } from "@tegojs/contracts";
+import { SqliteStateStore } from "@tegojs/drivers-local";
 import type { PreparedArtifact } from "@tegojs/runtime";
+import {
+  connectMain,
+  createMainEndpoint,
+  listenForMain,
+  MemoryRemoteAttemptStore,
+  MemoryWorkerEpochAllocator,
+  RemoteExecutor,
+  requestFingerprint,
+  systemWorkerClock,
+  type RemoteAttemptRecord,
+} from "@tegojs/transport-websocket";
 import {
   type WorkerStartCommand,
   parseCommand,
 } from "../src/parse-command.js";
+import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { runCli } from "../src/run-cli.js";
 import {
   createPreparedArtifactSelection,
+  runWorkerProcess,
+  StateRemoteAttemptStore,
   type WorkerReadiness,
 } from "../src/worker/worker-process.js";
+
+const deadlineMs = 5_000;
+
+async function beforeDeadline<T>(promise: Promise<T>, label: string): Promise<T> {
+  const signal = AbortSignal.timeout(deadlineMs);
+  return await Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new Error(`Timed out waiting for ${label}`, { cause: signal.reason })),
+        { once: true },
+      );
+    }),
+  ]);
+}
 
 function capture() {
   const stream = new PassThrough();
@@ -173,7 +207,7 @@ function preparedArtifact(
       pluginId,
       version: `1.0.${digestSuffix === "a" ? "0" : "1"}`,
       contractRange: ">=0.0.0",
-      nodeRange: ">=26.0.0 <27.0.0",
+      nodeRange: ">=24.0.0 <27.0.0",
       moduleFormat: "esm",
       components: [
         {
@@ -254,4 +288,226 @@ test("@spec:worker-protocol/independent-worker-command/requires-a-bounded-worker
       ]),
     /worker|identity|invalid/iu,
   );
+});
+
+test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-attempt-store-"));
+  const databasePath = join(directory, "state.sqlite");
+  const workerId = parseWorkerId("worker-durable-attempts");
+  const request = assignment("org.example.durable");
+  const initial = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "acknowledged" as const,
+    epoch: "1",
+    updatedAt: new Date(0).toISOString(),
+    revision: "0",
+  };
+  let state = new SqliteStateStore({ databasePath });
+  try {
+    await state.open();
+    let store = new StateRemoteAttemptStore({ state, workerId });
+    const created = await store.commit(initial, { expectedRevision: null });
+    assert.equal(created?.revision, "1");
+    await state.close();
+
+    state = new SqliteStateStore({ databasePath });
+    await state.open();
+    store = new StateRemoteAttemptStore({ state, workerId });
+    const reopened = await store.load(request.taskId, request.attemptId);
+    assert.equal(reopened?.revision, "1");
+    assert.equal(reopened?.fingerprint, initial.fingerprint);
+
+    const running = {
+      ...(reopened ?? initial),
+      state: "running" as const,
+      updatedAt: new Date(1).toISOString(),
+    };
+    const committed = await store.commit(running, { expectedRevision: "1", expectedEpoch: "1" });
+    assert.equal(committed?.revision, "2");
+    assert.equal(
+      await store.commit(
+        { ...running, state: "terminal", updatedAt: new Date(2).toISOString() },
+        { expectedRevision: "1", expectedEpoch: "1" },
+      ),
+      undefined,
+    );
+    assert.deepEqual(
+      (await store.list(workerId)).map((record: RemoteAttemptRecord) => record.revision),
+      ["2"],
+    );
+  } finally {
+    await state.close().catch(() => undefined);
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+async function createWorkerArtifact(directory: string): Promise<{
+  readonly artifactPath: string;
+  readonly digest: string;
+}> {
+  const pluginDirectory = join(directory, "plugin");
+  const buildDirectory = join(pluginDirectory, "build");
+  const artifactPath = join(directory, "echo.tego");
+  await mkdir(buildDirectory, { recursive: true });
+  await writeFile(
+    join(pluginDirectory, "manifest.json"),
+    JSON.stringify({
+      schemaVersion: "1.0",
+      pluginId: "org.example.worker-echo",
+      version: "1.0.0",
+      contractRange: ">=0.0.0",
+      nodeRange: ">=26.0.0 <27.0.0",
+      moduleFormat: "esm",
+      components: [
+        {
+          componentId: "echo",
+          kind: "task",
+          entrypoint: "component.js",
+          executors: ["thread", "process"],
+        },
+      ],
+      permissions: [{ kind: "executor", executors: ["thread", "process"] }],
+      capabilities: { provides: [], requires: [] },
+    }),
+  );
+  await writeFile(
+    join(buildDirectory, "component.js"),
+    "export default { async run(_context, input) { return input; } };\n",
+  );
+  const packed = await packPlugin({
+    artifactPath,
+    build: false,
+    pluginDirectory,
+  });
+  return { artifactPath, digest: packed.digest };
+}
+
+test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertises-and-executes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-listen-process-"));
+  const { artifactPath, digest } = await createWorkerArtifact(directory);
+  const workerId = parseWorkerId("worker-listen-process");
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--listen",
+    "127.0.0.1:0",
+    "--credential",
+    "listen-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+    "--prepare",
+    artifactPath,
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  let readinessCount = 0;
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness: WorkerReadiness) => {
+      readinessCount += 1;
+      ready.resolve(readiness);
+    },
+  });
+  const main = createMainEndpoint({
+    credential: "listen-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const remote = new RemoteExecutor({
+    id: "listen-remote",
+    workerId,
+    clock: systemWorkerClock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  let session: Awaited<ReturnType<typeof connectMain>> | undefined;
+
+  try {
+    const readiness = await beforeDeadline(ready.promise, "listen Worker readiness");
+    assert.equal(readiness.direction, "listen");
+    assert.equal(readiness.workerId, workerId);
+    assert.equal(readiness.executors.length, 2);
+    session = await connectMain({ endpoint: main, url: new URL(readiness.url) });
+    await session.ready;
+    await remote.attach(session);
+    assert.deepEqual(main.registration(workerId)?.preparedArtifacts, [digest]);
+
+    const request = {
+      ...assignment("org.example.worker-echo"),
+      input: { usable: true },
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const result = await beforeDeadline(
+      (await remote.submit(request)).result,
+      "prepared Worker echo result",
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.output, { usable: true });
+    assert.equal(result.executor.metadata?.localExecutorKind, "thread");
+    assert.equal(readinessCount, 1);
+  } finally {
+    controller.abort();
+    await Promise.allSettled([session?.close(), remote.close(), main.close()]);
+    await beforeDeadline(running, "listen Worker cleanup");
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-attaches-runtime-before-readiness", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-process-"));
+  const workerId = parseWorkerId("worker-connect-process");
+  const main = createMainEndpoint({
+    credential: "connect-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const remote = new RemoteExecutor({
+    id: "connect-remote",
+    workerId,
+    clock: systemWorkerClock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const attached = Promise.withResolvers<void>();
+  const listener = await listenForMain({
+    endpoint: main,
+    host: "127.0.0.1",
+    port: 0,
+    onSession: async (session) => {
+      await remote.attach(session);
+      attached.resolve();
+    },
+  });
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    listener.url.href,
+    "--credential",
+    "connect-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness: WorkerReadiness) => ready.resolve(readiness),
+  });
+
+  try {
+    const readiness = await beforeDeadline(ready.promise, "connect Worker readiness");
+    await beforeDeadline(attached.promise, "connect Worker runtime attachment");
+    assert.equal(readiness.url, listener.url.href);
+    assert.equal((await remote.probe()).available, true);
+  } finally {
+    controller.abort();
+    await Promise.allSettled([remote.close(), listener.close(), main.close()]);
+    await beforeDeadline(running, "connect Worker cleanup");
+    await rm(directory, { force: true, recursive: true });
+  }
 });
