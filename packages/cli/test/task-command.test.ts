@@ -516,7 +516,7 @@ test("@spec:runtime-operations/task-operations/rejects-run-request-and-wait-iden
         }
         const terminal = taskRecord("terminal", {
           taskId: "task-cli-test",
-          attemptId: "attempt-cli-test",
+          attemptId: mismatch === "wait" ? "attempt-other" : "attempt-cli-test",
           status: "succeeded",
           executor: { kind: "thread" },
           startedAt: "2026-07-25T00:00:00.000Z",

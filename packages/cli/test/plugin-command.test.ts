@@ -334,7 +334,7 @@ test("@spec:runtime-operations/plugin-development-operations/human-and-json-use-
   const stderr = capture();
   const result = {
     identity: {
-      applicationId: "application-test",
+      applicationId: "application-default",
       pluginId: "org.example.echo",
     },
     observation: { state: "running" },
@@ -478,6 +478,45 @@ test("@spec:runtime-operations/plugin-development-operations/rejects-canonical-p
     });
 
     assert.equal(exitCode, 1);
+    assert.equal(await exists(artifactPath), false);
+    assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
+  } finally {
+    await rm(fixture.directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/rejects-dangling-symlink-output-alias-before-write", {
+  skip: process.platform === "win32" ? "file symlink contract runs on Unix" : false,
+}, async () => {
+  const fixture = await createPackFixture();
+  const artifactPath = join(fixture.directory, "plugin.tego");
+  const signaturePath = join(fixture.directory, "signature-link");
+  const stdout = capture();
+  const stderr = capture();
+  try {
+    await symlink("plugin.tego", signaturePath, "file");
+    const exitCode = await runCli({
+      argv: [
+        "plugin",
+        "pack",
+        fixture.pluginDirectory,
+        "--no-build",
+        "--output",
+        artifactPath,
+        "--private-key",
+        fixture.privateKeyPath,
+        "--key-id",
+        "test-key",
+        "--signature-output",
+        signaturePath,
+        "--json",
+      ],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(stdout.read(), "");
     assert.equal(await exists(artifactPath), false);
     assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
   } finally {
