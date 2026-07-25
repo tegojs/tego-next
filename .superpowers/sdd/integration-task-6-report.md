@@ -673,3 +673,60 @@ volta run --node 26.5.0 npm test
 Targeted Biome checks passed for the four affected source/test files.
 `git diff --check` passed, and no diagnostic report, debug instrumentation,
 child process, endpoint, or temporary runtime directory remained.
+
+## Final Signal-During-Cleanup Addendum
+
+The final review identified one remaining ordering race. If the lifecycle
+reported `stopped` first, Main entered sequential cleanup and sampled an
+unaborted signal. A later signal could not interrupt the pending runtime stop,
+so control close did not begin until that stop settled.
+
+### Commits
+
+- RED: `6fb337c`
+  (`test: expose late signal cleanup race`)
+- GREEN: `dc7298d`
+  (`fix: interrupt sequential shutdown on signal`)
+- Report addendum: the commit containing this update
+
+### RED and GREEN Behavior
+
+The deterministic regression publishes the lifecycle stop, waits until
+`runtime.stop()` is pending, then aborts the signal. Before the fix it observed:
+
+```text
+closeBeforeStop=false
+closeCount=0
+signalAborted=true
+```
+
+Cleanup now starts the runtime stop exactly once and listens for abort while
+awaiting it. If stop settles first, Main preserves the normal stop-then-close
+ordering needed for the control response. If abort wins, the idempotent close
+starts immediately and Main awaits both already-started operations with
+`Promise.allSettled`. Close is invoked once, synchronous throws become observed
+promise rejections, and cleanup errors retain the existing aggregation
+semantics.
+
+### Verification
+
+```text
+for tego_stress_run in {1..100}; do
+  volta run --node 26.5.0 node --test --test-timeout=6000 \
+    --test-name-pattern='signal-interrupts-lifecycle-stop-cleanup|control-stop-response-precedes-server-close|stop-failure-still-aggregates-control-cleanup' \
+    packages/cli/dist/test/runtime-process.test.js
+done
+100/100 repetitions passed
+
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+71 tests: 70 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run typecheck
+exit 0
+
+volta run --node 26.5.0 npm test
+612 tests: 611 passed, 0 failed, 1 Windows-only skipped
+```
+
+Targeted Biome checks passed for the two changed source/test files, and
+`git diff --check` passed.
