@@ -36,6 +36,20 @@ async function waitForPath(path: string, directory: string): Promise<void> {
 async function waitForExit(child: ChildProcess): Promise<{
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
+}>;
+async function waitForExit(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<{
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}>;
+async function waitForExit(
+  child: ChildProcess,
+  timeoutMs = deadlineMs,
+): Promise<{
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
 }> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return { code: child.exitCode, signal: child.signalCode };
@@ -44,7 +58,7 @@ async function waitForExit(child: ChildProcess): Promise<{
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("PROCESS_EXIT_TIMEOUT"));
-    }, deadlineMs);
+    }, timeoutMs);
     timer.unref();
     child.once("exit", (code, signal) => {
       clearTimeout(timer);
@@ -130,6 +144,66 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
   assert.equal(closeAttempted, true);
 });
 
+test("@spec:runtime-operations/local-runtime-operations/pending-start-abort-stops-before-control", async () => {
+  const start = Promise.withResolvers<void>();
+  const startCalled = Promise.withResolvers<void>();
+  const stopCalled = Promise.withResolvers<void>();
+  const stopCompletion = Promise.withResolvers<void>();
+  let serverCreated = false;
+  let settled = false;
+  const runtime: Runtime = {
+    start: () => {
+      startCalled.resolve();
+      return start.promise;
+    },
+    status: async () => ({ lifecycle: "running" }) as RuntimeStatus,
+    stop: () => {
+      stopCalled.resolve();
+      return stopCompletion.promise;
+    },
+    operations: {} as Runtime["operations"],
+    events: {
+      async *[Symbol.asyncIterator]() {},
+    },
+  };
+  const controller = new AbortController();
+  const running = runMainProcess({
+    endpoint: "in-memory",
+    runtime,
+    signal: controller.signal,
+    controlServerFactory: async () => {
+      serverCreated = true;
+      return {
+        endpoint: "in-memory",
+        close: async () => undefined,
+      };
+    },
+  });
+  void running.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+
+  await startCalled.promise;
+  controller.abort();
+  const stopBeforeStartSettled = await Promise.race([
+    stopCalled.promise.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 25)),
+  ]);
+  start.resolve();
+  await stopCalled.promise;
+  assert.equal(settled, false);
+  stopCompletion.resolve();
+  await running;
+
+  assert.equal(stopBeforeStartSettled, true);
+  assert.equal(serverCreated, false);
+});
+
 test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-cleans-endpoint", async () => {
   const directory = await temporaryRuntimeDirectory("tego-foreground-signal-");
   const endpoint = join(directory, "control.sock");
@@ -159,6 +233,32 @@ test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-clean
     assert.equal(child.kill("SIGTERM"), true);
     const exit = await waitForExit(child);
     assert.deepEqual(exit, { code: 0, signal: null });
+    await assert.rejects(access(endpoint));
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/local-runtime-operations/pre-readiness-sigterm-never-creates-endpoint", async () => {
+  const directory = await temporaryRuntimeDirectory("tego-pending-start-signal-");
+  const endpoint = join(directory, "control.sock");
+  const starting = join(directory, "startup.entered");
+  const stopped = join(directory, "runtime.stopped");
+  const fixture = fileURLToPath(new URL("fixtures/pending-start-main.js", import.meta.url));
+  const child = spawn(process.execPath, [fixture], {
+    env: {
+      ...process.env,
+      TEGO_PENDING_START_OPTIONS: JSON.stringify({ directory, endpoint }),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    await waitForPath(starting, directory);
+    assert.equal(child.kill("SIGTERM"), true);
+    const exit = await waitForExit(child, 1_000);
+    assert.deepEqual(exit, { code: 0, signal: null });
+    await access(stopped);
     await assert.rejects(access(endpoint));
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
