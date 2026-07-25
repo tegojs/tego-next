@@ -67,6 +67,29 @@ export interface ReconcileArtifactGate {
   validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact>;
 }
 
+interface ComponentLifecycleExecutor {
+  restore(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  isLive(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
+  close(authority?: RuntimeAuthority): Promise<void>;
+}
+
+function componentLifecycle(
+  effects: ComponentEffectExecutor,
+): ComponentLifecycleExecutor | undefined {
+  const { close, isLive, restore } = effects;
+  if (restore === undefined && isLive === undefined && close === undefined) return undefined;
+  if (restore === undefined || isLive === undefined || close === undefined) {
+    throw new TypeError(
+      "Component lifecycle capability requires restore, isLive, and close methods together",
+    );
+  }
+  return {
+    restore: restore.bind(effects),
+    isLive: isLive.bind(effects),
+    close: close.bind(effects),
+  };
+}
+
 export interface ReconcilerOptions {
   readonly state: StateStore;
   readonly clock: Clock;
@@ -278,6 +301,7 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
 export class Reconciler {
   readonly #options: ReconcilerOptions;
   readonly #owner: string;
+  readonly #componentLifecycle: ComponentLifecycleExecutor | undefined;
   readonly #diagnosticsByDeployment = new Map<string, readonly RuntimeDiagnostic[]>();
   readonly #readyDeployments = new Set<string>();
   #deployments: readonly PluginDeployment[] = [];
@@ -290,6 +314,7 @@ export class Reconciler {
   constructor(options: ReconcilerOptions) {
     this.#options = options;
     this.#owner = options.owner ?? "reconciler";
+    this.#componentLifecycle = componentLifecycle(options.effects);
   }
 
   get kernelRunning(): boolean {
@@ -313,7 +338,7 @@ export class Reconciler {
     } catch (error) {
       this.#running = false;
       try {
-        await this.#options.effects.close?.(this.#options.authority);
+        await this.#componentLifecycle?.close(this.#options.authority);
       } catch (closeError) {
         throw new AggregateError([error, closeError], "Reconciler startup cleanup failed");
       }
@@ -331,7 +356,7 @@ export class Reconciler {
   async stop(): Promise<void> {
     this.#running = false;
     await this.#tail;
-    await this.#options.effects.close?.(this.#options.authority);
+    await this.#componentLifecycle?.close(this.#options.authority);
   }
 
   diagnostics(): readonly RuntimeDiagnostic[] {
@@ -563,13 +588,13 @@ export class Reconciler {
   }
 
   async #restoreReadyComponents(): Promise<void> {
-    if (this.#options.effects.restore === undefined) return;
+    if (this.#componentLifecycle === undefined) return;
     const [deployments, loadedInstances] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstances(),
     ]);
     const restorable = loadedInstances
-      .filter((record) => isCanonicalInstance(record))
+      .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value)
       .filter(
         (instance) =>
@@ -590,14 +615,14 @@ export class Reconciler {
         left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
       );
     for (const instance of restorable) {
-      await this.#options.effects.restore(instance, this.#options.authority);
+      await this.#componentLifecycle.restore(instance, this.#options.authority);
     }
   }
 
   #isReadyAndLive(instance: ComponentInstance): boolean {
     return (
       instance.lifecycle === "ready" &&
-      (this.#options.effects.isLive?.(instance, this.#options.authority) ?? true)
+      (this.#componentLifecycle?.isLive(instance, this.#options.authority) ?? false)
     );
   }
 

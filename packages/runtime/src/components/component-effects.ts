@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   DiagnosticError,
   parseMessageId,
@@ -112,6 +113,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
   readonly #fingerprints = new Map<string, OperationFingerprint>();
   readonly #stoppedOperations: string[] = [];
   readonly #failedOperations: string[] = [];
+  readonly #restorations = new Map<string, Promise<void>>();
 
   constructor(options: ComponentEffectsOptions) {
     this.#artifacts = options.artifacts;
@@ -183,9 +185,29 @@ export class ComponentEffects implements ComponentEffectExecutor {
     return result;
   }
 
-  async restore(
+  restore(
     instance: ComponentInstance,
     authority: RuntimeAuthority | undefined = this.#authority(),
+  ): Promise<void> {
+    const key = this.#restorationKey(instance.instanceId, authority);
+    const existing = this.#restorations.get(key);
+    if (existing !== undefined) return existing;
+    const restoration = this.#restore(instance, authority);
+    this.#restorations.set(key, restoration);
+    void restoration.then(
+      () => {
+        if (this.#restorations.get(key) === restoration) this.#restorations.delete(key);
+      },
+      () => {
+        if (this.#restorations.get(key) === restoration) this.#restorations.delete(key);
+      },
+    );
+    return restoration;
+  }
+
+  async #restore(
+    instance: ComponentInstance,
+    authority: RuntimeAuthority | undefined,
   ): Promise<void> {
     const effect = this.#restorationEffect(instance, "start");
     this.#assertCurrentAuthority(effect, authority);
@@ -228,6 +250,12 @@ export class ComponentEffects implements ComponentEffectExecutor {
   }
 
   async close(authority: RuntimeAuthority | undefined = this.#authority()): Promise<void> {
+    const prefix = this.#restorationAuthorityPrefix(authority);
+    await Promise.allSettled(
+      [...this.#restorations.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([, restoration]) => restoration),
+    );
     const failures: unknown[] = [];
     for (const entry of this.#registry.entries()) {
       if (!sameAuthority(entry.binding.authority, authority)) continue;
@@ -244,11 +272,9 @@ export class ComponentEffects implements ComponentEffectExecutor {
         revision: parseRevision("0"),
         ...(entry.binding.workerId === undefined ? {} : { workerId: entry.binding.workerId }),
       };
-      try {
-        await this.#stop(this.#restorationEffect(instance, "stop"), entry, authority);
-      } catch (error) {
-        failures.push(error);
-      }
+      failures.push(
+        ...(await this.#closeEntry(this.#restorationEffect(instance, "stop"), entry, authority)),
+      );
     }
     if (failures.length > 0) {
       throw new DiagnosticError(
@@ -260,6 +286,47 @@ export class ComponentEffects implements ComponentEffectExecutor {
         }),
       );
     }
+  }
+
+  async #closeEntry(
+    effect: ReconcileEffect,
+    entry: RegisteredComponent,
+    authority: RuntimeAuthority | undefined,
+  ): Promise<readonly unknown[]> {
+    const failures: unknown[] = [];
+    let progress = entry;
+    if (progress.state === "active") {
+      try {
+        await this.#host.drain(progress.binding);
+        progress = this.#registry.transition(effect, "active", "draining", authority);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (progress.state !== "stopping") {
+      progress = this.#registry.transition(effect, progress.state, "stopping", authority);
+    }
+    if (!progress.hostStopped) {
+      try {
+        await this.#host.stop(progress.binding);
+        progress = this.#registry.updateStopProgress(effect, { hostStopped: true }, authority);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (!progress.artifactReleased) {
+      try {
+        await this.#artifacts.release(effect.artifactDigest);
+        progress = this.#registry.updateStopProgress(effect, { artifactReleased: true }, authority);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (progress.hostStopped && progress.artifactReleased) {
+      this.#registry.remove(effect, authority);
+      this.#forgetInstanceOperations(effect.instanceId, effect.operationId);
+    }
+    return failures;
   }
 
   async #perform(effect: ReconcileEffect, authority: RuntimeAuthority | undefined): Promise<void> {
@@ -509,7 +576,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
     if (instance.lifecycle !== "ready" || instance.artifactDigest === undefined) {
       throw new TypeError("Only exact persisted ready component instances can be restored");
     }
-    const identity = `restore.${instance.instanceId}.${kind}`;
+    const digest = createHash("sha256").update(instance.instanceId).digest("hex");
+    const identity = `restore.${kind}.${digest}`;
     return {
       kind,
       operationId: parseOperationId(identity),
@@ -523,6 +591,14 @@ export class ComponentEffects implements ComponentEffectExecutor {
       executor: instance.executor,
       ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
     };
+  }
+
+  #restorationKey(instanceId: string, authority: RuntimeAuthority | undefined): string {
+    return `${this.#restorationAuthorityPrefix(authority)}${instanceId}`;
+  }
+
+  #restorationAuthorityPrefix(authority: RuntimeAuthority | undefined): string {
+    return `${authority?.resource ?? ""}\0${authority?.epoch ?? ""}\0`;
   }
 
   #forgetInstanceOperations(instanceId: string, retainedOperationId: string): void {
