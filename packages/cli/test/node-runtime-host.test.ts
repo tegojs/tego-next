@@ -58,16 +58,18 @@ test("Node Worker listener binds only after runtime readiness and closes with it
   }
 });
 
-test("Node Worker listener rejects an empty credential before binding or readiness", async () => {
+test("Node Worker listener rejects blank and oversized credentials before binding or readiness", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-node-listener-credential-"));
   try {
-    await assert.rejects(
-      createNodeRuntimeHost({
-        ...options(directory),
-        worker: { ...options(directory).worker, credential: "" },
-      }),
-      /credential must not be empty/iu,
-    );
+    for (const credential of ["", "   ", "x".repeat(4_097)]) {
+      await assert.rejects(
+        createNodeRuntimeHost({
+          ...options(directory),
+          worker: { ...options(directory).worker, credential },
+        }),
+        /credential/iu,
+      );
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
