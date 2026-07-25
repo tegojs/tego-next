@@ -88,6 +88,28 @@ test("packs unchanged ESM plugin inputs into identical deterministic archives", 
   }
 });
 
+test("@spec:plugin-deployment/sdk-runtime-import/isolated-pack-resolves-the-public-sdk", async () => {
+  const directory = await temporaryFixture();
+  try {
+    await writeFile(
+      join(directory, "src/component.ts"),
+      `
+        import { defineComponent } from "@tegojs/plugin-sdk";
+        export default defineComponent({
+          kind: "task",
+          run: async (_context, input) => input,
+        });
+      `,
+    );
+    const artifactPath = join(directory, "sdk.tego");
+    await packPlugin({ artifactPath, pluginDirectory: directory });
+    const bytes = await readFile(artifactPath);
+    assert.ok(bytes.includes(Buffer.from('"runtimeImports":["@tegojs/plugin-sdk"]')));
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
 test("rejects undeclared TypeScript build outputs and source maps", async () => {
   const directory = await temporaryFixture();
   try {

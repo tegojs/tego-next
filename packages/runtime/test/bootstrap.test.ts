@@ -40,6 +40,7 @@ import {
   type StateTransactionOptions,
   type Versioned,
 } from "@tegojs/contracts";
+import { lifecycleConformance } from "@tegojs/testkit";
 import { createRuntime, isRuntimeReady, transitionRuntimeState } from "../src/index.js";
 
 const now = new Date("2026-07-23T00:00:00.000Z");
@@ -338,6 +339,8 @@ function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] 
     log,
   };
 }
+
+lifecycleConformance(() => createRuntime(configuration, controlledDrivers().drivers));
 
 test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecycle", async () => {
   const { coordination, drivers, log } = controlledDrivers();

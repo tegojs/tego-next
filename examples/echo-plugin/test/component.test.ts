@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { test } from "node:test";
 import type echoComponent from "../src/component.js";
 
@@ -27,6 +27,10 @@ test("echo is executor-neutral and loading only records the fixture marker", asy
   assert.strictEqual(await run(undefined as never, input), input);
 
   const source = await readFile(new URL("../src/component.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /import\s*\{\s*defineComponent\s*\}\s*from\s*["']@tegojs\/plugin-sdk["']/u,
+  );
   assert.doesNotMatch(source, /@tegojs\/(?:executor|transport)/u);
 
   const manifest = JSON.parse(
@@ -58,4 +62,5 @@ test("echo is executor-neutral and loading only records the fixture marker", asy
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
   ) as { dependencies?: Record<string, string> };
   assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), ["@tegojs/plugin-sdk"]);
+  await assert.rejects(access(new URL("../build", import.meta.url)), { code: "ENOENT" });
 });
