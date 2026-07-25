@@ -15,6 +15,7 @@ import {
   parsePluginId,
   parsePluginManifest,
   parseTaskId,
+  type Executor,
   type ExecutionRequest,
   type JsonValue,
 } from "@tegojs/contracts";
@@ -321,11 +322,26 @@ export default {
 };
 `;
 
-async function artifact() {
+const unhealthyComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async health() {
+    return { status: "unhealthy", reason: "dependency unavailable" };
+  },
+  async run() {
+    throw new Error("unhealthy components must not run");
+  }
+};
+`;
+
+async function artifact(
+  input: { readonly kind?: "service" | "task"; readonly source?: string } = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "tego-thread-executor-"));
   directories.push(root);
   await mkdir(join(root, "components"), { recursive: true });
-  await writeFile(join(root, "components", "echo.js"), componentSource);
+  await writeFile(join(root, "components", "echo.js"), input.source ?? componentSource);
   const artifactRoot = await realpath(root);
   const manifest = parsePluginManifest({
     schemaVersion: "1.0",
@@ -337,7 +353,7 @@ async function artifact() {
     components: [
       {
         componentId: "echo",
-        kind: "task",
+        kind: input.kind ?? "task",
         entrypoint: "components/echo.js",
         executors: ["process", "thread"],
       },
@@ -349,6 +365,28 @@ async function artifact() {
     capabilities: { provides: [], requires: [] },
   });
   return { artifactRoot, manifest };
+}
+
+interface TestComponentSession extends Executor {
+  readonly target: ExecutionRequest["target"];
+}
+
+type CreateThreadComponentSession = (input: {
+  readonly target: ExecutionRequest["target"];
+  readonly component: Awaited<ReturnType<ThreadExecutorOptions["resolveComponent"]>>;
+  readonly executorOptions: ThreadExecutorOptions;
+}) => Promise<TestComponentSession>;
+
+async function loadThreadComponentSessionFactory(): Promise<CreateThreadComponentSession> {
+  const executorNode = (await import("../src/index.js")) as {
+    readonly createThreadComponentSession?: unknown;
+  };
+  assert.equal(
+    typeof executorNode.createThreadComponentSession,
+    "function",
+    "executor-node must export createThreadComponentSession",
+  );
+  return executorNode.createThreadComponentSession as CreateThreadComponentSession;
 }
 
 function request(input: JsonValue, suffix: string): ExecutionRequest {
@@ -1311,4 +1349,90 @@ test("connect transfer failure closes both private ports and the worker", async 
   } finally {
     await executor.drain({});
   }
+});
+
+test("thread component session owns one Worker across same-target attempts and releases it on close", async () => {
+  const factory = new TrackingWorkerFactory();
+  const executorOptions = await options(factory);
+  const first = request({ mode: "echo", value: "first" }, "session-first");
+  const second = request({ mode: "echo", value: "second" }, "session-second");
+  const createSession = await loadThreadComponentSessionFactory();
+  const session = await createSession({
+    target: first.target,
+    component: await executorOptions.resolveComponent(first),
+    executorOptions,
+  });
+
+  try {
+    assert.deepEqual(session.target, first.target);
+    assert.equal(factory.created, 1);
+    assert.equal(factory.active, 1);
+    assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    assert.equal((await (await session.submit(second)).result).status, "succeeded");
+    assert.equal(factory.created, 1);
+    assert.equal(factory.active, 1);
+  } finally {
+    await session.close();
+  }
+
+  await eventually(() => assert.equal(factory.active, 0));
+});
+
+test("thread component session refuses unhealthy activation before accepting a run", async () => {
+  const factory = new TrackingWorkerFactory();
+  const fixture = await artifact({ source: unhealthyComponentSource });
+  const executorOptions = await options(factory, {
+    resolveComponent: async () => ({
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: "instance",
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-unhealthy");
+  const createSession = await loadThreadComponentSessionFactory();
+
+  await assert.rejects(
+    createSession({
+      target: execution.target,
+      component: await executorOptions.resolveComponent(execution),
+      executorOptions,
+    }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMPONENT_UNHEALTHY",
+  );
+  await eventually(() => assert.equal(factory.active, 0));
+});
+
+test("thread component session rejects service kind before creating a Worker", async () => {
+  const factory = new TrackingWorkerFactory();
+  const fixture = await artifact({ kind: "service" });
+  const executorOptions = await options(factory, {
+    resolveComponent: async () => ({
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: "instance",
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-service");
+  const createSession = await loadThreadComponentSessionFactory();
+
+  await assert.rejects(
+    createSession({
+      target: execution.target,
+      component: await executorOptions.resolveComponent(execution),
+      executorOptions,
+    }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMPONENT_UNSUPPORTED",
+  );
+  assert.equal(factory.created, 0);
+  assert.equal(factory.active, 0);
 });

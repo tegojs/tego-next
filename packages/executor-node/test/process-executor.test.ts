@@ -17,6 +17,7 @@ import {
   parseTaskId,
   type Clock,
   type DriverHealth,
+  type Executor,
   type ExecutionRequest,
   type HostedProcess,
   type HostedProcessExit,
@@ -503,12 +504,27 @@ export default {
 };
 `;
 
-async function artifact() {
+const unhealthyComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async health() {
+    return { status: "unhealthy", reason: "dependency unavailable" };
+  },
+  async run() {
+    throw new Error("unhealthy components must not run");
+  }
+};
+`;
+
+async function artifact(
+  input: { readonly kind?: "service" | "task"; readonly source?: string } = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "tego-process-executor-"));
   directories.push(root);
   const componentPath = join(root, "components", "echo.js");
   await mkdir(join(root, "components"), { recursive: true });
-  await writeFile(componentPath, componentSource);
+  await writeFile(componentPath, input.source ?? componentSource);
   const artifactRoot = await realpath(root);
   const manifest = parsePluginManifest({
     schemaVersion: "1.0",
@@ -520,7 +536,7 @@ async function artifact() {
     components: [
       {
         componentId: "echo",
-        kind: "task",
+        kind: input.kind ?? "task",
         entrypoint: "components/echo.js",
         executors: ["process", "thread"],
       },
@@ -532,6 +548,28 @@ async function artifact() {
     capabilities: { provides: [], requires: [] },
   });
   return { artifactRoot, manifest };
+}
+
+interface TestComponentSession extends Executor {
+  readonly target: ExecutionRequest["target"];
+}
+
+type CreateProcessComponentSession = (input: {
+  readonly target: ExecutionRequest["target"];
+  readonly component: Awaited<ReturnType<ProcessExecutorOptions["resolveComponent"]>>;
+  readonly executorOptions: ProcessExecutorOptions;
+}) => Promise<TestComponentSession>;
+
+async function loadProcessComponentSessionFactory(): Promise<CreateProcessComponentSession> {
+  const executorNode = (await import("../src/index.js")) as {
+    readonly createProcessComponentSession?: unknown;
+  };
+  assert.equal(
+    typeof executorNode.createProcessComponentSession,
+    "function",
+    "executor-node must export createProcessComponentSession",
+  );
+  return executorNode.createProcessComponentSession as CreateProcessComponentSession;
 }
 
 function request(input: JsonValue, suffix: string): ExecutionRequest {
@@ -1998,4 +2036,101 @@ test("selection filters support, grant, resources, and health before preference"
       }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_SELECTION_UNAVAILABLE",
   );
+});
+
+test("process component session owns one child across same-target attempts and releases it on close", async () => {
+  const processHost = new TestProcessHost();
+  const executorOptions = await options({ processHost });
+  const first = request({ mode: "echo", value: "first" }, "session-first");
+  const second = request({ mode: "echo", value: "second" }, "session-second");
+  const createSession = await loadProcessComponentSessionFactory();
+  const session = await createSession({
+    target: first.target,
+    component: await executorOptions.resolveComponent(first),
+    executorOptions,
+  });
+
+  try {
+    assert.deepEqual(session.target, first.target);
+    assert.equal(processHost.activeProcessCount, 1);
+    assert.equal(processHost.peakActiveProcessCount, 1);
+    assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    assert.equal((await (await session.submit(second)).result).status, "succeeded");
+    assert.equal(processHost.activeProcessCount, 1);
+    assert.equal(processHost.peakActiveProcessCount, 1);
+  } finally {
+    await session.close();
+    await processHost.close();
+  }
+
+  assert.equal(processHost.activeProcessCount, 0);
+});
+
+test("process component session refuses unhealthy activation before accepting a run", async () => {
+  const processHost = new TestProcessHost();
+  const fixture = await artifact({ source: unhealthyComponentSource });
+  const executorOptions = await options({
+    processHost,
+    resolveComponent: async () => ({
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: "instance",
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-unhealthy");
+  const createSession = await loadProcessComponentSessionFactory();
+
+  try {
+    await assert.rejects(
+      createSession({
+        target: execution.target,
+        component: await executorOptions.resolveComponent(execution),
+        executorOptions,
+      }),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMPONENT_UNHEALTHY",
+    );
+    await eventually(() => assert.equal(processHost.activeProcessCount, 0));
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("process component session rejects service kind before spawning a child", async () => {
+  const processHost = new TestProcessHost();
+  const fixture = await artifact({ kind: "service" });
+  const executorOptions = await options({
+    processHost,
+    resolveComponent: async () => ({
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: "instance",
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-service");
+  const createSession = await loadProcessComponentSessionFactory();
+
+  try {
+    await assert.rejects(
+      createSession({
+        target: execution.target,
+        component: await executorOptions.resolveComponent(execution),
+        executorOptions,
+      }),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMPONENT_UNSUPPORTED",
+    );
+    assert.equal(processHost.peakActiveProcessCount, 0);
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    await processHost.close();
+  }
 });
