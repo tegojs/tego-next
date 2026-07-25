@@ -380,3 +380,95 @@ exit 0
 
 Targeted Biome checks passed for all four touched CLI source/test files, and
 `git diff --check` passed.
+
+## Findings 11–12 Capacity and Startup Abort Addendum
+
+Final review identified two additional Task 6 lifecycle gaps: socket close
+released global capacity before an asynchronous dispatch settled, and Main
+startup did not observe abort while `runtime.start()` was pending.
+
+### Commits
+
+- Finding 11 RED: `5879d87`
+  (`test: expose control dispatch capacity gap`)
+- Finding 12 RED: `4cdc7af`
+  (`test: expose pending startup abort gap`)
+- GREEN: `b532869`
+  (`fix: retain control capacity through dispatch`)
+- Report addendum: the commit containing this update
+
+### Finding 11 RED
+
+The regression starts one pending operation with
+`maxOutstandingRequests: 1`, disconnects its client, then opens another
+connection. Against the unfixed server, the second operation was dispatched
+instead of receiving the capacity diagnostic:
+
+```text
+volta run --node 26.5.0 npm run build --workspace @tegojs/cli
+volta run --node 26.5.0 node --test \
+  --test-name-pattern='disconnected-dispatch-retains-capacity' \
+  packages/cli/dist/test/control.test.js
+1 test: 0 passed, 1 failed
+AssertionError: a disconnected pending dispatch released capacity
+```
+
+The GREEN server gives each reservation an explicit owner. Socket close
+releases only a pre-dispatch reservation; accepting a complete frame transfers
+ownership to dispatch, whose `finally` releases it. The regression also
+resolves the operation, reserves capacity with another incomplete connection,
+proves a concurrent request is still rejected, closes that connection, and
+proves the next request succeeds. This catches both leaks and double-release
+underflow.
+
+### Finding 12 RED
+
+The controlled regression holds `runtime.start()` pending, aborts after its
+explicit start callback, and requires `runtime.stop()` to begin before startup
+settles. It also holds stop pending to prove `runMainProcess` awaits it and
+checks that the control-server factory is never called.
+
+The real fixture installs signal handlers before writing `startup.entered`.
+The test watches that explicit phase file, sends SIGTERM, and requires a normal
+exit, an awaited `runtime.stopped` marker, and no control endpoint.
+
+Against the unfixed Main process:
+
+```text
+volta run --node 26.5.0 npm run build --workspace @tegojs/cli
+volta run --node 26.5.0 node --test \
+  --test-name-pattern='pending-start-abort|pre-readiness-sigterm' \
+  packages/cli/dist/test/runtime-process.test.js
+2 tests: 0 passed, 2 failed
+controlled failure: stop was not called before startup settled
+real-process failure: PROCESS_EXIT_TIMEOUT
+```
+
+The GREEN Main startup races the start promise against the supplied abort
+signal. An abort before readiness skips control-server creation and enters the
+existing `finally`, which initiates and awaits runtime stop. A late-settling
+startup promise no longer prevents process settlement.
+
+### GREEN and Stress Evidence
+
+```text
+for tego_stress_run in {1..20}; do
+  volta run --node 26.5.0 node --test \
+    --test-name-pattern='disconnected-dispatch-retains-capacity' \
+    packages/cli/dist/test/control.test.js
+  volta run --node 26.5.0 node --test \
+    --test-name-pattern='pending-start-abort|pre-readiness-sigterm' \
+    packages/cli/dist/test/runtime-process.test.js
+done
+20/20 repetitions passed
+
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+64 tests: 63 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run typecheck --workspace @tegojs/cli
+exit 0
+```
+
+Targeted Biome checks passed for the five affected source/test files.
+`git diff --check` also passed, and no real child process, endpoint, or
+temporary runtime directory remained.
