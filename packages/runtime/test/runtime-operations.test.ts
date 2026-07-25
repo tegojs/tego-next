@@ -407,18 +407,12 @@ test("runtime snapshot rejects every non-canonical cursor encoding in requests a
   controller.openReadOnly();
   const canonical = createRuntimeSnapshotStateCursor("installations", "installation-a");
   const nonCanonical = [
-    cursorFromJson(
-      '{"section":"installations","version":1,"position":{"id":"installation-a"}}',
-    ),
-    cursorFromJson(
-      '{"version":1, "section":"installations","position":{"id":"installation-a"}}',
-    ),
+    cursorFromJson('{"section":"installations","version":1,"position":{"id":"installation-a"}}'),
+    cursorFromJson('{"version":1, "section":"installations","position":{"id":"installation-a"}}'),
     cursorFromJson(
       String.raw`{"version":1,"section":"installations","position":{"id":"installation-\u0061"}}`,
     ),
-    cursorFromJson(
-      '{"version":1.0,"section":"installations","position":{"id":"installation-a"}}',
-    ),
+    cursorFromJson('{"version":1.0,"section":"installations","position":{"id":"installation-a"}}'),
     `${canonical}=`,
   ];
 

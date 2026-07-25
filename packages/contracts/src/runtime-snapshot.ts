@@ -169,7 +169,7 @@ export function parseRuntimeSnapshotCursor(
   token: string,
   expectedSection: RuntimeSnapshotSection,
 ): ParsedRuntimeSnapshotCursor {
-  if (!token.startsWith(snapshotCursorPrefix) || token.length > 8_192) {
+  if (!token.startsWith(snapshotCursorPrefix)) {
     throw snapshotError("Runtime snapshot cursor is invalid");
   }
   const encoded = token.slice(snapshotCursorPrefix.length);
@@ -196,22 +196,33 @@ export function parseRuntimeSnapshotCursor(
   const position = objectValue(value.position, "Runtime snapshot cursor position");
   if (expectedSection === "operations") {
     exactKeys(position, ["revision", "operationId"]);
-    return {
+    const cursor: ParsedRuntimeSnapshotOperationCursor = {
       section: "operations",
       after: {
         revision: parseRevision(position.revision),
         operationId: parseOperationId(position.operationId),
       },
     };
+    if (
+      createRuntimeSnapshotOperationCursor(cursor.after.revision, cursor.after.operationId) !==
+      token
+    ) {
+      throw snapshotError("Runtime snapshot cursor is not canonically encoded");
+    }
+    return cursor;
   }
   exactKeys(position, ["id"]);
   if (typeof position.id !== "string" || position.id.length === 0) {
     throw snapshotError("Runtime snapshot cursor ID must not be empty");
   }
-  return {
+  const cursor: ParsedRuntimeSnapshotStateCursor = {
     section: expectedSection,
     afterId: position.id,
   };
+  if (createRuntimeSnapshotStateCursor(cursor.section, cursor.afterId) !== token) {
+    throw snapshotError("Runtime snapshot cursor is not canonically encoded");
+  }
+  return cursor;
 }
 
 export function parseRuntimeSnapshotRequest(input: unknown): RuntimeSnapshotRequest {
