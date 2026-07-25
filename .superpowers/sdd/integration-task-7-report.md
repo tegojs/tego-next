@@ -16,7 +16,14 @@ Task input is bounded before JSON parsing and normalized through the public
 operation contracts. `task run` waits by default and supports `--no-wait`.
 Unknown status remains `null`; a terminal `indeterminate` record preserves its
 non-retryable diagnostic and has no output. Human and JSON modes serialize the
-same typed result.
+same typed result. Direct injected control responses pass through the same
+protocol validation and sanitization boundary as real socket responses.
+
+Plugin packaging rejects artifact, signature, and private-key output collisions
+before writing. The preflight covers lexical paths, symlinked parents, dangling
+symlinks, hard links, and a conservative NFC/case-folded portable path identity.
+Controlled plugin and task responses are correlated back to their request,
+deployment, artifact, task, and attempt identities.
 
 ## TDD commits
 
@@ -27,20 +34,28 @@ same typed result.
 - `946257f` — `test: verify cli control parity and build reuse`
 - `3e53464` — `feat: add plugin and task cli commands`
 - `a0a272f` — `style: format task command test`
+- `09efd31` — `test: expose cli protocol boundary gaps`
+- `12f5f32` — `test: strengthen cli response correlations`
+- `681850d` — `test: cover dangling artifact path aliases`
+- `123c59d` — `fix: harden plugin and task cli boundaries`
+- `9157c27` — `test: expose portable cli identity aliases`
+- `0aee6f2` — `fix: normalize cli correlation identities`
 
 Every behavioral test commit was observed failing against the unsupported or
 incomplete command behavior before the production implementation passed it.
+The review-fix RED suite produced ten deterministic failures, followed by two
+additional portable-identity failures, before their respective GREEN commits.
 
 ## Verification
 
 - `npm run test:unit --workspace @tegojs/cli`
-  - 87 tests: 86 passed, 1 Windows-only skip, 0 failed.
+  - 101 tests: 100 passed, 1 Windows-only skip, 0 failed.
 - `npm run build`
   - all workspaces passed.
 - `npm run typecheck`
   - all workspaces passed.
 - `npm test`
-  - 628 tests: 627 passed, 1 Windows-only skip, 0 failed.
+  - 642 tests: 641 passed, 1 Windows-only skip, 0 failed.
 - `npm run format:check`
   - 195 files checked, no changes required.
 - `npm run lint`
@@ -52,7 +67,10 @@ incomplete command behavior before the production implementation passed it.
 - Worktree was clean after removing the generated echo-plugin build output.
 
 The CLI suite also proves identical typed JSON output through an injected
-control call and a real local control socket.
+control call and a real local control socket, rejects success frames with a
+missing `result`, preserves explicit `null`, sanitizes nested diagnostics, uses
+one monotonic run/wait timeout budget, and accepts requests that are equivalent
+on the JSON wire.
 
 ## Deliberate bounds
 
