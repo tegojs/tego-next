@@ -115,6 +115,7 @@ export class WorkerRuntime {
   #attachChain = Promise.resolve();
   #highestEpoch = 0n;
   #hydrated = false;
+  #initialization?: Promise<void>;
   #recovered = false;
   #closed = false;
   #reservedResults = 0;
@@ -190,6 +191,11 @@ export class WorkerRuntime {
     return this.#results.count;
   }
 
+  initialize(): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error("Worker runtime is closed"));
+    return (this.#initialization ??= this.#hydrate());
+  }
+
   attach(session: RemoteSession): Promise<void> {
     const attached = this.#attachChain.then(async () => this.#attach(session));
     this.#attachChain = attached.catch(() => undefined);
@@ -201,7 +207,7 @@ export class WorkerRuntime {
     if (session.state !== "ready" || !session.available) {
       throw new Error("Worker session must be ready before attaching execution");
     }
-    await this.#hydrate();
+    await this.initialize();
     const epoch = BigInt(session.epoch);
     if (epoch <= this.#highestEpoch && this.#session !== session) {
       throw new Error("Worker runtime session epoch is stale");

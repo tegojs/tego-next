@@ -427,7 +427,7 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
     assert.equal(committed?.revision, "2");
     assert.equal(
       await store.commit(
-        { ...running, state: "terminal", updatedAt: new Date(2).toISOString() },
+        { ...running, updatedAt: new Date(2).toISOString() },
         { expectedRevision: "1", expectedEpoch: "1" },
       ),
       undefined,

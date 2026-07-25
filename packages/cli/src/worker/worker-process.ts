@@ -5,6 +5,8 @@ import { join } from "node:path";
 import {
   DiagnosticError,
   parseArtifactDigest,
+  parseExecutionRequest,
+  parseExecutionResult,
   parseWorkerId,
   runtimeDiagnostic,
   serializeWireValue,
@@ -31,6 +33,7 @@ import {
   createWorkerEndpoint,
   listenForWorker,
   parseAttemptRevision,
+  requestFingerprint,
   WorkerRuntime,
   type RemoteAttemptCommitCondition,
   type RemoteAttemptRecord,
@@ -42,6 +45,117 @@ import {
 import type { WorkerStartCommand } from "../parse-command.js";
 
 const WORKER_ATTEMPT_COLLECTION = "worker-attempts";
+const WORKER_ATTEMPT_STATES = new Set(["acknowledged", "expired", "running", "terminal"] as const);
+const WORKER_ATTEMPT_FIELDS = new Set([
+  "acknowledgedAt",
+  "cancellation",
+  "epoch",
+  "fingerprint",
+  "request",
+  "result",
+  "revision",
+  "state",
+  "updatedAt",
+  "workerId",
+]);
+
+function attemptStateId(
+  workerId: WorkerId,
+  taskId: ExecutionRequest["taskId"],
+  attemptId: ExecutionRequest["attemptId"],
+): string {
+  return `${workerId}:${taskId.length}:${taskId}${attemptId}`;
+}
+
+function parseAttemptTimestamp(value: unknown, field: string): string {
+  if (
+    typeof value !== "string" ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  ) {
+    throw new Error(`Persisted Worker attempt ${field} is invalid`);
+  }
+  return value;
+}
+
+function parsePersistedAttempt(
+  value: unknown,
+  options: {
+    readonly expectedAttemptId?: ExecutionRequest["attemptId"];
+    readonly expectedStateId: string;
+    readonly expectedTaskId?: ExecutionRequest["taskId"];
+    readonly workerId: WorkerId;
+  },
+): RemoteAttemptRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Persisted Worker attempt must be an object");
+  }
+  const fields = value as Readonly<Record<string, unknown>>;
+  for (const field of Object.keys(fields)) {
+    if (!WORKER_ATTEMPT_FIELDS.has(field)) {
+      throw new Error("Persisted Worker attempt contains an unknown field");
+    }
+  }
+  const workerId = parseWorkerId(fields.workerId);
+  if (workerId !== options.workerId) {
+    throw new Error("Persisted Worker attempt belongs to a different Worker");
+  }
+  const request = parseExecutionRequest(fields.request);
+  if (
+    (options.expectedTaskId !== undefined && request.taskId !== options.expectedTaskId) ||
+    (options.expectedAttemptId !== undefined && request.attemptId !== options.expectedAttemptId) ||
+    attemptStateId(workerId, request.taskId, request.attemptId) !== options.expectedStateId
+  ) {
+    throw new Error("Persisted Worker attempt identity does not match its state key");
+  }
+  const fingerprint = requestFingerprint(request);
+  if (fields.fingerprint !== fingerprint) {
+    throw new Error("Persisted Worker attempt fingerprint does not match its request");
+  }
+  if (
+    typeof fields.state !== "string" ||
+    !WORKER_ATTEMPT_STATES.has(fields.state as "acknowledged" | "expired" | "running" | "terminal")
+  ) {
+    throw new Error("Persisted Worker attempt state is invalid");
+  }
+  const state = fields.state as "acknowledged" | "expired" | "running" | "terminal";
+  const epoch = parseAttemptRevision(fields.epoch);
+  const revision = parseAttemptRevision(fields.revision);
+  const updatedAt = parseAttemptTimestamp(fields.updatedAt, "updatedAt");
+  const result = fields.result === undefined ? undefined : parseExecutionResult(fields.result);
+  if (
+    result !== undefined &&
+    (result.taskId !== request.taskId || result.attemptId !== request.attemptId)
+  ) {
+    throw new Error("Persisted Worker attempt result identity does not match its request");
+  }
+  if ((state === "terminal" || state === "expired") !== (result !== undefined)) {
+    throw new Error("Persisted Worker attempt state and result are inconsistent");
+  }
+  const acknowledgedAt =
+    fields.acknowledgedAt === undefined
+      ? undefined
+      : parseAttemptTimestamp(fields.acknowledgedAt, "acknowledgedAt");
+  if (acknowledgedAt !== undefined && state !== "terminal" && state !== "expired") {
+    throw new Error("Persisted Worker attempt acknowledgement state is invalid");
+  }
+  const cancellation = fields.cancellation;
+  if (cancellation !== undefined && cancellation !== "cancelled" && cancellation !== "timed-out") {
+    throw new Error("Persisted Worker attempt cancellation is invalid");
+  }
+  return {
+    workerId,
+    request,
+    fingerprint,
+    state,
+    epoch,
+    updatedAt,
+    revision,
+    ...(result === undefined ? {} : { result }),
+    ...(acknowledgedAt === undefined ? {} : { acknowledgedAt }),
+    ...(cancellation === undefined ? {} : { cancellation }),
+  };
+}
 
 function cloneRecord(record: RemoteAttemptRecord): RemoteAttemptRecord {
   return serializeWireValue(record) as unknown as RemoteAttemptRecord;
@@ -68,9 +182,11 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
   async save(record: RemoteAttemptRecord): Promise<void> {
     this.#assertWorker(record.workerId);
     const key = this.#key(record.request.taskId, record.request.attemptId);
-    const snapshot = cloneRecord({
-      ...record,
-      revision: parseAttemptRevision(record.revision),
+    const snapshot = parsePersistedAttempt(record, {
+      expectedAttemptId: record.request.attemptId,
+      expectedStateId: key.id,
+      expectedTaskId: record.request.taskId,
+      workerId: this.#workerId,
     });
     await this.#state.transact({}, async (transaction) => {
       const current = await transaction.get(key);
@@ -86,26 +202,43 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
     condition: RemoteAttemptCommitCondition,
   ): Promise<RemoteAttemptRecord | undefined> {
     this.#assertWorker(record.workerId);
-    parseAttemptRevision(record.revision);
+    const key = this.#key(record.request.taskId, record.request.attemptId);
+    const validated = parsePersistedAttempt(record, {
+      expectedAttemptId: record.request.attemptId,
+      expectedStateId: key.id,
+      expectedTaskId: record.request.taskId,
+      workerId: this.#workerId,
+    });
     if (condition.expectedRevision !== null) {
       parseAttemptRevision(condition.expectedRevision);
     }
-    const key = this.#key(record.request.taskId, record.request.attemptId);
+    if (condition.expectedEpoch !== undefined) {
+      parseAttemptRevision(condition.expectedEpoch);
+    }
     const committed = await this.#state.transact({}, async (transaction) => {
       const current = await transaction.get(key);
+      const currentRecord =
+        current === undefined
+          ? undefined
+          : parsePersistedAttempt(current.value, {
+              expectedAttemptId: record.request.attemptId,
+              expectedStateId: key.id,
+              expectedTaskId: record.request.taskId,
+              workerId: this.#workerId,
+            });
       if (
         (condition.expectedRevision === null && current !== undefined) ||
         (condition.expectedRevision !== null &&
-          current?.value.revision !== condition.expectedRevision) ||
+          currentRecord?.revision !== condition.expectedRevision) ||
         (condition.expectedEpoch !== undefined &&
-          current !== undefined &&
-          current.value.epoch !== condition.expectedEpoch)
+          currentRecord !== undefined &&
+          currentRecord.epoch !== condition.expectedEpoch)
       ) {
         return null;
       }
       const snapshot = cloneRecord({
-        ...record,
-        revision: incrementRevision(current?.value.revision ?? "0"),
+        ...validated,
+        revision: incrementRevision(currentRecord?.revision ?? "0"),
       });
       await transaction.put(key, snapshot, {
         expectedRevision: current?.revision ?? "absent",
@@ -133,8 +266,16 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
     taskId: ExecutionRequest["taskId"],
     attemptId: ExecutionRequest["attemptId"],
   ): Promise<RemoteAttemptRecord | undefined> {
-    const record = await this.#state.read(this.#key(taskId, attemptId));
-    return record === undefined ? undefined : cloneRecord(record.value);
+    const key = this.#key(taskId, attemptId);
+    const record = await this.#state.read(key);
+    return record === undefined
+      ? undefined
+      : parsePersistedAttempt(record.value, {
+          expectedAttemptId: attemptId,
+          expectedStateId: key.id,
+          expectedTaskId: taskId,
+          workerId: this.#workerId,
+        });
   }
 
   async list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]> {
@@ -145,7 +286,12 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
       collection: WORKER_ATTEMPT_COLLECTION,
       idPrefix: `${this.#workerId}:`,
     })) {
-      records.push(cloneRecord(record.value));
+      records.push(
+        parsePersistedAttempt(record.value, {
+          expectedStateId: record.key.id,
+          workerId: this.#workerId,
+        }),
+      );
     }
     return records;
   }
@@ -163,7 +309,7 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
     return {
       namespace: "tego",
       collection: WORKER_ATTEMPT_COLLECTION,
-      id: `${this.#workerId}:${taskId.length}:${taskId}${attemptId}`,
+      id: attemptStateId(this.#workerId, taskId, attemptId),
     };
   }
 }
@@ -413,6 +559,7 @@ export async function runWorkerProcess(
       },
       validateAssignment: selection.validateAssignment,
     });
+    await runtime.initialize();
     endpoint = createWorkerEndpoint({
       credential: command.credential,
       workerId,
