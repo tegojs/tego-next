@@ -583,13 +583,18 @@ function parseWorker(arguments_: readonly string[]): WorkerStartCommand {
     if ((connect === undefined) === (listen === undefined)) {
       throw commandError("Worker start requires exactly one of --connect or --listen");
     }
-    const workerId = parseWorkerId(parsed.values["worker-id"] ?? `worker-${String(process.pid)}`);
+    const credential = parsed.values.credential ?? process.env.TEGO_WORKER_CREDENTIAL;
+    if (credential === undefined || credential.trim().length === 0) {
+      throw commandError("Worker start requires --credential or TEGO_WORKER_CREDENTIAL");
+    }
+    const configuredWorkerId = parsed.values["worker-id"];
+    if (configuredWorkerId === undefined || configuredWorkerId.length === 0) {
+      throw commandError("Worker start requires --worker-id");
+    }
+    const workerId = parseWorkerId(configuredWorkerId);
     const base = {
       kind: "worker.start" as const,
-      credential:
-        parsed.values.credential ??
-        process.env.TEGO_WORKER_CREDENTIAL ??
-        "development-worker-secret",
+      credential,
       dataDirectory: resolve(
         parsed.values["data-dir"] ?? join(defaultDataDirectory(), "workers", workerId),
       ),
