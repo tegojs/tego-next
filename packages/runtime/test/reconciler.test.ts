@@ -865,10 +865,16 @@ test("an unready capability consumer does not block its provider from bootstrapp
   await reconciler.start();
 
   assert.deepEqual(
-    effects.performed.map((effect) => effect.pluginId),
-    [providerId],
+    effects.performed.map((effect) => [effect.pluginId, effect.kind]),
+    [
+      [providerId, "prepare"],
+      [providerId, "start"],
+      [consumerId, "prepare"],
+      [consumerId, "start"],
+    ],
   );
-  assert.equal(reconciler.diagnostics()[0]?.code, "CAPABILITY_REQUIRED_UNAVAILABLE");
+  assert.deepEqual(reconciler.diagnostics(), []);
+  assert.equal(reconciler.applicationReady(), true);
   await reconciler.stop();
 });
 
@@ -1337,17 +1343,15 @@ test("claimed effects revalidate current placement before journaling or performi
 
   await reconciler.start();
 
-  assert.deepEqual(effects.calls, []);
+  assert.deepEqual(
+    effects.calls.map((candidate) => candidate.executor),
+    ["thread", "thread"],
+  );
   assert.equal(reconciler.replanCount, 1);
   assert.equal(
-    [...state.operations.values()].some((operation) => operation.status === "executing"),
+    effects.calls.some((candidate) => candidate.executor === effect.executor),
     false,
   );
-  effects.supportedExecutors = ["process"];
-  await reconciler.wake();
-  assert.deepEqual(effects.calls, []);
-  await reconciler.wake();
-  assert.equal(effects.performed.at(-1)?.kind, "prepare");
   await reconciler.stop();
 });
 
@@ -1451,7 +1455,17 @@ test("claimed remote effects require the current worker placement to match exact
 
   await reconciler.start();
 
-  assert.deepEqual(effects.calls, []);
+  assert.deepEqual(
+    effects.calls.map((candidate) => [candidate.workerId, candidate.kind]),
+    [
+      ["worker-b", "prepare"],
+      ["worker-b", "start"],
+    ],
+  );
+  assert.equal(
+    effects.calls.some((candidate) => candidate.workerId === plannedWorkerId),
+    false,
+  );
   assert.equal(reconciler.replanCount, 1);
   await reconciler.stop();
 });
@@ -1915,19 +1929,11 @@ test("retry pre-state revision conflicts replan before external execution", asyn
 
   await reconciler.start();
 
-  assert.equal(effects.calls.length, 0);
-  assert.equal(reconciler.replanCount >= 1, true);
-  assert.equal(
-    [...state.operations.values()].some((operation) => operation.status === "executing"),
-    false,
-  );
-
-  await reconciler.wake();
-
   assert.deepEqual(
     effects.calls.map((candidate) => candidate.kind),
     ["start"],
   );
+  assert.equal(reconciler.replanCount >= 1, true);
   const ready = await state.read({
     namespace: "tego",
     collection: "component-instances",
@@ -2002,10 +2008,11 @@ test("restart after observed commit but before acknowledgement does not repeat t
   const second = new Reconciler(options);
   await second.start();
 
-  assert.equal(effects.calls.length, 1);
+  assert.equal(effects.calls.filter((effect) => effect.kind === "prepare").length, 1);
+  assert.equal(effects.calls.filter((effect) => effect.kind === "start").length, 1);
   assert.equal(
     [...state.operations.values()].filter((entry) => entry.status === "completed").length,
-    1,
+    2,
   );
   await second.stop();
 });
@@ -2061,7 +2068,10 @@ test("a queued startup effect is discarded when desired state becomes disabled",
   await second.wake();
 
   assert.equal(effects.calls.filter((effect) => effect.kind === "prepare").length, 1);
-  assert.equal(effects.calls.at(-1)?.kind, "drain");
+  assert.deepEqual(
+    effects.calls.slice(-2).map((effect) => effect.kind),
+    ["drain", "stop"],
+  );
   assert.equal(second.replanCount, 1);
   await second.stop();
 });
@@ -2095,7 +2105,10 @@ test("disabled deployments can drain persisted instances after installation remo
   });
   await disabled.start();
 
-  assert.equal(effects.performed.at(-1)?.kind, "drain");
+  assert.deepEqual(
+    effects.performed.slice(-2).map((effect) => effect.kind),
+    ["drain", "stop"],
+  );
   await disabled.stop();
 });
 
@@ -2167,7 +2180,7 @@ test("component start failure records failure and only essential deployment read
   }
 });
 
-test("deployment observations progress from converging to ready", async () => {
+test("deployment observations are ready when wake convergence completes", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
@@ -2187,7 +2200,7 @@ test("deployment observations progress from converging to ready", async () => {
         (entry) => entry.key.collection === "deployment-observations",
       )?.value as { readonly status?: string } | undefined
     )?.status;
-  assert.equal(status(), "converging");
+  assert.equal(status(), "ready");
 
   await reconciler.wake();
   assert.equal(status(), "ready");
@@ -2330,9 +2343,8 @@ test("failed effect conditional commits reread after a revision conflict", async
     loadInstallations: async () => [installation()],
   });
 
-  await reconciler.start();
   state.failNextFailureCommit = true;
-  await reconciler.wake();
+  await reconciler.start();
 
   assert.equal(reconciler.replanCount, 1);
   assert.equal(

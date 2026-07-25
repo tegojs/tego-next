@@ -54,6 +54,7 @@ import { deterministicRetryDelay } from "./retry.js";
 
 const namespace = "tego";
 const claimLeaseMs = 30_000;
+const defaultMaxConvergencePasses = 10_000;
 
 export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
@@ -101,6 +102,7 @@ export interface ReconcilerOptions {
   readonly loadDeployments?: () => Promise<readonly PluginDeployment[]>;
   readonly loadInstallations?: () => Promise<readonly PluginInstallation[]>;
   readonly interruptAfterEffect?: boolean;
+  readonly maxConvergencePasses?: number;
 }
 
 interface PersistedComponentInstance extends JsonObject {
@@ -302,6 +304,7 @@ export class Reconciler {
   readonly #options: ReconcilerOptions;
   readonly #owner: string;
   readonly #componentLifecycle: ComponentLifecycleExecutor | undefined;
+  readonly #maxConvergencePasses: number;
   readonly #diagnosticsByDeployment = new Map<string, readonly RuntimeDiagnostic[]>();
   readonly #readyDeployments = new Set<string>();
   #deployments: readonly PluginDeployment[] = [];
@@ -315,6 +318,10 @@ export class Reconciler {
     this.#options = options;
     this.#owner = options.owner ?? "reconciler";
     this.#componentLifecycle = componentLifecycle(options.effects);
+    this.#maxConvergencePasses = options.maxConvergencePasses ?? defaultMaxConvergencePasses;
+    if (!Number.isSafeInteger(this.#maxConvergencePasses) || this.#maxConvergencePasses < 1) {
+      throw new RangeError("maxConvergencePasses must be a positive safe integer");
+    }
   }
 
   get kernelRunning(): boolean {
@@ -348,7 +355,7 @@ export class Reconciler {
 
   wake(): Promise<void> {
     if (!this.#running) return Promise.resolve();
-    const pass = this.#tail.then(() => this.#reconcilePass());
+    const pass = this.#tail.then(() => this.#reconcileUntilQuiescent());
     this.#tail = pass.catch(() => undefined);
     return pass;
   }
@@ -378,18 +385,36 @@ export class Reconciler {
     return true;
   }
 
-  async #reconcilePass(): Promise<void> {
+  async #reconcileUntilQuiescent(): Promise<void> {
+    this.#diagnosticsByDeployment.clear();
+    for (let pass = 0; pass < this.#maxConvergencePasses; pass += 1) {
+      if (!this.#running) return;
+      if (!(await this.#reconcilePass())) return;
+    }
     if (!this.#running) return;
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "LIFECYCLE_RECONCILE_DID_NOT_CONVERGE",
+        message: `Reconciler did not converge within ${this.#maxConvergencePasses} pass${this.#maxConvergencePasses === 1 ? "" : "es"}`,
+        source: { kind: "runtime", id: this.#owner },
+        details: { maxConvergencePasses: this.#maxConvergencePasses },
+        observedAt: this.#options.clock.now().toISOString(),
+      }),
+    );
+  }
+
+  async #reconcilePass(): Promise<boolean> {
+    if (!this.#running) return false;
     let [deployments, installations, loadedInstances] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstallations(),
       this.#loadInstances(),
     ]);
     this.#deployments = deployments;
-    this.#diagnosticsByDeployment.clear();
     this.#readyDeployments.clear();
 
     const existingClaim = await this.#claimNext();
+    let performedImmediateWork = existingClaim !== undefined;
     if (existingClaim !== undefined) {
       await this.#executeClaim(existingClaim);
       [deployments, installations, loadedInstances] = await Promise.all([
@@ -414,6 +439,7 @@ export class Reconciler {
     const gates = new Map<string, ArtifactDeploymentGate | DiagnosticError>();
     const orderRanks = new Map<string, number>();
     for (const deployment of lexicalDeployments) {
+      this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
       const invalidInstances = loadedInstances
         .filter(
           (record) =>
@@ -529,9 +555,13 @@ export class Reconciler {
 
     if (existingClaim === undefined) {
       const claim = await this.#claimNext();
-      if (claim !== undefined) await this.#executeClaim(claim);
+      if (claim !== undefined) {
+        performedImmediateWork = true;
+        await this.#executeClaim(claim);
+      }
     }
     await this.#refreshReadiness();
+    return performedImmediateWork;
   }
 
   async #claimNext(): Promise<OutboxClaim | undefined> {
