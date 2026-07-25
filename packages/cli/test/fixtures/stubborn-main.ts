@@ -10,8 +10,9 @@ if (options.dataDirectory === undefined) {
   throw new Error("fixture requires dataDirectory");
 }
 
-await writeFile(join(options.dataDirectory, "stubborn.pid"), String(process.pid));
 process.on("SIGTERM", () => undefined);
+await writeFile(join(options.dataDirectory, "stubborn.pid"), String(process.pid));
+process.send?.({ type: "fixture.ready" });
 
 const channel = new MessageChannel();
 channel.port1.on("message", () => undefined);

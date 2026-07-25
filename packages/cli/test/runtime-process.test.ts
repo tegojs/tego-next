@@ -164,6 +164,8 @@ test("@spec:runtime-operations/local-runtime-operations/detached-timeout-confirm
   const command = parsed as RuntimeStartCommand;
   type DetachedOptions = {
     readonly mainProcessPath: string;
+    readonly readinessGateMessageType: string;
+    readonly readinessGateTimeoutMs: number;
     readonly readinessTimeoutMs: number;
     readonly terminationTimeoutMs: number;
   };
@@ -176,7 +178,9 @@ test("@spec:runtime-operations/local-runtime-operations/detached-timeout-confirm
     await assert.rejects(
       configurableStart(command, {
         mainProcessPath: fileURLToPath(new URL("fixtures/stubborn-main.js", import.meta.url)),
-        readinessTimeoutMs: 50,
+        readinessGateMessageType: "fixture.ready",
+        readinessGateTimeoutMs: deadlineMs,
+        readinessTimeoutMs: 1,
         terminationTimeoutMs: 100,
       }),
       /LIFECYCLE_DETACHED_START_TIMEOUT/u,
