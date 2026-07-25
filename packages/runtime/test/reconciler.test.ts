@@ -1,16 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  parseApplicationId,
-  parseArtifactDigest,
-  parseCapabilityName,
-  parseComponentId,
-  parseFencingEpoch,
-  parseGeneration,
-  parseMessageId,
-  parseOperationId,
-  parsePluginId,
-  parseRevision,
   type ArtifactDigest,
   type Clock,
   type DriverHealth,
@@ -27,6 +17,16 @@ import {
   type PluginDeployment,
   type PluginInstallation,
   type PluginManifest,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseCapabilityName,
+  parseComponentId,
+  parseFencingEpoch,
+  parseGeneration,
+  parseMessageId,
+  parseOperationId,
+  parsePluginId,
+  parseRevision,
   type Revision,
   type ScannedState,
   type StateChange,
@@ -38,14 +38,14 @@ import {
   type Versioned,
 } from "@tegojs/contracts";
 import {
-  deterministicRetryDelay,
-  planReconcile,
-  Reconciler,
   type ArtifactDeploymentGate,
   type ComponentEffectExecutor,
   type ComponentInstance,
+  deterministicRetryDelay,
+  planReconcile,
   type ReconcileEffect,
   type ReconcilePlanStep,
+  Reconciler,
   type ReconcileSnapshot,
 } from "../src/index.js";
 
@@ -603,6 +603,19 @@ class TestStateStore implements StateStore {
   ): AsyncIterable<PersistedOperationJournalEntry> {
     const entries = [...this.operations.values()]
       .filter((entry) => entry.status === "executing" || entry.status === "planned")
+      .slice(0, query.limit);
+    for (const entry of entries) yield structuredClone(entry);
+  }
+
+  async *scanOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    const entries = [...this.operations.values()]
+      .sort(compareOperationJournalCursors)
+      .filter(
+        (entry) =>
+          query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+      )
       .slice(0, query.limit);
     for (const entry of entries) yield structuredClone(entry);
   }

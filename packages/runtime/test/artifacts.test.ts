@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import test from "node:test";
 import {
-  DiagnosticError,
-  parseArtifactDigest,
-  parseComponentId,
-  parsePluginId,
   type ArtifactDigest,
   type ArtifactStore,
+  DiagnosticError,
   type DriverHealth,
   type JsonValue,
   type PluginManifest,
+  parseArtifactDigest,
+  parseComponentId,
+  parsePluginId,
   type Revision,
   type ScannedState,
   type StateChange,
@@ -167,6 +167,7 @@ class InstallationStateStore implements StateStore {
     return this.records.get(JSON.stringify(key)) as Versioned<T> | undefined;
   }
   async *scan<T extends JsonValue>(_query: StateQuery<T>): AsyncIterable<ScannedState<T>> {}
+  async *scanOperations(): AsyncIterable<never> {}
   async *scanRecoverableOperations(): AsyncIterable<never> {}
   claimOutbox(): ReturnType<StateStore["claimOutbox"]> {
     return Promise.resolve([]);

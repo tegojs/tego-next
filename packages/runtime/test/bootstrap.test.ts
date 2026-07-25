@@ -1,37 +1,37 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  DiagnosticError,
-  diagnosticCode,
-  compareOperationJournalCursors,
-  parseApplicationId,
-  parseArtifactDigest,
-  parseFencingEpoch,
-  parseNodeId,
-  parseOperationId,
-  parseRevision,
-  parseRuntimeId,
-  parseRuntimeEvent,
-  parseRuntimeStatus,
   type ArtifactDigest,
   type ArtifactStore,
   type Clock,
   type CoordinationChange,
   type CoordinationProvider,
   type CoordinationWatchRequest,
+  compareOperationJournalCursors,
+  DiagnosticError,
   type DriverHealth,
+  diagnosticCode,
+  type HostedProcess,
   type JsonValue,
   type Leadership,
   type LeadershipHandle,
   type OperationJournalQuery,
   type PersistedOperationJournalEntry,
-  type HostedProcess,
   type ProcessHost,
   type ProcessSpawnRequest,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseFencingEpoch,
+  parseNodeId,
+  parseOperationId,
+  parseRevision,
+  parseRuntimeEvent,
+  parseRuntimeId,
+  parseRuntimeStatus,
   type RuntimeConfiguration,
   type RuntimeDrivers,
-  type SecretProvider,
   type ScannedState,
+  type SecretProvider,
   type StateChange,
   type StateKey,
   type StateQuery,
@@ -130,6 +130,21 @@ class ControlledStateStore implements StateStore {
       async *[Symbol.asyncIterator]() {
         store.log.push(`state.recover:${query.limit ?? "all"}`);
         await store.recoveryGate;
+        const entries = store.recovered
+          .filter(
+            (entry) =>
+              query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+          )
+          .slice(0, query.limit);
+        for (const entry of entries) yield entry;
+      },
+    };
+  }
+
+  scanOperations(query: OperationJournalQuery = {}): AsyncIterable<PersistedOperationJournalEntry> {
+    const store = this;
+    return {
+      async *[Symbol.asyncIterator]() {
         const entries = store.recovered
           .filter(
             (entry) =>

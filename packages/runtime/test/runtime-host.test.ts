@@ -1,14 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  diagnosticCode,
-  parseApplicationId,
-  parseFencingEpoch,
-  parseNodeId,
-  parseRuntimeId,
-  parseTaskId,
-  type parseRevision,
-  runtimeDiagnostic,
   type ArtifactDigest,
   type ArtifactStore,
   type CampaignRequest,
@@ -17,18 +9,26 @@ import {
   type CoordinationProvider,
   type CoordinationWatchRequest,
   type DriverHealth,
+  diagnosticCode,
   type HostedProcess,
   type JsonValue,
   type LeadershipHandle,
   type ProcessHost,
   type ProcessSpawnRequest,
+  parseApplicationId,
+  parseFencingEpoch,
+  parseNodeId,
+  type parseRevision,
+  parseRuntimeId,
+  parseTaskId,
+  type RunTaskRequest,
   type RuntimeAuthority,
   type RuntimeConfiguration,
-  type RuntimeDrivers,
   type RuntimeDiagnostic,
+  type RuntimeDrivers,
   type RuntimeTaskLifecycle,
   type RuntimeWorkerDirectory,
-  type RunTaskRequest,
+  runtimeDiagnostic,
   type ScannedState,
   type SecretProvider,
   type StateChange,
@@ -42,8 +42,8 @@ import {
   type Versioned,
 } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
-import { createRuntimeHost, type Reconciler, type RuntimeHostServices } from "../src/index.js";
 import { wakeReconcilerForAuthority } from "../src/create-runtime.js";
+import { createRuntimeHost, type Reconciler, type RuntimeHostServices } from "../src/index.js";
 
 const now = new Date("2026-07-24T00:00:00.000Z");
 const clock: Clock = {
@@ -87,6 +87,10 @@ class EmptyState implements StateStore {
   }
 
   scan<T extends JsonValue>(_query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
+    return emptyAsyncIterable();
+  }
+
+  scanOperations(): AsyncIterable<never> {
     return emptyAsyncIterable();
   }
 
