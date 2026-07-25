@@ -49,6 +49,55 @@ export interface NodeRuntimeHost {
   startWorkerListener(): Promise<string | undefined>;
 }
 
+interface OwnedWorkerListener {
+  readonly url: URL;
+  close(): Promise<void>;
+}
+
+export class NodeWorkerListenerOwner {
+  readonly #bind: () => Promise<OwnedWorkerListener>;
+  readonly #closedDuringBind = new Error("Worker listener owner closed during bind");
+  #listener: OwnedWorkerListener | undefined;
+  #listenerStart: Promise<OwnedWorkerListener> | undefined;
+  #closed = false;
+
+  constructor(bind: () => Promise<OwnedWorkerListener>) {
+    this.#bind = bind;
+  }
+
+  async start(): Promise<string> {
+    if (this.#closed) throw new Error("Worker listener owner is closed");
+    this.#listenerStart ??= this.#bind().then(async (candidate) => {
+      if (this.#closed) {
+        try {
+          await candidate.close();
+        } catch (error) {
+          throw new AggregateError([error], "Worker listener rollback failed");
+        }
+        throw this.#closedDuringBind;
+      }
+      this.#listener = candidate;
+      return candidate;
+    });
+    return (await this.#listenerStart).url.href;
+  }
+
+  async close(): Promise<void> {
+    this.#closed = true;
+    if (this.#listener !== undefined) {
+      await this.#listener.close();
+      return;
+    }
+    if (this.#listenerStart === undefined) return;
+    try {
+      await this.#listenerStart;
+    } catch (error) {
+      if (error === this.#closedDuringBind) return;
+      throw error;
+    }
+  }
+}
+
 async function digestFile(path: string): Promise<ReturnType<typeof parseArtifactDigest>> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -128,21 +177,24 @@ export async function createNodeRuntimeHost(
           epochAllocator,
           clock: drivers.clock,
         });
-  let listener: Awaited<ReturnType<typeof listenForMain>> | undefined;
-  let listenerStart: Promise<Awaited<ReturnType<typeof listenForMain>>> | undefined;
-  let listenerClosed = false;
-  const closeListener = async (): Promise<void> => {
-    listenerClosed = true;
-    const active = listener ?? (await listenerStart?.catch(() => undefined));
-    await active?.close();
-  };
+  const listenerOwner =
+    options.worker === undefined || mainEndpoint === undefined
+      ? undefined
+      : new NodeWorkerListenerOwner(() =>
+          listenForMain({
+            endpoint: mainEndpoint,
+            host: options.worker?.host ?? "127.0.0.1",
+            port: options.worker?.port ?? 0,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          }),
+        );
   const workers = {
     count: () => mainEndpoint?.activeSessionCount ?? 0,
     placements: () => [],
     close: async () => {
       const results = await Promise.allSettled([
         executor.close(),
-        closeListener(),
+        listenerOwner?.close(),
         mainEndpoint?.close(),
       ]);
       const errors = results
@@ -196,26 +248,12 @@ export async function createNodeRuntimeHost(
     },
   };
   const startWorkerListener = async (): Promise<string | undefined> => {
-    if (options.worker === undefined || mainEndpoint === undefined) return undefined;
-    if (listenerClosed) throw new Error("Worker listener owner is closed");
+    if (listenerOwner === undefined) return undefined;
     const status = await runtime.status();
     if (status.lifecycle !== "running") {
       throw new Error("Runtime must be running before the Worker listener binds");
     }
-    listenerStart ??= listenForMain({
-      endpoint: mainEndpoint,
-      host: options.worker.host,
-      port: options.worker.port,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    }).then(async (candidate) => {
-      if (listenerClosed) {
-        await candidate.close();
-        throw new Error("Worker listener owner closed during bind");
-      }
-      listener = candidate;
-      return candidate;
-    });
-    return (await listenerStart).url.href;
+    return listenerOwner.start();
   };
   return {
     runtime,
