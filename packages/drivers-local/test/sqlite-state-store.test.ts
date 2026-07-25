@@ -623,6 +623,57 @@ test("transaction scans decode only their SQL page and keep one immutable snapsh
   await second.close();
 });
 
+test("transaction scans do not expand their SQL page for unrelated staged puts", async () => {
+  const databasePath = await temporaryDatabase("scan-unrelated-staged-put");
+  const initial = await openStore(databasePath);
+  await initial.transact({}, async (transaction) => {
+    await transaction.put(key("scan-page", "A"), { label: "first" }, {});
+    return null;
+  });
+  await initial.close();
+
+  const database = new DatabaseSync(databasePath);
+  database.prepare("INSERT INTO revisions DEFAULT VALUES").run();
+  database
+    .prepare(
+      `
+        INSERT INTO records(
+          namespace,
+          collection_name,
+          record_id,
+          record_id_order_key,
+          value_json,
+          revision
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `,
+    )
+    .run(
+      "scan-page",
+      "examples",
+      "B",
+      Buffer.from(stateStringOrderKey("B")),
+      '{"not":',
+      2,
+    );
+  database.close();
+
+  const store = await openStore(databasePath);
+  await store.transact({}, async (transaction) => {
+    await transaction.put(key("unrelated-page", "staged"), { label: "unrelated" }, {});
+    const labels = [];
+    for await (const entry of transaction.scan<ExampleRecord>({
+      namespace: "scan-page",
+      collection: "examples",
+      limit: 1,
+    })) {
+      labels.push(entry.value.label);
+    }
+    assert.deepEqual(labels, ["first"]);
+    return null;
+  });
+  await store.close();
+});
+
 test("a failed SQLite open can be retried after repairing the path", async () => {
   const unusedDatabasePath = await temporaryDatabase("retry-open");
   const blockedDirectory = `${unusedDatabasePath}.blocked`;
