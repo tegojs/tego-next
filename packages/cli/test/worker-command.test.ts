@@ -429,6 +429,151 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
   }
 });
 
+function attemptStateKey(record: RemoteAttemptRecord) {
+  const { taskId, attemptId } = record.request;
+  return {
+    namespace: "tego",
+    collection: "worker-attempts",
+    id: `${record.workerId}:${taskId.length}:${taskId}${attemptId}`,
+  } as const;
+}
+
+async function putRawAttempt(
+  state: SqliteStateStore,
+  keyRecord: RemoteAttemptRecord,
+  value: RemoteAttemptRecord,
+): Promise<void> {
+  await state.transact({}, async (transaction) => {
+    await transaction.put(attemptStateKey(keyRecord), value, {
+      expectedRevision: "absent",
+    });
+    return null;
+  });
+}
+
+test("@spec:worker-protocol/durable-worker-attempts/rejects-corrupt-sqlite-records-at-the-store-boundary", async () => {
+  const workerId = parseWorkerId("worker-corrupt-attempts");
+  const request = assignment("org.example.corrupt");
+  const valid: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "acknowledged",
+    epoch: "1",
+    updatedAt: new Date(0).toISOString(),
+    revision: "1",
+  };
+  const cases = [
+    {
+      name: "invalid epoch",
+      value: { ...valid, epoch: "-1" },
+    },
+    {
+      name: "wrong worker",
+      value: { ...valid, workerId: parseWorkerId("worker-corrupt-other") },
+    },
+    {
+      name: "request and key mismatch",
+      value: {
+        ...valid,
+        request: {
+          ...request,
+          taskId: "task-corrupt-mismatch" as ExecutionRequest["taskId"],
+        },
+      },
+    },
+    {
+      name: "fingerprint mismatch",
+      value: { ...valid, fingerprint: "0".repeat(64) },
+    },
+  ] satisfies readonly {
+    readonly name: string;
+    readonly value: RemoteAttemptRecord;
+  }[];
+
+  for (const fixture of cases) {
+    const state = new SqliteStateStore({ databasePath: ":memory:" });
+    try {
+      await state.open();
+      await putRawAttempt(state, valid, fixture.value);
+      const store = new StateRemoteAttemptStore({ state, workerId });
+      await assert.rejects(
+        store.load(request.taskId, request.attemptId),
+        /attempt|epoch|fingerprint|worker|identity|invalid/iu,
+        fixture.name,
+      );
+      await assert.rejects(
+        store.list(workerId),
+        /attempt|epoch|fingerprint|worker|identity|invalid/iu,
+        fixture.name,
+      );
+    } finally {
+      await state.close().catch(() => undefined);
+    }
+  }
+});
+
+test("@spec:worker-protocol/durable-worker-attempts/listen-fails-before-readiness-on-corrupt-state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-corrupt-readiness-"));
+  const dataDirectory = join(directory, "data");
+  const workerId = parseWorkerId("worker-corrupt-readiness");
+  const request = assignment("org.example.corrupt-readiness");
+  const corrupt: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "running",
+    epoch: "invalid",
+    updatedAt: new Date(0).toISOString(),
+    revision: "1",
+  };
+  const seed = new SqliteStateStore({
+    databasePath: join(dataDirectory, "state.sqlite"),
+  });
+  await seed.open();
+  await putRawAttempt(seed, corrupt, corrupt);
+  await seed.close();
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--listen",
+    "127.0.0.1:0",
+    "--credential",
+    "corrupt-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    dataDirectory,
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<void>();
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: () => ready.resolve(),
+  });
+
+  try {
+    const outcome = await beforeDeadline(
+      Promise.race([
+        ready.promise.then(() => ({ kind: "ready" as const })),
+        running.then(
+          () => ({ kind: "stopped" as const }),
+          (error: unknown) => ({ error, kind: "failed" as const }),
+        ),
+      ]),
+      "corrupt Worker preflight",
+    );
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.match(String(outcome.error), /attempt|epoch|invalid/iu);
+    }
+  } finally {
+    controller.abort();
+    await running.catch(() => undefined);
+    await cleanupDirectory(directory);
+  }
+});
+
 async function createWorkerArtifact(directory: string): Promise<{
   readonly artifactPath: string;
   readonly digest: string;
