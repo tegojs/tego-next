@@ -1,4 +1,6 @@
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 import type { MainEndpoint } from "./main-endpoint.js";
 import type { WorkerSession } from "./session.js";
@@ -188,14 +190,24 @@ async function listen(
   if (options.host.length === 0) throw new TypeError("host must not be empty");
   if (isAborted(options.signal)) throw abortError(options.signal);
 
-  const server = new WebSocketServer({
-    clientTracking: false,
-    host: options.host,
-    maxPayload: limits.maxPayloadBytes,
-    path,
-    perMessageDeflate: false,
-    port: options.port,
+  const server = createServer((_request, response) => {
+    response.writeHead(404, {
+      Connection: "close",
+      "Content-Type": "text/plain; charset=utf-8",
+    });
+    response.end("Not Found");
   });
+  server.headersTimeout = limits.handshakeTimeoutMs;
+  server.requestTimeout = limits.handshakeTimeoutMs;
+  server.keepAliveTimeout = limits.handshakeTimeoutMs;
+  const webSockets = new WebSocketServer({
+    clientTracking: false,
+    maxPayload: limits.maxPayloadBytes,
+    noServer: true,
+    perMessageDeflate: false,
+  });
+  const connections = new Set<Duplex>();
+  const connectionTimeouts = new Map<Duplex, NodeJS.Timeout>();
   const sockets = new Set<WebSocket>();
   const sessions = new Set<WorkerSession>();
   const alive = new WeakMap<WebSocket, boolean>();
@@ -211,6 +223,12 @@ async function listen(
     }
   };
 
+  const clearConnectionTimeout = (socket: Duplex): void => {
+    const timeout = connectionTimeouts.get(socket);
+    if (timeout !== undefined) clearTimeout(timeout);
+    connectionTimeouts.delete(socket);
+  };
+
   const close = (): Promise<void> => {
     if (closing !== undefined) return closing;
     closing = (async () => {
@@ -218,6 +236,12 @@ async function listen(
       clearInterval(heartbeat);
       await Promise.allSettled([...sessions].map(async (session) => session.close()));
       for (const socket of sockets) socket.terminate();
+      for (const socket of connections) socket.destroy();
+      for (const timeout of connectionTimeouts.values()) clearTimeout(timeout);
+      connectionTimeouts.clear();
+      await new Promise<void>((resolve) => {
+        webSockets.close(() => resolve());
+      });
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {
           if (
@@ -230,8 +254,12 @@ async function listen(
           }
         });
       });
+      webSockets.removeAllListeners();
+      server.removeAllListeners("connection");
+      server.removeAllListeners("upgrade");
       sockets.clear();
       sessions.clear();
+      connections.clear();
     })();
     return closing;
   };
@@ -245,10 +273,22 @@ async function listen(
   server.on("error", serverError);
 
   server.on("connection", (socket) => {
-    if (closing !== undefined || sockets.size >= limits.maxConnections) {
-      socket.close(1013, "WORKER_CONNECTION_LIMIT");
+    if (closing !== undefined || connections.size >= limits.maxConnections) {
+      socket.destroy();
       return;
     }
+    connections.add(socket);
+    const timeout = setTimeout(() => socket.destroy(), limits.handshakeTimeoutMs);
+    timeout.unref();
+    connectionTimeouts.set(socket, timeout);
+    socket.once("close", () => {
+      clearConnectionTimeout(socket);
+      connections.delete(socket);
+    });
+  });
+
+  webSockets.on("connection", (socket: WebSocket, request) => {
+    clearConnectionTimeout(request.socket);
     sockets.add(socket);
     alive.set(socket, true);
     socket.on("pong", () => alive.set(socket, true));
@@ -264,10 +304,55 @@ async function listen(
         }
       });
       void session.ready
-        .then(async () => options.onSession?.(session))
+        .then(async () => {
+          try {
+            await options.onSession?.(session);
+          } catch (error) {
+            reportError(
+              error instanceof Error
+                ? error
+                : new Error("WebSocket session handler failed", { cause: error }),
+            );
+            await session.close();
+          }
+        })
         .catch(() => session.close());
-    } catch {
+    } catch (error) {
+      reportError(
+        error instanceof Error
+          ? error
+          : new Error("WebSocket endpoint rejected a connection", { cause: error }),
+      );
       socket.close(1011, "WORKER_ENDPOINT_REJECTED");
+    }
+  });
+
+  server.on("upgrade", (request, socket, head) => {
+    if (closing !== undefined || !connections.has(socket)) {
+      socket.destroy();
+      return;
+    }
+    let requestPath: string;
+    try {
+      const url = new URL(request.url ?? "/", "http://localhost");
+      requestPath = url.search.length === 0 ? url.pathname : "";
+    } catch {
+      requestPath = "";
+    }
+    if (requestPath !== path) {
+      socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      return;
+    }
+    clearConnectionTimeout(socket);
+    try {
+      webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+        webSockets.emit("connection", webSocket, request);
+      });
+    } catch (error) {
+      reportError(
+        error instanceof Error ? error : new Error("WebSocket upgrade failed", { cause: error }),
+      );
+      socket.destroy();
     }
   });
 
@@ -308,6 +393,7 @@ async function listen(
       server.once("close", closed);
       options.signal?.addEventListener("abort", aborted, { once: true });
       if (isAborted(options.signal)) aborted();
+      server.listen(options.port, options.host);
     });
   } catch (error) {
     await close().catch(() => undefined);
