@@ -1,7 +1,14 @@
+import { createHash } from "node:crypto";
 import {
-  parseCapabilityDefinition,
+  DiagnosticError,
+  parseExecutorId,
+  parseNodeId,
   parseTaskExecutionTarget,
+  runtimeDiagnostic,
   type Clock,
+  type ExecutorKind,
+  type JsonValue,
+  type PluginManifest,
   type ProcessHost,
   type SecretProvider,
   type TaskExecutionTarget,
@@ -12,7 +19,11 @@ import {
   type ResolvedProcessComponent,
   type ResolvedThreadComponent,
 } from "@tegojs/executor-node";
-import type { ComponentBinding, ComponentLifecycleHost } from "@tegojs/runtime";
+import {
+  canonicalJsonBytes,
+  type ComponentBinding,
+  type ComponentLifecycleHost,
+} from "@tegojs/runtime";
 import type {
   LocalComponentSessionRegistry,
   LocalComponentSessionRegistration,
@@ -27,17 +38,40 @@ export interface LocalComponentSessionHostOptions {
   readonly registry: LocalComponentSessionRegistry;
 }
 
-function capabilityDefinitions(binding: ComponentBinding) {
-  return binding.artifact.manifest.capabilities.provides.map((provided) =>
-    parseCapabilityDefinition({
-      identity: {
-        name: provided.name,
-        protocolVersion: provided.protocolVersion,
-      },
-      requestSchema: {},
-      responseSchema: {},
-    }),
-  );
+export function localComponentExecutorId(
+  nodeId: string,
+  executor: Extract<ExecutorKind, "process" | "thread">,
+): string {
+  const canonicalNodeId = parseNodeId(nodeId);
+  const digest = createHash("sha256").update(canonicalNodeId, "utf8").digest("hex");
+  return parseExecutorId(`node-${digest}:${executor}`);
+}
+
+export function canonicalJsonEqual(left: JsonValue, right: JsonValue): boolean {
+  return Buffer.compare(canonicalJsonBytes(left), canonicalJsonBytes(right)) === 0;
+}
+
+export function assertLocalComponentManifestSupported(manifest: PluginManifest): void {
+  if (manifest.capabilities.provides.length > 0 || manifest.capabilities.requires.length > 0) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "CAPABILITY_DEFINITION_UNAVAILABLE",
+        message:
+          "Local component sessions require durable capability schemas and token definitions",
+        source: { kind: "artifact", id: manifest.pluginId },
+      }),
+    );
+  }
+  const service = manifest.components.find((component) => component.kind === "service");
+  if (service !== undefined) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "LIFECYCLE_COMPONENT_KIND_UNSUPPORTED",
+        message: "Local service component sessions are not supported in phase 1",
+        source: { kind: "plugin", id: `${manifest.pluginId}/${service.componentId}` },
+      }),
+    );
+  }
 }
 
 export class LocalComponentSessionHost implements ComponentLifecycleHost {
@@ -48,6 +82,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
   }
 
   async start(binding: ComponentBinding): Promise<void> {
+    assertLocalComponentManifestSupported(binding.artifact.manifest);
     if (binding.executor !== "process" && binding.executor !== "thread") {
       throw new TypeError("Local component sessions support only process and thread executors");
     }
@@ -66,7 +101,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
       instanceId: binding.instanceId,
       configuration: binding.deployment.configuration,
       permissionGrants: binding.deployment.permissionGrants,
-      capabilityDefinitions: capabilityDefinitions(binding),
+      capabilityDefinitions: [],
     };
     const executor =
       binding.executor === "thread"
@@ -137,7 +172,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
       deploymentGeneration: binding.deployment.generation,
       artifactDigest: binding.artifact.digest,
       executor: {
-        id: `${this.#options.nodeId}:${binding.executor}`,
+        id: localComponentExecutorId(this.#options.nodeId, binding.executor),
         type: binding.executor,
       },
     });

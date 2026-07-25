@@ -20,6 +20,12 @@ interface RegisteredLocalComponentSession extends LocalComponentSessionRegistrat
   accepting: boolean;
 }
 
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const nested of Object.values(value)) deepFreeze(nested);
+  return Object.freeze(value);
+}
+
 function registryError(
   code: `LIFECYCLE_${string}`,
   message: string,
@@ -74,9 +80,10 @@ export class LocalComponentSessionRegistry {
         { target: key },
       );
     }
+    const target = deepFreeze(parseTaskExecutionTarget(registration.target));
     this.#sessions.set(key, {
       ...registration,
-      target: parseTaskExecutionTarget(registration.target),
+      target,
       accepting: true,
     });
   }
@@ -178,12 +185,12 @@ export class LocalComponentSessionRegistry {
   }
 
   #snapshot(session: RegisteredLocalComponentSession): LocalComponentSessionRegistration {
-    return {
+    return Object.freeze({
       applicationId: session.applicationId,
       pluginId: session.pluginId,
       componentId: session.componentId,
-      target: session.target,
+      target: deepFreeze(structuredClone(session.target)),
       executor: session.executor,
-    };
+    });
   }
 }

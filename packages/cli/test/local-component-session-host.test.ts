@@ -9,16 +9,11 @@ import {
 } from "@tegojs/contracts";
 import * as localHost from "../src/runtime/local-component-session-host.js";
 
-type LocalComponentExecutorId = (
-  nodeId: string,
-  executor: "process" | "thread",
-) => string;
+type LocalComponentExecutorId = (nodeId: string, executor: "process" | "thread") => string;
 type AssertLocalManifestSupported = (manifest: PluginManifest) => void;
 type CanonicalJsonEqual = (left: JsonValue, right: JsonValue) => boolean;
 
-function helper<Name extends keyof typeof localHost>(
-  name: Name,
-): (typeof localHost)[Name] {
+function helper<Name extends keyof typeof localHost>(name: Name): (typeof localHost)[Name] {
   const value = localHost[name];
   assert.equal(typeof value, "function", `local session host must export ${name}`);
   return value;

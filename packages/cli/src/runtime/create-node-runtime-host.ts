@@ -33,7 +33,11 @@ import {
   StateWorkerEpochAllocator,
 } from "@tegojs/transport-websocket";
 import type { LocalArtifactIngress } from "../control/server.js";
-import { LocalComponentSessionHost } from "./local-component-session-host.js";
+import {
+  assertLocalComponentManifestSupported,
+  canonicalJsonEqual,
+  LocalComponentSessionHost,
+} from "./local-component-session-host.js";
 import { LocalComponentSessionRegistry } from "./local-component-session-registry.js";
 
 export interface NodeWorkerListenerOptions {
@@ -159,6 +163,13 @@ export async function createNodeRuntimeHost(
       tegoContractVersion: "0.0.0",
     },
   });
+  const localArtifactGate = {
+    validate: async (request: Parameters<ArtifactService["validate"]>[0]) => {
+      const artifact = await artifactService.validate(request);
+      assertLocalComponentManifestSupported(artifact.manifest);
+      return artifact;
+    },
+  };
   const preparedArtifacts = new PreparedArtifactCache({
     artifacts: drivers.artifacts,
     root: join(options.dataDirectory, "prepared"),
@@ -236,7 +247,7 @@ export async function createNodeRuntimeHost(
     workers,
     createReconciler: (authority) =>
       new Reconciler({
-        artifactGate: artifactService,
+        artifactGate: localArtifactGate,
         authority,
         clock: drivers.clock,
         effects: new ComponentEffects({
@@ -268,7 +279,7 @@ export async function createNodeRuntimeHost(
             });
             if (durableInstallation === undefined) return undefined;
             const installation = parsePluginInstallation(durableInstallation.value);
-            const artifact = await artifactService.validate({
+            const artifact = await localArtifactGate.validate({
               digest: effect.artifactDigest,
             });
             if (
@@ -276,7 +287,7 @@ export async function createNodeRuntimeHost(
               installation.version !== deployment.version ||
               installation.digest !== deployment.artifactDigest ||
               artifact.digest !== installation.digest ||
-              JSON.stringify(artifact.manifest) !== JSON.stringify(installation.manifest)
+              !canonicalJsonEqual(artifact.manifest, installation.manifest)
             ) {
               return undefined;
             }
