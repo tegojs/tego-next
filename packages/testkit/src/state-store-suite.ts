@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  DiagnosticError,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
   STATE_QUERY_MAX_LIMIT,
@@ -1230,6 +1231,98 @@ export function stateStoreConformance(
             ["operation-failed", parseRevision("1"), "failed"],
             ["operation-transitioned", parseRevision("1"), "planned"],
             ["operation-transitioned", parseRevision("2"), "completed"],
+          ],
+        );
+      });
+    });
+
+    test("duplicate operation appends reject atomically with one structured diagnostic", async () => {
+      await withStore(factory, async (store) => {
+        const duplicateId = parseOperationId("operation-duplicate");
+        let rejection: unknown;
+        try {
+          await store.transact({}, async (transaction) => {
+            await transaction.appendOperation({
+              operationId: duplicateId,
+              kind: "deploy",
+              status: "planned",
+              state: { step: 1 },
+              updatedAt: "2026-07-25T00:00:00.000Z",
+            });
+            await transaction.appendOperation({
+              operationId: duplicateId,
+              kind: "deploy",
+              status: "executing",
+              state: { step: 2 },
+              updatedAt: "2026-07-25T00:00:01.000Z",
+            });
+            return null;
+          });
+        } catch (error) {
+          rejection = error;
+        }
+
+        assert.ok(rejection instanceof DiagnosticError);
+        assert.deepEqual(
+          {
+            code: rejection.diagnostic.code,
+            message: rejection.diagnostic.message,
+            sourceKind: rejection.diagnostic.source.kind,
+            retryable: rejection.diagnostic.retryable,
+            details: rejection.diagnostic.details,
+          },
+          {
+            code: "STATE_DATA_INVALID",
+            message: "An operation may be appended only once per state transaction",
+            sourceKind: "state",
+            retryable: false,
+            details: { operationId: duplicateId },
+          },
+        );
+        assert.deepEqual(
+          (await operations(store)).filter((entry) => entry.operationId === duplicateId),
+          [],
+        );
+        assert.deepEqual(
+          (await operationHistory(store)).filter((entry) => entry.operationId === duplicateId),
+          [],
+        );
+
+        const firstId = parseOperationId("operation-a");
+        const secondId = parseOperationId("operation-b");
+        await store.transact({}, async (transaction) => {
+          for (const operationId of [firstId, secondId]) {
+            await transaction.appendOperation({
+              operationId,
+              kind: "deploy",
+              status: "planned",
+              state: { operationId },
+              updatedAt: "2026-07-25T00:00:02.000Z",
+            });
+          }
+          return null;
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.appendOperation({
+            operationId: firstId,
+            kind: "deploy",
+            status: "completed",
+            state: { operationId: firstId },
+            updatedAt: "2026-07-25T00:00:03.000Z",
+          });
+          return null;
+        });
+
+        assert.deepEqual(
+          (await operationHistory(store)).map(({ operationId, revision, status }) => [
+            operationId,
+            revision,
+            status,
+          ]),
+          [
+            [firstId, parseRevision("1"), "planned"],
+            [secondId, parseRevision("1"), "planned"],
+            [firstId, parseRevision("2"), "completed"],
           ],
         );
       });
