@@ -799,6 +799,64 @@ test("sessions accept the ws message(data, isBinary) event signature", async () 
   await Promise.all([main.close(), worker.close()]);
 });
 
+test("@spec:worker-protocol/reliable-pre-consumer-delivery/flushes-once-in-exact-order", async () => {
+  const connection = await directConnection();
+  const received: string[] = [];
+  await connection.mainSession.send("session.reconcile", { order: "first" });
+  await connection.mainSession.send("session.reconcile", { order: "second" });
+  await flush();
+
+  connection.workerSession.onMessage((message) => {
+    const payload = message.payload as { order: string };
+    received.push(payload.order);
+  });
+  const duplicateConsumer: string[] = [];
+  connection.workerSession.onMessage((message) => {
+    duplicateConsumer.push((message.payload as { order: string }).order);
+  });
+
+  assert.deepEqual(received, ["first", "second"]);
+  assert.deepEqual(duplicateConsumer, []);
+  await cleanup(connection);
+});
+
+test(
+  "@spec:worker-protocol/reliable-pre-consumer-delivery/bounds-buffered-message-bytes",
+  { timeout: 2_000 },
+  async () => {
+    const connection = await directConnection({
+      maxFrameBytes: 512,
+      maxInflightMessages: 10,
+    });
+    const closed = Promise.withResolvers<void>();
+    connection.workerSession.onStateChange((state) => {
+      if (state === "closed") closed.resolve();
+    });
+    await connection.mainSession.send("session.reconcile", { value: "x".repeat(180) });
+    await connection.mainSession.send("session.reconcile", { value: "y".repeat(180) });
+    await connection.mainSession.send("session.reconcile", { value: "z".repeat(180) });
+
+    await closed.promise;
+    assert.equal(
+      connection.workerSession.diagnostic?.code,
+      "PROTOCOL_INFLIGHT_LIMIT_EXCEEDED",
+    );
+    await cleanup(connection);
+  },
+);
+
+test("@spec:worker-protocol/reliable-pre-consumer-delivery/close-revokes-unconsumed-messages", async () => {
+  const connection = await directConnection();
+  await connection.mainSession.send("session.reconcile", { retained: true });
+  await flush();
+  await connection.workerSession.close();
+  const received: JsonValue[] = [];
+  connection.workerSession.onMessage((message) => received.push(message.payload));
+
+  assert.deepEqual(received, []);
+  await cleanup(connection);
+});
+
 test("an incomplete authentication handshake expires without retaining the socket", async () => {
   const clock = new FakeClock();
   const main = createMainEndpoint({
