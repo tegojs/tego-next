@@ -509,6 +509,86 @@ async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
   });
 }
 
+function hasAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
+const RETRYABLE_NETWORK_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+const INITIAL_RECONNECT_DELAY_MS = 50;
+const MAXIMUM_RECONNECT_DELAY_MS = 2_000;
+
+function reconnectDelay(attempt: number): number {
+  return Math.min(
+    INITIAL_RECONNECT_DELAY_MS * 2 ** Math.min(attempt, 6),
+    MAXIMUM_RECONNECT_DELAY_MS,
+  );
+}
+
+function isRetryableNetworkError(error: unknown): boolean {
+  if (error instanceof DiagnosticError) {
+    return (
+      error.diagnostic.code === "PROTOCOL_HANDSHAKE_TIMEOUT" ||
+      error.diagnostic.code === "WORKER_HEARTBEAT_EXPIRED" ||
+      error.diagnostic.code === "WORKER_TRANSPORT_ERROR"
+    );
+  }
+  const code =
+    typeof error === "object" && error !== null && "code" in error ? String(error.code) : undefined;
+  if (code !== undefined && RETRYABLE_NETWORK_CODES.has(code)) return true;
+  return (
+    error instanceof Error &&
+    /closed during handshake|opening handshake has timed out|socket hang up/iu.test(error.message)
+  );
+}
+
+async function waitForSessionLoss(
+  session: WorkerSession,
+  signal: AbortSignal | undefined,
+): Promise<"aborted" | "lost"> {
+  if (hasAborted(signal)) return "aborted";
+  if (session.state !== "ready") return "lost";
+  return await new Promise<"aborted" | "lost">((resolve) => {
+    let removeState = (): void => undefined;
+    const finish = (outcome: "aborted" | "lost"): void => {
+      removeState();
+      signal?.removeEventListener("abort", aborted);
+      resolve(outcome);
+    };
+    removeState = session.onStateChange((state) => {
+      if (state !== "ready") finish("lost");
+    });
+    const aborted = (): void => finish("aborted");
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (hasAborted(signal)) aborted();
+    else if (session.state !== "ready") finish("lost");
+  });
+}
+
+async function waitForReconnect(
+  drivers: RuntimeDrivers,
+  delayMs: number,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  if (hasAborted(signal)) return false;
+  try {
+    await drivers.clock.sleep(delayMs, signal);
+    return !hasAborted(signal);
+  } catch (error) {
+    if (hasAborted(signal)) return false;
+    throw error;
+  }
+}
+
 export async function runWorkerProcess(
   command: WorkerStartCommand,
   options: WorkerProcessOptions = {},
@@ -571,7 +651,6 @@ export async function runWorkerProcess(
       },
     });
 
-    let url: URL;
     if (command.direction === "listen") {
       listener = await listenForWorker({
         endpoint,
@@ -580,26 +659,67 @@ export async function runWorkerProcess(
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         onSession: async (accepted) => runtime?.attach(accepted),
       });
-      url = listener.url;
-    } else {
-      url = new URL(command.url);
-      session = await connectWorker({
-        endpoint,
-        url,
-        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      await options.onReady?.({
+        type: "worker.ready",
+        pid: process.pid,
+        direction: command.direction,
+        url: listener.url.href,
+        workerId,
+        executors: capabilities,
       });
-      await session.ready;
-      await runtime.attach(session);
+      await waitForAbort(options.signal);
+    } else {
+      const url = new URL(command.url);
+      let retryAttempt = 0;
+      let readinessEmitted = false;
+      for (;;) {
+        if (hasAborted(options.signal)) break;
+        let retryableAttachRace = false;
+        try {
+          session = await connectWorker({
+            endpoint,
+            url,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          });
+          await session.ready;
+          if (session.state !== "ready") {
+            retryableAttachRace = true;
+            throw new Error("Worker session closed before runtime attachment");
+          }
+          try {
+            await runtime.attach(session);
+          } catch (error) {
+            retryableAttachRace = session.state !== "ready";
+            throw error;
+          }
+          retryAttempt = 0;
+          if (!readinessEmitted) {
+            await options.onReady?.({
+              type: "worker.ready",
+              pid: process.pid,
+              direction: command.direction,
+              url: url.href,
+              workerId,
+              executors: capabilities,
+            });
+            readinessEmitted = true;
+          }
+          const outcome = await waitForSessionLoss(session, options.signal);
+          await session.close();
+          session = undefined;
+          if (outcome === "aborted") break;
+        } catch (error) {
+          await session?.close().catch(() => undefined);
+          session = undefined;
+          if (hasAborted(options.signal)) break;
+          if (!retryableAttachRace && !isRetryableNetworkError(error)) throw error;
+        }
+        if (!(await waitForReconnect(drivers, reconnectDelay(retryAttempt), options.signal))) {
+          break;
+        }
+        retryAttempt += 1;
+      }
     }
-    await options.onReady?.({
-      type: "worker.ready",
-      pid: process.pid,
-      direction: command.direction,
-      url: url.href,
-      workerId,
-      executors: capabilities,
-    });
-    await waitForAbort(options.signal);
   } finally {
     const settle = async (operation: () => Promise<void> | undefined): Promise<void> => {
       try {

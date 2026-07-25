@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -57,6 +58,15 @@ async function waitForValue<T>(read: () => Promise<T>, accept: (value: T) => boo
     if (accept(value)) return value;
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error === undefined) resolve();
+      else reject(error);
+    });
+  });
 }
 
 async function cleanupDirectory(root: string): Promise<void> {
@@ -828,6 +838,164 @@ test("@spec:worker-protocol/independent-worker-command/connect-attaches-runtime-
     controller.abort();
     await Promise.allSettled([remote.close(), listener.close(), main.close()]);
     await beforeDeadline(running, "connect Worker cleanup");
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-retries-initial-network-failure-before-readiness", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-initial-retry-"));
+  const workerId = parseWorkerId("worker-connect-initial-retry");
+  const disrupted = Promise.withResolvers<void>();
+  const disruptor = createServer((socket) => {
+    disrupted.resolve();
+    socket.destroy();
+  });
+  await new Promise<void>((resolve, reject) => {
+    disruptor.once("error", reject);
+    disruptor.listen(0, "127.0.0.1", resolve);
+  });
+  const address = disruptor.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const main = createMainEndpoint({
+    credential: "initial-retry-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    `ws://127.0.0.1:${String(address.port)}/worker`,
+    "--credential",
+    "initial-retry-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  let readinessCount = 0;
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness) => {
+      readinessCount += 1;
+      ready.resolve(readiness);
+    },
+  });
+  let listener: Awaited<ReturnType<typeof listenForMain>> | undefined;
+
+  try {
+    await beforeDeadline(disrupted.promise, "initial disrupted Worker connection");
+    assert.equal(readinessCount, 0);
+    await closeServer(disruptor);
+    listener = await listenForMain({
+      endpoint: main,
+      host: "127.0.0.1",
+      port: address.port,
+    });
+    await beforeDeadline(ready.promise, "Worker readiness after initial network recovery");
+    assert.equal(readinessCount, 1);
+    assert.equal(main.current(workerId)?.available, true);
+  } finally {
+    controller.abort();
+    if (disruptor.listening) await closeServer(disruptor);
+    await Promise.allSettled([listener?.close(), main.close()]);
+    await beforeDeadline(running, "initial retry Worker cleanup");
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-abort-terminates-network-retry", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-retry-abort-"));
+  const workerId = parseWorkerId("worker-connect-retry-abort");
+  const disrupted = Promise.withResolvers<void>();
+  const disruptor = createServer((socket) => {
+    disrupted.resolve();
+    socket.destroy();
+  });
+  await new Promise<void>((resolve, reject) => {
+    disruptor.once("error", reject);
+    disruptor.listen(0, "127.0.0.1", resolve);
+  });
+  const address = disruptor.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    `ws://127.0.0.1:${String(address.port)}/worker`,
+    "--credential",
+    "retry-abort-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  let readinessCount = 0;
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: () => {
+      readinessCount += 1;
+    },
+  });
+
+  try {
+    await beforeDeadline(disrupted.promise, "disrupted Worker connection before abort");
+    await closeServer(disruptor);
+    controller.abort();
+    await beforeDeadline(running, "aborted Worker reconnect loop");
+    assert.equal(readinessCount, 0);
+  } finally {
+    controller.abort();
+    if (disruptor.listening) await closeServer(disruptor);
+    await running.catch(() => undefined);
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-authentication-failure-is-not-retried", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-auth-failure-"));
+  const workerId = parseWorkerId("worker-connect-auth-failure");
+  const main = createMainEndpoint({
+    credential: "correct-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const listener = await listenForMain({
+    endpoint: main,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    listener.url.href,
+    "--credential",
+    "wrong-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+  ]) as WorkerStartCommand;
+  let readinessCount = 0;
+  const running = runWorkerProcess(command, {
+    onReady: () => {
+      readinessCount += 1;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      beforeDeadline(running, "non-retryable Worker authentication failure"),
+      /authentication|credential|protocol/iu,
+    );
+    assert.equal(readinessCount, 0);
+  } finally {
+    await Promise.allSettled([listener.close(), main.close()]);
+    await running.catch(() => undefined);
     await cleanupDirectory(directory);
   }
 });
