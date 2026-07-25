@@ -23,6 +23,7 @@ import {
   requestFingerprint,
   systemWorkerClock,
   type RemoteAttemptRecord,
+  type WorkerSession,
 } from "@tegojs/transport-websocket";
 import { type WorkerStartCommand, parseCommand } from "../src/parse-command.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
@@ -48,6 +49,14 @@ async function beforeDeadline<T>(promise: Promise<T>, label: string): Promise<T>
       );
     }),
   ]);
+}
+
+async function waitForValue<T>(read: () => Promise<T>, accept: (value: T) => boolean): Promise<T> {
+  for (;;) {
+    const value = await read();
+    if (accept(value)) return value;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
 }
 
 async function cleanupDirectory(root: string): Promise<void> {
@@ -387,7 +396,7 @@ async function createWorkerArtifact(directory: string): Promise<{
   );
   await writeFile(
     join(buildDirectory, "component.js"),
-    'export default { protocol: "tego.component/1.0", kind: "task", async run(_context, input) { return input; } };\n',
+    'export default { protocol: "tego.component/1.0", kind: "task", async run(_context, input) { if (input.delayMs) await new Promise((resolve) => setTimeout(resolve, input.delayMs)); return input; } };\n',
   );
   const packed = await packPlugin({
     artifactPath,
@@ -521,6 +530,122 @@ test("@spec:worker-protocol/independent-worker-command/connect-attaches-runtime-
     controller.abort();
     await Promise.allSettled([remote.close(), listener.close(), main.close()]);
     await beforeDeadline(running, "connect Worker cleanup");
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered-result-after-network-loss", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-recovery-"));
+  const { artifactPath } = await createWorkerArtifact(directory);
+  const workerId = parseWorkerId("worker-connect-recovery");
+  const main = createMainEndpoint({
+    credential: "recovery-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const remote = new RemoteExecutor({
+    id: "connect-recovery-remote",
+    workerId,
+    clock: systemWorkerClock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    orphanTimeoutMs: 2_000,
+  });
+  let attached = Promise.withResolvers<WorkerSession>();
+  const attach = async (session: WorkerSession): Promise<void> => {
+    await remote.attach(session);
+    attached.resolve(session);
+  };
+  let listener = await listenForMain({
+    endpoint: main,
+    host: "127.0.0.1",
+    port: 0,
+    onSession: attach,
+  });
+  const reconnectPort = Number(listener.url.port);
+  const command = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    listener.url.href,
+    "--credential",
+    "recovery-secret",
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+    "--prepare",
+    artifactPath,
+  ]) as WorkerStartCommand;
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  const observerState = new SqliteStateStore({
+    databasePath: join(directory, "data", "state.sqlite"),
+  });
+  const observerAttempts = new StateRemoteAttemptStore({
+    state: observerState,
+    workerId,
+  });
+  let readinessCount = 0;
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness: WorkerReadiness) => {
+      readinessCount += 1;
+      ready.resolve(readiness);
+    },
+  });
+
+  try {
+    await beforeDeadline(ready.promise, "initial connect Worker readiness");
+    await observerState.open();
+    const firstSession = await beforeDeadline(attached.promise, "initial Worker attachment");
+    const firstSessionClosed = Promise.withResolvers<void>();
+    firstSession.onStateChange((state) => {
+      if (state === "closed") firstSessionClosed.resolve();
+    });
+    const handle = await remote.submit({
+      ...assignment("org.example.worker-echo"),
+      input: { delayMs: 200, recovered: true },
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+      orphanPolicy: "finish-and-buffer",
+    });
+    let terminalResults = 0;
+    void handle.result.then(() => {
+      terminalResults += 1;
+    });
+
+    await listener.close();
+    await beforeDeadline(firstSessionClosed.promise, "initial Worker session close");
+    await beforeDeadline(
+      waitForValue(
+        () => observerAttempts.load(handle.taskId, handle.attemptId),
+        (record) => record?.state === "terminal",
+      ),
+      "offline terminal Worker attempt",
+    );
+    attached = Promise.withResolvers<WorkerSession>();
+    listener = await listenForMain({
+      endpoint: main,
+      host: "127.0.0.1",
+      port: reconnectPort,
+      onSession: attach,
+    });
+    const replacement = await beforeDeadline(attached.promise, "reconnected Worker attachment");
+    const result = await beforeDeadline(handle.result, "reconnected buffered result");
+
+    assert.ok(BigInt(replacement.epoch) > BigInt(firstSession.epoch));
+    assert.equal(result.status, "succeeded", JSON.stringify(result));
+    assert.deepEqual(result.output, { delayMs: 200, recovered: true });
+    assert.equal(terminalResults, 1);
+    assert.equal(readinessCount, 1);
+  } finally {
+    controller.abort();
+    await Promise.allSettled([
+      observerState.close(),
+      remote.close(),
+      listener.close(),
+      main.close(),
+    ]);
+    await beforeDeadline(running, "reconnecting Worker cleanup");
     await cleanupDirectory(directory);
   }
 });
