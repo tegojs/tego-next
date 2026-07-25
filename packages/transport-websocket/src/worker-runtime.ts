@@ -193,7 +193,10 @@ export class WorkerRuntime {
 
   initialize(): Promise<void> {
     if (this.#closed) return Promise.reject(new Error("Worker runtime is closed"));
-    return (this.#initialization ??= this.#hydrate());
+    if (this.#initialization === undefined) {
+      this.#initialization = this.#hydrate();
+    }
+    return this.#initialization;
   }
 
   attach(session: RemoteSession): Promise<void> {
