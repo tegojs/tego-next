@@ -116,7 +116,7 @@ test("local session registry keys exact targets and keeps draining sessions reco
   registry.register(thread);
   assert.throws(
     () => registry.resolveFresh(taskRequest(), () => false),
-    /missing|unavailable/iu,
+    /no active accepting/iu,
     "fresh selection must also require lifecycle registry admission",
   );
   registry.register(process);
