@@ -131,7 +131,10 @@ async function connect(endpoint: string): Promise<Socket> {
   return socket;
 }
 
-async function settlesBeforeDeadline(promise: PromiseLike<unknown>, timeoutMs = 100): Promise<boolean> {
+async function settlesBeforeDeadline(
+  promise: PromiseLike<unknown>,
+  timeoutMs = 100,
+): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([

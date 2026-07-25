@@ -32,17 +32,38 @@ async function waitForStop(runtime: Runtime, signal?: AbortSignal): Promise<void
   }
 }
 
-async function startUntilAbort(runtime: Runtime, signal?: AbortSignal): Promise<boolean> {
+type PreReadinessResult<T> =
+  | { readonly aborted: true }
+  | { readonly aborted: false; readonly value: T };
+
+async function runUntilAbort<T>(
+  operation: () => T | PromiseLike<T>,
+  signal?: AbortSignal,
+  onLateValue?: (value: T) => void | Promise<void>,
+): Promise<PreReadinessResult<T>> {
+  if (signal?.aborted === true) return { aborted: true };
+  const operationPromise = Promise.resolve().then(() => {
+    if (signal?.aborted === true) {
+      throw new DOMException("Pre-readiness operation aborted", "AbortError");
+    }
+    return operation();
+  });
   if (signal === undefined) {
-    await runtime.start();
-    return true;
+    return { aborted: false, value: await operationPromise };
   }
-  if (signal.aborted) return false;
-  const aborted = Promise.withResolvers<false>();
-  const onAbort = () => aborted.resolve(false);
+  const aborted = Promise.withResolvers<PreReadinessResult<T>>();
+  const onAbort = () => aborted.resolve({ aborted: true });
   signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
   try {
-    return await Promise.race([runtime.start().then(() => true), aborted.promise]);
+    const result = await Promise.race([
+      operationPromise.then((value) => ({ aborted: false as const, value })),
+      aborted.promise,
+    ]);
+    if (result.aborted && onLateValue !== undefined) {
+      void operationPromise.then(onLateValue).catch(() => undefined);
+    }
+    return result;
   } finally {
     signal.removeEventListener("abort", onAbort);
   }
@@ -52,30 +73,39 @@ export async function runMainProcess(options: MainProcessOptions): Promise<void>
   let server: Awaited<ReturnType<typeof startControlServer>> | undefined;
   const errors: unknown[] = [];
   try {
-    const started = await startUntilAbort(options.runtime, options.signal);
-    if (started && options.signal?.aborted !== true) {
-      server = await (options.controlServerFactory ?? startControlServer)({
-        endpoint: options.endpoint,
-        operations: options.runtime,
-        ...(options.artifactIngress === undefined
-          ? {}
-          : { artifactIngress: options.artifactIngress }),
-      });
-      await options.onReady?.(await options.runtime.status());
-      await waitForStop(options.runtime, options.signal);
+    const started = await runUntilAbort(() => options.runtime.start(), options.signal);
+    if (!started.aborted) {
+      const created = await runUntilAbort(
+        () =>
+          (options.controlServerFactory ?? startControlServer)({
+            endpoint: options.endpoint,
+            operations: options.runtime,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            ...(options.artifactIngress === undefined
+              ? {}
+              : { artifactIngress: options.artifactIngress }),
+          }),
+        options.signal,
+        (lateServer) => lateServer.close(),
+      );
+      if (!created.aborted) {
+        server = created.value;
+        const status = await runUntilAbort(() => options.runtime.status(), options.signal);
+        if (!status.aborted) {
+          const ready = await runUntilAbort(() => options.onReady?.(status.value), options.signal);
+          if (!ready.aborted) await waitForStop(options.runtime, options.signal);
+        }
+      }
     }
   } catch (error) {
     errors.push(error);
   } finally {
-    try {
-      await options.runtime.stop();
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await server?.close();
-    } catch (error) {
-      errors.push(error);
+    const cleanup = await Promise.allSettled([
+      Promise.resolve().then(() => options.runtime.stop()),
+      Promise.resolve().then(() => server?.close()),
+    ]);
+    for (const result of cleanup) {
+      if (result.status === "rejected") errors.push(result.reason);
     }
   }
   if (errors.length === 1) throw errors[0];

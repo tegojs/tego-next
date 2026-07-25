@@ -40,6 +40,7 @@ export interface ControlRuntimeOperations {
 export interface ControlServerOptions {
   readonly endpoint: string;
   readonly operations: ControlRuntimeOperations;
+  readonly signal?: AbortSignal;
   readonly artifactIngress?: LocalArtifactIngress;
   readonly maxLineBytes?: number;
   readonly maxOutstandingRequests?: number;
@@ -51,6 +52,35 @@ export interface ControlServerOptions {
 export interface ControlServer {
   readonly endpoint: string;
   close(): Promise<void>;
+}
+
+function controlInitializationAbortError(): DOMException {
+  return new DOMException("Control server initialization aborted", "AbortError");
+}
+
+function assertControlInitializationActive(signal?: AbortSignal): void {
+  if (signal?.aborted === true) throw controlInitializationAbortError();
+}
+
+async function awaitControlInitialization<T>(
+  operation: () => T | PromiseLike<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  assertControlInitializationActive(signal);
+  const operationPromise = Promise.resolve().then(() => {
+    assertControlInitializationActive(signal);
+    return operation();
+  });
+  if (signal === undefined) return await operationPromise;
+  const aborted = Promise.withResolvers<never>();
+  const onAbort = () => aborted.reject(controlInitializationAbortError());
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  try {
+    return await Promise.race([operationPromise, aborted.promise]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function inputObject(input: JsonValue): JsonObject {
@@ -214,6 +244,7 @@ export async function removeOwnedControlEndpoint(endpoint: string): Promise<void
 
 export async function startControlServer(options: ControlServerOptions): Promise<ControlServer> {
   if (options.endpoint.length === 0) throw new TypeError("endpoint must not be empty");
+  assertControlInitializationActive(options.signal);
   const maxLineBytes = options.maxLineBytes ?? MAX_CONTROL_LINE_BYTES;
   const maxOutstanding = options.maxOutstandingRequests ?? MAX_CONTROL_OUTSTANDING_REQUESTS;
   const readTimeoutMs = options.readTimeoutMs ?? DEFAULT_CONTROL_READ_TIMEOUT_MS;
@@ -227,6 +258,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
     throw new RangeError("readTimeoutMs must be a positive safe integer");
   }
   await assertPrivateEndpointParent(options.endpoint);
+  assertControlInitializationActive(options.signal);
 
   const sockets = new Set<Socket>();
   let reservations = 0;
@@ -345,38 +377,56 @@ export async function startControlServer(options: ControlServerOptions): Promise
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
-      server.off("listening", onListening);
-      reject(error);
-    };
-    const onListening = () => {
-      server.off("error", onError);
-      resolve();
-    };
-    server.once("error", onError);
-    server.once("listening", onListening);
-    server.listen(options.endpoint);
-  });
-  server.on("error", (error) => {
-    terminalError ??= error;
-    try {
-      options.onServerError?.(error);
-    } catch (callbackError) {
-      terminalError = new AggregateError(
-        [terminalError, callbackError],
-        "Control listener error reporting failed",
-      );
-    }
-    for (const socket of sockets) socket.destroy();
-  });
-
   try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        options.signal?.removeEventListener("abort", onAbort);
+        server.off("error", onError);
+        server.off("listening", onListening);
+      };
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      const onAbort = () => finish(controlInitializationAbortError());
+      const onError = (error: Error) => finish(error);
+      const onListening = () => finish();
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      server.once("error", onError);
+      server.once("listening", onListening);
+      if (options.signal?.aborted === true) {
+        onAbort();
+        return;
+      }
+      server.listen(options.endpoint);
+    });
+    server.on("error", (error) => {
+      terminalError ??= error;
+      try {
+        options.onServerError?.(error);
+      } catch (callbackError) {
+        terminalError = new AggregateError(
+          [terminalError, callbackError],
+          "Control listener error reporting failed",
+        );
+      }
+      for (const socket of sockets) socket.destroy();
+    });
+
     if (process.platform !== "win32") {
-      await (options.setEndpointPermissions ?? ((endpoint) => chmod(endpoint, 0o600)))(
-        options.endpoint,
+      await awaitControlInitialization(
+        () =>
+          (options.setEndpointPermissions ?? ((endpoint) => chmod(endpoint, 0o600)))(
+            options.endpoint,
+          ),
+        options.signal,
       );
     }
+    assertControlInitializationActive(options.signal);
   } catch (error) {
     try {
       await closeListener(server, sockets);
