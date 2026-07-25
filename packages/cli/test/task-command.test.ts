@@ -187,6 +187,55 @@ test("@spec:runtime-operations/task-operations/unknown-and-indeterminate-remain-
   assert.equal("output" in indeterminate.result, false);
 });
 
+test("@spec:runtime-operations/task-operations/cancel-returns-canonical-task", async () => {
+  const jsonStdout = capture();
+  const humanStdout = capture();
+  const stderr = capture();
+  const requests: ControlClientOptions[] = [];
+  const cancelled = taskRecord("terminal", {
+    taskId: "task-cli-test",
+    attemptId: "attempt-cli-test",
+    status: "cancelled",
+    executor: { kind: "thread" },
+    startedAt: "2026-07-25T00:00:00.000Z",
+    completedAt: "2026-07-25T00:00:01.000Z",
+  });
+  const requestControl = async (request: ControlClientOptions) => {
+    requests.push(request);
+    return response(cancelled);
+  };
+
+  assert.equal(
+    await runCli({
+      argv: ["task", "cancel", "task-cli-test", "--json"],
+      stdout: jsonStdout.stream,
+      stderr: stderr.stream,
+      requestControl,
+    }),
+    0,
+  );
+  assert.equal(
+    await runCli({
+      argv: ["task", "cancel", "task-cli-test"],
+      stdout: humanStdout.stream,
+      stderr: stderr.stream,
+      requestControl,
+    }),
+    0,
+  );
+
+  assert.equal(stderr.read(), "");
+  assert.deepEqual(
+    requests.map(({ input, operation }) => ({ input, operation })),
+    [
+      { operation: "task.cancel", input: { taskId: "task-cli-test" } },
+      { operation: "task.cancel", input: { taskId: "task-cli-test" } },
+    ],
+  );
+  assert.deepEqual(JSON.parse(humanStdout.read()), JSON.parse(jsonStdout.read()));
+  assert.equal(JSON.parse(jsonStdout.read()).result.status, "cancelled");
+});
+
 test("@spec:runtime-operations/task-operations/reject-invalid-json-before-control", async () => {
   const stdout = capture();
   const stderr = capture();

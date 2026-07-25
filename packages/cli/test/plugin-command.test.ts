@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
+import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { runCli } from "../src/run-cli.js";
 
 function capture() {
@@ -56,6 +57,44 @@ test("@spec:runtime-operations/plugin-development-operations/validate-before-pac
     assert.equal(await exists(outputArtifact), false);
     assert.equal(stdout.read(), "");
     assert.equal(JSON.parse(stderr.read()).diagnostic.source.kind, "artifact");
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/validate-and-inspect-locally", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-plugin-inspect-command-"));
+  const artifactPath = join(directory, "echo.tego");
+  const validateStdout = capture();
+  const inspectStdout = capture();
+  const stderr = capture();
+  try {
+    const pluginDirectory = resolve("../..", "examples/echo-plugin");
+    await packPlugin({ artifactPath, pluginDirectory });
+
+    assert.equal(
+      await runCli({
+        argv: ["plugin", "validate", pluginDirectory, "--json"],
+        stdout: validateStdout.stream,
+        stderr: stderr.stream,
+      }),
+      0,
+    );
+    assert.equal(
+      await runCli({
+        argv: ["plugin", "inspect", artifactPath],
+        stdout: inspectStdout.stream,
+        stderr: stderr.stream,
+      }),
+      0,
+    );
+
+    assert.equal(stderr.read(), "");
+    assert.equal(JSON.parse(validateStdout.read()).valid, true);
+    const inspected = JSON.parse(inspectStdout.read());
+    assert.equal(inspected.manifest.pluginId, "org.example.echo");
+    assert.match(inspected.digest, /^sha256:[0-9a-f]{64}$/u);
+    assert.ok(inspected.files.files.length > 0);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -177,4 +216,40 @@ test("@spec:runtime-operations/plugin-development-operations/deploy-and-status-u
       },
     ],
   );
+});
+
+test("@spec:runtime-operations/plugin-development-operations/human-and-json-use-one-result", async () => {
+  const jsonStdout = capture();
+  const humanStdout = capture();
+  const stderr = capture();
+  const result = {
+    identity: {
+      applicationId: "application-test",
+      pluginId: "org.example.echo",
+    },
+    observation: { state: "running" },
+  };
+  const requestControl = async () => response(result);
+
+  assert.equal(
+    await runCli({
+      argv: ["plugin", "status", "org.example.echo", "--json"],
+      stdout: jsonStdout.stream,
+      stderr: stderr.stream,
+      requestControl,
+    }),
+    0,
+  );
+  assert.equal(
+    await runCli({
+      argv: ["plugin", "status", "org.example.echo"],
+      stdout: humanStdout.stream,
+      stderr: stderr.stream,
+      requestControl,
+    }),
+    0,
+  );
+
+  assert.equal(stderr.read(), "");
+  assert.deepEqual(JSON.parse(humanStdout.read()), JSON.parse(jsonStdout.read()));
 });
