@@ -142,6 +142,19 @@ test("Worker listener shutdown completes after a successful close during a bind 
   assert.equal(closeResult.status, "fulfilled");
 });
 
+test("Worker listener shutdown does not reclassify a bind failure as cleanup failure", async () => {
+  const binding = Promise.withResolvers<{
+    readonly url: URL;
+    close(): Promise<void>;
+  }>();
+  const owner = new NodeWorkerListenerOwner(() => binding.promise);
+  const starting = owner.start();
+  binding.reject(new Error("listener bind failed"));
+
+  await assert.rejects(starting, /listener bind failed/iu);
+  await owner.close();
+});
+
 test("SQLite-backed Worker epochs advance across Main restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-node-listener-epoch-"));
   const worker = createWorkerEndpoint({
