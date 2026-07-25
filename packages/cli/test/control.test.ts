@@ -79,6 +79,45 @@ function fakeRuntimeOperations(): RuntimeOperations {
   };
 }
 
+test("runtime.snapshot dispatches the public snapshot request", async () => {
+  await withEndpoint(async (endpoint) => {
+    let input: unknown;
+    const operations = fakeOperations();
+    const server = await startControlServer({
+      endpoint,
+      operations: {
+        ...operations,
+        operations: {
+          ...operations.operations,
+          snapshot: async (request: unknown) => {
+            input = request;
+            return {
+              installations: { items: [] },
+              deployments: { items: [] },
+              instances: { items: [] },
+              operations: { items: [] },
+              tasks: { items: [] },
+            };
+          },
+        } as RuntimeOperations,
+      },
+    });
+    try {
+      const result = await requestControl({
+        endpoint,
+        operation: "runtime.snapshot" as never,
+        input: { limit: 10 },
+        requestId: "request-runtime-snapshot",
+        timeoutMs: 1_000,
+      });
+      assert.equal(result.ok, true);
+      assert.deepEqual(input, { limit: 10 });
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 function fakeOperations(): ControlRuntimeOperations {
   return {
     status: async () => runtimeStatus(),

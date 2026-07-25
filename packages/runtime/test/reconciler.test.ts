@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   type ArtifactDigest,
   type Clock,
+  compareOperationJournalCursors,
   type DriverHealth,
   type ExecutorKind,
   type FencingEpoch,

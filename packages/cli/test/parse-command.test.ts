@@ -90,6 +90,12 @@ test("@spec:runtime-operations/local-runtime-operations/structured-command-diagn
 });
 
 test("@spec:runtime-operations/local-runtime-operations/parse-runtime-lifecycle-commands", () => {
+  assert.deepEqual(parseCommand(["runtime", "snapshot", "--json", "--endpoint", "control.sock"]), {
+    kind: "runtime.snapshot",
+    endpoint: "control.sock",
+    input: {},
+    json: true,
+  });
   assert.deepEqual(parseCommand(["runtime", "status", "--json", "--endpoint", "control.sock"]), {
     kind: "runtime.status",
     endpoint: "control.sock",
