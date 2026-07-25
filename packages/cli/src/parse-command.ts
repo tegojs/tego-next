@@ -11,6 +11,7 @@ import {
   parsePluginDeploymentIdentity,
   parseRunTaskRequest,
   parseTaskId,
+  parseWorkerId,
   type RunTaskRequest,
   type RuntimeMode,
   runtimeDiagnostic,
@@ -105,6 +106,28 @@ export interface TaskRecordCommand {
   readonly timeoutMs: number;
 }
 
+interface WorkerStartCommandBase {
+  readonly kind: "worker.start";
+  readonly credential: string;
+  readonly dataDirectory: string;
+  readonly json: boolean;
+  readonly prepare: readonly string[];
+  readonly workerId: string;
+}
+
+export interface WorkerConnectStartCommand extends WorkerStartCommandBase {
+  readonly direction: "connect";
+  readonly url: string;
+}
+
+export interface WorkerListenStartCommand extends WorkerStartCommandBase {
+  readonly direction: "listen";
+  readonly host: string;
+  readonly port: number;
+}
+
+export type WorkerStartCommand = WorkerConnectStartCommand | WorkerListenStartCommand;
+
 export interface HelpCommand {
   readonly kind: "help";
 }
@@ -121,7 +144,8 @@ export type ParsedCommand =
   | RuntimeStatusCommand
   | RuntimeStopCommand
   | TaskRecordCommand
-  | TaskRunCommand;
+  | TaskRunCommand
+  | WorkerStartCommand;
 
 export function defaultDataDirectory(): string {
   return resolve(process.env.TEGO_DATA_DIR ?? join(cwd(), ".tego"));
@@ -535,10 +559,96 @@ function parseTask(arguments_: readonly string[]): ParsedCommand {
   }
 }
 
+function parseWorker(arguments_: readonly string[]): WorkerStartCommand {
+  if (arguments_[0] !== "start") {
+    throw commandError("Unknown worker command", { command: arguments_[0] ?? "" });
+  }
+  try {
+    const parsed = parseArgs({
+      args: [...arguments_.slice(1)],
+      allowPositionals: false,
+      options: {
+        connect: { type: "string" },
+        credential: { type: "string" },
+        "data-dir": { type: "string" },
+        json: { type: "boolean", default: false },
+        listen: { type: "string" },
+        prepare: { type: "string", multiple: true },
+        "worker-id": { type: "string" },
+      },
+      strict: true,
+    });
+    const connect = parsed.values.connect;
+    const listen = parsed.values.listen;
+    if ((connect === undefined) === (listen === undefined)) {
+      throw commandError("Worker start requires exactly one of --connect or --listen");
+    }
+    const workerId = parseWorkerId(parsed.values["worker-id"] ?? `worker-${String(process.pid)}`);
+    const base = {
+      kind: "worker.start" as const,
+      credential:
+        parsed.values.credential ??
+        process.env.TEGO_WORKER_CREDENTIAL ??
+        "development-worker-secret",
+      dataDirectory: resolve(
+        parsed.values["data-dir"] ?? join(defaultDataDirectory(), "workers", workerId),
+      ),
+      json: parsed.values.json ?? false,
+      prepare: (parsed.values.prepare ?? []).map((path) => resolve(path)),
+      workerId,
+    };
+    if (connect !== undefined) {
+      const url = new URL(connect);
+      if (
+        (url.protocol !== "ws:" && url.protocol !== "wss:") ||
+        url.username.length > 0 ||
+        url.password.length > 0
+      ) {
+        throw commandError("--connect must be a credential-free ws: or wss: URL");
+      }
+      return { ...base, direction: "connect", url: url.href };
+    }
+    const address = new URL(`ws://${listen as string}`);
+    if (
+      address.username.length > 0 ||
+      address.password.length > 0 ||
+      address.pathname !== "/" ||
+      address.search.length > 0 ||
+      address.hash.length > 0 ||
+      address.port.length === 0
+    ) {
+      throw commandError("--listen must be a host and port");
+    }
+    const port = Number(address.port);
+    if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
+      throw commandError("--listen port must be between 0 and 65535");
+    }
+    return {
+      ...base,
+      direction: "listen",
+      host: address.hostname,
+      port,
+    };
+  } catch (error) {
+    if (error instanceof DiagnosticError && error.diagnostic.code === "PROTOCOL_COMMAND_INVALID") {
+      throw error;
+    }
+    throw commandError("Worker start options are invalid", {
+      cause:
+        error instanceof DiagnosticError
+          ? error.diagnostic.code
+          : error instanceof Error
+            ? error.message
+            : String(error),
+    });
+  }
+}
+
 export function parseCommand(argv: readonly string[]): ParsedCommand {
   if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") return { kind: "help" };
   if (argv[0] === "plugin") return parsePlugin(argv.slice(1));
   if (argv[0] === "task") return parseTask(argv.slice(1));
+  if (argv[0] === "worker") return parseWorker(argv.slice(1));
   if (argv[0] === "runtime") {
     switch (argv[1]) {
       case "start":

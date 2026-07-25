@@ -822,33 +822,28 @@ test("@spec:worker-protocol/reliable-pre-consumer-delivery/flushes-once-in-exact
   await cleanup(connection);
 });
 
-test(
-  "@spec:worker-protocol/reliable-pre-consumer-delivery/bounds-buffered-message-bytes",
-  { timeout: 2_000 },
-  async () => {
-    const connection = await directConnection({
-      maxBinaryBytes: 64,
-      maxFrameBytes: 512,
-      maxInflightMessages: 10,
-    });
-    const closed = Promise.withResolvers<void>();
-    connection.workerSession.onStateChange((state) => {
-      if (state === "closed") closed.resolve();
-    });
-    await connection.mainSession.send("session.reconcile", { value: "x".repeat(180) });
-    await assert.rejects(async () => {
-      await connection.mainSession.send("session.reconcile", { value: "y".repeat(180) });
-      await connection.mainSession.send("session.reconcile", { value: "z".repeat(180) });
-    }, /closed|available/iu);
+test("@spec:worker-protocol/reliable-pre-consumer-delivery/bounds-buffered-message-bytes", {
+  timeout: 2_000,
+}, async () => {
+  const connection = await directConnection({
+    maxBinaryBytes: 64,
+    maxFrameBytes: 512,
+    maxInflightMessages: 10,
+  });
+  const closed = Promise.withResolvers<void>();
+  connection.workerSession.onStateChange((state) => {
+    if (state === "closed") closed.resolve();
+  });
+  await connection.mainSession.send("session.reconcile", { value: "x".repeat(180) });
+  await assert.rejects(async () => {
+    await connection.mainSession.send("session.reconcile", { value: "y".repeat(180) });
+    await connection.mainSession.send("session.reconcile", { value: "z".repeat(180) });
+  }, /closed|available/iu);
 
-    await closed.promise;
-    assert.equal(
-      connection.workerSession.diagnostic?.code,
-      "PROTOCOL_INFLIGHT_LIMIT_EXCEEDED",
-    );
-    await cleanup(connection);
-  },
-);
+  await closed.promise;
+  assert.equal(connection.workerSession.diagnostic?.code, "PROTOCOL_INFLIGHT_LIMIT_EXCEEDED");
+  await cleanup(connection);
+});
 
 test("@spec:worker-protocol/reliable-pre-consumer-delivery/close-revokes-unconsumed-messages", async () => {
   const connection = await directConnection();

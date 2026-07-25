@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -24,10 +24,7 @@ import {
   systemWorkerClock,
   type RemoteAttemptRecord,
 } from "@tegojs/transport-websocket";
-import {
-  type WorkerStartCommand,
-  parseCommand,
-} from "../src/parse-command.js";
+import { type WorkerStartCommand, parseCommand } from "../src/parse-command.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { runCli } from "../src/run-cli.js";
 import {
@@ -51,6 +48,25 @@ async function beforeDeadline<T>(promise: Promise<T>, label: string): Promise<T>
       );
     }),
   ]);
+}
+
+async function cleanupDirectory(root: string): Promise<void> {
+  async function makeDirectoriesWritable(path: string): Promise<void> {
+    let identity: Awaited<ReturnType<typeof lstat>>;
+    try {
+      identity = await lstat(path);
+    } catch {
+      return;
+    }
+    if (identity.isSymbolicLink() || !identity.isDirectory()) return;
+    await chmod(path, 0o700);
+    for (const entry of await readdir(path)) {
+      await makeDirectoriesWritable(join(path, entry));
+    }
+  }
+
+  await makeDirectoriesWritable(root);
+  await rm(root, { force: true, recursive: true });
 }
 
 function capture() {
@@ -195,10 +211,7 @@ test("@spec:worker-protocol/independent-worker-command/emits-exactly-one-structu
   assert.equal(stderr.read(), "");
 });
 
-function preparedArtifact(
-  pluginId: string,
-  digestSuffix: string,
-): PreparedArtifact {
+function preparedArtifact(pluginId: string, digestSuffix: string): PreparedArtifact {
   return {
     digest: parseArtifactDigest(`sha256:${digestSuffix.repeat(64)}`),
     root: `/prepared/${digestSuffix}`,
@@ -243,10 +256,10 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
   );
   const exactRequest = assignment("org.example.exact");
   assert.equal(exact.validateAssignment(exactRequest), undefined);
-  assert.equal(
-    exact.resolveComponent(exactRequest).artifactDigest,
-    `sha256:${"a".repeat(64)}`,
-  );
+  assert.equal(exact.resolveComponent(exactRequest).artifactDigest, `sha256:${"a".repeat(64)}`);
+  assert.deepEqual(exact.resolveComponent(exactRequest).permissionGrants, [
+    { kind: "executor", executors: ["thread"] },
+  ]);
 
   const missing = exact.validateAssignment(assignment("org.example.missing"));
   assert.equal(missing?.code, "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED");
@@ -358,7 +371,7 @@ async function createWorkerArtifact(directory: string): Promise<{
       pluginId: "org.example.worker-echo",
       version: "1.0.0",
       contractRange: ">=0.0.0",
-      nodeRange: ">=26.0.0 <27.0.0",
+      nodeRange: ">=24.0.0 <27.0.0",
       moduleFormat: "esm",
       components: [
         {
@@ -374,7 +387,7 @@ async function createWorkerArtifact(directory: string): Promise<{
   );
   await writeFile(
     join(buildDirectory, "component.js"),
-    "export default { async run(_context, input) { return input; } };\n",
+    'export default { protocol: "tego.component/1.0", kind: "task", async run(_context, input) { return input; } };\n',
   );
   const packed = await packPlugin({
     artifactPath,
@@ -444,7 +457,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
       (await remote.submit(request)).result,
       "prepared Worker echo result",
     );
-    assert.equal(result.status, "succeeded");
+    assert.equal(result.status, "succeeded", JSON.stringify(result));
     assert.deepEqual(result.output, { usable: true });
     assert.equal(result.executor.metadata?.localExecutorKind, "thread");
     assert.equal(readinessCount, 1);
@@ -452,7 +465,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
     controller.abort();
     await Promise.allSettled([session?.close(), remote.close(), main.close()]);
     await beforeDeadline(running, "listen Worker cleanup");
-    await rm(directory, { force: true, recursive: true });
+    await cleanupDirectory(directory);
   }
 });
 
@@ -508,6 +521,6 @@ test("@spec:worker-protocol/independent-worker-command/connect-attaches-runtime-
     controller.abort();
     await Promise.allSettled([remote.close(), listener.close(), main.close()]);
     await beforeDeadline(running, "connect Worker cleanup");
-    await rm(directory, { force: true, recursive: true });
+    await cleanupDirectory(directory);
   }
 });

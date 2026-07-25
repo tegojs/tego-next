@@ -13,6 +13,7 @@ import {
 } from "./commands/plugin.js";
 import { startRuntimeDetached, startRuntimeForeground } from "./commands/runtime.js";
 import { executeTaskCommand } from "./commands/task.js";
+import { startWorkerForeground, type WorkerReadyHandler } from "./commands/worker.js";
 import { type ControlClientOptions, requestControl } from "./control/client.js";
 import {
   type ControlResponse,
@@ -21,7 +22,12 @@ import {
   type RuntimeOperationName,
   sanitizeControlDiagnostic,
 } from "./control/protocol.js";
-import { type ParsedCommand, parseCommand, type RuntimeStartCommand } from "./parse-command.js";
+import {
+  type ParsedCommand,
+  parseCommand,
+  type RuntimeStartCommand,
+  type WorkerStartCommand,
+} from "./parse-command.js";
 
 const help = `Usage: tego <command>
 
@@ -31,6 +37,7 @@ Commands:
   runtime stop [--json] [--endpoint <path>]
   plugin validate|pack|inspect|install|deploy|status
   task run|status|wait|cancel
+  worker start (--connect <url> | --listen <host:port>) [--prepare <artifact>]
 `;
 
 export interface CliRunOptions {
@@ -41,6 +48,10 @@ export interface CliRunOptions {
   readonly monotonicNow?: () => number;
   readonly startForeground?: (command: RuntimeStartCommand) => Promise<RuntimeStatus>;
   readonly startDetached?: (command: RuntimeStartCommand) => Promise<RuntimeStatus>;
+  readonly startWorker?: (
+    command: WorkerStartCommand,
+    onReady: WorkerReadyHandler,
+  ) => Promise<void>;
 }
 
 function write(stream: Pick<Writable, "write">, value: unknown, json: boolean): void {
@@ -66,6 +77,18 @@ export async function runCli(options: CliRunOptions): Promise<number> {
         ? (options.startDetached ?? startRuntimeDetached)
         : (options.startForeground ?? startRuntimeForeground);
       write(stdout, await start(command), command.json);
+      return 0;
+    }
+    if (command.kind === "worker.start") {
+      const workerCommand = command;
+      let ready = false;
+      const start = options.startWorker ?? startWorkerForeground;
+      await start(workerCommand, (readiness) => {
+        if (ready) throw new Error("LIFECYCLE_WORKER_READINESS_DUPLICATED");
+        ready = true;
+        write(stdout, readiness, workerCommand.json);
+      });
+      if (!ready) throw new Error("LIFECYCLE_WORKER_NOT_READY");
       return 0;
     }
     const control = options.requestControl ?? requestControl;

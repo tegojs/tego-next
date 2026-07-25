@@ -337,7 +337,9 @@ export function connectWorker(options: WorkerWebSocketConnectOptions): Promise<W
   return connect(options.endpoint, options);
 }
 
-export function listenForWorker(options: WorkerWebSocketListenerOptions): Promise<WebSocketListener> {
+export function listenForWorker(
+  options: WorkerWebSocketListenerOptions,
+): Promise<WebSocketListener> {
   return listen(options.endpoint, options);
 }
 

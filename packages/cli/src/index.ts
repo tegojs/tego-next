@@ -33,6 +33,9 @@ export {
   type RuntimeStopCommand,
   type TaskRecordCommand,
   type TaskRunCommand,
+  type WorkerConnectStartCommand,
+  type WorkerListenStartCommand,
+  type WorkerStartCommand,
 } from "./parse-command.js";
 export { type BuildPluginOptions, buildPlugin } from "./plugin/build-plugin.js";
 export {
@@ -45,6 +48,13 @@ export {
   signArtifact,
 } from "./plugin/sign-plugin.js";
 export { type CliRunOptions, runCli } from "./run-cli.js";
+export {
+  createPreparedArtifactSelection,
+  runWorkerProcess,
+  StateRemoteAttemptStore,
+  type WorkerProcessOptions,
+  type WorkerReadiness,
+} from "./worker/worker-process.js";
 export {
   type CreateNodeRuntimeHostOptions,
   createNodeRuntimeHost,

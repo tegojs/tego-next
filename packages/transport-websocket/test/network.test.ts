@@ -15,11 +15,7 @@ import {
   WorkerRuntime,
   type WorkerSession,
 } from "../src/index.js";
-import {
-  executionRequest,
-  memorySessionPair,
-  TestLocalExecutor,
-} from "./remote-test-support.js";
+import { executionRequest, memorySessionPair, TestLocalExecutor } from "./remote-test-support.js";
 
 const deadlineMs = 2_000;
 
@@ -267,12 +263,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/connect-abort-regi
     );
     assert.equal(outcome, "aborted");
   } finally {
-    await Promise.all([
-      unexpectedSession?.close(),
-      listener.close(),
-      main.close(),
-      worker.close(),
-    ]);
+    await Promise.all([unexpectedSession?.close(), listener.close(), main.close(), worker.close()]);
   }
 });
 
