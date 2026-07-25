@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Writable } from "node:stream";
 import {
   DiagnosticError,
@@ -16,6 +17,7 @@ import { type ControlClientOptions, requestControl } from "./control/client.js";
 import {
   type ControlResponse,
   DEFAULT_CONTROL_TIMEOUT_MS,
+  parseControlResponse,
   type RuntimeOperationName,
   sanitizeControlDiagnostic,
 } from "./control/protocol.js";
@@ -36,6 +38,7 @@ export interface CliRunOptions {
   readonly stdout?: Pick<Writable, "write">;
   readonly stderr?: Pick<Writable, "write">;
   readonly requestControl?: (options: ControlClientOptions) => Promise<ControlResponse>;
+  readonly monotonicNow?: () => number;
   readonly startForeground?: (command: RuntimeStartCommand) => Promise<RuntimeStatus>;
   readonly startDetached?: (command: RuntimeStartCommand) => Promise<RuntimeStatus>;
 }
@@ -72,7 +75,19 @@ export async function runCli(options: CliRunOptions): Promise<number> {
       input: JsonValue,
       timeoutMs: number,
     ): Promise<JsonValue> => {
-      const response = await control({ endpoint, operation, input, timeoutMs });
+      const requestId = randomUUID();
+      const response = parseControlResponse(
+        await control({ endpoint, operation, input, timeoutMs, requestId }),
+      );
+      if (response.requestId !== requestId) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: "PROTOCOL_CONTROL_REQUEST_MISMATCH",
+            message: "Control response request ID does not match",
+            source: { kind: "protocol", id: "cli" },
+          }),
+        );
+      }
       if (!response.ok) {
         throw new DiagnosticError(
           response.diagnostic ??
@@ -83,7 +98,16 @@ export async function runCli(options: CliRunOptions): Promise<number> {
             }),
         );
       }
-      return response.result ?? null;
+      if (!Object.hasOwn(response, "result")) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: "PROTOCOL_CONTROL_FRAME_INVALID",
+            message: "Successful control response did not contain a result",
+            source: { kind: "protocol", id: "cli" },
+          }),
+        );
+      }
+      return response.result as JsonValue;
     };
 
     if (
@@ -118,8 +142,10 @@ export async function runCli(options: CliRunOptions): Promise<number> {
       const endpoint = command.endpoint;
       write(
         stdout,
-        await executeTaskCommand(command, (operation, input, timeoutMs) =>
-          request(endpoint, operation, input, timeoutMs),
+        await executeTaskCommand(
+          command,
+          (operation, input, timeoutMs) => request(endpoint, operation, input, timeoutMs),
+          options.monotonicNow,
         ),
         command.json,
       );

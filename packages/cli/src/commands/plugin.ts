@@ -1,12 +1,14 @@
 import { createReadStream } from "node:fs";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readlink, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
+  DiagnosticError,
   type JsonValue,
   parsePluginDeployment,
   parsePluginDeploymentStatus,
   parsePluginInstallation,
+  runtimeDiagnostic,
 } from "@tegojs/contracts";
 import { readPluginArtifact } from "@tegojs/runtime";
 import type {
@@ -32,6 +34,101 @@ export interface PluginControlRequest {
   readonly operation: "plugin.deploy" | "plugin.install-path" | "plugin.status";
 }
 
+interface PathIdentity {
+  readonly canonicalPath: string;
+  readonly device?: bigint;
+  readonly inode?: bigint;
+}
+
+function artifactPathConflict(): DiagnosticError {
+  return new DiagnosticError(
+    runtimeDiagnostic({
+      code: "ARTIFACT_OUTPUT_PATH_CONFLICT",
+      message: "Artifact output, signature output, and private key paths must be distinct",
+      source: { kind: "artifact", id: "cli-pack" },
+    }),
+  );
+}
+
+async function canonicalPotentialPath(path: string): Promise<string> {
+  let current = resolve(path);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      return join(await realpath(current), ...missing.reverse());
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      ) {
+        throw error;
+      }
+      try {
+        const metadata = await lstat(current);
+        if (metadata.isSymbolicLink()) {
+          const target = resolve(dirname(current), await readlink(current));
+          return join(await canonicalPotentialPath(target), ...missing.reverse());
+        }
+      } catch (metadataError) {
+        if (
+          typeof metadataError !== "object" ||
+          metadataError === null ||
+          !("code" in metadataError) ||
+          metadataError.code !== "ENOENT"
+        ) {
+          throw metadataError;
+        }
+      }
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+async function pathIdentity(path: string): Promise<PathIdentity> {
+  const canonicalPath = await canonicalPotentialPath(path);
+  try {
+    const metadata = await stat(path, { bigint: true });
+    return {
+      canonicalPath,
+      device: metadata.dev,
+      inode: metadata.ino,
+    };
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return { canonicalPath };
+    }
+    throw error;
+  }
+}
+
+async function assertPackPathsDistinct(command: PluginPackCommand): Promise<void> {
+  if (command.keyId === undefined || command.privateKeyPath === undefined) return;
+  const paths = [
+    command.artifactPath,
+    command.privateKeyPath,
+    command.signaturePath ?? `${command.artifactPath}.sig`,
+  ];
+  const identities = await Promise.all(paths.map((path) => pathIdentity(path)));
+  for (const [index, first] of identities.entries()) {
+    for (const second of identities.slice(index + 1)) {
+      if (
+        first.canonicalPath === second.canonicalPath ||
+        (first.device !== undefined &&
+          first.inode !== undefined &&
+          first.device === second.device &&
+          first.inode === second.inode)
+      ) {
+        throw artifactPathConflict();
+      }
+    }
+  }
+}
+
 export async function executeLocalPluginCommand(command: LocalPluginCommand): Promise<JsonValue> {
   if (command.kind === "plugin.inspect") {
     const artifact = await readPluginArtifact(createReadStream(command.artifactPath));
@@ -42,6 +139,7 @@ export async function executeLocalPluginCommand(command: LocalPluginCommand): Pr
     };
   }
   if (command.kind === "plugin.pack") {
+    await assertPackPathsDistinct(command);
     const packed = await packPlugin({
       artifactPath: command.artifactPath,
       build: command.build,
@@ -104,11 +202,43 @@ export function parsePluginControlResult(
   result: JsonValue,
 ): JsonValue {
   switch (command.kind) {
-    case "plugin.deploy":
-      return parsePluginDeployment(result);
+    case "plugin.deploy": {
+      const deployment = parsePluginDeployment(result);
+      if (
+        deployment.applicationId !== command.input.applicationId ||
+        deployment.pluginId !== command.input.pluginId ||
+        deployment.artifactDigest !== command.input.artifactDigest
+      ) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: "PROTOCOL_CONTROL_REQUEST_MISMATCH",
+            message: "Plugin deployment response identity does not match the request",
+            source: { kind: "protocol", id: "cli" },
+          }),
+        );
+      }
+      return deployment;
+    }
     case "plugin.install":
       return parsePluginInstallation(result);
-    case "plugin.status":
-      return parsePluginDeploymentStatus(result);
+    case "plugin.status": {
+      const status = parsePluginDeploymentStatus(result);
+      if (
+        status.identity.applicationId !== command.input.applicationId ||
+        status.identity.pluginId !== command.input.pluginId ||
+        (status.desired !== undefined &&
+          (status.desired.applicationId !== status.identity.applicationId ||
+            status.desired.pluginId !== status.identity.pluginId))
+      ) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: "PROTOCOL_CONTROL_REQUEST_MISMATCH",
+            message: "Plugin status response identity does not match the request",
+            source: { kind: "protocol", id: "cli" },
+          }),
+        );
+      }
+      return status;
+    }
   }
 }
