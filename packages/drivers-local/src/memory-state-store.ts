@@ -528,6 +528,7 @@ export class MemoryStateStore implements StateStore {
   readonly #clock: Clock;
   readonly #records = new Map<string, StoredRecord>();
   readonly #operations = new Map<string, PersistedOperationJournalEntry>();
+  readonly #operationHistory: PersistedOperationJournalEntry[] = [];
   readonly #outbox = new Map<string, StoredOutboxMessage>();
   #outboxSequence = 0n;
   readonly #fences = new Map<string, bigint>();
@@ -625,6 +626,24 @@ export class MemoryStateStore implements StateStore {
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
     yield* this.#scanOperationJournal(query, false);
+  }
+
+  async *scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    this.#assertOpen();
+    this.#assertOperationQuery(query);
+    const matching = this.#operationHistory
+      .filter(
+        (entry) =>
+          query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+      )
+      .sort(compareOperationJournalCursors);
+    const limit = query.limit ?? matching.length;
+    for (const entry of matching.slice(0, limit)) {
+      this.#assertOpen();
+      yield structuredClone(entry);
+    }
   }
 
   async *scanRecoverableOperations(
@@ -962,10 +981,12 @@ export class MemoryStateStore implements StateStore {
         this.#records.set(identifier, record);
       }
       for (const entry of staged.operations) {
-        this.#operations.set(entry.operationId, {
+        const persisted = {
           ...structuredClone(entry),
           revision,
-        });
+        };
+        this.#operationHistory.push(persisted);
+        this.#operations.set(entry.operationId, persisted);
       }
       for (const message of newOutbox) {
         this.#outboxSequence += 1n;

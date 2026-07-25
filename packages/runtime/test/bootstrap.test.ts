@@ -156,6 +156,12 @@ class ControlledStateStore implements StateStore {
     };
   }
 
+  scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    return this.scanOperations(query);
+  }
+
   claimOutbox(): ReturnType<StateStore["claimOutbox"]> {
     return Promise.resolve([]);
   }

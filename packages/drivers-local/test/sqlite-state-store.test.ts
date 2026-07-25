@@ -261,7 +261,7 @@ test("migrations are idempotent and configure WAL mode", async () => {
       .prepare("SELECT version FROM schema_migrations ORDER BY version")
       .all()
       .map((row) => row.version);
-    assert.deepEqual(migrations, [1, 2, 3, 4]);
+    assert.deepEqual(migrations, [1, 2, 3, 4, 5]);
     assert.equal(database.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
     const tables = database
       .prepare(
@@ -273,6 +273,7 @@ test("migrations are idempotent and configure WAL mode", async () => {
       "changes",
       "fences",
       "idempotency",
+      "operation_history",
       "operations",
       "outbox",
       "records",

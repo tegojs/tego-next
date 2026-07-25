@@ -154,6 +154,40 @@ const migrations = [
     CREATE INDEX tego_operations_scan_order
       ON tego_operations(driver_namespace, revision, operation_id COLLATE "C");
   `,
+  `
+    CREATE TABLE tego_operation_history (
+      driver_namespace text NOT NULL,
+      operation_id text NOT NULL,
+      kind text NOT NULL,
+      status text NOT NULL,
+      state_json jsonb NOT NULL,
+      updated_at timestamptz NOT NULL,
+      revision bigint NOT NULL CHECK (revision > 0),
+      PRIMARY KEY (driver_namespace, revision, operation_id)
+    );
+
+    INSERT INTO tego_operation_history(
+      driver_namespace,
+      operation_id,
+      kind,
+      status,
+      state_json,
+      updated_at,
+      revision
+    )
+    SELECT
+      driver_namespace,
+      operation_id,
+      kind,
+      status,
+      state_json,
+      updated_at,
+      revision
+    FROM tego_operations;
+
+    CREATE INDEX tego_operation_history_scan_order
+      ON tego_operation_history(driver_namespace, revision, operation_id COLLATE "C");
+  `,
 ] as const;
 
 export const postgresSchemaVersion = migrations.length;

@@ -141,29 +141,33 @@ test("PostgreSQL operation scans preserve exact bigint cursors and code-unit ord
       }
       return null;
     });
-    await pool.query(
-      `
-        UPDATE tego_operations
-        SET revision = 9007199254740993
-        WHERE driver_namespace = $1
-      `,
-      [stateNamespace],
-    );
-
-    const entries = [];
-    for await (const entry of store.scanOperations({
-      after: {
-        revision: parseRevision("9007199254740993"),
-        operationId: parseOperationId("operation-A"),
-      },
-      limit: 2,
-    })) {
-      entries.push([entry.operationId, entry.revision]);
+    for (const table of ["tego_operations", "tego_operation_history"]) {
+      await pool.query(
+        `
+          UPDATE ${table}
+          SET revision = 9007199254740993
+          WHERE driver_namespace = $1
+        `,
+        [stateNamespace],
+      );
     }
-    assert.deepEqual(entries, [
-      ["operation-_", parseRevision("9007199254740993")],
-      ["operation-a", parseRevision("9007199254740993")],
-    ]);
+
+    for (const scan of [store.scanOperations.bind(store), store.scanOperationHistory.bind(store)]) {
+      const entries = [];
+      for await (const entry of scan({
+        after: {
+          revision: parseRevision("9007199254740993"),
+          operationId: parseOperationId("operation-A"),
+        },
+        limit: 2,
+      })) {
+        entries.push([entry.operationId, entry.revision]);
+      }
+      assert.deepEqual(entries, [
+        ["operation-_", parseRevision("9007199254740993")],
+        ["operation-a", parseRevision("9007199254740993")],
+      ]);
+    }
   } finally {
     await Promise.all([store.close(), pool.end()]);
   }

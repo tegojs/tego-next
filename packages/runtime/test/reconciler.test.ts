@@ -621,6 +621,12 @@ class TestStateStore implements StateStore {
     for (const entry of entries) yield structuredClone(entry);
   }
 
+  scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    return this.scanOperations(query);
+  }
+
   async claimOutbox(request: OutboxClaimRequest): Promise<readonly OutboxClaim[]> {
     const claimedAt = this.#clock.now().toISOString();
     const now = this.#clock.now().getTime();

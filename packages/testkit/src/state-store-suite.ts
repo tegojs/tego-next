@@ -1219,9 +1219,11 @@ export function stateStoreConformance(
           limit: 3,
         });
         assert.deepEqual(
-          [...firstHistoryPage, ...secondHistoryPage].map(
-            ({ operationId, revision, status }) => [operationId, revision, status],
-          ),
+          [...firstHistoryPage, ...secondHistoryPage].map(({ operationId, revision, status }) => [
+            operationId,
+            revision,
+            status,
+          ]),
           [
             ["operation-completed", parseRevision("1"), "completed"],
             ["operation-executing", parseRevision("1"), "executing"],

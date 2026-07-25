@@ -94,6 +94,10 @@ class EmptyState implements StateStore {
     return emptyAsyncIterable();
   }
 
+  scanOperationHistory(): AsyncIterable<never> {
+    return emptyAsyncIterable();
+  }
+
   scanRecoverableOperations(): AsyncIterable<never> {
     return emptyAsyncIterable();
   }

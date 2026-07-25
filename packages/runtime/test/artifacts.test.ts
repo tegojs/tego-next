@@ -167,6 +167,7 @@ class InstallationStateStore implements StateStore {
     return this.records.get(JSON.stringify(key)) as Versioned<T> | undefined;
   }
   async *scan<T extends JsonValue>(_query: StateQuery<T>): AsyncIterable<ScannedState<T>> {}
+  async *scanOperationHistory(): AsyncIterable<never> {}
   async *scanOperations(): AsyncIterable<never> {}
   async *scanRecoverableOperations(): AsyncIterable<never> {}
   claimOutbox(): ReturnType<StateStore["claimOutbox"]> {

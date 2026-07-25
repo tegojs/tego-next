@@ -770,17 +770,24 @@ export class SqliteStateStore implements StateStore {
   async *scanRecoverableOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
-    yield* this.#scanOperationJournal(query, true);
+    yield* this.#scanOperationJournal(query, "operations", true);
   }
 
   async *scanOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
-    yield* this.#scanOperationJournal(query, false);
+    yield* this.#scanOperationJournal(query, "operations", false);
+  }
+
+  async *scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, "operation_history", false);
   }
 
   async *#scanOperationJournal(
     query: OperationJournalQuery,
+    table: "operation_history" | "operations",
     recoverableOnly: boolean,
   ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
@@ -794,7 +801,7 @@ export class SqliteStateStore implements StateStore {
             .prepare(
               `
                 SELECT ${columns}
-                FROM operations
+                FROM ${table}
                 WHERE 1 = 1 ${statusClause}
                 ORDER BY revision, operation_id
                 ${query.limit === undefined ? "" : "LIMIT ?"}
@@ -806,7 +813,7 @@ export class SqliteStateStore implements StateStore {
             .prepare(
               `
                 SELECT ${columns}
-                FROM operations
+                FROM ${table}
                 WHERE (revision > ? OR (revision = ? AND operation_id > ?))
                   ${statusClause}
                 ORDER BY revision, operation_id
@@ -1407,6 +1414,23 @@ export class SqliteStateStore implements StateStore {
         }
 
         for (const operation of staged.operations) {
+          const values = [
+            operation.operationId,
+            operation.kind,
+            operation.status,
+            canonicalJson(operation.state),
+            operation.updatedAt,
+            revisionInteger,
+          ] as const;
+          database
+            .prepare(
+              `
+                INSERT INTO operation_history(
+                  operation_id, kind, status, state_json, updated_at, revision
+                ) VALUES (?, ?, ?, ?, ?, ?)
+              `,
+            )
+            .run(...values);
           database
             .prepare(
               `
@@ -1421,14 +1445,7 @@ export class SqliteStateStore implements StateStore {
                   revision = excluded.revision
               `,
             )
-            .run(
-              operation.operationId,
-              operation.kind,
-              operation.status,
-              canonicalJson(operation.state),
-              operation.updatedAt,
-              revisionInteger,
-            );
+            .run(...values);
         }
 
         const maximumSequence = database

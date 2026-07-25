@@ -555,6 +555,23 @@ class PostgresTransaction implements StateTransaction {
       });
     }
     const revision = await this.#writeRevision();
+    const values = [
+      this.#namespace,
+      entry.operationId,
+      entry.kind,
+      entry.status,
+      canonicalJson(entry.state),
+      entry.updatedAt,
+      revision,
+    ];
+    await this.#client.query(
+      `
+        INSERT INTO tego_operation_history(
+          driver_namespace, operation_id, kind, status, state_json, updated_at, revision
+        ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+      `,
+      values,
+    );
     await this.#client.query(
       `
         INSERT INTO tego_operations(
@@ -567,15 +584,7 @@ class PostgresTransaction implements StateTransaction {
           updated_at = EXCLUDED.updated_at,
           revision = EXCLUDED.revision
       `,
-      [
-        this.#namespace,
-        entry.operationId,
-        entry.kind,
-        entry.status,
-        canonicalJson(entry.state),
-        entry.updatedAt,
-        revision,
-      ],
+      values,
     );
   }
 
@@ -953,17 +962,24 @@ export class PostgresStateStore implements StateStore {
   async *scanRecoverableOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
-    yield* this.#scanOperationJournal(query, true);
+    yield* this.#scanOperationJournal(query, "tego_operations", true);
   }
 
   async *scanOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
-    yield* this.#scanOperationJournal(query, false);
+    yield* this.#scanOperationJournal(query, "tego_operations", false);
+  }
+
+  async *scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, "tego_operation_history", false);
   }
 
   async *#scanOperationJournal(
     query: OperationJournalQuery,
+    table: "tego_operation_history" | "tego_operations",
     recoverableOnly: boolean,
   ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
@@ -978,7 +994,7 @@ export class PostgresStateStore implements StateStore {
     const result = await this.#pool.query(
       `
         SELECT operation_id, kind, status, state_json, updated_at, revision::text
-        FROM tego_operations
+        FROM ${table}
         WHERE driver_namespace = $1
           ${recoverableOnly ? "AND status IN ('executing', 'planned')" : ""}
           AND (

@@ -157,6 +157,28 @@ const migrations = [
       SELECT RAISE(ABORT, 'record_id_order_key is required');
     END;
   `,
+  `
+    CREATE TABLE operation_history (
+      operation_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      state_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      revision INTEGER NOT NULL REFERENCES revisions(revision),
+      PRIMARY KEY (revision, operation_id)
+    ) STRICT, WITHOUT ROWID;
+
+    INSERT INTO operation_history(
+      operation_id,
+      kind,
+      status,
+      state_json,
+      updated_at,
+      revision
+    )
+    SELECT operation_id, kind, status, state_json, updated_at, revision
+    FROM operations;
+  `,
 ] as const;
 
 export const sqliteSchemaVersion = migrations.length;
