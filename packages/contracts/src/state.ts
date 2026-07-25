@@ -20,7 +20,15 @@ export interface StateQuery<_T extends JsonValue> {
   readonly namespace: string;
   readonly collection: string;
   readonly idPrefix?: string;
+  /**
+   * Excludes this identifier. Results begin at the first matching record whose
+   * identifier is greater in ECMAScript code-unit order.
+   */
+  readonly afterId?: string;
+  readonly limit?: number;
 }
+
+export const STATE_QUERY_MAX_LIMIT = 100;
 
 export interface StateChange {
   readonly revision: Revision;
@@ -174,6 +182,7 @@ export interface StateStore {
   ): Promise<T>;
   read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined>;
   scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>>;
+  scanOperations(query?: OperationJournalQuery): AsyncIterable<PersistedOperationJournalEntry>;
   scanRecoverableOperations(
     query?: OperationJournalQuery,
   ): AsyncIterable<PersistedOperationJournalEntry>;

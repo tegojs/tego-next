@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 import {
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
+  STATE_QUERY_MAX_LIMIT,
   diagnosticCode,
   compareOperationJournalCursors,
   parseFencingEpoch,
@@ -64,6 +65,28 @@ async function recoverableOperations(
     entries.push(entry);
   }
   return entries;
+}
+
+async function operations(
+  store: StateStore,
+  query: Parameters<StateStore["scanOperations"]>[0] = {},
+): Promise<readonly PersistedOperationJournalEntry[]> {
+  const entries = [];
+  for await (const entry of store.scanOperations(query)) {
+    entries.push(entry);
+  }
+  return entries;
+}
+
+async function scannedIds(
+  store: StateStore,
+  query: Parameters<StateStore["scan"]>[0],
+): Promise<readonly string[]> {
+  const ids = [];
+  for await (const entry of store.scan(query)) {
+    ids.push(entry.key.id);
+  }
+  return ids;
 }
 
 export function stateStoreConformance(
@@ -209,6 +232,59 @@ export function stateStoreConformance(
 
         assert.deepEqual(scanned, ["-", "A", "_", "a"]);
         assert.deepEqual(changed, ["-", "A", "_", "a"]);
+      });
+    });
+
+    test("state scans page exclusively in stable code-unit identifier order", async () => {
+      await withStore(factory, async (store) => {
+        await store.transact({}, async (transaction) => {
+          for (const id of ["A", "_", "a", "-"]) {
+            await transaction.put(key("state-pagination", id), { label: id }, {});
+          }
+          return null;
+        });
+
+        const first = await scannedIds(store, {
+          namespace: "state-pagination",
+          collection: "examples",
+          limit: 2,
+        });
+        const firstCursor = first.at(-1);
+        assert.notEqual(firstCursor, undefined);
+        const second = await scannedIds(store, {
+          namespace: "state-pagination",
+          collection: "examples",
+          afterId: firstCursor ?? "",
+          limit: 2,
+        });
+        const secondCursor = second.at(-1);
+        assert.notEqual(secondCursor, undefined);
+        const exhausted = await scannedIds(store, {
+          namespace: "state-pagination",
+          collection: "examples",
+          afterId: secondCursor ?? "",
+          limit: 2,
+        });
+
+        assert.deepEqual(first, ["-", "A"]);
+        assert.deepEqual(second, ["_", "a"]);
+        assert.deepEqual(exhausted, []);
+        assert.deepEqual([...first, ...second], ["-", "A", "_", "a"]);
+      });
+    });
+
+    test("state scan limit is a positive safe integer within the public maximum", async () => {
+      await withStore(factory, async (store) => {
+        for (const limit of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, STATE_QUERY_MAX_LIMIT + 1]) {
+          await assert.rejects(
+            scannedIds(store, {
+              namespace: "state-pagination",
+              collection: "examples",
+              limit,
+            }),
+            expectDiagnostic("STATE_QUERY_INVALID"),
+          );
+        }
       });
     });
 
@@ -934,6 +1010,67 @@ export function stateStoreConformance(
         assert.deepEqual(
           secondPage.map(({ operationId, revision }) => [operationId, revision]),
           [["operation-b", parseRevision("2")]],
+        );
+      });
+    });
+
+    test("operation scans return every latest status while recoverable scans remain filtered", async () => {
+      await withStore(factory, async (store) => {
+        await store.transact({}, async (transaction) => {
+          for (const [operationId, status] of [
+            ["operation-completed", "completed"],
+            ["operation-executing", "executing"],
+            ["operation-failed", "failed"],
+            ["operation-transitioned", "planned"],
+          ] as const) {
+            await transaction.appendOperation({
+              operationId: parseOperationId(operationId),
+              kind: "deploy",
+              status,
+              state: { status },
+              updatedAt: "2026-07-23T00:00:00.000Z",
+            });
+          }
+          return null;
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.appendOperation({
+            operationId: parseOperationId("operation-transitioned"),
+            kind: "deploy",
+            status: "completed",
+            state: { status: "completed" },
+            updatedAt: "2026-07-23T00:00:01.000Z",
+          });
+          return null;
+        });
+
+        const firstPage = await operations(store, { limit: 2 });
+        const cursor = {
+          revision: firstPage.at(-1)?.revision ?? parseRevision("0"),
+          operationId:
+            firstPage.at(-1)?.operationId ?? parseOperationId("missing-operation-cursor"),
+        };
+        const secondPage = await operations(store, { after: cursor, limit: 2 });
+
+        assert.deepEqual(
+          [...firstPage, ...secondPage].map(({ operationId, revision, status }) => [
+            operationId,
+            revision,
+            status,
+          ]),
+          [
+            ["operation-completed", parseRevision("1"), "completed"],
+            ["operation-executing", parseRevision("1"), "executing"],
+            ["operation-failed", parseRevision("1"), "failed"],
+            ["operation-transitioned", parseRevision("2"), "completed"],
+          ],
+        );
+        assert.deepEqual(
+          (await recoverableOperations(store)).map(({ operationId, status }) => [
+            operationId,
+            status,
+          ]),
+          [["operation-executing", "executing"]],
         );
       });
     });
