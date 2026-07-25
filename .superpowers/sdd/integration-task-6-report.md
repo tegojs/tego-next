@@ -301,3 +301,82 @@ A separate built-executable smoke run verified:
 
 No smoke process, socket, temporary runtime directory, generated example build
 output, or debug code remained after verification.
+
+## Finding 10 Deterministic Detached Cleanup Addendum
+
+The controller reproduced a race in the original detached-timeout regression:
+its 50 ms deadline could expire before the fixture installed its SIGTERM
+handler and wrote `stubborn.pid`. Finding 10 fixes the proof without increasing
+that timeout.
+
+### Commits
+
+- Finding 10 RED: `1535c74` (`test: expose detached readiness race`)
+- Provisional gate implementation: `0a5f9c7`
+  (`fix: gate detached readiness deadline`)
+- Final minimal correction: `69c012e`
+  (`test: stabilize detached termination regression`)
+- Report addendum: the commit containing this update
+
+The provisional implementation exposed fixture-only gate options on
+`DetachedRuntimeStartOptions`. The final correction fully removes that API
+expansion; `packages/cli/src/commands/runtime.ts` is byte-identical to
+`b34058a` after `69c012e`.
+
+### RED
+
+The test-only RED changed the real resistant fixture to announce readiness only
+after installing its SIGTERM handler and writing its PID, then requested a
+1 ms post-readiness deadline. The unfixed implementation ignored that
+handshake and started its deadline at spawn:
+
+```text
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+60 tests: 58 passed, 1 failed, 1 Windows-only skipped
+```
+
+The expected failure was:
+
+```text
+ENOENT: no such file or directory, open '.../stubborn.pid'
+```
+
+This reproduced the controller's race deterministically rather than hiding it
+with a larger readiness timeout.
+
+### Final Test Design
+
+The resistant fixture now:
+
+1. installs its SIGTERM handler;
+2. writes `stubborn.pid`;
+3. sends the existing `runtime.failed` IPC message.
+
+The real child-process regression therefore enters the existing
+`catch -> terminateDetachedChild` path only after resistance and PID publication
+are established. It proves SIGTERM does not end the child, bounded SIGKILL does,
+`process.kill(pid, 0)` returns `ESRCH`, and the endpoint is absent.
+
+A separate silent-child regression retains the 1 ms bounded readiness-timeout
+assertion without depending on PID publication. No fixture-specific protocol
+or option was added to production code.
+
+### GREEN and Stress Evidence
+
+```text
+for tego_stress_run in {1..20}; do
+  volta run --node 26.5.0 node --test \
+    --test-name-pattern='detached-(failure|readiness)' \
+    packages/cli/dist/test/runtime-process.test.js
+done
+20/20 repetitions passed
+
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+61 tests: 60 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run typecheck --workspace @tegojs/cli
+exit 0
+```
+
+Targeted Biome checks passed for all four touched CLI source/test files, and
+`git diff --check` passed.
