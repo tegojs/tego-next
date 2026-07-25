@@ -4,8 +4,8 @@ import { join, resolve, win32 } from "node:path";
 import { cwd } from "node:process";
 import { parseArgs } from "node:util";
 import {
-  DiagnosticError,
   type DeployPluginRequest,
+  DiagnosticError,
   type JsonValue,
   parseDeployPluginRequest,
   parsePluginDeploymentIdentity,
@@ -14,6 +14,7 @@ import {
   parseWorkerId,
   type RunTaskRequest,
   type RuntimeMode,
+  type RuntimeSnapshotRequest,
   runtimeDiagnostic,
   runtimeOperationMaxBytes,
 } from "@tegojs/contracts";
@@ -42,6 +43,13 @@ export interface RuntimeStatusCommand {
 export interface RuntimeStopCommand {
   readonly kind: "runtime.stop";
   readonly endpoint: string;
+  readonly json: boolean;
+}
+
+export interface RuntimeSnapshotCommand {
+  readonly kind: "runtime.snapshot";
+  readonly endpoint: string;
+  readonly input: RuntimeSnapshotRequest;
   readonly json: boolean;
 }
 
@@ -141,6 +149,7 @@ export type ParsedCommand =
   | PluginStatusCommand
   | PluginValidateCommand
   | RuntimeStartCommand
+  | RuntimeSnapshotCommand
   | RuntimeStatusCommand
   | RuntimeStopCommand
   | TaskRecordCommand
@@ -660,6 +669,12 @@ export function parseCommand(argv: readonly string[]): ParsedCommand {
         return parseStart(argv.slice(2));
       case "status":
         return { kind: "runtime.status", ...parseLifecycleOptions(argv.slice(2)) };
+      case "snapshot":
+        return {
+          kind: "runtime.snapshot",
+          input: {},
+          ...parseLifecycleOptions(argv.slice(2)),
+        };
       case "stop":
         return { kind: "runtime.stop", ...parseLifecycleOptions(argv.slice(2)) };
       default:

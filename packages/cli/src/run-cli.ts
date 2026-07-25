@@ -3,6 +3,7 @@ import type { Writable } from "node:stream";
 import {
   DiagnosticError,
   type JsonValue,
+  parseRuntimeSnapshotResponse,
   type RuntimeStatus,
   runtimeDiagnostic,
 } from "@tegojs/contracts";
@@ -33,6 +34,7 @@ const help = `Usage: tego <command>
 
 Commands:
   runtime start [--detach] [--json] [--data-dir <path>] [--endpoint <path>]
+  runtime snapshot [--json] [--endpoint <path>]
   runtime status [--json] [--endpoint <path>]
   runtime stop [--json] [--endpoint <path>]
   plugin validate|pack|inspect|install|deploy|status
@@ -169,6 +171,16 @@ export async function runCli(options: CliRunOptions): Promise<number> {
           command,
           (operation, input, timeoutMs) => request(endpoint, operation, input, timeoutMs),
           options.monotonicNow,
+        ),
+        command.json,
+      );
+      return 0;
+    }
+    if (command.kind === "runtime.snapshot") {
+      write(
+        stdout,
+        parseRuntimeSnapshotResponse(
+          await request(command.endpoint, command.kind, command.input, DEFAULT_CONTROL_TIMEOUT_MS),
         ),
         command.json,
       );

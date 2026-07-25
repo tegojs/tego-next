@@ -242,6 +242,7 @@ test("@spec:runtime-operations/task-operations/direct-and-socket-json-parity", a
     waitTask: unused,
     cancelTask: unused,
     recoveredOperations: async () => [],
+    snapshot: () => Promise.reject(new Error("not used")),
   };
   const server = await startControlServer({
     endpoint,
@@ -316,6 +317,7 @@ test("@spec:runtime-operations/task-operations/direct-and-socket-success-values-
     waitTask: unused,
     cancelTask: unused,
     recoveredOperations: async () => [],
+    snapshot: () => Promise.reject(new Error("not used")),
   };
   const server = await startControlServer({
     endpoint,
@@ -400,6 +402,7 @@ test("@spec:runtime-operations/task-operations/diagnostic-shaped-business-input-
     },
     cancelTask: unused,
     recoveredOperations: async () => [],
+    snapshot: () => Promise.reject(new Error("not used")),
   };
   const server = await startControlServer({
     endpoint,

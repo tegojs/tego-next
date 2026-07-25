@@ -125,6 +125,12 @@ async function dispatch(
       return { stopped: true };
     case "runtime.recovered-operations":
       return serializeWireValue(await operations.operations.recoveredOperations());
+    case "runtime.snapshot":
+      return serializeWireValue(
+        await operations.operations.snapshot(
+          request.input as Parameters<RuntimeOperations["snapshot"]>[0],
+        ),
+      );
     case "plugin.install":
       return serializeWireValue(
         await operations.operations.installPlugin(

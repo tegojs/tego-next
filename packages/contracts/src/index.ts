@@ -13,6 +13,7 @@ export * from "./permission-grant.js";
 export * from "./plugin.js";
 export * from "./process-host.js";
 export * from "./runtime.js";
+export * from "./runtime-snapshot.js";
 export * from "./schema.js";
 export * from "./secrets.js";
 export * from "./state.js";

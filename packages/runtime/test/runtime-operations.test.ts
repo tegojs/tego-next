@@ -49,9 +49,11 @@ interface SnapshotResponse {
 function snapshotOperation(
   controller: RuntimeOperationController,
 ): (request: SnapshotRequest) => Promise<SnapshotResponse> {
-  return (controller as unknown as RuntimeOperations & {
-    snapshot(request: SnapshotRequest): Promise<SnapshotResponse>;
-  }).snapshot.bind(controller);
+  return (
+    controller as unknown as RuntimeOperations & {
+      snapshot(request: SnapshotRequest): Promise<SnapshotResponse>;
+    }
+  ).snapshot.bind(controller);
 }
 
 function record(id: string, value: JsonObject, revision: string): ScannedState<JsonObject> {
@@ -226,7 +228,7 @@ test("runtime snapshot pages durable sections with stable cursors and safe defau
   const result = await snapshotOperation(controller)({
     limit: 1,
     cursors: {
-      installations: "installation-before",
+      installations: "installation-0",
       operations: { revision: "5", operationId: "operation-before" },
     },
   });
@@ -238,7 +240,7 @@ test("runtime snapshot pages durable sections with stable cursors and safe defau
       limit: query.limit,
     })),
     [
-      { collection: "installations", afterId: "installation-before", limit: 1 },
+      { collection: "installations", afterId: "installation-0", limit: 1 },
       { collection: "deployments", afterId: undefined, limit: 1 },
       { collection: "component-instances", afterId: undefined, limit: 1 },
       { collection: "tasks", afterId: undefined, limit: 1 },

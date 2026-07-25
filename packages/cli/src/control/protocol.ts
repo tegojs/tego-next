@@ -21,6 +21,7 @@ export type RuntimeOperationName =
   | "plugin.install-path"
   | "plugin.status"
   | "runtime.recovered-operations"
+  | "runtime.snapshot"
   | "runtime.status"
   | "runtime.stop"
   | "task.cancel"
@@ -49,6 +50,7 @@ const operationNames = new Set<RuntimeOperationName>([
   "plugin.install-path",
   "plugin.status",
   "runtime.recovered-operations",
+  "runtime.snapshot",
   "runtime.status",
   "runtime.stop",
   "task.cancel",

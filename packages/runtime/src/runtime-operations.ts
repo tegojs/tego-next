@@ -4,6 +4,8 @@ import {
   DiagnosticError,
   diagnosticCode,
   type InstallPluginRequest,
+  type JsonObject,
+  type JsonValue,
   type PersistedOperationJournalEntry,
   type PluginDeployment,
   type PluginDeploymentIdentity,
@@ -16,16 +18,27 @@ import {
   parsePluginDeploymentStatus,
   parsePluginInstallation,
   parseRunTaskRequest,
+  parseRuntimeSnapshotRequest,
+  parseRuntimeSnapshotResponse,
   parseTaskId,
   parseTaskRecord,
   type RunTaskRequest,
   type RuntimeAuthority,
   type RuntimeOperations,
+  type RuntimeSnapshotOperationPage,
+  type RuntimeSnapshotOperationRecord,
+  type RuntimeSnapshotRequest,
+  type RuntimeSnapshotResponse,
+  type RuntimeSnapshotStatePage,
+  type RuntimeSnapshotStateRecord,
   runtimeDiagnostic,
+  runtimeSnapshotDefaultLimit,
+  runtimeSnapshotMaxBytes,
   type StateFencing,
   type StateKey,
   type StateStore,
   type StateTransaction,
+  serializeWireValue,
   type TaskId,
   type TaskRecord,
 } from "@tegojs/contracts";
@@ -95,6 +108,107 @@ function sameDesired(left: PluginDeployment, right: DeployPluginRequest): boolea
     canonical(left.permissionGrants) === canonical(right.permissionGrants) &&
     canonical(left.capabilityBindings) === canonical(right.capabilityBindings)
   );
+}
+
+function snapshotObject(value: JsonValue, name: string): JsonObject {
+  const cloned = serializeWireValue(value);
+  if (typeof cloned !== "object" || cloned === null || Array.isArray(cloned)) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "PROTOCOL_OPERATION_INVALID",
+        message: `Runtime snapshot ${name} must be an object`,
+        source: { kind: "protocol", id: "runtime-snapshot" },
+      }),
+    );
+  }
+  return cloned as JsonObject;
+}
+
+function stripVolatileAuthority(value: JsonValue): JsonValue {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((entry) => stripVolatileAuthority(entry));
+  const stripped: Record<string, JsonValue> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "authority" || key === "epoch" || key === "session" || key === "sessionId") {
+      continue;
+    }
+    stripped[key] = stripVolatileAuthority(entry);
+  }
+  return stripped;
+}
+
+function projectInstallation(value: JsonValue): JsonObject {
+  const installation = snapshotObject(value, "installation");
+  const { manifest: _manifest, ...projected } = installation;
+  return snapshotObject(stripVolatileAuthority(projected), "installation projection");
+}
+
+function projectDeployment(value: JsonValue, includeConfiguration: boolean): JsonObject {
+  const deployment = snapshotObject(value, "deployment");
+  const { configuration, ...projected } = deployment;
+  return snapshotObject(
+    stripVolatileAuthority({
+      ...projected,
+      ...(includeConfiguration && configuration !== undefined ? { configuration } : {}),
+    }),
+    "deployment projection",
+  );
+}
+
+function projectInstance(value: JsonValue): JsonObject {
+  return snapshotObject(stripVolatileAuthority(value), "instance projection");
+}
+
+function projectTask(
+  value: JsonValue,
+  projection: RuntimeSnapshotRequest["projection"],
+): JsonObject {
+  const task = snapshotObject(value, "task");
+  const { authority: _authority, cancellation, request, result, ...projected } = task;
+  const taskRequest =
+    request === undefined
+      ? undefined
+      : (() => {
+          const requestValue = snapshotObject(request, "task request");
+          const { input, ...safeRequest } = requestValue;
+          return {
+            ...safeRequest,
+            ...(projection?.taskInput === true && input !== undefined ? { input } : {}),
+          };
+        })();
+  const taskResult =
+    result === undefined
+      ? undefined
+      : (() => {
+          const resultValue = snapshotObject(result, "task result");
+          const { output, ...safeResult } = resultValue;
+          return {
+            ...safeResult,
+            ...(projection?.taskOutput === true && output !== undefined ? { output } : {}),
+          };
+        })();
+  const safeCancellation =
+    cancellation === undefined
+      ? undefined
+      : (() => {
+          const cancellationValue = snapshotObject(cancellation, "task cancellation");
+          return cancellationValue.requestedAt === undefined
+            ? undefined
+            : { requestedAt: cancellationValue.requestedAt };
+        })();
+  return snapshotObject(
+    stripVolatileAuthority({
+      ...projected,
+      ...(taskRequest === undefined ? {} : { request: taskRequest }),
+      ...(taskResult === undefined ? {} : { result: taskResult }),
+      ...(safeCancellation === undefined ? {} : { cancellation: safeCancellation }),
+    }),
+    "task projection",
+  );
+}
+
+function snapshotBytes(value: RuntimeSnapshotResponse): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 export class RuntimeOperationController implements RuntimeOperations {
@@ -337,6 +451,97 @@ export class RuntimeOperationController implements RuntimeOperations {
   async recoveredOperations(): Promise<readonly PersistedOperationJournalEntry[]> {
     this.#requireAvailable();
     return structuredClone(this.#recovered);
+  }
+
+  async snapshot(input: RuntimeSnapshotRequest): Promise<RuntimeSnapshotResponse> {
+    this.#requireAvailable();
+    const state = this.#requireState();
+    const request = parseRuntimeSnapshotRequest(input);
+    const limit = request.limit ?? runtimeSnapshotDefaultLimit;
+    const loadStatePage = async (
+      collection: string,
+      afterId: string | undefined,
+      project: (value: JsonValue) => JsonObject,
+    ): Promise<RuntimeSnapshotStatePage> => {
+      const items: RuntimeSnapshotStateRecord[] = [];
+      for await (const stored of state.scan<JsonValue>({
+        namespace: "tego",
+        collection,
+        ...(afterId === undefined ? {} : { afterId }),
+        limit,
+      })) {
+        items.push({
+          id: stored.key.id,
+          revision: stored.revision,
+          value: project(stored.value),
+        });
+      }
+      const lastItem = items.at(-1);
+      return items.length === limit && lastItem !== undefined
+        ? { items, nextCursor: lastItem.id }
+        : { items };
+    };
+
+    const installations = await loadStatePage(
+      "installations",
+      request.cursors?.installations,
+      projectInstallation,
+    );
+    const deployments = await loadStatePage("deployments", request.cursors?.deployments, (value) =>
+      projectDeployment(value, request.projection?.deploymentConfiguration === true),
+    );
+    const instances = await loadStatePage(
+      "component-instances",
+      request.cursors?.instances,
+      projectInstance,
+    );
+    const tasks = await loadStatePage("tasks", request.cursors?.tasks, (value) =>
+      projectTask(value, request.projection),
+    );
+    const operationItems: RuntimeSnapshotOperationRecord[] = [];
+    for await (const entry of state.scanOperations({
+      ...(request.cursors?.operations === undefined ? {} : { after: request.cursors.operations }),
+      limit,
+    })) {
+      operationItems.push({
+        operationId: entry.operationId,
+        kind: entry.kind,
+        status: entry.status,
+        updatedAt: entry.updatedAt,
+        revision: entry.revision,
+      });
+    }
+    const lastOperation = operationItems.at(-1);
+    const operations: RuntimeSnapshotOperationPage = {
+      items: operationItems,
+      ...(operationItems.length === limit && lastOperation !== undefined
+        ? {
+            nextCursor: {
+              revision: lastOperation.revision,
+              operationId: lastOperation.operationId,
+            },
+          }
+        : {}),
+    };
+    const response: RuntimeSnapshotResponse = {
+      installations,
+      deployments,
+      instances,
+      operations,
+      tasks,
+    };
+
+    if (snapshotBytes(response) > runtimeSnapshotMaxBytes) {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "PROTOCOL_OPERATION_INVALID",
+          message:
+            "Runtime snapshot projection is too large; use a smaller limit or omit sensitive fields",
+          source: { kind: "protocol", id: "runtime-snapshot" },
+        }),
+      );
+    }
+    return parseRuntimeSnapshotResponse(response);
   }
 
   async #findInstallation(request: DeployPluginRequest): Promise<LocatedInstallation> {

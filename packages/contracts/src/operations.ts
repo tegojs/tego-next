@@ -33,6 +33,7 @@ import {
 import type { JsonObject, JsonValue } from "./json.js";
 import type { Permission } from "./permission.js";
 import type { PluginDeployment, PluginDeploymentIdentity, PluginInstallation } from "./plugin.js";
+import type { RuntimeSnapshotRequest, RuntimeSnapshotResponse } from "./runtime-snapshot.js";
 import type { PersistedOperationJournalEntry } from "./state.js";
 
 export interface ArtifactSignatureEnvelope extends JsonObject {
@@ -430,6 +431,7 @@ export interface RuntimeOperations {
   waitTask(taskId: TaskId): Promise<TaskRecord>;
   cancelTask(taskId: TaskId): Promise<TaskRecord>;
   recoveredOperations(): Promise<readonly PersistedOperationJournalEntry[]>;
+  snapshot(request: RuntimeSnapshotRequest): Promise<RuntimeSnapshotResponse>;
 }
 
 export function indeterminateTaskDiagnostic(

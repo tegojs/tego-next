@@ -76,6 +76,7 @@ function fakeRuntimeOperations(): RuntimeOperations {
     waitTask: () => Promise.reject(new Error("not used")),
     cancelTask: () => Promise.reject(new Error("not used")),
     recoveredOperations: async () => [],
+    snapshot: () => Promise.reject(new Error("not used")),
   };
 }
 
