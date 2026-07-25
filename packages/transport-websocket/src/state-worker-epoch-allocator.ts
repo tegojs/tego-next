@@ -11,6 +11,8 @@ import {
 } from "@tegojs/contracts";
 import type { WorkerEpochAllocator } from "./main-endpoint.js";
 
+const MAXIMUM_UNSIGNED_64 = (1n << 64n) - 1n;
+
 interface WorkerEpochRecord extends JsonObject {
   readonly workerId: WorkerId;
   readonly epoch: FencingEpoch;
@@ -42,6 +44,17 @@ function invalidRecord(workerId: WorkerId, cause?: unknown): DiagnosticError {
   );
 }
 
+function exhaustedEpochs(workerId: WorkerId): DiagnosticError {
+  return new DiagnosticError(
+    runtimeDiagnostic({
+      code: "WORKER_EPOCH_LIMIT_EXCEEDED",
+      message: "Worker session epoch exceeds the unsigned 64-bit protocol limit",
+      source: { kind: "worker", id: workerId },
+      details: { workerId },
+    }),
+  );
+}
+
 export class StateWorkerEpochAllocator implements WorkerEpochAllocator {
   readonly #state: StateStore;
 
@@ -67,6 +80,9 @@ export class StateWorkerEpochAllocator implements WorkerEpochAllocator {
         } catch (error) {
           throw invalidRecord(workerId, error);
         }
+      }
+      if (previous >= MAXIMUM_UNSIGNED_64) {
+        throw exhaustedEpochs(workerId);
       }
       let epoch: FencingEpoch;
       try {
