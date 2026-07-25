@@ -20,10 +20,10 @@ function capture() {
   return { read: () => output, stream };
 }
 
-function response(result: JsonValue): ControlResponse {
+function response(result: JsonValue, requestId = "request-task-command-test"): ControlResponse {
   return {
     protocolVersion: "1.0",
-    requestId: "request-task-command-test",
+    requestId,
     ok: true,
     result,
   };
@@ -69,17 +69,27 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
     requestControl: async (request: ControlClientOptions) => {
       requests.push(request);
       return request.operation === "task.run"
-        ? response(taskRecord("accepted"))
+        ? response(
+            {
+              ...(taskRecord("accepted") as Record<string, JsonValue>),
+              request: request.input,
+            },
+            request.requestId,
+          )
         : response(
-            taskRecord("terminal", {
-              taskId: "task-cli-test",
-              attemptId: "attempt-cli-test",
-              status: "succeeded",
-              output: { message: "hi" },
-              executor: { kind: "thread" },
-              startedAt: "2026-07-25T00:00:00.000Z",
-              completedAt: "2026-07-25T00:00:01.000Z",
-            }),
+            {
+              ...(taskRecord("terminal", {
+                taskId: "task-cli-test",
+                attemptId: "attempt-cli-test",
+                status: "succeeded",
+                output: { message: "hi" },
+                executor: { kind: "thread" },
+                startedAt: "2026-07-25T00:00:00.000Z",
+                completedAt: "2026-07-25T00:00:01.000Z",
+              }) as Record<string, JsonValue>),
+              request: requests[0]?.input ?? null,
+            },
+            request.requestId,
           );
     },
   });
@@ -127,7 +137,13 @@ test("@spec:runtime-operations/task-operations/no-wait-returns-accepted-task", a
     stderr: stderr.stream,
     requestControl: async (request) => {
       requests.push(request);
-      return response(taskRecord("accepted"));
+      return response(
+        {
+          ...(taskRecord("accepted") as Record<string, JsonValue>),
+          request: request.input,
+        },
+        request.requestId,
+      );
     },
   });
 
@@ -145,7 +161,7 @@ test("@spec:runtime-operations/task-operations/unknown-and-indeterminate-remain-
   const indeterminateStdout = capture();
   const stderr = capture();
   const requestControl = async (request: ControlClientOptions) => {
-    if (request.operation === "task.status") return response(null);
+    if (request.operation === "task.status") return response(null, request.requestId);
     return response(
       taskRecord("terminal", {
         taskId: "task-cli-test",
@@ -163,6 +179,7 @@ test("@spec:runtime-operations/task-operations/unknown-and-indeterminate-remain-
         startedAt: "2026-07-25T00:00:00.000Z",
         completedAt: "2026-07-25T00:00:01.000Z",
       }),
+      request.requestId,
     );
   };
 
@@ -238,7 +255,7 @@ test("@spec:runtime-operations/task-operations/direct-and-socket-json-parity", a
         argv: ["task", "status", "task-cli-test", "--json"],
         stdout: directStdout.stream,
         stderr: stderr.stream,
-        requestControl: async () => response(record),
+        requestControl: async (request) => response(record, request.requestId),
       }),
       0,
     );
@@ -308,7 +325,7 @@ test("@spec:runtime-operations/task-operations/direct-and-socket-success-values-
         argv: ["task", "status", "task-cli-test", "--json"],
         stdout: directStdout.stream,
         stderr: stderr.stream,
-        requestControl: async () => response(record),
+        requestControl: async (request) => response(record, request.requestId),
       }),
       0,
     );
@@ -337,9 +354,9 @@ test("@spec:runtime-operations/task-operations/rejects-success-without-result", 
     argv: ["task", "status", "task-cli-test", "--json"],
     stdout: stdout.stream,
     stderr: stderr.stream,
-    requestControl: async () => ({
+    requestControl: async (request) => ({
       protocolVersion: "1.0",
-      requestId: "request-task-command-test",
+      requestId: request.requestId ?? "",
       ok: true,
     }),
   });
@@ -367,7 +384,13 @@ test("@spec:runtime-operations/task-operations/no-wait-uses-short-submission-tim
     stderr: stderr.stream,
     requestControl: async (request) => {
       timeouts.push(request.timeoutMs);
-      return response(taskRecord("accepted"));
+      return response(
+        {
+          ...(taskRecord("accepted") as Record<string, JsonValue>),
+          request: request.input,
+        },
+        request.requestId,
+      );
     },
   });
 
@@ -381,6 +404,7 @@ test("@spec:runtime-operations/task-operations/run-and-wait-share-one-time-budge
   const stderr = capture();
   const timeouts: number[] = [];
   let monotonicTime = 10_000;
+  let submittedInput: JsonValue = null;
   const runOptions = {
     argv: [
       "task",
@@ -398,19 +422,30 @@ test("@spec:runtime-operations/task-operations/run-and-wait-share-one-time-budge
     requestControl: async (request: ControlClientOptions) => {
       timeouts.push(request.timeoutMs);
       if (request.operation === "task.run") {
+        submittedInput = request.input;
         monotonicTime += 650;
-        return response(taskRecord("accepted"));
+        return response(
+          {
+            ...(taskRecord("accepted") as Record<string, JsonValue>),
+            request: request.input,
+          },
+          request.requestId,
+        );
       }
       return response(
-        taskRecord("terminal", {
-          taskId: "task-cli-test",
-          attemptId: "attempt-cli-test",
-          status: "succeeded",
-          output: { message: "hi" },
-          executor: { kind: "thread" },
-          startedAt: "2026-07-25T00:00:00.000Z",
-          completedAt: "2026-07-25T00:00:01.000Z",
-        }),
+        {
+          ...(taskRecord("terminal", {
+            taskId: "task-cli-test",
+            attemptId: "attempt-cli-test",
+            status: "succeeded",
+            output: { message: "hi" },
+            executor: { kind: "thread" },
+            startedAt: "2026-07-25T00:00:00.000Z",
+            completedAt: "2026-07-25T00:00:01.000Z",
+          }) as Record<string, JsonValue>),
+          request: submittedInput,
+        },
+        request.requestId,
       );
     },
   };
@@ -429,11 +464,14 @@ test("@spec:runtime-operations/task-operations/rejects-mismatched-task-identitie
       argv: ["task", command, "task-cli-test", "--json"],
       stdout: stdout.stream,
       stderr: stderr.stream,
-      requestControl: async () =>
-        response({
-          ...(taskRecord("accepted") as Record<string, JsonValue>),
-          taskId: "task-other",
-        }),
+      requestControl: async (request) =>
+        response(
+          {
+            ...(taskRecord("accepted") as Record<string, JsonValue>),
+            taskId: "task-other",
+          },
+          request.requestId,
+        ),
     });
 
     assert.equal(exitCode, 1, command);
@@ -465,13 +503,16 @@ test("@spec:runtime-operations/task-operations/rejects-run-request-and-wait-iden
         if (request.operation === "task.run") {
           submittedInput = request.input;
           const accepted = taskRecord("accepted") as Record<string, JsonValue>;
-          return response({
-            ...accepted,
-            request:
-              mismatch === "request"
-                ? { ...(accepted.request as Record<string, JsonValue>), componentId: "other" }
-                : request.input,
-          });
+          return response(
+            {
+              ...accepted,
+              request:
+                mismatch === "request"
+                  ? { ...(accepted.request as Record<string, JsonValue>), componentId: "other" }
+                  : request.input,
+            },
+            request.requestId,
+          );
         }
         const terminal = taskRecord("terminal", {
           taskId: "task-cli-test",
@@ -481,11 +522,14 @@ test("@spec:runtime-operations/task-operations/rejects-run-request-and-wait-iden
           startedAt: "2026-07-25T00:00:00.000Z",
           completedAt: "2026-07-25T00:00:01.000Z",
         }) as Record<string, JsonValue>;
-        return response({
-          ...terminal,
-          attemptId: mismatch === "wait" ? "attempt-other" : "attempt-cli-test",
-          request: submittedInput,
-        });
+        return response(
+          {
+            ...terminal,
+            attemptId: mismatch === "wait" ? "attempt-other" : "attempt-cli-test",
+            request: submittedInput,
+          },
+          request.requestId,
+        );
       },
     });
 
@@ -510,7 +554,7 @@ test("@spec:runtime-operations/task-operations/cancel-returns-canonical-task", a
   });
   const requestControl = async (request: ControlClientOptions) => {
     requests.push(request);
-    return response(cancelled);
+    return response(cancelled, request.requestId);
   };
 
   assert.equal(

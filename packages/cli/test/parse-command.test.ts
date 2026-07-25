@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { parseRuntimeStatus, type RuntimeStatus } from "@tegojs/contracts";
+import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { defaultControlEndpoint, parseCommand } from "../src/parse-command.js";
 import { runCli } from "../src/run-cli.js";
@@ -42,10 +43,13 @@ function capture() {
   };
 }
 
-function response(result?: ControlResponse["result"]): ControlResponse {
+function response(
+  result: ControlResponse["result"],
+  requestId = "request-cli-test",
+): ControlResponse {
   return {
     protocolVersion: "1.0",
-    requestId: "request-cli-test",
+    requestId,
     ok: true,
     ...(result === undefined ? {} : { result }),
   };
@@ -59,9 +63,9 @@ test("@spec:runtime-operations/local-runtime-operations/json-status", async () =
     argv: ["runtime", "status", "--json"],
     stdout: stdout.stream,
     stderr: stderr.stream,
-    requestControl: async (request: { readonly operation: string }) => {
+    requestControl: async (request) => {
       requests.push(request.operation);
-      return response(runningStatus());
+      return response(runningStatus(), request.requestId);
     },
   });
 
@@ -179,7 +183,7 @@ test("@spec:runtime-operations/local-runtime-operations/graceful-idempotent-stop
   const stderr = capture();
   const requests: string[] = [];
   let stopped = false;
-  const requestControl = async (request: { readonly operation: string }) => {
+  const requestControl = async (request: ControlClientOptions) => {
     requests.push(request.operation);
     if (stopped) {
       const error = new Error("connect ENOENT") as NodeJS.ErrnoException;
@@ -187,7 +191,7 @@ test("@spec:runtime-operations/local-runtime-operations/graceful-idempotent-stop
       throw error;
     }
     stopped = true;
-    return response({ stopped: true });
+    return response({ stopped: true }, request.requestId);
   };
   const firstExitCode = await runCli({
     argv: ["runtime", "stop", "--json"],

@@ -32,10 +32,13 @@ function capture() {
   return { read: () => output, stream };
 }
 
-function response(result: Exclude<ControlResponse["result"], undefined>): ControlResponse {
+function response(
+  result: Exclude<ControlResponse["result"], undefined>,
+  requestId = "request-plugin-command-test",
+): ControlResponse {
   return {
     protocolVersion: "1.0",
-    requestId: "request-plugin-command-test",
+    requestId,
     ok: true,
     result,
   };
@@ -169,30 +172,33 @@ test("@spec:runtime-operations/plugin-development-operations/install-sends-canon
       stderr: stderr.stream,
       requestControl: async (request) => {
         requests.push(request);
-        return response({
-          digest: `sha256:${"a".repeat(64)}`,
-          installedAt: "2026-07-25T00:00:00.000Z",
-          manifest: {
-            schemaVersion: "1.0",
+        return response(
+          {
+            digest: `sha256:${"a".repeat(64)}`,
+            installedAt: "2026-07-25T00:00:00.000Z",
+            manifest: {
+              schemaVersion: "1.0",
+              pluginId: "org.example.echo",
+              version: "1.0.0",
+              contractRange: "^1.0.0",
+              nodeRange: ">=26.0.0",
+              moduleFormat: "esm",
+              components: [
+                {
+                  componentId: "echo",
+                  kind: "task",
+                  entrypoint: "component.js",
+                  executors: ["thread"],
+                },
+              ],
+              permissions: [],
+              capabilities: { provides: [], requires: [] },
+            },
             pluginId: "org.example.echo",
             version: "1.0.0",
-            contractRange: "^1.0.0",
-            nodeRange: ">=26.0.0",
-            moduleFormat: "esm",
-            components: [
-              {
-                componentId: "echo",
-                kind: "task",
-                entrypoint: "component.js",
-                executors: ["thread"],
-              },
-            ],
-            permissions: [],
-            capabilities: { provides: [], requires: [] },
           },
-          pluginId: "org.example.echo",
-          version: "1.0.0",
-        });
+          request.requestId,
+        );
       },
     });
 
@@ -218,17 +224,23 @@ test("@spec:runtime-operations/plugin-development-operations/deploy-and-status-u
   const requestControl = async (request: ControlClientOptions) => {
     requests.push(request);
     if (request.operation === "plugin.deploy") {
-      return response({
-        ...(request.input as Record<string, JsonValue>),
-        version: "1.0.0",
-        generation: "1",
-        state: "active",
-      });
+      return response(
+        {
+          ...(request.input as Record<string, JsonValue>),
+          version: "1.0.0",
+          generation: "1",
+          state: "active",
+        },
+        request.requestId,
+      );
     }
-    return response({
-      identity: request.input,
-      observation: { state: "running" },
-    });
+    return response(
+      {
+        identity: request.input,
+        observation: { state: "running" },
+      },
+      request.requestId,
+    );
   };
 
   assert.equal(
@@ -327,7 +339,8 @@ test("@spec:runtime-operations/plugin-development-operations/human-and-json-use-
     },
     observation: { state: "running" },
   };
-  const requestControl = async () => response(result);
+  const requestControl = async (request: ControlClientOptions) =>
+    response(result, request.requestId);
 
   assert.equal(
     await runCli({
@@ -502,19 +515,92 @@ test("@spec:runtime-operations/plugin-development-operations/rejects-mismatched-
       stderr: stderr.stream,
       requestControl: async (request) =>
         command === "deploy"
-          ? response({
-              ...(request.input as Record<string, JsonValue>),
-              applicationId: "application-other",
-              version: "1.0.0",
-              generation: "1",
-              state: "active",
-            })
-          : response({
-              identity: {
+          ? response(
+              {
+                ...(request.input as Record<string, JsonValue>),
                 applicationId: "application-other",
-                pluginId: "org.example.echo",
+                version: "1.0.0",
+                generation: "1",
+                state: "active",
               },
-            }),
+              request.requestId,
+            )
+          : response(
+              {
+                identity: {
+                  applicationId: "application-other",
+                  pluginId: "org.example.echo",
+                },
+              },
+              request.requestId,
+            ),
+    });
+
+    assert.equal(exitCode, 1, command);
+    assert.equal(stdout.read(), "");
+    assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_CONTROL_REQUEST_MISMATCH");
+  }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/rejects-mismatched-plugin-artifact-and-desired-identity", async () => {
+  const requestedDigest = `sha256:${"d".repeat(64)}`;
+  const otherDigest = `sha256:${"e".repeat(64)}`;
+  for (const command of ["deploy", "status"] as const) {
+    const stdout = capture();
+    const stderr = capture();
+    const exitCode = await runCli({
+      argv:
+        command === "deploy"
+          ? [
+              "plugin",
+              "deploy",
+              "org.example.echo",
+              "--digest",
+              requestedDigest,
+              "--application-id",
+              "application-test",
+              "--json",
+            ]
+          : [
+              "plugin",
+              "status",
+              "org.example.echo",
+              "--application-id",
+              "application-test",
+              "--json",
+            ],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      requestControl: async (request) =>
+        command === "deploy"
+          ? response(
+              {
+                ...(request.input as Record<string, JsonValue>),
+                artifactDigest: otherDigest,
+                version: "1.0.0",
+                generation: "1",
+                state: "active",
+              },
+              request.requestId,
+            )
+          : response(
+              {
+                identity: request.input,
+                desired: {
+                  applicationId: "application-other",
+                  pluginId: "org.example.echo",
+                  version: "1.0.0",
+                  artifactDigest: requestedDigest,
+                  generation: "1",
+                  state: "active",
+                  essential: false,
+                  configuration: {},
+                  permissionGrants: [],
+                  capabilityBindings: {},
+                },
+              },
+              request.requestId,
+            ),
     });
 
     assert.equal(exitCode, 1, command);
