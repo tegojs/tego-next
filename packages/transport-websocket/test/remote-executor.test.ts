@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { parseWorkerId, type JsonValue } from "@tegojs/contracts";
+import {
+  parseWorkerId,
+  type ExecutionRequest,
+  type JsonValue,
+} from "@tegojs/contracts";
 import {
   executorConformance,
   eventually,
@@ -10,8 +14,10 @@ import {
 } from "@tegojs/testkit";
 import {
   MemoryRemoteAttemptStore,
+  REMOTE_ASSIGN,
   RemoteExecutor,
   WorkerRuntime,
+  type RemoteAttemptStore,
   type RemoteExecutorOptions,
 } from "../src/index.js";
 import {
@@ -182,6 +188,168 @@ test("same attempt with a different fingerprint is rejected before remote execut
     await eventually(() => assert.equal(local.executions, 1));
   } finally {
     await remote.cancel(request.taskId, request.attemptId);
+  }
+});
+
+test("RemoteExecutor rejects mismatched immutable targets before attempt-store access", async (t) => {
+  const cases: readonly {
+    readonly name: string;
+    readonly target: ExecutionRequest["target"];
+  }[] = [
+    {
+      name: "executor id",
+      target: {
+        ...executionRequest(null, "target-id").target,
+        executor: {
+          id: "different-remote",
+          type: "remote",
+          workerId,
+        },
+      },
+    },
+    {
+      name: "executor type",
+      target: {
+        ...executionRequest(null, "target-type").target,
+        executor: {
+          id: "remote",
+          type: "process",
+        },
+      },
+    },
+    {
+      name: "worker id",
+      target: {
+        ...executionRequest(null, "target-worker").target,
+        executor: {
+          id: "remote",
+          type: "remote",
+          workerId: parseWorkerId("different-worker"),
+        },
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      let storeCalls = 0;
+      const store: RemoteAttemptStore = {
+        save: async () => {
+          storeCalls += 1;
+        },
+        commit: async () => {
+          storeCalls += 1;
+          return undefined;
+        },
+        delete: async () => {
+          storeCalls += 1;
+        },
+        load: async () => {
+          storeCalls += 1;
+          return undefined;
+        },
+        list: async () => {
+          storeCalls += 1;
+          return [];
+        },
+      };
+      const remote = new RemoteExecutor({
+        id: "remote",
+        workerId,
+        clock,
+        attemptStore: store,
+      });
+      const request = executionRequest(null, `remote-${testCase.name.replaceAll(" ", "-")}`);
+
+      await assert.rejects(
+        remote.submit({ ...request, target: testCase.target }),
+        /target|executor|worker/iu,
+      );
+      assert.equal(storeCalls, 0);
+    });
+  }
+});
+
+test("WorkerRuntime rejects non-bound immutable targets before persistence, ACK, or selection", async (t) => {
+  const cases: readonly {
+    readonly name: string;
+    readonly target: ExecutionRequest["target"];
+  }[] = [
+    {
+      name: "local executor target",
+      target: {
+        ...executionRequest(null, "worker-local-target").target,
+        executor: {
+          id: "local",
+          type: "thread",
+        },
+      },
+    },
+    {
+      name: "different worker target",
+      target: {
+        ...executionRequest(null, "worker-cross-target").target,
+        executor: {
+          id: "remote",
+          type: "remote",
+          workerId: parseWorkerId("different-worker"),
+        },
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      let storeCalls = 0;
+      let selectorCalls = 0;
+      const local = new TestLocalExecutor();
+      const store: RemoteAttemptStore = {
+        save: async () => {
+          storeCalls += 1;
+        },
+        commit: async () => {
+          storeCalls += 1;
+          return undefined;
+        },
+        delete: async () => {
+          storeCalls += 1;
+        },
+        load: async () => {
+          storeCalls += 1;
+          return undefined;
+        },
+        list: async () => {
+          storeCalls += 1;
+          return [];
+        },
+      };
+      const [mainSession, workerSession] = memorySessionPair("1");
+      const runtime = new WorkerRuntime({
+        workerId,
+        clock,
+        attemptStore: store,
+        selectExecutor: () => {
+          selectorCalls += 1;
+          return local;
+        },
+      });
+      await runtime.attach(workerSession);
+      storeCalls = 0;
+      cleanups.push(async () => runtime.close());
+      const request = executionRequest(null, `worker-${testCase.name.replaceAll(" ", "-")}`);
+
+      const response = await mainSession.request(REMOTE_ASSIGN, {
+        request: { ...request, target: testCase.target },
+      });
+
+      assert.equal(
+        (response.payload as { readonly accepted?: boolean }).accepted,
+        false,
+      );
+      assert.equal(storeCalls, 0);
+      assert.equal(selectorCalls, 0);
+      assert.equal(local.executions, 0);
+    });
   }
 });
 
