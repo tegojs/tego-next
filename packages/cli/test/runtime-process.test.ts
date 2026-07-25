@@ -197,6 +197,58 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
   assert.equal(closeAttempted, true);
 });
 
+test("@spec:runtime-operations/local-runtime-operations/signal-interrupts-lifecycle-stop-cleanup", {
+  timeout: deadlineMs,
+}, async () => {
+  const lifecycleStopped = Promise.withResolvers<void>();
+  const ready = Promise.withResolvers<void>();
+  const stopCalled = Promise.withResolvers<void>();
+  const stopCompletion = Promise.withResolvers<void>();
+  const closeCalled = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  let closeCount = 0;
+  const runtime: Runtime = {
+    start: async () => undefined,
+    status: async () => ({ lifecycle: "running" }) as RuntimeStatus,
+    stop: async () => {
+      stopCalled.resolve();
+      await stopCompletion.promise;
+    },
+    operations: {} as Runtime["operations"],
+    events: {
+      async *[Symbol.asyncIterator]() {
+        await lifecycleStopped.promise;
+        yield { current: "stopped" };
+      },
+    } as Runtime["events"],
+  };
+  const running = runMainProcess({
+    endpoint: "in-memory",
+    runtime,
+    onBackgroundError: failOnBackgroundError,
+    onReady: () => ready.resolve(),
+    signal: controller.signal,
+    controlServerFactory: async () => ({
+      endpoint: "in-memory",
+      close: async () => {
+        closeCount += 1;
+        closeCalled.resolve();
+      },
+    }),
+  });
+
+  await ready.promise;
+  lifecycleStopped.resolve();
+  await stopCalled.promise;
+  controller.abort();
+  const closeBeforeStop = await settlesBeforeDeadline(closeCalled.promise, 50);
+  stopCompletion.resolve();
+  await running;
+
+  assert.equal(closeBeforeStop, true);
+  assert.equal(closeCount, 1);
+});
+
 test("@spec:runtime-operations/local-runtime-operations/control-stop-response-precedes-server-close", {
   timeout: deadlineMs,
 }, async () => {
