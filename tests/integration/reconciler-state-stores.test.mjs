@@ -44,9 +44,24 @@ class ManualClock {
 class RecordingEffects {
   supportedExecutors = ["thread"];
   calls = [];
+  live = new Set();
 
   async perform(effect) {
     this.calls.push(effect);
+    if (effect.kind === "start") this.live.add(effect.instanceId);
+    if (effect.kind === "stop") this.live.delete(effect.instanceId);
+  }
+
+  async restore(instance) {
+    this.live.add(instance.instanceId);
+  }
+
+  isLive(instance) {
+    return this.live.has(instance.instanceId);
+  }
+
+  async close() {
+    this.live.clear();
   }
 }
 
@@ -436,6 +451,7 @@ test("failed prepare retries after retryAt and converges to ready", async (t) =>
         prepareAttempts += 1;
         if (prepareAttempts === 1) throw new Error("prepare failed once");
       }
+      if (effect.kind === "start") effects.live.add(effect.instanceId);
     };
     const reconciler = new Reconciler({
       artifactGate: { validate: async () => gate().artifact },
@@ -728,6 +744,8 @@ test("failed start and stop retries persist a legal pre-state before external ef
             targetAttempts += 1;
             if (targetAttempts === 1) throw new Error(`${target} failed once`);
           }
+          if (effect.kind === "start") effects.live.add(effect.instanceId);
+          if (effect.kind === "stop") effects.live.delete(effect.instanceId);
         };
         const reconciler = new Reconciler({
           artifactGate: { validate: async () => gate().artifact },

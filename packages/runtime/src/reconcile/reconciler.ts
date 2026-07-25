@@ -1,6 +1,15 @@
 import {
+  type ApplicationId,
+  type ArtifactDigest,
+  type Clock,
   DiagnosticError,
   diagnosticCode,
+  type ExecutorKind,
+  type JsonObject,
+  type OperationId,
+  type OutboxClaim,
+  type PluginDeployment,
+  type PluginInstallation,
   parseApplicationId,
   parseArtifactDigest,
   parseCapabilityName,
@@ -8,48 +17,39 @@ import {
   parseGeneration,
   parseMessageId,
   parseOperationId,
-  parsePluginId,
   parsePluginDeployment,
+  parsePluginId,
   parsePluginInstallation,
-  runtimeDiagnostic,
-  serializeCause,
-  type ArtifactDigest,
-  type ApplicationId,
-  type Clock,
-  type ExecutorKind,
-  type JsonObject,
-  type OperationId,
-  type OutboxClaim,
-  type PluginDeployment,
-  type PluginInstallation,
   type RuntimeAuthority,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type StateKey,
   type StateStore,
+  serializeCause,
 } from "@tegojs/contracts";
 import type {
   ArtifactService,
-  ValidatedPluginArtifact,
   ValidateArtifactRequest,
+  ValidatedPluginArtifact,
 } from "../artifacts/artifact-service.js";
 import {
-  resolveCapabilities,
   type CapabilityResolutionDeployment,
   type PreviousCapabilityBinding,
+  resolveCapabilities,
 } from "../capabilities/resolver.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
+import type { PlacementWorker } from "./placement.js";
+import { planPlacement } from "./placement.js";
 import {
-  planReconcile,
-  reconcileEffectIdentities,
   type ArtifactDeploymentGate,
   type ComponentInstance,
+  planReconcile,
   type ReconcileEffect,
   type ReconcileEffectKind,
   type ReconcilePlanStep,
+  reconcileEffectIdentities,
 } from "./plan.js";
-import type { PlacementWorker } from "./placement.js";
-import { planPlacement } from "./placement.js";
 import { deterministicRetryDelay } from "./retry.js";
 
 const namespace = "tego";
@@ -1407,6 +1407,20 @@ export class Reconciler {
       .filter((record) => isInstanceContextConsistent(record, this.#deployments))
       .map((record) => record.value);
     for (const deployment of this.#deployments) {
+      const deploymentInstances = instances.filter(
+        (instance) =>
+          instance.applicationId === deployment.applicationId &&
+          instance.pluginId === deployment.pluginId &&
+          (deployment.state === "disabled" ||
+            instance.deploymentGeneration === deployment.generation),
+      );
+      const failedDiagnostics = deploymentInstances.flatMap((instance) =>
+        instance.diagnostic === undefined ? [] : [instance.diagnostic],
+      );
+      if (failedDiagnostics.length > 0) {
+        this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
+        await this.#recordObservation(deployment, "failed", failedDiagnostics);
+      }
       if (deployment.state !== "active") continue;
       const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
       if (
@@ -1419,19 +1433,6 @@ export class Reconciler {
         )
       ) {
         continue;
-      }
-      const deploymentInstances = instances.filter(
-        (instance) =>
-          instance.applicationId === deployment.applicationId &&
-          instance.pluginId === deployment.pluginId &&
-          instance.deploymentGeneration === deployment.generation,
-      );
-      const failedDiagnostics = deploymentInstances.flatMap((instance) =>
-        instance.diagnostic === undefined ? [] : [instance.diagnostic],
-      );
-      if (failedDiagnostics.length > 0) {
-        this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
-        await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
       const installation = (await this.#loadInstallations()).find(
         (candidate) =>

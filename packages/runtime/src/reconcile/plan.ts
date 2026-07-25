@@ -1,9 +1,7 @@
 import { createHash } from "node:crypto";
 import {
-  parseMessageId,
-  parseOperationId,
-  type ArtifactDigest,
   type ApplicationId,
+  type ArtifactDigest,
   type ComponentId,
   type ExecutorKind,
   type Generation,
@@ -12,6 +10,8 @@ import {
   type OperationId,
   type PluginDeployment,
   type PluginId,
+  parseMessageId,
+  parseOperationId,
   type Revision,
   type RuntimeDiagnostic,
 } from "@tegojs/contracts";
@@ -20,10 +20,10 @@ import type { ResolutionResult } from "../capabilities/resolver.js";
 import type { PermissionDecision } from "../permissions/permission-set.js";
 import type { ComponentLifecycleState } from "./component-lifecycle.js";
 import {
-  planPlacement,
   type ComponentPlacement,
   type PlacementDiagnostic,
   type PlacementWorker,
+  planPlacement,
 } from "./placement.js";
 
 export type ReconcileEffectKind = "drain" | "prepare" | "start" | "stop";
@@ -167,6 +167,7 @@ function step(
 function oldInstanceStep(
   deployment: PluginDeployment,
   instance: ComponentInstance,
+  now: string,
 ): ReconcilePlanStep | undefined {
   const oldDeployment = {
     ...deployment,
@@ -177,6 +178,22 @@ function oldInstanceStep(
     executor: instance.executor,
     ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
   };
+  if (instance.lifecycle === "failed") {
+    if (
+      instance.retryEffect === undefined ||
+      (instance.retryAt !== undefined && instance.retryAt > now)
+    ) {
+      return undefined;
+    }
+    return step(
+      oldDeployment,
+      instance.componentId,
+      instance.retryEffect,
+      placement,
+      instance.revision,
+      instance.lifecycle,
+    );
+  }
   if (instance.lifecycle === "draining") {
     const drainOperationId = reconcileEffectIdentities(
       oldDeployment,
@@ -328,7 +345,7 @@ export function planReconcile(snapshot: ReconcileSnapshot): ReconcilePlan {
       snapshot.deployment.state === "disabled" ||
       instance.deploymentGeneration !== snapshot.deployment.generation
     ) {
-      const obsolete = oldInstanceStep(snapshot.deployment, instance);
+      const obsolete = oldInstanceStep(snapshot.deployment, instance, snapshot.now);
       if (obsolete !== undefined) steps.push(obsolete);
     }
   }
