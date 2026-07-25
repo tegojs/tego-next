@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,7 +19,8 @@ function safeName(value) {
 }
 
 export async function createRunArtifacts(testName) {
-  const baseDirectory = process.env.TEGO_TEST_ARTIFACTS_DIR ?? tmpdir();
+  const configuredDirectory = process.env.TEGO_TEST_ARTIFACTS_DIR;
+  const baseDirectory = configuredDirectory ?? tmpdir();
   await mkdir(baseDirectory, { recursive: true });
   const directory = await mkdtemp(join(baseDirectory, `tego-${safeName(testName)}-`));
 
@@ -38,6 +39,10 @@ export async function createRunArtifacts(testName) {
     events: (name) => artifact(name, "events.ndjson"),
     transcript: (name) => artifact(name, "transcript.ndjson"),
     cleanup: (name) => artifact(name, "cleanup.json"),
+    async dispose() {
+      if (configuredDirectory !== undefined) return;
+      await rm(directory, { force: true, recursive: true });
+    },
     async initialize(name) {
       const target = processDirectory(name);
       await mkdir(target);
