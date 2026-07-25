@@ -415,6 +415,7 @@ async function advanceFence(
 class PostgresTransaction implements StateTransaction {
   readonly #client: PoolClient;
   readonly #namespace: string;
+  readonly #operationIds = new Set<string>();
   #revision: Revision | undefined;
   #active = true;
 
@@ -549,11 +550,20 @@ class PostgresTransaction implements StateTransaction {
 
   async appendOperation(entry: OperationJournalEntry): Promise<void> {
     this.#assertActive();
+    if (this.#operationIds.has(entry.operationId)) {
+      throw postgresError(
+        "STATE_DATA_INVALID",
+        "An operation may be appended only once per state transaction",
+        "state",
+        { operationId: entry.operationId },
+      );
+    }
     if (!validTimestamp(entry.updatedAt)) {
       throw postgresError("STATE_DATA_INVALID", "Operation timestamp is invalid", "state", {
         operationId: entry.operationId,
       });
     }
+    this.#operationIds.add(entry.operationId);
     const revision = await this.#writeRevision();
     const values = [
       this.#namespace,

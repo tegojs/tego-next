@@ -329,6 +329,7 @@ class MemoryTransaction implements StateTransaction {
   readonly #clock: Clock;
   readonly #mutations = new Map<string, Mutation>();
   readonly #operations: OperationJournalEntry[] = [];
+  readonly #operationIds = new Set<string>();
   readonly #outbox: OutboxMessage[] = [];
   #active = true;
 
@@ -418,6 +419,15 @@ class MemoryTransaction implements StateTransaction {
 
   async appendOperation(entry: OperationJournalEntry): Promise<void> {
     this.#assertActive();
+    if (this.#operationIds.has(entry.operationId)) {
+      throw stateError(
+        "STATE_DATA_INVALID",
+        "An operation may be appended only once per state transaction",
+        { operationId: entry.operationId },
+        this.#clock,
+      );
+    }
+    this.#operationIds.add(entry.operationId);
     this.#operations.push({
       operationId: entry.operationId,
       kind: entry.kind,
