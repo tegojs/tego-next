@@ -740,12 +740,24 @@ test("failed start and stop retries persist a legal pre-state before external ef
         });
 
         await reconciler.start();
+        const callsAfterFailure = effects.calls.length;
         await reconciler.wake();
         const failedEffect = effects.calls.findLast((effect) => effect.kind === target);
         assert.ok(failedEffect);
         const failed = await readOnlyInstance(state, failedEffect.instanceId);
         assert.equal(failed?.value.lifecycle, "failed");
         assert.equal(failed?.value.retryEffect, target);
+        assert.equal(
+          effects.calls.length,
+          callsAfterFailure,
+          "wake must not retry a failed effect before retryAt",
+        );
+        assert.equal(
+          reconciler
+            .diagnostics()
+            .some((diagnostic) => diagnostic.code === `LIFECYCLE_${target.toUpperCase()}_FAILED`),
+          true,
+        );
 
         clock.advance(60_000);
         await reconciler.wake();
