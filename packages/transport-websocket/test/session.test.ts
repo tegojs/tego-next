@@ -6,6 +6,7 @@ import {
   parseMessageId,
   parseSequence,
   parseSessionId,
+  type ExecutorKind,
   type FencingEpoch,
   type JsonValue,
   type WorkerId,
@@ -42,7 +43,29 @@ workerSessionConformance(
       ...options,
       epochAllocator: new MemoryWorkerEpochAllocator(),
     }),
-  createWorkerEndpoint,
+  (options) => {
+    const { registration, ...endpointOptions } = options;
+    return createWorkerEndpoint({
+      ...endpointOptions,
+      ...(registration === undefined
+        ? {}
+        : {
+            registration: {
+              labels: registration.labels,
+              resources: registration.resources,
+              executors: registration.executors.map((executor): ExecutorKind => {
+                if (executor === "process" || executor === "thread" || executor === "remote") {
+                  return executor;
+                }
+                throw new TypeError(`unsupported conformance executor: ${executor}`);
+              }),
+              preparedArtifacts: registration.preparedArtifacts.map((artifact) =>
+                parseArtifactDigest(artifact),
+              ),
+            },
+          }),
+    });
+  },
 );
 
 const ENVELOPE: WorkerControlEnvelope = {

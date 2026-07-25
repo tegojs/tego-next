@@ -125,15 +125,15 @@ export interface WorkerRegistration extends JsonObject {
   readonly workerId: WorkerId;
   readonly labels: JsonObject;
   readonly resources: JsonObject;
-  readonly executors: readonly ExecutorKind[];
-  readonly preparedArtifacts: readonly ArtifactDigest[];
+  readonly executors: readonly string[];
+  readonly preparedArtifacts: readonly string[];
 }
 
 export interface WorkerRegistrationInput {
   readonly labels: JsonObject;
   readonly resources: JsonObject;
-  readonly executors: readonly ExecutorKind[];
-  readonly preparedArtifacts: readonly ArtifactDigest[];
+  readonly executors: readonly string[];
+  readonly preparedArtifacts: readonly string[];
 }
 
 export interface WorkerSessionMessage {
@@ -147,7 +147,7 @@ export interface WorkerSessionMessage {
 export interface WorkerSessionLike {
   readonly ready: Promise<void>;
   readonly sessionId: SessionId;
-  readonly epoch: FencingEpoch;
+  readonly epoch: string;
   readonly state: "authenticating" | "closed" | "ready" | "unavailable";
   readonly available: boolean;
   readonly acceptingAssignments: boolean;

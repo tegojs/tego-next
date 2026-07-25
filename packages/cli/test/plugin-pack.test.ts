@@ -362,6 +362,11 @@ test("rejects host-resolved bare module specifiers without false positives", asy
       "const load = () => `value: $" + '{import("left-pad")}`;\nexport default load;\n',
     ],
     ["fake node builtin", 'import value from "node:left-pad";\nexport default value;\n'],
+    ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
+    [
+      "dynamic plugin SDK import in template expression",
+      "const load = () => `sdk: $" + '{import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
+    ],
   ] as const) {
     await context.test(label, async () => {
       const directory = await temporaryFixture();
@@ -438,11 +443,6 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
     ],
     ["static plugin SDK import", 'import sdk from "@tegojs/plugin-sdk";\nexport default sdk;\n'],
     ["plugin SDK export", 'export { default } from "@tegojs/plugin-sdk";\n'],
-    ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
-    [
-      "plugin SDK import in template expression",
-      "const load = () => `sdk: $" + '{import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
-    ],
   ] as const) {
     await context.test(label, async () => {
       await withBuiltSource(source, async (directory) => {

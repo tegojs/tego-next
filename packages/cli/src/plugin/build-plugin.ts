@@ -143,7 +143,7 @@ async function runCompiler(
         paths: {
           "@tegojs/plugin-sdk": [sdkTypesPath],
         },
-        skipLibCheck: true,
+        skipLibCheck: false,
       },
     }),
   );
@@ -175,6 +175,8 @@ async function runCompiler(
       "false",
       "--emitDeclarationOnly",
       "false",
+      "--skipLibCheck",
+      "true",
       "--tsBuildInfoFile",
       join(temporaryRoot, ".tsbuildinfo"),
     ],
@@ -212,8 +214,6 @@ async function runCompiler(
       }),
     );
   });
-  await rm(compilerConfiguration, { force: true });
-
   if (exitCode !== 0) {
     throw new DiagnosticError(
       runtimeDiagnostic({
@@ -221,6 +221,60 @@ async function runCompiler(
         message: "Plugin TypeScript compilation failed",
         source: { kind: "artifact", id: "build" },
         details: { exitCode, output: Buffer.concat(chunks).toString("utf8") },
+      }),
+    );
+  }
+  const validation = spawn(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./validate-plugin-declarations.js", import.meta.url)),
+      compilerConfiguration,
+      sourceRoot,
+    ],
+    {
+      cwd: pluginRoot,
+      env: process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const validationChunks: Buffer[] = [];
+  let validationBytes = 0;
+  const collectValidation = (chunk: Buffer) => {
+    if (validationBytes >= MAX_BUILD_OUTPUT_BYTES) return;
+    const remaining = MAX_BUILD_OUTPUT_BYTES - validationBytes;
+    validationChunks.push(Buffer.from(chunk.subarray(0, remaining)));
+    validationBytes += Math.min(chunk.byteLength, remaining);
+  };
+  validation.stdout?.on("data", collectValidation);
+  validation.stderr?.on("data", collectValidation);
+  const validationExitCode = await new Promise<number | null>((resolveExit, reject) => {
+    validation.once("error", reject);
+    validation.once("close", resolveExit);
+  }).catch((error: unknown) => {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ARTIFACT_BUILD_FAILED",
+        message: "Plugin declaration validator could not be started",
+        source: { kind: "artifact", id: "build" },
+        cause:
+          error instanceof Error
+            ? { name: error.name, message: error.message }
+            : { name: "UnknownCause", message: String(error) },
+      }),
+    );
+  });
+  await rm(compilerConfiguration, { force: true });
+  if (validationExitCode !== 0) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ARTIFACT_BUILD_FAILED",
+        message: "Plugin declaration validation failed",
+        source: { kind: "artifact", id: "build" },
+        details: {
+          exitCode: validationExitCode,
+          output: Buffer.concat(validationChunks).toString("utf8"),
+        },
       }),
     );
   }
