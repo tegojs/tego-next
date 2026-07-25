@@ -185,14 +185,12 @@ export async function runNodeMainProcess(options: NodeMainProcessOptions): Promi
       }),
     artifactIngress: host.artifactIngress,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
-    ...(options.onReady === undefined
-      ? {}
-      : {
-          onReady: (status: RuntimeStatus) =>
-            options.onReady?.(status, {
-              ...(host.workerUrl === undefined ? {} : { workerUrl: host.workerUrl }),
-            }),
-        }),
+    onReady: async (status: RuntimeStatus) => {
+      const workerUrl = await host.startWorkerListener();
+      await options.onReady?.(status, {
+        ...(workerUrl === undefined ? {} : { workerUrl }),
+      });
+    },
   });
 }
 

@@ -45,7 +45,7 @@ export interface CreateNodeRuntimeHostOptions {
 export interface NodeRuntimeHost {
   readonly runtime: Runtime;
   readonly artifactIngress: LocalArtifactIngress;
-  readonly workerUrl?: string;
+  startWorkerListener(): Promise<string | undefined>;
 }
 
 async function digestFile(path: string): Promise<ReturnType<typeof parseArtifactDigest>> {
@@ -67,6 +67,9 @@ function unavailableComponent(): never {
 export async function createNodeRuntimeHost(
   options: CreateNodeRuntimeHostOptions,
 ): Promise<NodeRuntimeHost> {
+  if (options.worker?.credential.length === 0) {
+    throw new TypeError("Worker listener credential must not be empty");
+  }
   await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
   const local = await createLocalDrivers({ dataDirectory: options.dataDirectory });
   let drivers: RuntimeDrivers = local;
@@ -123,22 +126,21 @@ export async function createNodeRuntimeHost(
           epochAllocator,
           clock: drivers.clock,
         });
-  const listener =
-    options.worker === undefined || mainEndpoint === undefined
-      ? undefined
-      : await listenForMain({
-          endpoint: mainEndpoint,
-          host: options.worker.host,
-          port: options.worker.port,
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        });
+  let listener: Awaited<ReturnType<typeof listenForMain>> | undefined;
+  let listenerStart: Promise<Awaited<ReturnType<typeof listenForMain>>> | undefined;
+  let listenerClosed = false;
+  const closeListener = async (): Promise<void> => {
+    listenerClosed = true;
+    const active = listener ?? (await listenerStart?.catch(() => undefined));
+    await active?.close();
+  };
   const workers = {
     count: () => mainEndpoint?.activeSessionCount ?? 0,
     placements: () => [],
     close: async () => {
       const results = await Promise.allSettled([
         executor.close(),
-        listener?.close(),
+        closeListener(),
         mainEndpoint?.close(),
       ]);
       const errors = results
@@ -191,9 +193,31 @@ export async function createNodeRuntimeHost(
       return digest;
     },
   };
+  const startWorkerListener = async (): Promise<string | undefined> => {
+    if (options.worker === undefined || mainEndpoint === undefined) return undefined;
+    if (listenerClosed) throw new Error("Worker listener owner is closed");
+    const status = await runtime.status();
+    if (status.lifecycle !== "running") {
+      throw new Error("Runtime must be running before the Worker listener binds");
+    }
+    listenerStart ??= listenForMain({
+      endpoint: mainEndpoint,
+      host: options.worker.host,
+      port: options.worker.port,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    }).then(async (candidate) => {
+      if (listenerClosed) {
+        await candidate.close();
+        throw new Error("Worker listener owner closed during bind");
+      }
+      listener = candidate;
+      return candidate;
+    });
+    return (await listenerStart).url.href;
+  };
   return {
     runtime,
     artifactIngress,
-    ...(listener === undefined ? {} : { workerUrl: listener.url.href }),
+    startWorkerListener,
   };
 }
