@@ -310,6 +310,33 @@ test("concurrent restoration shares one attempt and evicts a failed attempt for 
   await effects.close();
 });
 
+test("concurrent restoration rejects immutable identity and lifecycle conflicts for one key", async () => {
+  const prepareGate = deferred();
+  const { calls, effects, setPrepareGate } = harness();
+  const instance = readyInstance();
+  setPrepareGate(prepareGate.promise);
+
+  const first = effects.restore(instance);
+  await Promise.resolve();
+  const identityConflict = effects.restore({
+    ...instance,
+    componentId: otherComponentId,
+  });
+  const lifecycleConflict = Promise.resolve().then(() =>
+    effects.restore({
+      ...instance,
+      lifecycle: "draining",
+    }),
+  );
+  prepareGate.resolve();
+
+  await first;
+  await assert.rejects(identityConflict, /conflict|identity|lifecycle/iu);
+  await assert.rejects(lifecycleConflict, /conflict|identity|lifecycle|ready/iu);
+  assert.deepEqual(calls, [`start:${instanceId}`]);
+  await effects.close();
+});
+
 test("bulk close drains, stops, and releases every exact-authority entry despite failures", async () => {
   const authority = { resource: "runtime:app", epoch: parseFencingEpoch("3") };
   const { cache, calls, effects, setFailDrains, setFailStops } = harness({ authority });
