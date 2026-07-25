@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { parseWorkerId } from "@tegojs/contracts";
 import { connectWorker, createWorkerEndpoint } from "@tegojs/transport-websocket";
-import { createNodeRuntimeHost } from "../src/runtime/create-node-runtime-host.js";
+import {
+  createNodeRuntimeHost,
+  NodeWorkerListenerOwner,
+} from "../src/runtime/create-node-runtime-host.js";
 import { runNodeMainProcess } from "../src/runtime/main-process.js";
 
 async function assertPort(workerUrl: string, expected: "closed" | "open"): Promise<void> {
@@ -96,6 +99,28 @@ test("a readiness failure after Worker bind rolls the listener back", async () =
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("Worker listener shutdown reports a failed close during a bind race", async () => {
+  const binding = Promise.withResolvers<{
+    readonly url: URL;
+    close(): Promise<void>;
+  }>();
+  const owner = new NodeWorkerListenerOwner(() => binding.promise);
+  const starting = owner.start();
+  const closing = owner.close();
+  binding.resolve({
+    url: new URL("ws://127.0.0.1:12345/"),
+    close: async () => {
+      throw new Error("listener close failed");
+    },
+  });
+
+  const [startResult, closeResult] = await Promise.allSettled([starting, closing]);
+  assert.equal(startResult.status, "rejected");
+  assert.equal(closeResult.status, "rejected");
+  assert.match(String(closeResult.reason), /listener rollback failed/iu);
+  assert.match(String(closeResult.reason), /listener close failed/iu);
 });
 
 test("SQLite-backed Worker epochs advance across Main restart", async () => {
