@@ -1,8 +1,10 @@
 import type { RuntimeDiagnostic } from "./diagnostic.js";
 import type {
   ApplicationId,
+  ArtifactDigest,
   AttemptId,
   ComponentId,
+  Generation,
   PluginId,
   TaskId,
   WorkerId,
@@ -11,6 +13,17 @@ import type { JsonObject, JsonValue } from "./json.js";
 import type { DriverHealth } from "./state.js";
 
 export type OrphanPolicy = "cancel" | "finish-and-buffer" | "finish-and-persist";
+
+export interface TaskExecutionTarget extends JsonObject {
+  readonly instanceId: string;
+  readonly deploymentGeneration: Generation;
+  readonly artifactDigest: ArtifactDigest;
+  readonly executor: {
+    readonly id: string;
+    readonly type: "process" | "remote" | "thread";
+    readonly workerId?: WorkerId;
+  };
+}
 
 export interface ExecutionRequest extends JsonObject {
   readonly taskId: TaskId;

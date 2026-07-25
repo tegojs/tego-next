@@ -5,9 +5,11 @@ import {
   parseAttemptId,
   parseComponentId,
   parseFencingEpoch,
+  parseGeneration,
   parseOperationId,
   parsePluginId,
   parseTaskId,
+  parseWorkerId,
   type ApplicationId,
   type ArtifactDigest,
   type AttemptId,
@@ -23,7 +25,7 @@ import {
   parsePluginDeployment,
   parseRuntimeDiagnostic,
 } from "./schema.js";
-import type { ExecutionResult, OrphanPolicy } from "./execution.js";
+import type { ExecutionResult, OrphanPolicy, TaskExecutionTarget } from "./execution.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { Permission } from "./permission.js";
 import type { PluginDeployment, PluginDeploymentIdentity, PluginInstallation } from "./plugin.js";
@@ -89,6 +91,7 @@ export interface TaskRecord extends JsonObject {
   readonly state: TaskRecordState;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly target?: TaskExecutionTarget;
   readonly executor?: TaskExecutorReference;
   readonly authority?: {
     readonly resource: string;
@@ -305,7 +308,7 @@ export function parseTaskRecord(input: unknown): TaskRecord {
   exactKeys(
     value,
     ["taskId", "attemptId", "request", "state", "createdAt", "updatedAt"],
-    ["executor", "authority", "cancellation", "diagnostic", "result"],
+    ["target", "executor", "authority", "cancellation", "diagnostic", "result"],
   );
   if (value.state !== "accepted" && value.state !== "running" && value.state !== "terminal") {
     throw operationError("Task state is invalid");
@@ -326,6 +329,44 @@ export function parseTaskRecord(input: unknown): TaskRecord {
             id: entry.id,
             type: entry.type as TaskExecutorReference["type"],
           };
+        })();
+  const target =
+    value.target === undefined
+      ? undefined
+      : (() => {
+          const entry = objectValue(value.target);
+          exactKeys(entry, [
+            "instanceId",
+            "deploymentGeneration",
+            "artifactDigest",
+            "executor",
+          ]);
+          if (typeof entry.instanceId !== "string" || entry.instanceId.length === 0) {
+            throw operationError("Task execution target instance is invalid");
+          }
+          const targetExecutor = objectValue(entry.executor);
+          exactKeys(targetExecutor, ["id", "type"], ["workerId"]);
+          if (
+            typeof targetExecutor.id !== "string" ||
+            targetExecutor.id.length === 0 ||
+            (targetExecutor.type !== "process" &&
+              targetExecutor.type !== "remote" &&
+              targetExecutor.type !== "thread")
+          ) {
+            throw operationError("Task execution target executor is invalid");
+          }
+          return {
+            instanceId: entry.instanceId,
+            deploymentGeneration: parseGeneration(entry.deploymentGeneration),
+            artifactDigest: parseArtifactDigest(entry.artifactDigest),
+            executor: {
+              id: targetExecutor.id,
+              type: targetExecutor.type,
+              ...(targetExecutor.workerId === undefined
+                ? {}
+                : { workerId: parseWorkerId(targetExecutor.workerId) }),
+            },
+          } satisfies TaskExecutionTarget;
         })();
   const authority =
     value.authority === undefined
@@ -386,6 +427,7 @@ export function parseTaskRecord(input: unknown): TaskRecord {
     state: value.state as TaskRecordState,
     createdAt,
     updatedAt,
+    ...(target === undefined ? {} : { target }),
     ...(executor === undefined ? {} : { executor }),
     ...(authority === undefined ? {} : { authority }),
     ...(cancellation === undefined ? {} : { cancellation }),
