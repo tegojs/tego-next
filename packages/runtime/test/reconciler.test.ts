@@ -72,6 +72,65 @@ class ManualClock implements Clock {
   }
 }
 
+class ScheduledClock implements Clock {
+  #now = Date.parse("2026-07-23T00:00:00.000Z");
+  readonly #sleepers = new Set<{
+    readonly dueAt: number;
+    readonly resolve: () => void;
+    readonly reject: (error: unknown) => void;
+    readonly signal?: AbortSignal;
+    readonly onAbort?: () => void;
+  }>();
+
+  now(): Date {
+    return new Date(this.#now);
+  }
+
+  sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (milliseconds <= 0) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      let sleeper!: {
+        readonly dueAt: number;
+        readonly resolve: () => void;
+        readonly reject: (error: unknown) => void;
+        readonly signal?: AbortSignal;
+        readonly onAbort?: () => void;
+      };
+      sleeper = {
+        dueAt: this.#now + milliseconds,
+        resolve,
+        reject,
+        ...(signal === undefined ? {} : { signal }),
+        ...(signal === undefined
+          ? {}
+          : {
+              onAbort: () => {
+                this.#sleepers.delete(sleeper);
+                reject(signal.reason);
+              },
+            }),
+      };
+      this.#sleepers.add(sleeper);
+      if (sleeper.onAbort !== undefined) {
+        signal?.addEventListener("abort", sleeper.onAbort, { once: true });
+      }
+    });
+  }
+
+  advance(milliseconds: number): void {
+    this.#now += milliseconds;
+    for (const sleeper of [...this.#sleepers]) {
+      if (sleeper.dueAt > this.#now) continue;
+      this.#sleepers.delete(sleeper);
+      if (sleeper.onAbort !== undefined) {
+        sleeper.signal?.removeEventListener("abort", sleeper.onAbort);
+      }
+      sleeper.resolve();
+    }
+  }
+}
+
 function manifest(
   version: string,
   digest: ArtifactDigest,
@@ -2247,6 +2306,130 @@ test("wake fails closed when immediate lifecycle work exceeds its pass budget", 
   await assert.rejects(reconciler.start(), /did not converge within 1 pass/u);
   assert.equal(reconciler.kernelRunning, false);
   assert.equal(effects.live.size, 0);
+});
+
+test("the convergence pass budget counts lifecycle work without an extra idle proof pass", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 2,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    effects.performed.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
+test("interruptAfterEffect terminates the whole convergence loop after one external effect", async () => {
+  const secondComponentId = parseComponentId("second-service");
+  const value = installation();
+  const twoComponentManifest: PluginManifest = {
+    ...value.manifest,
+    components: [
+      ...value.manifest.components,
+      {
+        componentId: secondComponentId,
+        kind: "service",
+        entrypoint: "components/second.js",
+        executors: ["process"],
+      },
+    ],
+  };
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async () => ({ ...gate().artifact, manifest: twoComponentManifest }),
+    },
+    clock,
+    effects,
+    interruptAfterEffect: true,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [{ ...value, manifest: twoComponentManifest }],
+  });
+
+  await reconciler.start();
+
+  assert.equal(effects.calls.length, 1);
+  await reconciler.stop();
+});
+
+test("stop prevents a gated reconciliation pass from starting a new external effect", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<ReturnType<typeof gate>["artifact"]>();
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async () => {
+        entered.resolve();
+        return release.promise;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  const starting = reconciler.start();
+  await entered.promise;
+  const stopping = reconciler.stop();
+  release.resolve(gate().artifact);
+  await Promise.all([starting, stopping]);
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.kernelRunning, false);
+});
+
+test("failed lifecycle effects wake automatically when retryAt becomes due", async () => {
+  const clock = new ScheduledClock();
+  const effects = new RecordingEffects();
+  effects.failStart = true;
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  effects.failStart = false;
+
+  clock.advance(60_000);
+  for (let turn = 0; turn < 20 && effects.calls.length < 3; turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "start", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
 });
 
 test("deployment observations distinguish unavailable, inconsistent, and degraded states", async () => {
