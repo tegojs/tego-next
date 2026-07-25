@@ -2194,6 +2194,29 @@ test("deployment observations progress from converging to ready", async () => {
   await reconciler.stop();
 });
 
+test("one wake converges immediately available lifecycle effects to quiescence", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    effects.performed.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
 test("deployment observations distinguish unavailable, inconsistent, and degraded states", async () => {
   for (const [expected, instances, installations] of [
     ["unavailable", [], []],
