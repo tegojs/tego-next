@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { connect as connectTcp, type Socket } from "node:net";
 import { test } from "node:test";
 import { parseWorkerId } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
@@ -82,6 +83,20 @@ function abortsDuringListenerRegistration(): AbortSignal {
       if (aborted) throw reason;
     },
   } as AbortSignal;
+}
+
+async function openRawConnection(port: number): Promise<{
+  readonly closed: Promise<void>;
+  readonly socket: Socket;
+}> {
+  const socket = connectTcp({ host: "127.0.0.1", port });
+  const connected = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<void>();
+  socket.once("connect", () => connected.resolve());
+  socket.once("error", (error) => connected.reject(error));
+  socket.once("close", () => closed.resolve());
+  await connected.promise;
+  return { closed: closed.promise, socket };
 }
 
 test("@spec:worker-protocol/real-process-transport-acceptance/loopback-session", async () => {
@@ -327,6 +342,80 @@ test("@spec:worker-protocol/real-process-transport-acceptance/listener-errors-us
     assert.equal((errors[0] as NodeJS.ErrnoException).code, "EADDRINUSE");
   } finally {
     await Promise.all([listener.close(), firstMain.close(), secondMain.close()]);
+  }
+});
+
+test("@spec:worker-protocol/real-process-transport-acceptance/session-handler-failure-is-observable", async () => {
+  const workerId = parseWorkerId("worker-session-handler-error");
+  const main = createMainEndpoint({
+    credential: "handler-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const worker = createWorkerEndpoint({
+    credential: "handler-secret",
+    workerId,
+  });
+  const errors: Error[] = [];
+  const listener = await listenForMain({
+    endpoint: main,
+    host: "127.0.0.1",
+    port: 0,
+    onError: (error) => errors.push(error),
+    onSession: async () => {
+      throw new Error("session-handler-root-cause");
+    },
+  });
+  const session = await connectWorker({ endpoint: worker, url: listener.url });
+
+  try {
+    await session.ready;
+    await waitForSessionState(session, (state) => state === "closed");
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]?.message ?? "", /session-handler-root-cause/u);
+  } finally {
+    await Promise.all([session.close(), listener.close(), main.close(), worker.close()]);
+  }
+});
+
+test("@spec:worker-protocol/real-process-transport-acceptance/pre-upgrade-connections-are-bounded-and-expire", async () => {
+  const workerId = parseWorkerId("worker-pre-upgrade-limit");
+  const main = createMainEndpoint({
+    credential: "pre-upgrade-secret",
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const listener = await listenForMain({
+    endpoint: main,
+    handshakeTimeoutMs: 100,
+    host: "127.0.0.1",
+    maxConnections: 2,
+    port: 0,
+  });
+  const connections: {
+    readonly closed: Promise<void>;
+    readonly socket: Socket;
+  }[] = [];
+
+  try {
+    connections.push(await openRawConnection(Number(listener.url.port)));
+    connections.push(await openRawConnection(Number(listener.url.port)));
+    connections.push(await openRawConnection(Number(listener.url.port)));
+
+    await beforeDeadline(connections[2]?.closed ?? Promise.resolve(), "excess raw TCP rejection");
+    await beforeDeadline(
+      Promise.all(connections.slice(0, 2).map((connection) => connection.closed)).then(
+        () => undefined,
+      ),
+      "raw TCP handshake expiration",
+    );
+    assert.equal(
+      connections.every((connection) => connection.socket.destroyed),
+      true,
+    );
+  } finally {
+    for (const connection of connections) connection.socket.destroy();
+    await Promise.all([listener.close(), main.close()]);
   }
 });
 
