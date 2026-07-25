@@ -1450,3 +1450,52 @@ test("thread component session rejects service kind before creating a Worker", a
   assert.equal(factory.created, 0);
   assert.equal(factory.active, 0);
 });
+
+test("thread component session rejects mismatched resolved targets before creating a Worker", async () => {
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-target-fence");
+  const mismatches: readonly ExecutionRequest["target"][] = [
+    {
+      ...execution.target,
+      instanceId: parseComponentInstanceId("app.org.example.thread.echo.other.g1"),
+    },
+    {
+      ...execution.target,
+      deploymentGeneration: parseGeneration("2"),
+    },
+    {
+      ...execution.target,
+      artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    },
+  ];
+
+  for (const [index, resolvedTarget] of mismatches.entries()) {
+    const factory = new TrackingWorkerFactory();
+    const executorOptions = await options(factory);
+    const createSession = await loadThreadComponentSessionFactory();
+    const component = {
+      ...(await executorOptions.resolveComponent(execution)),
+      target: resolvedTarget,
+    };
+    let unexpectedSession: TestComponentSession | undefined;
+    let rejection: unknown;
+    try {
+      unexpectedSession = await createSession({
+        target: execution.target,
+        identity: execution,
+        component,
+        executorOptions,
+      });
+    } catch (error) {
+      rejection = error;
+    } finally {
+      await unexpectedSession?.close();
+    }
+    assert.equal(
+      diagnosticCode(rejection),
+      "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      `resolved target mismatch ${index} must fail closed`,
+    );
+    assert.equal(factory.created, 0);
+    assert.equal(factory.active, 0);
+  }
+});

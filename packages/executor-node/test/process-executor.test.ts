@@ -2148,3 +2148,53 @@ test("process component session rejects service kind before spawning a child", a
     await processHost.close();
   }
 });
+
+test("process component session rejects mismatched resolved targets before spawning a child", async () => {
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-target-fence");
+  const mismatches: readonly ExecutionRequest["target"][] = [
+    {
+      ...execution.target,
+      instanceId: parseComponentInstanceId("app.org.example.process.echo.other.g1"),
+    },
+    {
+      ...execution.target,
+      deploymentGeneration: parseGeneration("2"),
+    },
+    {
+      ...execution.target,
+      artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    },
+  ];
+
+  for (const [index, resolvedTarget] of mismatches.entries()) {
+    const processHost = new TestProcessHost();
+    const executorOptions = await options({ processHost });
+    const createSession = await loadProcessComponentSessionFactory();
+    const component = {
+      ...(await executorOptions.resolveComponent(execution)),
+      target: resolvedTarget,
+    };
+    let unexpectedSession: TestComponentSession | undefined;
+    let rejection: unknown;
+    try {
+      unexpectedSession = await createSession({
+        target: execution.target,
+        identity: execution,
+        component,
+        executorOptions,
+      });
+    } catch (error) {
+      rejection = error;
+    } finally {
+      await unexpectedSession?.close();
+      await processHost.close();
+    }
+    assert.equal(
+      diagnosticCode(rejection),
+      "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      `resolved target mismatch ${index} must fail closed`,
+    );
+    assert.equal(processHost.peakActiveProcessCount, 0);
+    assert.equal(processHost.activeProcessCount, 0);
+  }
+});
