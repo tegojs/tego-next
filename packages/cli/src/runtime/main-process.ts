@@ -119,24 +119,38 @@ export async function runMainProcess(options: MainProcessOptions): Promise<void>
   } catch (error) {
     errors.push(error);
   } finally {
-    const cleanup = [() => options.runtime.stop(), () => server?.close()] as const;
-    if (options.signal?.aborted === true) {
-      const results = await Promise.allSettled(
-        cleanup.map((operation) => Promise.resolve().then(operation)),
-      );
-      for (const result of results) {
-        if (result.status === "rejected") errors.push(result.reason);
-      }
+    const stop = Promise.resolve().then(() => options.runtime.stop());
+    let close: Promise<void> | undefined;
+    const closeServer = () =>
+      (close ??= Promise.resolve()
+        .then(() => server?.close())
+        .then(() => undefined));
+    const stopSettled = stop.then(
+      () => ({ status: "fulfilled" as const, value: undefined }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+    const record = (result: PromiseSettledResult<void>) => {
+      if (result.status === "rejected") errors.push(result.reason);
+    };
+
+    if (options.signal === undefined) {
+      record(await stopSettled);
+      record((await Promise.allSettled([closeServer()]))[0]);
     } else {
+      const aborted = Promise.withResolvers<"aborted">();
+      const onAbort = () => aborted.resolve("aborted");
+      options.signal.addEventListener("abort", onAbort, { once: true });
+      if (options.signal.aborted) onAbort();
       try {
-        await cleanup[0]();
-      } catch (error) {
-        errors.push(error);
-      }
-      try {
-        await cleanup[1]();
-      } catch (error) {
-        errors.push(error);
+        const first = await Promise.race([stopSettled, aborted.promise]);
+        if (first === "aborted") {
+          for (const result of await Promise.allSettled([stop, closeServer()])) record(result);
+        } else {
+          record(first);
+          record((await Promise.allSettled([closeServer()]))[0]);
+        }
+      } finally {
+        options.signal.removeEventListener("abort", onAbort);
       }
     }
   }
