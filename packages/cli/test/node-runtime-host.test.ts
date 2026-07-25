@@ -119,8 +119,9 @@ test("Worker listener shutdown reports a failed close during a bind race", async
   const [startResult, closeResult] = await Promise.allSettled([starting, closing]);
   assert.equal(startResult.status, "rejected");
   assert.equal(closeResult.status, "rejected");
+  assert.equal(closeResult.reason instanceof AggregateError, true);
   assert.match(String(closeResult.reason), /listener rollback failed/iu);
-  assert.match(String(closeResult.reason), /listener close failed/iu);
+  assert.match(String(closeResult.reason.errors[0]), /listener close failed/iu);
 });
 
 test("SQLite-backed Worker epochs advance across Main restart", async () => {
