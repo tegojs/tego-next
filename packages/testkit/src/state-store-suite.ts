@@ -273,6 +273,37 @@ export function stateStoreConformance(
       });
     });
 
+    test("transaction state scans apply pagination after staged mutations", async () => {
+      await withStore(factory, async (store) => {
+        const first = key("transaction-pagination", "A");
+        const second = key("transaction-pagination", "B");
+        const third = key("transaction-pagination", "C");
+        await store.transact({}, async (transaction) => {
+          await transaction.put(first, { label: "A" }, {});
+          await transaction.put(second, { label: "B" }, {});
+          await transaction.put(third, { label: "C" }, {});
+          return null;
+        });
+
+        await store.transact({}, async (transaction) => {
+          await transaction.delete(first, {});
+          await transaction.delete(second, {});
+          await transaction.put(key("transaction-pagination", "D"), { label: "D" }, {});
+          const ids = [];
+          for await (const entry of transaction.scan<ExampleRecord>({
+            namespace: "transaction-pagination",
+            collection: "examples",
+            afterId: "B",
+            limit: 1,
+          })) {
+            ids.push(entry.key.id);
+          }
+          assert.deepEqual(ids, ["C"]);
+          return null;
+        });
+      });
+    });
+
     test("state scan limit is a positive safe integer within the public maximum", async () => {
       await withStore(factory, async (store) => {
         for (const limit of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, STATE_QUERY_MAX_LIMIT + 1]) {

@@ -6,6 +6,7 @@ import {
   DiagnosticError,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
+  STATE_QUERY_MAX_LIMIT,
   parseFencingEpoch,
   parseMessageId,
   parseOperationId,
@@ -125,6 +126,20 @@ function serializedKey(key: StateKey<JsonValue>): string {
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function assertStateQuery(query: StateQuery<JsonValue>, clock: Clock): void {
+  if (
+    query.limit !== undefined &&
+    (!Number.isSafeInteger(query.limit) || query.limit <= 0 || query.limit > STATE_QUERY_MAX_LIMIT)
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      `State query limit must be a positive safe integer no greater than ${STATE_QUERY_MAX_LIMIT}`,
+      { limit: query.limit },
+      clock,
+    );
+  }
 }
 
 function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): number {
@@ -359,6 +374,7 @@ class SqliteTransaction implements StateTransaction {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
+    assertStateQuery(query, this.#clock);
     const records = new Map(
       this.#scanRecords(query).map((record) => [serializedKey(record.key), record]),
     );
@@ -380,10 +396,14 @@ class SqliteTransaction implements StateTransaction {
         });
       }
     }
-    const matching = [...records.values()].sort((left, right) =>
-      compareCodeUnits(left.key.id, right.key.id),
-    );
-    for (const record of matching) {
+    const matching = [...records.values()]
+      .filter(
+        (record) =>
+          query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0,
+      )
+      .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
+    const limit = query.limit ?? matching.length;
+    for (const record of matching.slice(0, limit)) {
       this.#assertActive();
       yield {
         key: cloneKey(record.key) as StateKey<T>,
@@ -714,10 +734,24 @@ export class SqliteStateStore implements StateStore {
   async *scanRecoverableOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, true);
+  }
+
+  async *scanOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, false);
+  }
+
+  async *#scanOperationJournal(
+    query: OperationJournalQuery,
+    recoverableOnly: boolean,
+  ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
     this.#assertOperationQuery(query);
     const columns = "operation_id, kind, status, state_json, updated_at, revision";
     const after = query.after;
+    const statusClause = recoverableOnly ? "AND status IN ('executing', 'planned')" : "";
     const rows =
       after === undefined
         ? this.#database()
@@ -725,7 +759,7 @@ export class SqliteStateStore implements StateStore {
               `
                 SELECT ${columns}
                 FROM operations
-                WHERE status IN ('executing', 'planned')
+                WHERE 1 = 1 ${statusClause}
                 ORDER BY revision, operation_id
                 ${query.limit === undefined ? "" : "LIMIT ?"}
               `,
@@ -737,8 +771,8 @@ export class SqliteStateStore implements StateStore {
               `
                 SELECT ${columns}
                 FROM operations
-                WHERE status IN ('executing', 'planned')
-                  AND (revision > ? OR (revision = ? AND operation_id > ?))
+                WHERE (revision > ? OR (revision = ? AND operation_id > ?))
+                  ${statusClause}
                 ORDER BY revision, operation_id
                 ${query.limit === undefined ? "" : "LIMIT ?"}
               `,
@@ -1445,7 +1479,8 @@ export class SqliteStateStore implements StateStore {
   }
 
   #scanRecords(query: StateQuery<JsonValue>): readonly StoredRecord[] {
-    return this.#database()
+    assertStateQuery(query, this.#clock);
+    const matching = this.#database()
       .prepare(
         `
           SELECT namespace, collection_name, record_id, value_json, revision
@@ -1456,8 +1491,13 @@ export class SqliteStateStore implements StateStore {
       )
       .all(query.namespace, query.collection)
       .map((row) => this.#decodeRecord(row))
-      .filter((record) => query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix))
+      .filter(
+        (record) =>
+          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+          (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
+      )
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
+    return query.limit === undefined ? matching : matching.slice(0, query.limit);
   }
 
   #snapshotRecords(): ReadonlyMap<string, StoredRecord> {

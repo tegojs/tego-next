@@ -6,6 +6,7 @@ import {
   type OperationJournalQuery,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
+  STATE_QUERY_MAX_LIMIT,
   type OutboxAcknowledgement,
   type OutboxAcknowledgementRequest,
   type OutboxClaim,
@@ -64,6 +65,20 @@ interface TransactionControl {
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function assertStateQuery(query: StateQuery<JsonValue>): void {
+  if (
+    query.limit !== undefined &&
+    (!Number.isSafeInteger(query.limit) || query.limit <= 0 || query.limit > STATE_QUERY_MAX_LIMIT)
+  ) {
+    throw postgresError(
+      "STATE_QUERY_INVALID",
+      `State query limit must be a positive safe integer no greater than ${STATE_QUERY_MAX_LIMIT}`,
+      "state",
+      { limit: query.limit },
+    );
+  }
 }
 
 function validTimestamp(value: string): boolean {
@@ -399,6 +414,7 @@ class PostgresTransaction implements StateTransaction {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
+    assertStateQuery(query);
     const result = await this.#client.query(
       `
         SELECT namespace, collection_name, record_id, value_json, revision::text
@@ -409,9 +425,13 @@ class PostgresTransaction implements StateTransaction {
       `,
       [this.#namespace, query.namespace, query.collection, query.idPrefix ?? null],
     );
-    const rows = result.rows.sort((left, right) =>
-      compareCodeUnits(String(left.record_id), String(right.record_id)),
-    );
+    const matching = result.rows
+      .filter(
+        (row) =>
+          query.afterId === undefined || compareCodeUnits(String(row.record_id), query.afterId) > 0,
+      )
+      .sort((left, right) => compareCodeUnits(String(left.record_id), String(right.record_id)));
+    const rows = query.limit === undefined ? matching : matching.slice(0, query.limit);
     for (const row of rows) {
       this.#assertActive();
       const record = stateRecord(row);
@@ -833,6 +853,7 @@ export class PostgresStateStore implements StateStore {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertOpen();
+    assertStateQuery(query);
     const result = await this.#pool.query(
       `
         SELECT namespace, collection_name, record_id, value_json, revision::text
@@ -843,9 +864,13 @@ export class PostgresStateStore implements StateStore {
       `,
       [this.#namespace, query.namespace, query.collection, query.idPrefix ?? null],
     );
-    const rows = result.rows.sort((left, right) =>
-      compareCodeUnits(String(left.record_id), String(right.record_id)),
-    );
+    const matching = result.rows
+      .filter(
+        (row) =>
+          query.afterId === undefined || compareCodeUnits(String(row.record_id), query.afterId) > 0,
+      )
+      .sort((left, right) => compareCodeUnits(String(left.record_id), String(right.record_id)));
+    const rows = query.limit === undefined ? matching : matching.slice(0, query.limit);
     for (const row of rows) {
       this.#assertOpen();
       const record = stateRecord(row);
@@ -875,6 +900,19 @@ export class PostgresStateStore implements StateStore {
   async *scanRecoverableOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, true);
+  }
+
+  async *scanOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, false);
+  }
+
+  async *#scanOperationJournal(
+    query: OperationJournalQuery,
+    recoverableOnly: boolean,
+  ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
     if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0)) {
       throw postgresError(
@@ -889,7 +927,7 @@ export class PostgresStateStore implements StateStore {
         SELECT operation_id, kind, status, state_json, updated_at, revision::text
         FROM tego_operations
         WHERE driver_namespace = $1
-          AND status IN ('executing', 'planned')
+          ${recoverableOnly ? "AND status IN ('executing', 'planned')" : ""}
       `,
       [this.#namespace],
     );

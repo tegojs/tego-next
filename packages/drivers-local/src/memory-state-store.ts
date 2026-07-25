@@ -3,6 +3,7 @@ import {
   DiagnosticError,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
+  STATE_QUERY_MAX_LIMIT,
   compareOperationJournalCursors,
   parseFencingEpoch,
   parseRevision,
@@ -117,6 +118,20 @@ function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): num
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function assertStateQuery(query: StateQuery<JsonValue>, clock: Clock): void {
+  if (
+    query.limit !== undefined &&
+    (!Number.isSafeInteger(query.limit) || query.limit <= 0 || query.limit > STATE_QUERY_MAX_LIMIT)
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      `State query limit must be a positive safe integer no greater than ${STATE_QUERY_MAX_LIMIT}`,
+      { limit: query.limit },
+      clock,
+    );
+  }
 }
 
 function validTimestamp(value: string): boolean {
@@ -313,6 +328,7 @@ class MemoryTransaction implements StateTransaction {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
+    assertStateQuery(query, this.#clock);
     const records = new Map(this.#snapshot);
     for (const [identifier, mutation] of this.#mutations) {
       if (mutation.kind === "delete") {
@@ -331,10 +347,12 @@ class MemoryTransaction implements StateTransaction {
         (record) =>
           record.key.namespace === query.namespace &&
           record.key.collection === query.collection &&
-          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
+          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+          (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
       )
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
-    for (const record of matching) {
+    const limit = query.limit ?? matching.length;
+    for (const record of matching.slice(0, limit)) {
       yield scannedRecord<T>(record);
     }
   }
@@ -551,29 +569,45 @@ export class MemoryStateStore implements StateStore {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertOpen();
+    assertStateQuery(query, this.#clock);
     const matching = [...this.#records.values()]
       .filter(
         (record) =>
           record.key.namespace === query.namespace &&
           record.key.collection === query.collection &&
-          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
+          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+          (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
       )
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
-    for (const record of matching) {
+    const limit = query.limit ?? matching.length;
+    for (const record of matching.slice(0, limit)) {
       this.#assertOpen();
       yield scannedRecord<T>(record);
     }
   }
 
+  async *scanOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, false);
+  }
+
   async *scanRecoverableOperations(
     query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, true);
+  }
+
+  async *#scanOperationJournal(
+    query: OperationJournalQuery,
+    recoverableOnly: boolean,
   ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
     this.#assertOperationQuery(query);
     const matching = [...this.#operations.values()]
       .filter(
         (entry) =>
-          (entry.status === "executing" || entry.status === "planned") &&
+          (!recoverableOnly || entry.status === "executing" || entry.status === "planned") &&
           (query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0),
       )
       .sort(compareOperationJournalCursors);
