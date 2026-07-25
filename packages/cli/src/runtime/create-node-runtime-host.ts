@@ -68,8 +68,12 @@ function unavailableComponent(): never {
 export async function createNodeRuntimeHost(
   options: CreateNodeRuntimeHostOptions,
 ): Promise<NodeRuntimeHost> {
-  if (options.worker?.credential.length === 0) {
-    throw new TypeError("Worker listener credential must not be empty");
+  if (
+    options.worker !== undefined &&
+    (options.worker.credential.trim().length === 0 ||
+      Buffer.byteLength(options.worker.credential, "utf8") > 4_096)
+  ) {
+    throw new TypeError("Worker listener credential is invalid");
   }
   await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
   const local = await createLocalDrivers({ dataDirectory: options.dataDirectory });
