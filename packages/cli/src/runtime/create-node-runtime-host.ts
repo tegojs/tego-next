@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
+import { join } from "node:path";
 import {
   DiagnosticError,
-  type Executor,
   parseApplicationId,
   parseArtifactDigest,
   parseNodeId,
+  parsePluginDeployment,
+  parsePluginInstallation,
   parseRuntimeId,
   parseWorkerId,
   type Runtime,
@@ -16,14 +18,23 @@ import {
 } from "@tegojs/contracts";
 import { createLocalDrivers } from "@tegojs/drivers-local";
 import { createPostgresDrivers } from "@tegojs/drivers-postgres";
-import { ThreadExecutor } from "@tegojs/executor-node";
-import { ArtifactService, createRuntimeHost, Reconciler, TaskService } from "@tegojs/runtime";
+import {
+  ArtifactService,
+  ComponentEffects,
+  ComponentRegistry,
+  createRuntimeHost,
+  PreparedArtifactCache,
+  Reconciler,
+  TaskService,
+} from "@tegojs/runtime";
 import {
   createMainEndpoint,
   listenForMain,
   StateWorkerEpochAllocator,
 } from "@tegojs/transport-websocket";
 import type { LocalArtifactIngress } from "../control/server.js";
+import { LocalComponentSessionHost } from "./local-component-session-host.js";
+import { LocalComponentSessionRegistry } from "./local-component-session-registry.js";
 
 export interface NodeWorkerListenerOptions {
   readonly credential: string;
@@ -105,16 +116,6 @@ async function digestFile(path: string): Promise<ReturnType<typeof parseArtifact
   return parseArtifactDigest(`sha256:${hash.digest("hex")}`);
 }
 
-function unavailableComponent(): never {
-  throw new DiagnosticError(
-    runtimeDiagnostic({
-      code: "EXECUTOR_COMPONENT_UNAVAILABLE",
-      message: "The requested component has not been prepared by reconciliation",
-      source: { kind: "executor", id: "node-thread" },
-    }),
-  );
-}
-
 export async function createNodeRuntimeHost(
   options: CreateNodeRuntimeHostOptions,
 ): Promise<NodeRuntimeHost> {
@@ -158,22 +159,37 @@ export async function createNodeRuntimeHost(
       tegoContractVersion: "0.0.0",
     },
   });
-  const executor: Executor = new ThreadExecutor({
-    id: `${options.nodeId}:thread`,
+  const preparedArtifacts = new PreparedArtifactCache({
+    artifacts: drivers.artifacts,
+    root: join(options.dataDirectory, "prepared"),
+  });
+  const componentRegistry = new ComponentRegistry();
+  const sessionRegistry = new LocalComponentSessionRegistry(options.runtimeId);
+  const componentHost = new LocalComponentSessionHost({
+    nodeId: options.nodeId,
+    runtimeId: options.runtimeId,
     clock: drivers.clock,
-    resolveComponent: unavailableComponent,
+    processHost: drivers.processHost,
+    secretProvider: drivers.secrets,
+    registry: sessionRegistry,
   });
   const tasks = new TaskService({
     state: drivers.state,
     clock: drivers.clock,
-    selectExecutor: () => {
-      throw new DiagnosticError(
-        runtimeDiagnostic({
-          code: "LIFECYCLE_INSTANCE_MISSING",
-          message: "No active component execution target is available",
-          source: { kind: "runtime", id: options.runtimeId },
-        }),
-      );
+    selectExecutor: (request, target) => {
+      const selection =
+        target === undefined
+          ? sessionRegistry.resolveFresh(
+              request,
+              (candidate) =>
+                componentRegistry.get(candidate.instanceId)?.state === "active" &&
+                componentRegistry.get(candidate.instanceId)?.acceptingTasks === true,
+            )
+          : sessionRegistry.resolveExact(target);
+      return {
+        target: selection.target,
+        executor: selection.executor,
+      };
     },
   });
   const epochAllocator = new StateWorkerEpochAllocator({ state: drivers.state });
@@ -202,7 +218,8 @@ export async function createNodeRuntimeHost(
     placements: () => [],
     close: async () => {
       const results = await Promise.allSettled([
-        executor.close(),
+        sessionRegistry.close(),
+        preparedArtifacts.close(),
         listenerOwner?.close(),
         mainEndpoint?.close(),
       ]);
@@ -222,18 +239,53 @@ export async function createNodeRuntimeHost(
         artifactGate: artifactService,
         authority,
         clock: drivers.clock,
-        effects: {
-          supportedExecutors: ["thread"],
-          perform: async () => {
-            throw new DiagnosticError(
-              runtimeDiagnostic({
-                code: "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
-                message: "Node component hosting is not configured for this deployment",
-                source: { kind: "runtime", id: options.runtimeId },
-              }),
-            );
+        effects: new ComponentEffects({
+          artifacts: preparedArtifacts,
+          registry: componentRegistry,
+          supportedExecutors: ["process", "thread"],
+          host: componentHost,
+          authority: () => authority,
+          resolveDeployment: async (effect) => {
+            const durableDeployment = await drivers.state.read({
+              namespace: "tego",
+              collection: "deployments",
+              id: `${effect.applicationId}/${effect.pluginId}`,
+            });
+            if (durableDeployment === undefined) return undefined;
+            const deployment = parsePluginDeployment(durableDeployment.value);
+            if (
+              deployment.applicationId !== effect.applicationId ||
+              deployment.pluginId !== effect.pluginId ||
+              deployment.generation !== effect.deploymentGeneration ||
+              deployment.artifactDigest !== effect.artifactDigest
+            ) {
+              return undefined;
+            }
+            const durableInstallation = await drivers.state.read({
+              namespace: "tego",
+              collection: "installations",
+              id: `${deployment.pluginId}@${deployment.version}@${deployment.artifactDigest}`,
+            });
+            if (durableInstallation === undefined) return undefined;
+            const installation = parsePluginInstallation(durableInstallation.value);
+            const artifact = await artifactService.validate({
+              digest: effect.artifactDigest,
+            });
+            if (
+              installation.pluginId !== deployment.pluginId ||
+              installation.version !== deployment.version ||
+              installation.digest !== deployment.artifactDigest ||
+              artifact.digest !== installation.digest ||
+              JSON.stringify(artifact.manifest) !== JSON.stringify(installation.manifest)
+            ) {
+              return undefined;
+            }
+            return {
+              deployment,
+              artifact,
+            };
           },
-        },
+        }),
         state: drivers.state,
         workers: [],
       }),

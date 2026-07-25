@@ -25,7 +25,10 @@ interface SessionRegistry {
   register(registration: SessionRegistration): void;
   markDraining(target: TaskExecutionTarget): void;
   resolveExact(target: TaskExecutionTarget): SessionRegistration;
-  resolveFresh(request: RunTaskRequest): SessionRegistration;
+  resolveFresh(
+    request: RunTaskRequest,
+    isComponentAccepting?: (target: TaskExecutionTarget) => boolean,
+  ): SessionRegistration;
   remove(target: TaskExecutionTarget): SessionRegistration;
   close(): Promise<void>;
 }
@@ -103,11 +106,7 @@ test("local session registry keys exact targets and keeps draining sessions reco
       readonly LocalComponentSessionRegistry?: SessionRegistryConstructor;
     }
   ).LocalComponentSessionRegistry;
-  assert.equal(
-    typeof Registry,
-    "function",
-    "CLI must export LocalComponentSessionRegistry",
-  );
+  assert.equal(typeof Registry, "function", "CLI must export LocalComponentSessionRegistry");
   const registry = new (Registry as SessionRegistryConstructor)("runtime-local");
   const threadTarget = target("1", "thread");
   const processTarget = target("2", "process");
@@ -115,6 +114,11 @@ test("local session registry keys exact targets and keeps draining sessions reco
   const process = registration(processTarget);
 
   registry.register(thread);
+  assert.throws(
+    () => registry.resolveFresh(taskRequest(), () => false),
+    /missing|unavailable/iu,
+    "fresh selection must also require lifecycle registry admission",
+  );
   registry.register(process);
   assert.throws(
     () => registry.resolveFresh(taskRequest()),
@@ -123,7 +127,7 @@ test("local session registry keys exact targets and keeps draining sessions reco
   );
 
   registry.markDraining(threadTarget);
-  assert.equal(registry.resolveFresh(taskRequest()).target, processTarget);
+  assert.deepEqual(registry.resolveFresh(taskRequest()).target, processTarget);
   assert.equal(registry.resolveExact(threadTarget).executor, thread.executor);
 
   registry.remove(threadTarget);

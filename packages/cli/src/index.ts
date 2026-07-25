@@ -62,6 +62,11 @@ export {
   type NodeRuntimeHost,
 } from "./runtime/create-node-runtime-host.js";
 export {
+  LocalComponentSessionRegistry,
+  type LocalComponentSessionRegistration,
+  localComponentSessionTargetKey,
+} from "./runtime/local-component-session-registry.js";
+export {
   type MainProcessOptions,
   type NodeMainProcessReadiness,
   type NodeMainProcessOptions,
