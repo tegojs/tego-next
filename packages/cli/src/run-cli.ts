@@ -1,10 +1,22 @@
 import type { Writable } from "node:stream";
-import { DiagnosticError, type RuntimeStatus, runtimeDiagnostic } from "@tegojs/contracts";
+import {
+  DiagnosticError,
+  type JsonValue,
+  type RuntimeStatus,
+  runtimeDiagnostic,
+} from "@tegojs/contracts";
+import {
+  executeLocalPluginCommand,
+  parsePluginControlResult,
+  pluginControlRequest,
+} from "./commands/plugin.js";
 import { startRuntimeDetached, startRuntimeForeground } from "./commands/runtime.js";
+import { executeTaskCommand } from "./commands/task.js";
 import { type ControlClientOptions, requestControl } from "./control/client.js";
 import {
   type ControlResponse,
   DEFAULT_CONTROL_TIMEOUT_MS,
+  type RuntimeOperationName,
   sanitizeControlDiagnostic,
 } from "./control/protocol.js";
 import { type ParsedCommand, parseCommand, type RuntimeStartCommand } from "./parse-command.js";
@@ -15,6 +27,8 @@ Commands:
   runtime start [--detach] [--json] [--data-dir <path>] [--endpoint <path>]
   runtime status [--json] [--endpoint <path>]
   runtime stop [--json] [--endpoint <path>]
+  plugin validate|pack|inspect|install|deploy|status
+  task run|status|wait|cancel
 `;
 
 export interface CliRunOptions {
@@ -52,23 +66,71 @@ export async function runCli(options: CliRunOptions): Promise<number> {
       return 0;
     }
     const control = options.requestControl ?? requestControl;
-    const response = await control({
-      endpoint: command.endpoint,
-      operation: command.kind,
-      input: {},
-      timeoutMs: DEFAULT_CONTROL_TIMEOUT_MS,
-    });
-    if (!response.ok) {
-      throw new DiagnosticError(
-        response.diagnostic ??
-          runtimeDiagnostic({
-            code: "PROTOCOL_CONTROL_FRAME_INVALID",
-            message: "Control response did not contain a diagnostic",
-            source: { kind: "protocol", id: "cli" },
-          }),
-      );
+    const request = async (
+      endpoint: string,
+      operation: RuntimeOperationName,
+      input: JsonValue,
+      timeoutMs: number,
+    ): Promise<JsonValue> => {
+      const response = await control({ endpoint, operation, input, timeoutMs });
+      if (!response.ok) {
+        throw new DiagnosticError(
+          response.diagnostic ??
+            runtimeDiagnostic({
+              code: "PROTOCOL_CONTROL_FRAME_INVALID",
+              message: "Control response did not contain a diagnostic",
+              source: { kind: "protocol", id: "cli" },
+            }),
+        );
+      }
+      return response.result ?? null;
+    };
+
+    if (
+      command.kind === "plugin.inspect" ||
+      command.kind === "plugin.pack" ||
+      command.kind === "plugin.validate"
+    ) {
+      write(stdout, await executeLocalPluginCommand(command), command.json);
+      return 0;
     }
-    write(stdout, response.result ?? null, command.json);
+    if (
+      command.kind === "plugin.deploy" ||
+      command.kind === "plugin.install" ||
+      command.kind === "plugin.status"
+    ) {
+      const operation = await pluginControlRequest(command);
+      const result = await request(
+        command.endpoint,
+        operation.operation,
+        operation.input,
+        DEFAULT_CONTROL_TIMEOUT_MS,
+      );
+      write(stdout, parsePluginControlResult(command, result), command.json);
+      return 0;
+    }
+    if (
+      command.kind === "task.cancel" ||
+      command.kind === "task.run" ||
+      command.kind === "task.status" ||
+      command.kind === "task.wait"
+    ) {
+      const endpoint = command.endpoint;
+      write(
+        stdout,
+        await executeTaskCommand(command, (operation, input, timeoutMs) =>
+          request(endpoint, operation, input, timeoutMs),
+        ),
+        command.json,
+      );
+      return 0;
+    }
+
+    write(
+      stdout,
+      await request(command.endpoint, command.kind, {}, DEFAULT_CONTROL_TIMEOUT_MS),
+      command.json,
+    );
     return 0;
   } catch (error) {
     const connectionCode =

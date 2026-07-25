@@ -22,9 +22,17 @@ export {
   type DefaultControlEndpointOptions,
   type ParsedCommand,
   parseCommand,
+  type PluginDeployCommand,
+  type PluginInspectCommand,
+  type PluginInstallCommand,
+  type PluginPackCommand,
+  type PluginStatusCommand,
+  type PluginValidateCommand,
   type RuntimeStartCommand,
   type RuntimeStatusCommand,
   type RuntimeStopCommand,
+  type TaskRecordCommand,
+  type TaskRunCommand,
 } from "./parse-command.js";
 export { type BuildPluginOptions, buildPlugin } from "./plugin/build-plugin.js";
 export {
