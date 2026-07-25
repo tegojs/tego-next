@@ -371,11 +371,12 @@ export class Reconciler {
 
   wake(): Promise<void> {
     if (!this.#running) return Promise.resolve();
+    const preservedWakeAt = this.#deferredWake?.at;
     this.#cancelDeferredWake();
     const pass = this.#tail.then(async () => {
       if (!this.#running) return;
       try {
-        await this.#reconcileUntilQuiescent();
+        await this.#reconcileUntilQuiescent(preservedWakeAt);
       } catch (error) {
         this.#running = false;
         this.#cancelDeferredWake();
@@ -417,9 +418,9 @@ export class Reconciler {
     return true;
   }
 
-  async #reconcileUntilQuiescent(): Promise<void> {
+  async #reconcileUntilQuiescent(preservedWakeAt?: number): Promise<void> {
     this.#diagnosticsByDeployment.clear();
-    this.#nextWakeAt = undefined;
+    this.#nextWakeAt = preservedWakeAt;
     for (let pass = 0; pass < this.#maxConvergencePasses; pass += 1) {
       if (!this.#running) return;
       const pending = await this.#reconcilePass();

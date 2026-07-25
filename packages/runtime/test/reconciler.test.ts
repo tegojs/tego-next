@@ -2500,6 +2500,7 @@ test("an abandoned lifecycle claim is recovered automatically after its lease ex
     ["prepare"],
   );
 
+  await recovered.wake();
   clock.advance(30_001);
   for (let turn = 0; turn < 20 && effects.calls.length < 3; turn += 1) {
     await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
