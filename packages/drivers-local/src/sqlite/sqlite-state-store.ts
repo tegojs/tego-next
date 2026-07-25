@@ -182,6 +182,15 @@ function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): num
   );
 }
 
+function matchesStateQuery(key: StateKey<JsonValue>, query: StateQuery<JsonValue>): boolean {
+  return (
+    key.namespace === query.namespace &&
+    key.collection === query.collection &&
+    (query.idPrefix === undefined || key.id.startsWith(query.idPrefix)) &&
+    (query.afterId === undefined || compareCodeUnits(key.id, query.afterId) > 0)
+  );
+}
+
 function validTimestamp(value: string): boolean {
   return Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 }
@@ -415,18 +424,18 @@ class SqliteTransaction implements StateTransaction {
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
     assertStateQuery(query, this.#clock);
-    const baseLimit = query.limit === undefined ? undefined : query.limit + this.#mutations.size;
+    const matchingMutations = [...this.#mutations].filter(([, mutation]) =>
+      matchesStateQuery(mutation.key, query),
+    );
+    const deletedBaseSlots = matchingMutations.reduce(
+      (count, [, mutation]) => count + (mutation.kind === "delete" ? 1 : 0),
+      0,
+    );
+    const baseLimit = query.limit === undefined ? undefined : query.limit + deletedBaseSlots;
     const records = new Map(
       this.#scanRecords(query, baseLimit).map((record) => [serializedKey(record.key), record]),
     );
-    for (const [identifier, mutation] of this.#mutations) {
-      if (
-        mutation.key.namespace !== query.namespace ||
-        mutation.key.collection !== query.collection ||
-        (query.idPrefix !== undefined && !mutation.key.id.startsWith(query.idPrefix))
-      ) {
-        continue;
-      }
+    for (const [identifier, mutation] of matchingMutations) {
       if (mutation.kind === "delete") {
         records.delete(identifier);
       } else {

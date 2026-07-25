@@ -647,14 +647,7 @@ test("transaction scans do not expand their SQL page for unrelated staged puts",
         ) VALUES (?, ?, ?, ?, ?, ?)
       `,
     )
-    .run(
-      "scan-page",
-      "examples",
-      "B",
-      Buffer.from(stateStringOrderKey("B")),
-      '{"not":',
-      2,
-    );
+    .run("scan-page", "examples", "B", Buffer.from(stateStringOrderKey("B")), '{"not":', 2);
   database.close();
 
   const store = await openStore(databasePath);
