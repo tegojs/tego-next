@@ -112,6 +112,38 @@ test("component session close applies a default shutdown deadline", async () => 
   assert.equal((await handle.result).status, "cancelled");
 });
 
+test("component session close does not await a non-settling transport termination forever", async () => {
+  const run = Promise.withResolvers<never>();
+  const transport = {
+    executor: { kind: "thread" as const, metadata: { executorId: "thread-local" } },
+    run: () => run.promise,
+    async cancel() {},
+    async health() {
+      return { status: "healthy" as const };
+    },
+    async close() {},
+    terminate: () => new Promise<void>(() => {}),
+  };
+  const sandbox = session(transport);
+  await sandbox.submit(request("termination-timeout"));
+  let rejection: unknown;
+  void sandbox.close().catch((error: unknown) => {
+    rejection = error;
+  });
+
+  clock.advanceBy(100);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  clock.advanceBy(100);
+  await eventually(() => assert.notEqual(rejection, undefined), {
+    attempts: 10,
+    advance: () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
+  assert.equal(
+    (rejection as { readonly diagnostic?: { readonly code?: unknown } }).diagnostic?.code,
+    "EXECUTOR_SESSION_TERMINATION_TIMEOUT",
+  );
+});
+
 test("component session prunes terminal attempt retention at its hard bound", async () => {
   const transport = {
     executor: { kind: "thread" as const, metadata: { executorId: "thread-local" } },

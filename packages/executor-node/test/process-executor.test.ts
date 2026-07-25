@@ -552,6 +552,22 @@ export default {
 };
 `;
 
+const cleanupFailureComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async drain() {
+    throw new Error("drain cleanup failed");
+  },
+  async stop() {
+    throw new Error("stop cleanup failed");
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
 async function artifact(
   input: { readonly kind?: "service" | "task"; readonly source?: string } = {},
 ) {
@@ -2126,6 +2142,17 @@ test("process component session owns one child across same-target attempts and r
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
     );
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
+    const canonicalFirst = request(
+      { mode: "echo", value: { alpha: 1, nested: { left: true, right: false } } },
+      "session-canonical",
+    );
+    const canonicalReplay = request(
+      { value: { nested: { right: false, left: true }, alpha: 1 }, mode: "echo" },
+      "session-canonical",
+    );
+    const canonicalHandle = await session.submit(canonicalFirst);
+    assert.strictEqual(await session.submit(canonicalReplay), canonicalHandle);
+    assert.equal((await canonicalHandle.result).status, "succeeded");
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
     assert.deepEqual(lifecycle, ["lifecycle.start"]);
@@ -2204,6 +2231,44 @@ test("process component session bounds activation hooks and awaits rollback clea
         executorOptions,
       }),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+    );
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    await processHost.close();
+  }
+});
+
+test("process component session preserves drain and stop failures while terminating", async () => {
+  const processHost = new TestProcessHost();
+  const fixture = await artifact({ source: cleanupFailureComponentSource });
+  const execution = request({ mode: "echo", value: "run" }, "session-cleanup-errors");
+  const executorOptions = await options({
+    processHost,
+    resolveComponent: async (request_) => ({
+      target: request_.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: request_.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const createSession = await loadProcessComponentSessionFactory();
+  const session = await createSession({
+    target: execution.target,
+    identity: execution,
+    component: await executorOptions.resolveComponent(execution),
+    executorOptions,
+  });
+  assert.equal((await (await session.submit(execution)).result).status, "succeeded");
+
+  try {
+    await assert.rejects(
+      session.close(),
+      (error: unknown) => error instanceof AggregateError && error.errors.length === 2,
     );
     assert.equal(processHost.activeProcessCount, 0);
   } finally {

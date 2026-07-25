@@ -364,6 +364,38 @@ export default {
 };
 `;
 
+const cleanupFailureComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async drain() {
+    throw new Error("drain cleanup failed");
+  },
+  async stop() {
+    throw new Error("stop cleanup failed");
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
+const activationRollbackFailureComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async start() {
+    throw new Error("activation failed");
+  },
+  async stop() {
+    throw new Error("rollback stop failed");
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
 async function artifact(
   input: { readonly kind?: "service" | "task"; readonly source?: string } = {},
 ) {
@@ -1431,6 +1463,17 @@ test("thread component session owns one Worker across same-target attempts and r
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
     );
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
+    const canonicalFirst = request(
+      { mode: "echo", value: { alpha: 1, nested: { left: true, right: false } } },
+      "session-canonical",
+    );
+    const canonicalReplay = request(
+      { value: { nested: { right: false, left: true }, alpha: 1 }, mode: "echo" },
+      "session-canonical",
+    );
+    const canonicalHandle = await session.submit(canonicalFirst);
+    assert.strictEqual(await session.submit(canonicalReplay), canonicalHandle);
+    assert.equal((await canonicalHandle.result).status, "succeeded");
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
     assert.deepEqual(lifecycle, ["lifecycle.start"]);
@@ -1501,6 +1544,73 @@ test("thread component session bounds activation hooks and awaits rollback clean
       executorOptions,
     }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+  );
+  assert.equal(factory.active, 0);
+});
+
+test("thread component session preserves drain and stop failures while terminating", async () => {
+  const factory = new TrackingWorkerFactory();
+  const fixture = await artifact({ source: cleanupFailureComponentSource });
+  const execution = request({ mode: "echo", value: "run" }, "session-cleanup-errors");
+  const executorOptions = await options(factory, {
+    resolveComponent: async (request_) => ({
+      target: request_.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: request_.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const createSession = await loadThreadComponentSessionFactory();
+  const session = await createSession({
+    target: execution.target,
+    identity: execution,
+    component: await executorOptions.resolveComponent(execution),
+    executorOptions,
+  });
+  assert.equal((await (await session.submit(execution)).result).status, "succeeded");
+
+  await assert.rejects(
+    session.close(),
+    (error: unknown) => error instanceof AggregateError && error.errors.length === 2,
+  );
+  assert.equal(factory.active, 0);
+});
+
+test("thread activation rollback preserves activation and cleanup failures", async () => {
+  const factory = new TrackingWorkerFactory();
+  const fixture = await artifact({ source: activationRollbackFailureComponentSource });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-rollback-errors");
+  const executorOptions = await options(factory, {
+    resolveComponent: async (request_) => ({
+      target: request_.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: request_.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const createSession = await loadThreadComponentSessionFactory();
+
+  await assert.rejects(
+    createSession({
+      target: execution.target,
+      identity: execution,
+      component: await executorOptions.resolveComponent(execution),
+      executorOptions,
+    }),
+    (error: unknown) =>
+      error instanceof AggregateError &&
+      error.errors.length === 2 &&
+      error.errors[1] instanceof AggregateError,
   );
   assert.equal(factory.active, 0);
 });
