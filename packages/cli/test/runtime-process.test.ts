@@ -428,6 +428,43 @@ test("@spec:runtime-operations/local-runtime-operations/pending-control-factory-
   await stopCalled.promise;
 });
 
+test("@spec:runtime-operations/local-runtime-operations/late-factory-close-failure-reaches-background-sink", async () => {
+  const factory = Promise.withResolvers<ControlServer>();
+  const factoryCalled = Promise.withResolvers<void>();
+  const backgroundError = Promise.withResolvers<unknown>();
+  const controller = new AbortController();
+  type BackgroundAwareMainOptions = MainProcessOptions & {
+    readonly onBackgroundError: (error: unknown) => void;
+  };
+  const runBackgroundAware = runMainProcess as (
+    options: BackgroundAwareMainOptions,
+  ) => Promise<void>;
+  const running = runBackgroundAware({
+    endpoint: "in-memory",
+    runtime: mainProcessRuntime({}),
+    signal: controller.signal,
+    onBackgroundError: (error) => backgroundError.resolve(error),
+    controlServerFactory: () => {
+      factoryCalled.resolve();
+      return factory.promise;
+    },
+  });
+
+  await factoryCalled.promise;
+  controller.abort();
+  assert.equal(await settlesBeforeDeadline(running), true);
+  factory.resolve({
+    endpoint: "in-memory",
+    close: () => Promise.reject(new Error("secret late close path /Users/alice")),
+  });
+  const reported = await settlesBeforeDeadline(backgroundError.promise);
+  assert.equal(reported, true);
+  const error = await backgroundError.promise;
+  assert.ok(error instanceof Error);
+  assert.equal(error.message, "LIFECYCLE_BACKGROUND_CLEANUP_FAILED");
+  await running;
+});
+
 test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-cleans-endpoint", async () => {
   const directory = await temporaryRuntimeDirectory("tego-foreground-signal-");
   const endpoint = join(directory, "control.sock");
