@@ -335,6 +335,35 @@ export default {
 };
 `;
 
+const lifecycleComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async start(context) {
+    await context.events.emit("lifecycle.start", {});
+  },
+  async stop(context) {
+    await context.events.emit("lifecycle.stop", {});
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
+const nonSettlingStartComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async start() {
+    return new Promise(() => {});
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
 async function artifact(
   input: { readonly kind?: "service" | "task"; readonly source?: string } = {},
 ) {
@@ -420,12 +449,13 @@ async function options(
     workerFactory: factory,
     maxConcurrency: 2,
     cancellationGraceMs: 100,
-    resolveComponent: async () => ({
+    resolveComponent: async (execution) => ({
+      target: execution.target,
       artifactDigest: digest,
       artifactRoot: fixture.artifactRoot,
       manifest: fixture.manifest,
       runtimeId: "runtime",
-      instanceId: "instance",
+      instanceId: execution.target.instanceId,
       configuration: {},
       permissionGrants: fixture.manifest.permissions,
       capabilityDefinitions: [],
@@ -1354,9 +1384,28 @@ test("connect transfer failure closes both private ports and the worker", async 
 
 test("thread component session owns one Worker across same-target attempts and releases it on close", async () => {
   const factory = new TrackingWorkerFactory();
-  const executorOptions = await options(factory);
   const first = request({ mode: "echo", value: "first" }, "session-first");
   const second = request({ mode: "echo", value: "second" }, "session-second");
+  const fixture = await artifact({ source: lifecycleComponentSource });
+  const lifecycle: string[] = [];
+  const executorOptions = await options(factory, {
+    events: {
+      async emit(type) {
+        lifecycle.push(type);
+      },
+    },
+    resolveComponent: async (execution) => ({
+      target: execution.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
   const createSession = await loadThreadComponentSessionFactory();
   const session = await createSession({
     target: first.target,
@@ -1367,6 +1416,7 @@ test("thread component session owns one Worker across same-target attempts and r
 
   try {
     assert.deepEqual(session.target, first.target);
+    assert.deepEqual(lifecycle, ["lifecycle.start"]);
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
@@ -1383,23 +1433,26 @@ test("thread component session owns one Worker across same-target attempts and r
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
+    assert.deepEqual(lifecycle, ["lifecycle.start"]);
   } finally {
     await session.close();
   }
 
   await eventually(() => assert.equal(factory.active, 0));
+  assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.stop"]);
 });
 
 test("thread component session refuses unhealthy activation before accepting a run", async () => {
   const factory = new TrackingWorkerFactory();
   const fixture = await artifact({ source: unhealthyComponentSource });
   const executorOptions = await options(factory, {
-    resolveComponent: async () => ({
+    resolveComponent: async (execution) => ({
+      target: execution.target,
       artifactDigest: digest,
       artifactRoot: fixture.artifactRoot,
       manifest: fixture.manifest,
       runtimeId: "runtime",
-      instanceId: "instance",
+      instanceId: execution.target.instanceId,
       configuration: {},
       permissionGrants: fixture.manifest.permissions,
       capabilityDefinitions: [],
@@ -1420,16 +1473,49 @@ test("thread component session refuses unhealthy activation before accepting a r
   assert.equal(factory.active, 0);
 });
 
-test("thread component session rejects service kind before creating a Worker", async () => {
+test("thread component session bounds activation hooks and awaits rollback cleanup", async () => {
   const factory = new TrackingWorkerFactory();
-  const fixture = await artifact({ kind: "service" });
+  const fixture = await artifact({ source: nonSettlingStartComponentSource });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-start-timeout");
   const executorOptions = await options(factory, {
-    resolveComponent: async () => ({
+    componentControlTimeoutMs: 25,
+    resolveComponent: async (request_) => ({
+      target: request_.target,
       artifactDigest: digest,
       artifactRoot: fixture.artifactRoot,
       manifest: fixture.manifest,
       runtimeId: "runtime",
-      instanceId: "instance",
+      instanceId: request_.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const createSession = await loadThreadComponentSessionFactory();
+
+  await assert.rejects(
+    createSession({
+      target: execution.target,
+      identity: execution,
+      component: await executorOptions.resolveComponent(execution),
+      executorOptions,
+    }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+  );
+  assert.equal(factory.active, 0);
+});
+
+test("thread component session rejects service kind before creating a Worker", async () => {
+  const factory = new TrackingWorkerFactory();
+  const fixture = await artifact({ kind: "service" });
+  const executorOptions = await options(factory, {
+    resolveComponent: async (execution) => ({
+      target: execution.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
       configuration: {},
       permissionGrants: fixture.manifest.permissions,
       capabilityDefinitions: [],
@@ -1466,6 +1552,14 @@ test("thread component session rejects mismatched resolved targets before creati
       ...execution.target,
       artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
     },
+    {
+      ...execution.target,
+      executor: { id: "thread-other", type: "thread" },
+    },
+    {
+      ...execution.target,
+      executor: { id: "process-local", type: "process" },
+    },
   ];
 
   for (const [index, resolvedTarget] of mismatches.entries()) {
@@ -1497,5 +1591,53 @@ test("thread component session rejects mismatched resolved targets before creati
     );
     assert.equal(factory.created, 0);
     assert.equal(factory.active, 0);
+  }
+});
+
+test("thread executor rejects mismatched resolved targets before creating a Worker", async () => {
+  const execution = request({ mode: "echo", value: "must-not-run" }, "executor-target-fence");
+  const mismatches: readonly ExecutionRequest["target"][] = [
+    {
+      ...execution.target,
+      instanceId: parseComponentInstanceId("app.org.example.thread.echo.other.g1"),
+    },
+    {
+      ...execution.target,
+      deploymentGeneration: parseGeneration("2"),
+    },
+    {
+      ...execution.target,
+      artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    },
+    {
+      ...execution.target,
+      executor: { id: "thread-other", type: "thread" },
+    },
+    {
+      ...execution.target,
+      executor: { id: "process-local", type: "process" },
+    },
+  ];
+
+  for (const [index, resolvedTarget] of mismatches.entries()) {
+    const factory = new TrackingWorkerFactory();
+    const executorOptions = await options(factory);
+    const component = await executorOptions.resolveComponent(execution);
+    const executor = new ThreadExecutor({
+      ...executorOptions,
+      resolveComponent: async () => ({ ...component, target: resolvedTarget }),
+    });
+    try {
+      const result = await (await executor.submit(execution)).result;
+      assert.equal(
+        result.diagnostic?.code,
+        "EXECUTOR_REQUEST_TARGET_MISMATCH",
+        `resolved target mismatch ${index} must fail closed`,
+      );
+      assert.equal(factory.created, 0);
+      assert.equal(factory.active, 0);
+    } finally {
+      await executor.close();
+    }
   }
 });

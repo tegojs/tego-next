@@ -107,11 +107,16 @@ class TestHostedProcess implements HostedProcess {
 class TestProcessHost implements ProcessHost {
   readonly #processes = new Set<TestHostedProcess>();
   #open = false;
+  #openCount = 0;
   #peakActiveProcessCount = 0;
   #signalCount = 0;
 
   get activeProcessCount(): number {
     return this.#processes.size;
+  }
+
+  get openCount(): number {
+    return this.#openCount;
   }
 
   get signalCount(): number {
@@ -123,6 +128,7 @@ class TestProcessHost implements ProcessHost {
   }
 
   async open(): Promise<void> {
+    this.#openCount += 1;
     this.#open = true;
   }
 
@@ -517,6 +523,35 @@ export default {
 };
 `;
 
+const lifecycleComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async start(context) {
+    await context.events.emit("lifecycle.start", {});
+  },
+  async stop(context) {
+    await context.events.emit("lifecycle.stop", {});
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
+const nonSettlingStartComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async start() {
+    return new Promise(() => {});
+  },
+  async run(_context, input) {
+    return input.value;
+  }
+};
+`;
+
 async function artifact(
   input: { readonly kind?: "service" | "task"; readonly source?: string } = {},
 ) {
@@ -602,12 +637,13 @@ async function options(
     processHost: new TestProcessHost(),
     maxConcurrency: 2,
     cancellationGraceMs: 100,
-    resolveComponent: async () => ({
+    resolveComponent: async (execution) => ({
+      target: execution.target,
       artifactDigest: digest,
       artifactRoot: fixture.artifactRoot,
       manifest: fixture.manifest,
       runtimeId: "runtime",
-      instanceId: "instance",
+      instanceId: execution.target.instanceId,
       configuration: {},
       permissionGrants: fixture.manifest.permissions,
       capabilityDefinitions: [],
@@ -835,12 +871,13 @@ test("child permission validation accepts canonical narrowed grants for every pe
   const manifest = parsePluginManifest({ ...fixture.manifest, permissions: requested });
   const executor = new ProcessExecutor(
     await options({
-      resolveComponent: async () => ({
+      resolveComponent: async (execution) => ({
+        target: execution.target,
         artifactDigest: digest,
         artifactRoot: fixture.artifactRoot,
         manifest,
         runtimeId: "runtime",
-        instanceId: "instance",
+        instanceId: execution.target.instanceId,
         configuration: {},
         permissionGrants: granted,
         capabilityDefinitions: [],
@@ -2041,9 +2078,29 @@ test("selection filters support, grant, resources, and health before preference"
 
 test("process component session owns one child across same-target attempts and releases it on close", async () => {
   const processHost = new TestProcessHost();
-  const executorOptions = await options({ processHost });
   const first = request({ mode: "echo", value: "first" }, "session-first");
   const second = request({ mode: "echo", value: "second" }, "session-second");
+  const fixture = await artifact({ source: lifecycleComponentSource });
+  const lifecycle: string[] = [];
+  const executorOptions = await options({
+    processHost,
+    events: {
+      async emit(type) {
+        lifecycle.push(type);
+      },
+    },
+    resolveComponent: async (execution) => ({
+      target: execution.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
   const createSession = await loadProcessComponentSessionFactory();
   const session = await createSession({
     target: first.target,
@@ -2054,6 +2111,7 @@ test("process component session owns one child across same-target attempts and r
 
   try {
     assert.deepEqual(session.target, first.target);
+    assert.deepEqual(lifecycle, ["lifecycle.start"]);
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
@@ -2070,12 +2128,14 @@ test("process component session owns one child across same-target attempts and r
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
+    assert.deepEqual(lifecycle, ["lifecycle.start"]);
   } finally {
     await session.close();
     await processHost.close();
   }
 
   assert.equal(processHost.activeProcessCount, 0);
+  assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.stop"]);
 });
 
 test("process component session refuses unhealthy activation before accepting a run", async () => {
@@ -2083,12 +2143,13 @@ test("process component session refuses unhealthy activation before accepting a 
   const fixture = await artifact({ source: unhealthyComponentSource });
   const executorOptions = await options({
     processHost,
-    resolveComponent: async () => ({
+    resolveComponent: async (execution) => ({
+      target: execution.target,
       artifactDigest: digest,
       artifactRoot: fixture.artifactRoot,
       manifest: fixture.manifest,
       runtimeId: "runtime",
-      instanceId: "instance",
+      instanceId: execution.target.instanceId,
       configuration: {},
       permissionGrants: fixture.manifest.permissions,
       capabilityDefinitions: [],
@@ -2113,17 +2174,55 @@ test("process component session refuses unhealthy activation before accepting a 
   }
 });
 
+test("process component session bounds activation hooks and awaits rollback cleanup", async () => {
+  const processHost = new TestProcessHost();
+  const fixture = await artifact({ source: nonSettlingStartComponentSource });
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-start-timeout");
+  const executorOptions = await options({
+    processHost,
+    componentControlTimeoutMs: 25,
+    resolveComponent: async (request_) => ({
+      target: request_.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest: fixture.manifest,
+      runtimeId: "runtime",
+      instanceId: request_.target.instanceId,
+      configuration: {},
+      permissionGrants: fixture.manifest.permissions,
+      capabilityDefinitions: [],
+    }),
+  });
+  const createSession = await loadProcessComponentSessionFactory();
+
+  try {
+    await assert.rejects(
+      createSession({
+        target: execution.target,
+        identity: execution,
+        component: await executorOptions.resolveComponent(execution),
+        executorOptions,
+      }),
+      (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+    );
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    await processHost.close();
+  }
+});
+
 test("process component session rejects service kind before spawning a child", async () => {
   const processHost = new TestProcessHost();
   const fixture = await artifact({ kind: "service" });
   const executorOptions = await options({
     processHost,
-    resolveComponent: async () => ({
+    resolveComponent: async (execution) => ({
+      target: execution.target,
       artifactDigest: digest,
       artifactRoot: fixture.artifactRoot,
       manifest: fixture.manifest,
       runtimeId: "runtime",
-      instanceId: "instance",
+      instanceId: execution.target.instanceId,
       configuration: {},
       permissionGrants: fixture.manifest.permissions,
       capabilityDefinitions: [],
@@ -2144,6 +2243,7 @@ test("process component session rejects service kind before spawning a child", a
     );
     assert.equal(processHost.peakActiveProcessCount, 0);
     assert.equal(processHost.activeProcessCount, 0);
+    assert.equal(processHost.openCount, 0);
   } finally {
     await processHost.close();
   }
@@ -2163,6 +2263,14 @@ test("process component session rejects mismatched resolved targets before spawn
     {
       ...execution.target,
       artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    },
+    {
+      ...execution.target,
+      executor: { id: "process-other", type: "process" },
+    },
+    {
+      ...execution.target,
+      executor: { id: "thread-local", type: "thread" },
     },
   ];
 
@@ -2196,5 +2304,56 @@ test("process component session rejects mismatched resolved targets before spawn
     );
     assert.equal(processHost.peakActiveProcessCount, 0);
     assert.equal(processHost.activeProcessCount, 0);
+    assert.equal(processHost.openCount, 0);
+  }
+});
+
+test("process executor rejects mismatched resolved targets before opening or spawning", async () => {
+  const execution = request({ mode: "echo", value: "must-not-run" }, "executor-target-fence");
+  const mismatches: readonly ExecutionRequest["target"][] = [
+    {
+      ...execution.target,
+      instanceId: parseComponentInstanceId("app.org.example.process.echo.other.g1"),
+    },
+    {
+      ...execution.target,
+      deploymentGeneration: parseGeneration("2"),
+    },
+    {
+      ...execution.target,
+      artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    },
+    {
+      ...execution.target,
+      executor: { id: "process-other", type: "process" },
+    },
+    {
+      ...execution.target,
+      executor: { id: "thread-local", type: "thread" },
+    },
+  ];
+
+  for (const [index, resolvedTarget] of mismatches.entries()) {
+    const processHost = new TestProcessHost();
+    const executorOptions = await options({ processHost });
+    const component = await executorOptions.resolveComponent(execution);
+    const executor = new ProcessExecutor({
+      ...executorOptions,
+      resolveComponent: async () => ({ ...component, target: resolvedTarget }),
+    });
+    try {
+      const result = await (await executor.submit(execution)).result;
+      assert.equal(
+        result.diagnostic?.code,
+        "EXECUTOR_REQUEST_TARGET_MISMATCH",
+        `resolved target mismatch ${index} must fail closed`,
+      );
+      assert.equal(processHost.peakActiveProcessCount, 0);
+      assert.equal(processHost.activeProcessCount, 0);
+      assert.equal(processHost.openCount, 0);
+    } finally {
+      await executor.close();
+      await processHost.close();
+    }
   }
 });

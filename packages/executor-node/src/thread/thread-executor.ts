@@ -10,6 +10,7 @@ import {
   parseExecutionRequest,
   parseExecutionResult,
   parsePluginManifest,
+  parseTaskExecutionTarget,
   runtimeDiagnostic,
   type ArtifactDigest,
   type AttemptId,
@@ -31,7 +32,15 @@ import {
   type RuntimeDiagnostic,
   type SecretProvider,
   type TaskId,
+  type TaskExecutionTarget,
 } from "@tegojs/contracts";
+import {
+  COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
+  ComponentSandboxSession,
+  type ComponentSessionRunResult,
+  type ComponentSessionTransport,
+  taskExecutionTargetsEqual,
+} from "../host/component-session.js";
 import {
   COMPONENT_HOST_PROTOCOL,
   cloneComponentHostValue,
@@ -69,6 +78,7 @@ const systemClock: Clock = {
 };
 
 export interface ResolvedThreadComponent {
+  readonly target: TaskExecutionTarget;
   readonly artifactDigest: ArtifactDigest;
   readonly artifactRoot: string;
   readonly manifest: PluginManifest;
@@ -110,6 +120,7 @@ export interface ThreadExecutorOptions {
   readonly maxQueue?: number;
   readonly cancellationGraceMs?: number;
   readonly cleanupGraceMs?: number;
+  readonly componentControlTimeoutMs?: number;
   readonly workerEntrypoint?: string;
   readonly workerFactory?: ThreadWorkerFactory;
   readonly permissionBoundary?: ComponentPermissionBoundary;
@@ -119,6 +130,13 @@ export interface ThreadExecutorOptions {
   readonly events?: {
     emit(type: string, payload: JsonValue): Promise<void>;
   };
+}
+
+export interface CreateThreadComponentSessionOptions {
+  readonly target: TaskExecutionTarget;
+  readonly identity: Pick<ExecutionRequest, "applicationId" | "componentId" | "pluginId">;
+  readonly component: ResolvedThreadComponent;
+  readonly executorOptions: ThreadExecutorOptions;
 }
 
 export interface ThreadTransferOptions {
@@ -1024,7 +1042,7 @@ export class ThreadExecutor implements Executor {
             applicationId: entry.request.applicationId,
             pluginId: entry.request.pluginId,
             componentId: entry.request.componentId,
-            instanceId: component.instanceId,
+            instanceId: entry.request.target.instanceId,
           },
           configuration: component.configuration,
           permissionGrants: component.permissionGrants,
@@ -1146,8 +1164,21 @@ export class ThreadExecutor implements Executor {
 
   async #resolve(request: ExecutionRequest): Promise<ResolvedThreadComponent> {
     const resolved = await this.#options.resolveComponent(request);
+    const target = parseTaskExecutionTarget(resolved.target);
     const artifactDigest = parseArtifactDigest(resolved.artifactDigest);
     const manifest = parsePluginManifest(resolved.manifest);
+    if (
+      !taskExecutionTargetsEqual(target, request.target) ||
+      target.executor.type !== "thread" ||
+      target.executor.id !== this.id ||
+      target.artifactDigest !== artifactDigest
+    ) {
+      throw executorError(
+        "EXECUTOR_REQUEST_TARGET_MISMATCH",
+        "Resolved thread component does not match the execution target",
+        this.#clock.now(),
+      );
+    }
     if (!isAbsolute(resolved.artifactRoot)) {
       throw executorError(
         "ARTIFACT_ENTRY_OUTSIDE_ROOT",
@@ -1199,6 +1230,7 @@ export class ThreadExecutor implements Executor {
     }
     return deepFreeze({
       artifactDigest,
+      target,
       artifactRoot: resolved.artifactRoot,
       manifest: structuredClone(manifest),
       runtimeId: resolved.runtimeId,
@@ -1700,4 +1732,353 @@ export class ThreadExecutor implements Executor {
       this.#attempts.delete(terminal[0]);
     }
   }
+}
+
+export async function createThreadComponentSession(
+  input: CreateThreadComponentSessionOptions,
+): Promise<ComponentSandboxSession> {
+  const { executorOptions: options, identity } = input;
+  const clock = options.clock ?? systemClock;
+  const target = parseTaskExecutionTarget(input.target);
+  if (target.executor.type !== "thread" || target.executor.id !== options.id) {
+    throw executorError(
+      "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      "Thread session target does not match the selected executor",
+      clock.now(),
+    );
+  }
+  const artifactDigest = parseArtifactDigest(input.component.artifactDigest);
+  const resolvedTarget = parseTaskExecutionTarget(input.component.target);
+  const manifest = parsePluginManifest(input.component.manifest);
+  const definition = manifest.components.find(
+    (candidate) => candidate.componentId === identity.componentId,
+  );
+  if (
+    manifest.pluginId !== identity.pluginId ||
+    definition === undefined ||
+    definition.kind !== "task" ||
+    !definition.executors.includes("thread")
+  ) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_UNSUPPORTED",
+      "Component is not an activatable thread task",
+      clock.now(),
+    );
+  }
+  if (
+    !taskExecutionTargetsEqual(resolvedTarget, target) ||
+    artifactDigest !== target.artifactDigest
+  ) {
+    throw executorError(
+      "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      "Thread session artifact does not match the execution target",
+      clock.now(),
+    );
+  }
+  if (!isAbsolute(input.component.artifactRoot)) {
+    throw executorError(
+      "ARTIFACT_ENTRY_OUTSIDE_ROOT",
+      "Resolved thread artifact root must be absolute",
+      clock.now(),
+    );
+  }
+  const grantDecision = options.permissionBoundary?.validateGrant(
+    manifest.permissions,
+    input.component.permissionGrants,
+  );
+  if (grantDecision !== undefined && !grantDecision.allowed) {
+    throw executorError(
+      "PERMISSION_GRANT_EXCEEDS_REQUEST",
+      grantDecision.diagnostics[0]?.message ?? "Permission grant is invalid",
+      clock.now(),
+    );
+  }
+  const threadGranted = input.component.permissionGrants.some(
+    (permission) => permission.kind === "executor" && permission.executors.includes("thread"),
+  );
+  const executorDecision = options.permissionBoundary?.authorize(input.component.permissionGrants, {
+    kind: "executor",
+    executor: "thread",
+  });
+  if (!threadGranted || executorDecision?.allowed === false) {
+    throw executorError(
+      "PERMISSION_EXECUTOR_DENIED",
+      "Thread execution is not granted",
+      clock.now(),
+    );
+  }
+  const maxConcurrency = options.maxConcurrency ?? 1;
+  const maxQueue = options.maxQueue ?? THREAD_EXECUTOR_MAX_QUEUE;
+  const shutdownGraceMs = options.cleanupGraceMs ?? options.cancellationGraceMs ?? 1_000;
+  const componentControlTimeoutMs =
+    options.componentControlTimeoutMs ?? COMPONENT_SESSION_CONTROL_TIMEOUT_MS;
+  if (
+    !Number.isInteger(maxConcurrency) ||
+    maxConcurrency < 1 ||
+    maxConcurrency > THREAD_EXECUTOR_MAX_CONCURRENCY
+  ) {
+    throw new RangeError("maxConcurrency is outside the supported bound");
+  }
+  if (!Number.isInteger(maxQueue) || maxQueue < 0 || maxQueue > THREAD_EXECUTOR_MAX_QUEUE) {
+    throw new RangeError("maxQueue is outside the supported bound");
+  }
+  if (!Number.isFinite(shutdownGraceMs) || shutdownGraceMs < 0) {
+    throw new RangeError("cleanupGraceMs must be finite and non-negative");
+  }
+  if (!Number.isFinite(componentControlTimeoutMs) || componentControlTimeoutMs < 1) {
+    throw new RangeError("componentControlTimeoutMs must be finite and positive");
+  }
+
+  const component: ResolvedThreadComponent = deepFreeze({
+    ...input.component,
+    target: resolvedTarget,
+    artifactDigest,
+    manifest: structuredClone(manifest),
+    permissionGrants: structuredClone(input.component.permissionGrants),
+    capabilityDefinitions: structuredClone(input.component.capabilityDefinitions),
+    configuration: structuredClone(input.component.configuration),
+  });
+  const workerFactory = options.workerFactory ?? defaultWorkerFactory;
+  const workerEntrypoint =
+    options.workerEntrypoint ?? fileURLToPath(new URL("./thread-entry.js", import.meta.url));
+  const worker = workerFactory.create(workerEntrypoint);
+  const lease = createSessionWorkerLease(worker);
+  let channel: ThreadChannel | undefined;
+  let closed = false;
+  let commandSequence = 0;
+  const controlDeadline = () =>
+    new Date(clock.now().getTime() + componentControlTimeoutMs).toISOString();
+  const artifactCommand = (
+    type: "drain" | "import" | "start" | "stop",
+    commandId: string,
+  ): ComponentHostCommand => ({
+    protocol: COMPONENT_HOST_PROTOCOL,
+    commandId,
+    deadline: controlDeadline(),
+    type,
+    payload: { artifactDigest },
+  });
+  const hostCommand = async (command: ComponentHostCommand): Promise<ComponentHostResult> => {
+    if (channel === undefined) throw new Error("Thread component channel is unavailable");
+    const result = parseComponentHostResult(
+      await channel.request({
+        kind: "command",
+        command,
+      }),
+    );
+    if (!result.ok) {
+      throw new DiagnosticError(
+        result.diagnostics[0] ??
+          diagnostic(
+            "EXECUTOR_COMPONENT_HOST_FAILED",
+            "Component host command failed",
+            clock.now(),
+          ),
+      );
+    }
+    return result;
+  };
+  const terminate = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    channel?.close();
+    await worker.terminate();
+    await lease.exited;
+  };
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    await hostCommand(artifactCommand("drain", "session-drain")).catch(() => undefined);
+    await hostCommand(artifactCommand("stop", "session-stop")).catch(() => undefined);
+    await terminate();
+  };
+
+  try {
+    channel = new ThreadChannel(lease, options, component, { bytes: 0, count: 0 });
+    const bootstrap = await channel.request({
+      kind: "bootstrap",
+      now: clock.now().toISOString(),
+      artifact: {
+        artifactDigest,
+        artifactRoot: component.artifactRoot,
+        manifest,
+      },
+    });
+    if (
+      typeof bootstrap !== "object" ||
+      bootstrap === null ||
+      (bootstrap as { readonly ok?: unknown }).ok !== true
+    ) {
+      throw new Error("Worker thread bootstrap failed");
+    }
+    const prepare: PrepareComponentHostCommand = {
+      protocol: COMPONENT_HOST_PROTOCOL,
+      commandId: "session-prepare",
+      deadline: controlDeadline(),
+      type: "prepare",
+      payload: {
+        artifactDigest,
+        componentId: identity.componentId,
+        identity: {
+          runtimeId: component.runtimeId,
+          applicationId: identity.applicationId,
+          pluginId: identity.pluginId,
+          componentId: identity.componentId,
+          instanceId: target.instanceId,
+        },
+        configuration: component.configuration,
+        permissionGrants: component.permissionGrants,
+        capabilityDefinitions: component.capabilityDefinitions,
+        runtime: { executor: "thread", mode: "single-main" },
+      },
+    };
+    await hostCommand(prepare);
+    await hostCommand(artifactCommand("import", "session-import"));
+    await hostCommand(artifactCommand("start", "session-start"));
+    const health = parseSessionHealth(
+      await hostCommand({
+        protocol: COMPONENT_HOST_PROTOCOL,
+        commandId: "session-health-activation",
+        deadline: controlDeadline(),
+        type: "health",
+        payload: { artifactDigest },
+      }),
+      clock,
+    );
+    if (health.status === "unhealthy") {
+      throw executorError(
+        "EXECUTOR_COMPONENT_UNHEALTHY",
+        health.message ?? "Thread component reported unhealthy during activation",
+        clock.now(),
+      );
+    }
+
+    const transport: ComponentSessionTransport = {
+      executor: {
+        kind: "thread",
+        metadata: {
+          executorId: options.id,
+          ...(worker.threadId === undefined ? {} : { threadId: worker.threadId }),
+        },
+      },
+      async run(request): Promise<ComponentSessionRunResult> {
+        const result = await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-run-${++commandSequence}-${request.attemptId}`,
+          deadline: request.deadline,
+          type: "run",
+          payload: { artifactDigest, execution: request },
+        });
+        return parseSessionRunResult(result, clock);
+      },
+      async cancel(taskId, attemptId, reason): Promise<void> {
+        await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-cancel-${++commandSequence}-${attemptId}`,
+          deadline: controlDeadline(),
+          type: "cancel",
+          payload: { taskId, attemptId, reason },
+        });
+      },
+      async health() {
+        return parseSessionHealth(
+          await hostCommand({
+            protocol: COMPONENT_HOST_PROTOCOL,
+            commandId: `session-health-${++commandSequence}`,
+            deadline: controlDeadline(),
+            type: "health",
+            payload: { artifactDigest },
+          }),
+          clock,
+        );
+      },
+      close,
+      terminate,
+    };
+    return new ComponentSandboxSession({
+      id: options.id,
+      type: "thread",
+      target,
+      identity,
+      transport,
+      clock,
+      maxConcurrency,
+      maxQueue,
+      shutdownGraceMs,
+    });
+  } catch (error) {
+    await close().catch(() => terminate());
+    throw error;
+  }
+}
+
+function createSessionWorkerLease(worker: ThreadWorker): WorkerLease {
+  const exit = Promise.withResolvers<{ readonly code?: number; readonly error?: Error }>();
+  let error: Error | undefined;
+  worker.once("error", (value) => {
+    error = value instanceof Error ? value : new Error(String(value));
+  });
+  worker.once("exit", (value) => {
+    const code = typeof value === "number" ? value : undefined;
+    exit.resolve({
+      ...(code === undefined ? {} : { code }),
+      ...(error === undefined ? {} : { error }),
+    });
+  });
+  return { worker, exited: exit.promise };
+}
+
+function parseSessionHealth(
+  result: ComponentHostResult,
+  clock: Clock,
+): { readonly status: ExecutorHealth["status"]; readonly message?: string } {
+  const value = result.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component health result is invalid",
+      clock.now(),
+    );
+  }
+  const health = value as Record<string, JsonValue>;
+  if (!["degraded", "healthy", "unhealthy"].includes(String(health.status))) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component health status is invalid",
+      clock.now(),
+    );
+  }
+  return {
+    status: health.status as ExecutorHealth["status"],
+    ...(typeof health.message === "string"
+      ? { message: health.message }
+      : typeof health.reason === "string"
+        ? { message: health.reason }
+        : {}),
+  };
+}
+
+function parseSessionRunResult(
+  result: ComponentHostResult,
+  clock: Clock,
+): ComponentSessionRunResult {
+  const value = result.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component run result is invalid",
+      clock.now(),
+    );
+  }
+  const run = value as Record<string, JsonValue>;
+  if (!["cancelled", "failed", "rejected", "succeeded", "timed-out"].includes(String(run.status))) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component run status is invalid",
+      clock.now(),
+    );
+  }
+  return {
+    status: run.status as ComponentSessionRunResult["status"],
+    ...(run.output === undefined ? {} : { output: run.output }),
+  };
 }

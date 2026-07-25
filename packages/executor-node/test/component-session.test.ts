@@ -86,7 +86,10 @@ test("component session drain deadline cancels active work and force-terminates 
   });
 
   clock.advanceBy(100);
-  await eventually(() => assert.equal(drained, true), { attempts: 10 });
+  await eventually(() => assert.equal(drained, true), {
+    attempts: 10,
+    advance: () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
   assert.equal(fixture.terminateCalls(), 1);
   assert.equal((await handle.result).status, "cancelled");
 });
@@ -101,7 +104,10 @@ test("component session close applies a default shutdown deadline", async () => 
   });
 
   clock.advanceBy(100);
-  await eventually(() => assert.equal(closed, true), { attempts: 10 });
+  await eventually(() => assert.equal(closed, true), {
+    attempts: 10,
+    advance: () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
   assert.equal(fixture.terminateCalls(), 1);
   assert.equal((await handle.result).status, "cancelled");
 });

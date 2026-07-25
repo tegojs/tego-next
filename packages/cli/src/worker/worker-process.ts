@@ -398,11 +398,12 @@ export function createPreparedArtifactSelection(
         },
       ];
       return {
+        target: request.target,
         artifactDigest: artifact.digest,
         artifactRoot: artifact.root,
         manifest: artifact.manifest,
         runtimeId,
-        instanceId: `${request.applicationId}-${request.pluginId}-${request.componentId}`,
+        instanceId: request.target.instanceId,
         configuration: {},
         permissionGrants,
         capabilityDefinitions: [],

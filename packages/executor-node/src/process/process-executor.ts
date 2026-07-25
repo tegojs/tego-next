@@ -9,6 +9,7 @@ import {
   parseExecutionRequest,
   parseExecutionResult,
   parsePluginManifest,
+  parseTaskExecutionTarget,
   runtimeDiagnostic,
   type ArtifactDigest,
   type AttemptId,
@@ -32,7 +33,15 @@ import {
   type RuntimeDiagnostic,
   type SecretProvider,
   type TaskId,
+  type TaskExecutionTarget,
 } from "@tegojs/contracts";
+import {
+  COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
+  ComponentSandboxSession,
+  type ComponentSessionRunResult,
+  type ComponentSessionTransport,
+  taskExecutionTargetsEqual,
+} from "../host/component-session.js";
 import {
   COMPONENT_HOST_PROTOCOL,
   cloneComponentHostValue,
@@ -67,6 +76,7 @@ const systemClock: Clock = {
 };
 
 export interface ResolvedProcessComponent {
+  readonly target: TaskExecutionTarget;
   readonly artifactDigest: ArtifactDigest;
   readonly artifactRoot: string;
   readonly manifest: PluginManifest;
@@ -95,6 +105,7 @@ export interface ProcessExecutorOptions {
   readonly maxQueue?: number;
   readonly cancellationGraceMs?: number;
   readonly cleanupGraceMs?: number;
+  readonly componentControlTimeoutMs?: number;
   readonly processEntrypoint?: string;
   readonly permissionBoundary?: ComponentPermissionBoundary;
   readonly capabilityBoundary?: ComponentCapabilityBoundary;
@@ -103,6 +114,13 @@ export interface ProcessExecutorOptions {
   readonly events?: {
     emit(type: string, payload: JsonValue): Promise<void>;
   };
+}
+
+export interface CreateProcessComponentSessionOptions {
+  readonly target: TaskExecutionTarget;
+  readonly identity: Pick<ExecutionRequest, "applicationId" | "componentId" | "pluginId">;
+  readonly component: ResolvedProcessComponent;
+  readonly executorOptions: ProcessExecutorOptions;
 }
 
 interface AttemptEntry {
@@ -743,33 +761,6 @@ export class ProcessExecutor implements Executor {
       this.#settlePreChannelAdmissions(this.#fatalDiagnostic);
       return;
     }
-    try {
-      await this.#ensureOpen();
-    } catch (error) {
-      for (const entry of this.#queue.splice(0)) {
-        const now = this.#clock.now().toISOString();
-        const failure: ExecutionResult = {
-          taskId: entry.request.taskId,
-          attemptId: entry.request.attemptId,
-          status: "failed",
-          diagnostic:
-            error instanceof DiagnosticError
-              ? error.diagnostic
-              : diagnostic(
-                  "EXECUTOR_PROCESS_HOST_OPEN_FAILED",
-                  error instanceof Error ? error.message : "Process host failed to open",
-                  this.#clock.now(),
-                ),
-          executor: { kind: "process", metadata: { executorId: this.id } },
-          startedAt: now,
-          completedAt: now,
-        };
-        this.#settle(entry, failure);
-        if (entry.terminal !== undefined) entry.result.resolve(entry.terminal);
-        entry.completed.resolve();
-      }
-      return;
-    }
     while (this.#active < this.#maxConcurrency) {
       if (this.#fatalDiagnostic !== undefined) {
         this.#settlePreChannelAdmissions(this.#fatalDiagnostic);
@@ -793,6 +784,7 @@ export class ProcessExecutor implements Executor {
   async #run(entry: AttemptEntry): Promise<void> {
     let process_: HostedProcess | undefined;
     let channel: ProcessChannel | undefined;
+    let openingHost = false;
     let admissionSettlement = Promise.resolve();
     let requiredTerminationSettlement = Promise.resolve();
     const terminateBeforeChannel = async (hosted: HostedProcess): Promise<TerminationOutcome> => {
@@ -816,6 +808,9 @@ export class ProcessExecutor implements Executor {
         this.#decide(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
+      openingHost = true;
+      await this.#ensureOpen();
+      openingHost = false;
       const spawnAdmission = this.#raceAdmission(
         entry,
         this.#options.processHost.spawn({
@@ -877,7 +872,7 @@ export class ProcessExecutor implements Executor {
             applicationId: entry.request.applicationId,
             pluginId: entry.request.pluginId,
             componentId: entry.request.componentId,
-            instanceId: component.instanceId,
+            instanceId: entry.request.target.instanceId,
           },
           configuration: component.configuration,
           permissionGrants: component.permissionGrants,
@@ -936,9 +931,11 @@ export class ProcessExecutor implements Executor {
         const code =
           error instanceof DiagnosticError
             ? error.diagnostic.code
-            : process_ === undefined
-              ? "EXECUTOR_PROCESS_SPAWN_FAILED"
-              : "EXECUTOR_PROCESS_EXIT";
+            : openingHost
+              ? "EXECUTOR_PROCESS_HOST_OPEN_FAILED"
+              : process_ === undefined
+                ? "EXECUTOR_PROCESS_SPAWN_FAILED"
+                : "EXECUTOR_PROCESS_EXIT";
         const message =
           error instanceof Error ? error.message : "Process executor attempt failed unexpectedly";
         this.#decide(entry, {
@@ -992,8 +989,21 @@ export class ProcessExecutor implements Executor {
 
   async #resolve(request: ExecutionRequest): Promise<ResolvedProcessComponent> {
     const resolved = await this.#options.resolveComponent(request);
+    const target = parseTaskExecutionTarget(resolved.target);
     const artifactDigest = parseArtifactDigest(resolved.artifactDigest);
     const manifest = parsePluginManifest(resolved.manifest);
+    if (
+      !taskExecutionTargetsEqual(target, request.target) ||
+      target.executor.type !== "process" ||
+      target.executor.id !== this.id ||
+      target.artifactDigest !== artifactDigest
+    ) {
+      throw executorError(
+        "EXECUTOR_REQUEST_TARGET_MISMATCH",
+        "Resolved process component does not match the execution target",
+        this.#clock.now(),
+      );
+    }
     if (!isAbsolute(resolved.artifactRoot)) {
       throw executorError(
         "ARTIFACT_ENTRY_OUTSIDE_ROOT",
@@ -1043,7 +1053,7 @@ export class ProcessExecutor implements Executor {
         this.#clock.now(),
       );
     }
-    return { ...resolved, artifactDigest, manifest };
+    return { ...resolved, target, artifactDigest, manifest };
   }
 
   #artifactCommand(
@@ -1377,4 +1387,343 @@ export class ProcessExecutor implements Executor {
       this.#attempts.delete(terminal[0]);
     }
   }
+}
+
+export async function createProcessComponentSession(
+  input: CreateProcessComponentSessionOptions,
+): Promise<ComponentSandboxSession> {
+  const { executorOptions: options, identity } = input;
+  const clock = options.clock ?? systemClock;
+  const target = parseTaskExecutionTarget(input.target);
+  if (target.executor.type !== "process" || target.executor.id !== options.id) {
+    throw executorError(
+      "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      "Process session target does not match the selected executor",
+      clock.now(),
+    );
+  }
+  const artifactDigest = parseArtifactDigest(input.component.artifactDigest);
+  const resolvedTarget = parseTaskExecutionTarget(input.component.target);
+  const manifest = parsePluginManifest(input.component.manifest);
+  const definition = manifest.components.find(
+    (candidate) => candidate.componentId === identity.componentId,
+  );
+  if (
+    manifest.pluginId !== identity.pluginId ||
+    definition === undefined ||
+    definition.kind !== "task" ||
+    !definition.executors.includes("process")
+  ) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_UNSUPPORTED",
+      "Component is not an activatable process task",
+      clock.now(),
+    );
+  }
+  if (
+    !taskExecutionTargetsEqual(resolvedTarget, target) ||
+    artifactDigest !== target.artifactDigest
+  ) {
+    throw executorError(
+      "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      "Process session artifact does not match the execution target",
+      clock.now(),
+    );
+  }
+  if (!isAbsolute(input.component.artifactRoot)) {
+    throw executorError(
+      "ARTIFACT_ENTRY_OUTSIDE_ROOT",
+      "Resolved process artifact root must be absolute",
+      clock.now(),
+    );
+  }
+  const grantDecision = options.permissionBoundary?.validateGrant(
+    manifest.permissions,
+    input.component.permissionGrants,
+  );
+  if (grantDecision !== undefined && !grantDecision.allowed) {
+    throw executorError(
+      "PERMISSION_GRANT_EXCEEDS_REQUEST",
+      grantDecision.diagnostics[0]?.message ?? "Permission grant is invalid",
+      clock.now(),
+    );
+  }
+  const processGranted = input.component.permissionGrants.some(
+    (permission) => permission.kind === "executor" && permission.executors.includes("process"),
+  );
+  const executorDecision = options.permissionBoundary?.authorize(input.component.permissionGrants, {
+    kind: "executor",
+    executor: "process",
+  });
+  if (!processGranted || executorDecision?.allowed === false) {
+    throw executorError(
+      "PERMISSION_EXECUTOR_DENIED",
+      "Process execution is not granted",
+      clock.now(),
+    );
+  }
+  const maxConcurrency = options.maxConcurrency ?? 1;
+  const maxQueue = options.maxQueue ?? PROCESS_EXECUTOR_MAX_QUEUE;
+  const shutdownGraceMs = options.cleanupGraceMs ?? options.cancellationGraceMs ?? 1_000;
+  const componentControlTimeoutMs =
+    options.componentControlTimeoutMs ?? COMPONENT_SESSION_CONTROL_TIMEOUT_MS;
+  if (
+    !Number.isInteger(maxConcurrency) ||
+    maxConcurrency < 1 ||
+    maxConcurrency > PROCESS_EXECUTOR_MAX_CONCURRENCY
+  ) {
+    throw new RangeError("maxConcurrency is outside the supported bound");
+  }
+  if (!Number.isInteger(maxQueue) || maxQueue < 0 || maxQueue > PROCESS_EXECUTOR_MAX_QUEUE) {
+    throw new RangeError("maxQueue is outside the supported bound");
+  }
+  if (!Number.isFinite(shutdownGraceMs) || shutdownGraceMs < 0) {
+    throw new RangeError("cleanupGraceMs must be finite and non-negative");
+  }
+  if (!Number.isFinite(componentControlTimeoutMs) || componentControlTimeoutMs < 1) {
+    throw new RangeError("componentControlTimeoutMs must be finite and positive");
+  }
+
+  const component: ResolvedProcessComponent = deepFreeze({
+    ...input.component,
+    target: resolvedTarget,
+    artifactDigest,
+    manifest: structuredClone(manifest),
+    permissionGrants: structuredClone(input.component.permissionGrants),
+    capabilityDefinitions: structuredClone(input.component.capabilityDefinitions),
+    configuration: structuredClone(input.component.configuration),
+  });
+  const processEntrypoint =
+    options.processEntrypoint ?? fileURLToPath(new URL("./process-entry.js", import.meta.url));
+  let process_: HostedProcess | undefined;
+  let channel: ProcessChannel | undefined;
+  let closed = false;
+  let commandSequence = 0;
+  const controlDeadline = () =>
+    new Date(clock.now().getTime() + componentControlTimeoutMs).toISOString();
+  const artifactCommand = (
+    type: "drain" | "import" | "start" | "stop",
+    commandId: string,
+  ): ComponentHostCommand => ({
+    protocol: COMPONENT_HOST_PROTOCOL,
+    commandId,
+    deadline: controlDeadline(),
+    type,
+    payload: { artifactDigest },
+  });
+  const hostCommand = async (command: ComponentHostCommand): Promise<ComponentHostResult> => {
+    if (channel === undefined) throw new Error("Process component channel is unavailable");
+    const result = parseComponentHostResult(await channel.request({ kind: "command", command }));
+    if (!result.ok) {
+      throw new DiagnosticError(
+        result.diagnostics[0] ??
+          diagnostic(
+            "EXECUTOR_COMPONENT_HOST_FAILED",
+            "Component host command failed",
+            clock.now(),
+          ),
+      );
+    }
+    return result;
+  };
+  const terminate = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    if (process_ === undefined) return;
+    await process_.kill();
+    await process_.wait();
+  };
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    if (channel !== undefined) {
+      await hostCommand(artifactCommand("drain", "session-drain")).catch(() => undefined);
+      await hostCommand(artifactCommand("stop", "session-stop")).catch(() => undefined);
+    }
+    await process_?.stdin.close().catch(() => undefined);
+    await terminate();
+  };
+
+  try {
+    await options.processHost.open();
+    process_ = await options.processHost.spawn({
+      entrypoint: processEntrypoint,
+      environment: {},
+    });
+    channel = new ProcessChannel(process_, options, component);
+    const bootstrap = await channel.request({
+      kind: "bootstrap",
+      now: clock.now().toISOString(),
+      artifact: {
+        artifactDigest,
+        artifactRoot: component.artifactRoot,
+        manifest,
+      },
+    });
+    if (
+      typeof bootstrap !== "object" ||
+      bootstrap === null ||
+      (bootstrap as { readonly ok?: unknown }).ok !== true
+    ) {
+      throw new Error("Child process bootstrap failed");
+    }
+    const prepare: PrepareComponentHostCommand = {
+      protocol: COMPONENT_HOST_PROTOCOL,
+      commandId: "session-prepare",
+      deadline: controlDeadline(),
+      type: "prepare",
+      payload: {
+        artifactDigest,
+        componentId: identity.componentId,
+        identity: {
+          runtimeId: component.runtimeId,
+          applicationId: identity.applicationId,
+          pluginId: identity.pluginId,
+          componentId: identity.componentId,
+          instanceId: target.instanceId,
+        },
+        configuration: component.configuration,
+        permissionGrants: component.permissionGrants,
+        capabilityDefinitions: component.capabilityDefinitions,
+        runtime: { executor: "process", mode: "single-main" },
+      },
+    };
+    await hostCommand(prepare);
+    await hostCommand(artifactCommand("import", "session-import"));
+    await hostCommand(artifactCommand("start", "session-start"));
+    const health = parseProcessSessionHealth(
+      await hostCommand({
+        protocol: COMPONENT_HOST_PROTOCOL,
+        commandId: "session-health-activation",
+        deadline: controlDeadline(),
+        type: "health",
+        payload: { artifactDigest },
+      }),
+      clock,
+    );
+    if (health.status === "unhealthy") {
+      throw executorError(
+        "EXECUTOR_COMPONENT_UNHEALTHY",
+        health.message ?? "Process component reported unhealthy during activation",
+        clock.now(),
+      );
+    }
+    const activeProcess = process_;
+    const activeChannel = channel;
+
+    const transport: ComponentSessionTransport = {
+      get executor() {
+        return {
+          kind: "process" as const,
+          metadata: {
+            executorId: options.id,
+            ...(activeProcess.pid === undefined ? {} : { pid: activeProcess.pid }),
+            ...(activeChannel.stderr.length === 0 ? {} : { stderr: activeChannel.stderr }),
+          },
+        };
+      },
+      async run(request): Promise<ComponentSessionRunResult> {
+        const result = await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-run-${++commandSequence}-${request.attemptId}`,
+          deadline: request.deadline,
+          type: "run",
+          payload: { artifactDigest, execution: request },
+        });
+        return parseProcessSessionRunResult(result, clock);
+      },
+      async cancel(taskId, attemptId, reason): Promise<void> {
+        await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-cancel-${++commandSequence}-${attemptId}`,
+          deadline: controlDeadline(),
+          type: "cancel",
+          payload: { taskId, attemptId, reason },
+        });
+      },
+      async health() {
+        return parseProcessSessionHealth(
+          await hostCommand({
+            protocol: COMPONENT_HOST_PROTOCOL,
+            commandId: `session-health-${++commandSequence}`,
+            deadline: controlDeadline(),
+            type: "health",
+            payload: { artifactDigest },
+          }),
+          clock,
+        );
+      },
+      close,
+      terminate,
+    };
+    return new ComponentSandboxSession({
+      id: options.id,
+      type: "process",
+      target,
+      identity,
+      transport,
+      clock,
+      maxConcurrency,
+      maxQueue,
+      shutdownGraceMs,
+    });
+  } catch (error) {
+    await close().catch(() => terminate());
+    throw error;
+  }
+}
+
+function parseProcessSessionHealth(
+  result: ComponentHostResult,
+  clock: Clock,
+): { readonly status: ExecutorHealth["status"]; readonly message?: string } {
+  const value = result.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component health result is invalid",
+      clock.now(),
+    );
+  }
+  const health = value as Record<string, JsonValue>;
+  if (!["degraded", "healthy", "unhealthy"].includes(String(health.status))) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component health status is invalid",
+      clock.now(),
+    );
+  }
+  return {
+    status: health.status as ExecutorHealth["status"],
+    ...(typeof health.message === "string"
+      ? { message: health.message }
+      : typeof health.reason === "string"
+        ? { message: health.reason }
+        : {}),
+  };
+}
+
+function parseProcessSessionRunResult(
+  result: ComponentHostResult,
+  clock: Clock,
+): ComponentSessionRunResult {
+  const value = result.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component run result is invalid",
+      clock.now(),
+    );
+  }
+  const run = value as Record<string, JsonValue>;
+  if (!["cancelled", "failed", "rejected", "succeeded", "timed-out"].includes(String(run.status))) {
+    throw executorError(
+      "EXECUTOR_COMPONENT_HOST_FAILED",
+      "Component run status is invalid",
+      clock.now(),
+    );
+  }
+  return {
+    status: run.status as ComponentSessionRunResult["status"],
+    ...(run.output === undefined ? {} : { output: run.output }),
+  };
 }
