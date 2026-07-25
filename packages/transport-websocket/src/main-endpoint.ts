@@ -1,7 +1,10 @@
 import {
-  parseSequence,
+  parseFencingEpoch,
   parseWorkerId,
+  type ArtifactDigest,
   type Clock,
+  type ExecutorKind,
+  type FencingEpoch,
   type JsonObject,
   type WorkerId,
   type WorkerProtocolVersion,
@@ -13,8 +16,8 @@ import { compareWorkerEpoch, WorkerSession, type WorkerRegistration } from "./se
 export interface WorkerRegistrationInput {
   readonly labels: JsonObject;
   readonly resources: JsonObject;
-  readonly executors: readonly string[];
-  readonly preparedArtifacts: readonly string[];
+  readonly executors: readonly ExecutorKind[];
+  readonly preparedArtifacts: readonly ArtifactDigest[];
 }
 
 export interface WorkerSessionEndpointOptions {
@@ -41,7 +44,7 @@ export interface WorkerEndpointOptions extends WorkerSessionEndpointOptions {
 }
 
 export interface WorkerEpochAllocator {
-  next(workerId: WorkerId): Promise<string>;
+  next(workerId: WorkerId): Promise<FencingEpoch>;
 }
 
 export class MemoryWorkerEpochAllocator implements WorkerEpochAllocator {
@@ -49,14 +52,14 @@ export class MemoryWorkerEpochAllocator implements WorkerEpochAllocator {
 
   constructor(highWaterMarks: Readonly<Record<string, string>> = {}) {
     for (const [workerId, epoch] of Object.entries(highWaterMarks)) {
-      this.#epochs.set(parseWorkerId(workerId), BigInt(parseSequence(epoch)));
+      this.#epochs.set(parseWorkerId(workerId), BigInt(parseFencingEpoch(epoch)));
     }
   }
 
-  async next(workerIdValue: WorkerId): Promise<string> {
+  async next(workerIdValue: WorkerId): Promise<FencingEpoch> {
     const workerId = parseWorkerId(workerIdValue);
     const nextEpoch = (this.#epochs.get(workerId) ?? 0n) + 1n;
-    const parsed = parseSequence(nextEpoch.toString());
+    const parsed = parseFencingEpoch(nextEpoch.toString());
     this.#epochs.set(workerId, nextEpoch);
     return parsed;
   }
@@ -69,7 +72,7 @@ export class MainEndpoint {
   readonly #current = new Map<WorkerId, WorkerSession>();
   readonly #registrations = new Map<WorkerId, WorkerRegistration>();
   readonly #registrationTails = new Map<WorkerId, Promise<void>>();
-  readonly #lastEpochs = new Map<WorkerId, string>();
+  readonly #lastEpochs = new Map<WorkerId, FencingEpoch>();
   readonly #epochAllocator: WorkerEpochAllocator;
   #closed = false;
 
@@ -149,7 +152,7 @@ export class MainEndpoint {
     this.#registrations.clear();
   }
 
-  async #register(session: WorkerSession, registration: WorkerRegistration): Promise<string> {
+  async #register(session: WorkerSession, registration: WorkerRegistration): Promise<FencingEpoch> {
     const workerId = parseWorkerId(registration.workerId);
     const predecessor = this.#registrationTails.get(workerId) ?? Promise.resolve();
     const registrationAttempt = predecessor
@@ -173,7 +176,7 @@ export class MainEndpoint {
     workerId: WorkerId,
     session: WorkerSession,
     registration: WorkerRegistration,
-  ): Promise<string> {
+  ): Promise<FencingEpoch> {
     this.#assertRegistrationCandidate(session);
     const nextEpoch = await this.#allocateEpoch(workerId, session);
     this.#assertRegistrationCandidate(session);
@@ -184,10 +187,10 @@ export class MainEndpoint {
     return nextEpoch;
   }
 
-  async #allocateEpoch(workerId: WorkerId, session: WorkerSession): Promise<string> {
+  async #allocateEpoch(workerId: WorkerId, session: WorkerSession): Promise<FencingEpoch> {
     const allocation = Promise.resolve()
       .then(async () => this.#epochAllocator.next(workerId))
-      .then((epoch) => parseSequence(epoch));
+      .then((epoch) => parseFencingEpoch(epoch));
     let rejectClosed: ((error: Error) => void) | undefined;
     const closed = new Promise<never>((_resolve, reject) => {
       rejectClosed = reject;
@@ -220,8 +223,8 @@ export class MainEndpoint {
     }
   }
 
-  #recordAllocatedEpoch(workerId: WorkerId, nextEpoch: string): boolean {
-    const lastEpoch = this.#lastEpochs.get(workerId) ?? "0";
+  #recordAllocatedEpoch(workerId: WorkerId, nextEpoch: FencingEpoch): boolean {
+    const lastEpoch = this.#lastEpochs.get(workerId) ?? parseFencingEpoch("0");
     if (compareWorkerEpoch(nextEpoch, lastEpoch) <= 0) {
       return false;
     }

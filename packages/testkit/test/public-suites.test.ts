@@ -63,8 +63,8 @@ class PublicRuntimeFixture implements Runtime {
 
 lifecycleConformance(() => new PublicRuntimeFixture());
 
-const publicWorkerId = parseWorkerId("public-worker");
-const publicDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+const publicWorkerId = parseWorkerId("conformance-worker");
+const publicDigest = parseArtifactDigest(`sha256:${"0".repeat(64)}`);
 
 class PublicWorkerFixture {
   registration(): {

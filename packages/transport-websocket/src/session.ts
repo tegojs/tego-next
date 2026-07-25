@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 import {
   DiagnosticError,
+  parseArtifactDigest,
+  parseFencingEpoch,
   parseMessageId,
   parseSequence,
   parseSessionId,
   parseWorkerId,
   runtimeDiagnostic,
   serializeWireValue,
+  type ArtifactDigest,
   type Clock,
+  type ExecutorKind,
+  type FencingEpoch,
   type JsonObject,
   type JsonValue,
   type RuntimeDiagnostic,
@@ -33,8 +38,8 @@ export interface WorkerRegistration extends JsonObject {
   readonly workerId: WorkerId;
   readonly labels: JsonObject;
   readonly resources: JsonObject;
-  readonly executors: readonly string[];
-  readonly preparedArtifacts: readonly string[];
+  readonly executors: readonly ExecutorKind[];
+  readonly preparedArtifacts: readonly ArtifactDigest[];
 }
 
 export interface WorkerSessionMessage {
@@ -112,7 +117,7 @@ export interface WorkerSessionOptions {
   readonly onRegister?: (
     session: WorkerSession,
     registration: WorkerRegistration,
-  ) => string | Promise<string>;
+  ) => FencingEpoch | Promise<FencingEpoch>;
   readonly onUnavailable?: (session: WorkerSession) => void;
   readonly onClosed?: (session: WorkerSession) => void;
 }
@@ -212,7 +217,11 @@ function boundedUnsigned64(value: string, name: string): string {
   return value;
 }
 
-export function compareWorkerEpoch(left: string, right: string): number {
+function boundedWorkerEpoch(value: string, name: string): FencingEpoch {
+  return parseFencingEpoch(boundedUnsigned64(value, name));
+}
+
+export function compareWorkerEpoch(left: FencingEpoch, right: FencingEpoch): number {
   const leftValue = BigInt(boundedUnsigned64(left, "Worker epoch"));
   const rightValue = BigInt(boundedUnsigned64(right, "Worker epoch"));
   return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
@@ -246,7 +255,9 @@ function normalizeRegistration(value: WorkerRegistration): WorkerRegistration {
     resources === null ||
     Array.isArray(resources) ||
     !Array.isArray(value.executors) ||
-    value.executors.some((executor) => typeof executor !== "string" || executor.length === 0) ||
+    value.executors.some(
+      (executor) => executor !== "process" && executor !== "thread" && executor !== "remote",
+    ) ||
     !Array.isArray(value.preparedArtifacts) ||
     value.preparedArtifacts.some(
       (artifact) => typeof artifact !== "string" || artifact.length === 0,
@@ -262,7 +273,7 @@ function normalizeRegistration(value: WorkerRegistration): WorkerRegistration {
     labels: labels as JsonObject,
     resources: resources as JsonObject,
     executors: [...value.executors],
-    preparedArtifacts: [...value.preparedArtifacts],
+    preparedArtifacts: value.preparedArtifacts.map((artifact) => parseArtifactDigest(artifact)),
   };
 }
 
@@ -363,7 +374,7 @@ export class WorkerSession {
   #acceptingAssignments = false;
   #diagnostic?: RuntimeDiagnostic;
   #sessionId: SessionId;
-  #epoch = "0";
+  #epoch = parseFencingEpoch("0");
   #nextSequence = 0n;
   #expectedSequence = 0n;
   #remoteNonce?: string;
@@ -460,7 +471,7 @@ export class WorkerSession {
     return this.#sessionId;
   }
 
-  get epoch(): string {
+  get epoch(): FencingEpoch {
     return this.#epoch;
   }
 
@@ -998,7 +1009,7 @@ export class WorkerSession {
     this.#registrationPending = true;
     const epoch = await this.#onRegister(this, registration);
     if (this.#state !== "authenticating") return;
-    this.#epoch = boundedUnsigned64(epoch, "Worker session epoch");
+    this.#epoch = boundedWorkerEpoch(epoch, "Worker session epoch");
     this.#state = "ready";
     this.#notifyState();
     this.#available = true;
@@ -1027,7 +1038,7 @@ export class WorkerSession {
     if (typeof payload.epoch !== "string") {
       throw diagnosticError("PROTOCOL_MESSAGE_INVALID", "session epoch must be a string");
     }
-    this.#epoch = boundedUnsigned64(payload.epoch, "Worker session epoch");
+    this.#epoch = boundedWorkerEpoch(payload.epoch, "Worker session epoch");
     this.#state = "ready";
     this.#notifyState();
     this.#available = true;

@@ -1,4 +1,4 @@
-import { parseWorkerId, type WorkerId } from "@tegojs/contracts";
+import { parseFencingEpoch, parseWorkerId, type FencingEpoch, type WorkerId } from "@tegojs/contracts";
 import { systemWorkerClock } from "./clock.js";
 import { assertWorkerProtocolVersion } from "./codec.js";
 import type { WorkerEndpointOptions, WorkerRegistrationInput } from "./main-endpoint.js";
@@ -27,7 +27,7 @@ export class WorkerEndpoint {
   readonly #registration: WorkerRegistration;
   readonly #sessions = new Set<WorkerSession>();
   #current: WorkerSession | undefined;
-  #highestAcceptedEpoch = "0";
+  #highestAcceptedEpoch: FencingEpoch = parseFencingEpoch("0");
   #closed = false;
 
   constructor(options: WorkerEndpointOptions) {

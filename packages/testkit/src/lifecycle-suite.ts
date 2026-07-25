@@ -1,47 +1,54 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { RuntimeLifecycleState } from "@tegojs/contracts";
+import type { Runtime } from "@tegojs/contracts";
 
-export interface LifecycleConformanceFixture {
-  current(): RuntimeLifecycleState | Promise<RuntimeLifecycleState>;
-  transition(next: RuntimeLifecycleState): RuntimeLifecycleState | Promise<RuntimeLifecycleState>;
+export type LifecycleConformanceFactory = () => Runtime | Promise<Runtime>;
+
+async function withRuntime<T>(
+  factory: LifecycleConformanceFactory,
+  run: (runtime: Runtime) => Promise<T>,
+): Promise<T> {
+  const runtime = await factory();
+  try {
+    return await run(runtime);
+  } finally {
+    await runtime.stop();
+  }
 }
-
-export type LifecycleConformanceFactory = () =>
-  | LifecycleConformanceFixture
-  | Promise<LifecycleConformanceFixture>;
 
 export function lifecycleConformance(factory: LifecycleConformanceFactory): void {
   describe("Runtime lifecycle conformance", () => {
-    test("@spec:runtime-operations/reusable-conformance-test-kits/lifecycle-transitions", async () => {
-      const fixture = await factory();
-      assert.equal(await fixture.current(), "created");
-      for (const state of [
-        "opening",
-        "recovering",
-        "electing",
-        "running",
-        "draining",
-        "stopping",
-        "stopped",
-      ] as const) {
-        assert.equal(await fixture.transition(state), state);
-        assert.equal(await fixture.current(), state);
-      }
+    test("@spec:runtime-operations/reusable-conformance-test-kits/lifecycle-start", async () => {
+      await withRuntime(factory, async (runtime) => {
+        assert.equal((await runtime.status()).lifecycle, "created");
+
+        await Promise.all([runtime.start(), runtime.start()]);
+
+        const running = await runtime.status();
+        assert.equal(running.lifecycle, "running");
+        assert.equal(running.liveness, true);
+        assert.equal(running.readiness, true);
+        assert.equal(running.acceptingOperations, true);
+
+        await runtime.start();
+        assert.equal((await runtime.status()).lifecycle, "running");
+      });
     });
 
-    test("@spec:runtime-operations/reusable-conformance-test-kits/lifecycle-idempotency", async () => {
-      const fixture = await factory();
-      assert.equal(await fixture.transition("created"), "created");
-      assert.equal(await fixture.transition("opening"), "opening");
-      assert.equal(await fixture.transition("opening"), "opening");
-      assert.equal(await fixture.current(), "opening");
-    });
+    test("@spec:runtime-operations/reusable-conformance-test-kits/lifecycle-stop", async () => {
+      const runtime = await factory();
+      await runtime.start();
 
-    test("@spec:runtime-operations/reusable-conformance-test-kits/lifecycle-invalid-transition", async () => {
-      const fixture = await factory();
-      await assert.rejects(Promise.resolve().then(() => fixture.transition("running")));
-      assert.equal(await fixture.current(), "created");
+      await Promise.all([runtime.stop(), runtime.stop()]);
+
+      const stopped = await runtime.status();
+      assert.equal(stopped.lifecycle, "stopped");
+      assert.equal(stopped.liveness, false);
+      assert.equal(stopped.readiness, false);
+      assert.equal(stopped.acceptingOperations, false);
+
+      await runtime.stop();
+      assert.equal((await runtime.status()).lifecycle, "stopped");
     });
   });
 }

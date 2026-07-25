@@ -1,15 +1,24 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  parseFencingEpoch,
+  parseArtifactDigest,
   parseMessageId,
   parseSequence,
   parseSessionId,
+  type FencingEpoch,
   type JsonValue,
   type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
 } from "@tegojs/contracts";
-import { eventually, FakeClock, workerSessionConformance } from "@tegojs/testkit";
+import {
+  eventually,
+  FakeClock,
+  workerConformance,
+  workerSessionConformance,
+  type WorkerConformanceFixture,
+} from "@tegojs/testkit";
 import {
   createMainEndpoint,
   createWorkerCodec,
@@ -83,7 +92,7 @@ test("an injected epoch allocator preserves the Worker high-water mark across Ma
     next: async (id) => {
       const next = (durableEpochs.get(id) ?? 0n) + 1n;
       durableEpochs.set(id, next);
-      return next.toString();
+      return parseFencingEpoch(next.toString());
     },
   });
   const firstMain = createMainEndpoint({
@@ -124,7 +133,7 @@ test("an injected epoch allocator preserves the Worker high-water mark across Ma
 test("a closed replacement cannot claim authority after delayed epoch allocation", async () => {
   const workerId = "delayed-replacement-worker" as WorkerId;
   let allocationCount = 0;
-  let resolveReplacementEpoch: ((epoch: string) => void) | undefined;
+  let resolveReplacementEpoch: ((epoch: FencingEpoch) => void) | undefined;
   let replacementAllocationStarted: (() => void) | undefined;
   const replacementAllocation = new Promise<void>((resolve) => {
     replacementAllocationStarted = resolve;
@@ -132,9 +141,9 @@ test("a closed replacement cannot claim authority after delayed epoch allocation
   const epochAllocator: WorkerEpochAllocator = {
     next: async () => {
       allocationCount += 1;
-      if (allocationCount === 1) return "1";
+      if (allocationCount === 1) return parseFencingEpoch("1");
       replacementAllocationStarted?.();
-      return new Promise<string>((resolve) => {
+      return new Promise<FencingEpoch>((resolve) => {
         resolveReplacementEpoch = resolve;
       });
     },
@@ -156,7 +165,7 @@ test("a closed replacement cannot claim authority after delayed epoch allocation
   const replacementWorkerSession = replacementWorker.attach(replacementWorkerSocket);
   await replacementAllocation;
   await replacementWorker.close();
-  resolveReplacementEpoch?.("2");
+  resolveReplacementEpoch?.(parseFencingEpoch("2"));
   await assert.rejects(Promise.all([replacementMainSession.ready, replacementWorkerSession.ready]));
   await flush();
 
@@ -171,7 +180,7 @@ test("a timed-out epoch allocation cannot starve a later Worker registration", a
   const clock = new FakeClock();
   const workerId = "stalled-allocation-worker" as WorkerId;
   let allocationCount = 0;
-  let resolveFirstAllocation: ((epoch: string) => void) | undefined;
+  let resolveFirstAllocation: ((epoch: FencingEpoch) => void) | undefined;
   let firstAllocationStarted: (() => void) | undefined;
   const allocationStarted = new Promise<void>((resolve) => {
     firstAllocationStarted = resolve;
@@ -181,11 +190,11 @@ test("a timed-out epoch allocation cannot starve a later Worker registration", a
       allocationCount += 1;
       if (allocationCount === 1) {
         firstAllocationStarted?.();
-        return new Promise<string>((resolve) => {
+        return new Promise<FencingEpoch>((resolve) => {
           resolveFirstAllocation = resolve;
         });
       }
-      return allocationCount.toString();
+      return parseFencingEpoch(allocationCount.toString());
     },
   };
   const main = createMainEndpoint({
@@ -222,7 +231,7 @@ test("a timed-out epoch allocation cannot starve a later Worker registration", a
   await Promise.all([secondMainSession.ready, secondWorkerSession.ready]);
   assert.equal(main.current(workerId), secondMainSession);
 
-  resolveFirstAllocation?.("3");
+  resolveFirstAllocation?.(parseFencingEpoch("3"));
   await flush();
   const thirdWorker = createWorkerEndpoint({
     clock,
@@ -484,6 +493,140 @@ async function cleanup(connection: DirectConnection): Promise<void> {
   assert.equal(connection.mainSocket.listenerCount(), 0);
   assert.equal(connection.workerSocket.listenerCount(), 0);
 }
+
+const conformanceWorkerId = "conformance-worker" as WorkerId;
+const conformanceArtifact = parseArtifactDigest(`sha256:${"0".repeat(64)}`);
+
+async function conformanceConnection(options?: {
+  readonly clock?: FakeClock;
+  readonly epochAllocator?: WorkerEpochAllocator;
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatTimeoutMs?: number;
+  readonly main?: MainEndpoint;
+}): Promise<DirectConnection> {
+  const clock = options?.clock ?? new FakeClock();
+  const main =
+    options?.main ??
+    createMainEndpoint({
+      clock,
+      credential: "shared-secret",
+      workerId: conformanceWorkerId,
+      epochAllocator: options?.epochAllocator ?? new MemoryWorkerEpochAllocator(),
+      ...(options?.heartbeatTimeoutMs === undefined
+        ? {}
+        : { heartbeatTimeoutMs: options.heartbeatTimeoutMs }),
+    });
+  const worker = createWorkerEndpoint({
+    clock,
+    credential: "shared-secret",
+    workerId: conformanceWorkerId,
+    registration: {
+      labels: {},
+      resources: {},
+      executors: ["process", "thread", "remote"],
+      preparedArtifacts: [conformanceArtifact],
+    },
+    ...(options?.heartbeatIntervalMs === undefined
+      ? {}
+      : { heartbeatIntervalMs: options.heartbeatIntervalMs }),
+  });
+  const [mainSocket, workerSocket] = directSocketPair();
+  const mainSession = main.attach(mainSocket);
+  const workerSession = worker.attach(workerSocket);
+  await Promise.all([mainSession.ready, workerSession.ready]);
+  mainSocket.synchronousDelivery = true;
+  workerSocket.synchronousDelivery = true;
+  mainSocket.clearSent();
+  workerSocket.clearSent();
+  return {
+    clock,
+    main,
+    worker,
+    mainSession,
+    workerSession,
+    mainSocket,
+    workerSocket,
+  };
+}
+
+workerConformance(
+  (): WorkerConformanceFixture => ({
+    async registration() {
+      const connection = await conformanceConnection();
+      try {
+        const registration = connection.main.registration(conformanceWorkerId);
+        assert.ok(registration);
+        return {
+          workerId: registration.workerId,
+          executors: registration.executors,
+          preparedArtifacts: registration.preparedArtifacts,
+        };
+      } finally {
+        await cleanup(connection);
+      }
+    },
+    async heartbeat() {
+      const connection = await conformanceConnection({
+        heartbeatIntervalMs: 1_000,
+        heartbeatTimeoutMs: 100,
+      });
+      try {
+        const beforeExpiry = connection.main.current(conformanceWorkerId)?.available === true;
+        connection.clock.advanceBy(101);
+        await flush();
+        return {
+          beforeExpiry,
+          afterExpiry: connection.main.current(conformanceWorkerId)?.available === true,
+        };
+      } finally {
+        await cleanup(connection);
+      }
+    },
+    async reconnect() {
+      const clock = new FakeClock();
+      const main = createMainEndpoint({
+        clock,
+        credential: "shared-secret",
+        workerId: conformanceWorkerId,
+        epochAllocator: new MemoryWorkerEpochAllocator(),
+      });
+      const first = await conformanceConnection({ clock, main });
+      const previousEpoch = first.mainSession.epoch;
+      await first.worker.close();
+      await flush();
+      const second = await conformanceConnection({ clock, main });
+      try {
+        const currentEpoch = second.mainSession.epoch;
+        const authoritativeEpoch = main.current(conformanceWorkerId)?.epoch;
+        assert.ok(authoritativeEpoch);
+        return { previousEpoch, currentEpoch, authoritativeEpoch };
+      } finally {
+        await Promise.all([main.close(), second.worker.close()]);
+      }
+    },
+    async deduplicate(payload) {
+      const connection = await conformanceConnection();
+      try {
+        const received: JsonValue[] = [];
+        const unsubscribe = connection.workerSession.onMessage((message) => {
+          received.push(message.payload);
+        });
+        await connection.mainSession.send("session.reconcile", payload);
+        const frame = connection.mainSocket.sent.findLast(
+          (candidate): candidate is string => typeof candidate === "string",
+        );
+        assert.ok(frame);
+        connection.workerSocket.inject(frame);
+        await flush();
+        unsubscribe();
+        return received;
+      } finally {
+        await cleanup(connection);
+      }
+    },
+    close() {},
+  }),
+);
 
 test("RemoteExecutor and WorkerRuntime survive timeout and reconnect over authenticated sessions", async () => {
   const workerId = "direct-worker" as WorkerId;
