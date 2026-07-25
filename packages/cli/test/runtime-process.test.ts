@@ -24,13 +24,24 @@ async function waitForPath(path: string, directory: string): Promise<void> {
     return;
   } catch {}
   const signal = AbortSignal.timeout(deadlineMs);
-  for await (const _event of watch(directory, { signal })) {
+  const events = watch(directory, { signal });
+  let nextEvent = events.next();
+  try {
     try {
       await access(path);
       return;
     } catch {}
+    while (!(await nextEvent).done) {
+      try {
+        await access(path);
+        return;
+      } catch {}
+      nextEvent = events.next();
+    }
+    throw new Error(`PATH_READY_TIMEOUT:${path}`);
+  } finally {
+    await events.return?.();
   }
-  throw new Error(`PATH_READY_TIMEOUT:${path}`);
 }
 
 async function waitForExit(child: ChildProcess): Promise<{
@@ -186,13 +197,16 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
   assert.equal(closeAttempted, true);
 });
 
-test("@spec:runtime-operations/local-runtime-operations/control-stop-response-precedes-server-close", async () => {
+test("@spec:runtime-operations/local-runtime-operations/control-stop-response-precedes-server-close", {
+  timeout: deadlineMs,
+}, async () => {
   const directory = await temporaryRuntimeDirectory("tego-control-stop-response-");
   const endpoint = join(directory, "control.sock");
   const stopStarted = Promise.withResolvers<void>();
   const stopCompletion = Promise.withResolvers<void>();
   let stopCalls = 0;
   let stopPromise: Promise<void> | undefined;
+  const controller = new AbortController();
   const runtime: Runtime = {
     start: async () => undefined,
     status: async () => ({ lifecycle: "running" }) as RuntimeStatus,
@@ -216,6 +230,7 @@ test("@spec:runtime-operations/local-runtime-operations/control-stop-response-pr
     endpoint,
     runtime,
     onBackgroundError: failOnBackgroundError,
+    signal: controller.signal,
   });
   try {
     await waitForPath(endpoint, directory);
@@ -235,8 +250,9 @@ test("@spec:runtime-operations/local-runtime-operations/control-stop-response-pr
     assert.equal(stopCalls, 1);
     await running;
   } finally {
+    controller.abort();
     stopCompletion.resolve();
-    await running.catch(() => undefined);
+    assert.equal(await settlesBeforeDeadline(running, 1_000), true);
     await rm(directory, { force: true, recursive: true });
   }
 });
@@ -443,7 +459,9 @@ test("@spec:runtime-operations/local-runtime-operations/pending-control-factory-
   await stopCalled.promise;
 });
 
-test("@spec:runtime-operations/local-runtime-operations/late-factory-close-failure-reaches-background-sink", async () => {
+test("@spec:runtime-operations/local-runtime-operations/late-factory-close-failure-reaches-background-sink", {
+  timeout: deadlineMs,
+}, async () => {
   const factory = Promise.withResolvers<ControlServer>();
   const factoryCalled = Promise.withResolvers<void>();
   const backgroundError = Promise.withResolvers<unknown>();
