@@ -13,8 +13,10 @@ import {
   parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
   parseDeployPluginRequest,
   parseFencingEpoch,
+  parseGeneration,
   parseOperationId,
   parsePluginDeployment,
   parsePluginId,
@@ -23,6 +25,7 @@ import {
   parseRunTaskRequest,
   parseTaskId,
   parseTaskRecord,
+  parseWorkerId,
   type RuntimeAuthority,
   runtimeDiagnostic,
   type ScannedState,
@@ -33,10 +36,16 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type StateWriteOptions,
+  type TaskExecutionTarget,
   type Versioned,
 } from "@tegojs/contracts";
-import { FakeClock } from "@tegojs/testkit";
-import { RuntimeOperationController, type TaskIdentity, TaskService } from "../src/index.js";
+import { eventually, FakeClock } from "@tegojs/testkit";
+import {
+  RuntimeOperationController,
+  type TaskExecutorSelection,
+  type TaskIdentity,
+  TaskService,
+} from "../src/index.js";
 
 const now = new Date("2026-07-25T00:00:00.000Z");
 const clock: Clock = {
@@ -52,6 +61,10 @@ const authority: RuntimeAuthority = {
   resource: "runtime:runtime-01",
   epoch: parseFencingEpoch("7"),
 };
+
+function advanceTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 function clone<T extends JsonValue>(value: T): T {
   return structuredClone(value);
@@ -301,9 +314,9 @@ const request = {
   orphanPolicy: "cancel" as const,
 };
 
-const generationOneTarget = {
-  instanceId: "application-01.echo.echo.1",
-  deploymentGeneration: "1",
+const generationOneTarget: TaskExecutionTarget = {
+  instanceId: parseComponentInstanceId("application-01.echo.echo.1"),
+  deploymentGeneration: parseGeneration("1"),
   artifactDigest: parseArtifactDigest(
     "sha256:1111111111111111111111111111111111111111111111111111111111111111",
   ),
@@ -311,11 +324,11 @@ const generationOneTarget = {
     id: "executor-01",
     type: "process",
   },
-} as const;
+};
 
-const generationTwoTarget = {
-  instanceId: "application-01.echo.echo.2",
-  deploymentGeneration: "2",
+const generationTwoTarget: TaskExecutionTarget = {
+  instanceId: parseComponentInstanceId("application-01.echo.echo.2"),
+  deploymentGeneration: parseGeneration("2"),
   artifactDigest: parseArtifactDigest(
     "sha256:2222222222222222222222222222222222222222222222222222222222222222",
   ),
@@ -323,14 +336,38 @@ const generationTwoTarget = {
     id: "executor-01",
     type: "process",
   },
-} as const;
+};
+
+function executorSelection(
+  executor: Executor,
+  target: TaskExecutionTarget = generationOneTarget,
+): TaskExecutorSelection {
+  const targetExecutor: TaskExecutionTarget["executor"] =
+    executor.type === "remote"
+      ? {
+          id: executor.id,
+          type: "remote",
+          workerId: parseWorkerId("worker-01"),
+        }
+      : {
+          id: executor.id,
+          type: executor.type,
+        };
+  return {
+    target: {
+      ...target,
+      executor: targetExecutor,
+    },
+    executor,
+  };
+}
 
 function serviceFixture(executor = new ControlledExecutor()) {
   const state = new TransactionalState();
   const service = new TaskService({
     state,
     clock,
-    selectExecutor: async () => executor,
+    selectExecutor: async () => executorSelection(executor),
     createIdentity: () => identity,
   });
   return { executor, service, state };
@@ -382,9 +419,9 @@ test("@spec:runtime-operations/task-operations/idempotent-run-replay", async () 
   );
   assert.deepEqual(
     typeof durable?.value === "object" && durable.value !== null && !Array.isArray(durable.value)
-      ? (durable.value as { readonly executor?: JsonValue }).executor
+      ? (durable.value as { readonly target?: JsonValue }).target
       : undefined,
-    { id: executor.id, type: executor.type },
+    generationOneTarget,
   );
   const duplicate = service.run(structuredClone(replayable));
   gate.resolve();
@@ -415,7 +452,7 @@ test("@spec:runtime-operations/task-operations/unkeyed-runs-are-distinct", async
     selectExecutor: async () => {
       const executor = new ControlledExecutor();
       executors.push(executor);
-      return executor;
+      return executorSelection(executor);
     },
     createIdentity: () => {
       sequence += 1;
@@ -464,7 +501,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/tasks-recover-before-disp
     state: "accepted",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
-    executor: { id: executor.id, type: executor.type },
+    target: executorSelection(executor).target,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
@@ -486,7 +523,7 @@ test("recovery commits a locally observed terminal attempt without redispatch", 
     state: "running",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
-    executor: { id: executor.id, type: executor.type },
+    target: executorSelection(executor).target,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
@@ -518,7 +555,7 @@ test("missing local running attempt recovers as durable indeterminate without re
     state: "running",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
-    executor: { id: executor.id, type: executor.type },
+    target: executorSelection(executor).target,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
@@ -558,7 +595,7 @@ test("terminal persistence uncertainty retains recoverable evidence for restart 
   const restarted = new TaskService({
     state,
     clock,
-    selectExecutor: async () => executor,
+    selectExecutor: async () => executorSelection(executor),
     createIdentity: () => identity,
   });
   await restarted.recover();
@@ -577,7 +614,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/accepted-remote-unknown-i
     state: "accepted",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
-    executor: { id: executor.id, type: executor.type },
+    target: executorSelection(executor).target,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
@@ -612,7 +649,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/lost-submit-ack-observes-
   const restarted = new TaskService({
     state,
     clock,
-    selectExecutor: async () => executor,
+    selectExecutor: async () => executorSelection(executor),
     createIdentity: () => identity,
   });
   await restarted.recover();
@@ -661,9 +698,9 @@ test("cancel is idempotent and close releases all waiters", async () => {
   await service.run(request);
   const first = service.cancel(identity.taskId);
   const second = service.cancel(identity.taskId);
-  while (executor.cancelled.length === 0) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+  await eventually(() => assert.equal(executor.cancelled.length, 1), {
+    advance: advanceTurn,
+  });
   executor.result.resolve({
     taskId: identity.taskId,
     attemptId: identity.attemptId,
@@ -1040,7 +1077,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-observation-failur
     state: "running",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
-    executor: { id: executor.id, type: executor.type },
+    target: executorSelection(executor).target,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
@@ -1059,7 +1096,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/observation-is-clock-boun
   const service = new TaskService({
     state,
     clock: runtimeClock,
-    selectExecutor: async () => executor,
+    selectExecutor: async () => executorSelection(executor),
     createIdentity: () => identity,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, {
@@ -1070,7 +1107,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/observation-is-clock-boun
       state: "running",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
-      executor: { id: executor.id, type: executor.type },
+      target: executorSelection(executor).target,
       authority,
     }),
     revision: 1,
@@ -1127,7 +1164,7 @@ test("@spec:runtime-operations/task-operations/complete-operation-payloads-have-
         state: "terminal",
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
-        executor: { id: "executor-01", type: "process" },
+        target: generationOneTarget,
         result: {
           taskId: identity.taskId,
           attemptId: identity.attemptId,
@@ -1150,7 +1187,7 @@ test("@spec:runtime-operations/task-operations/task-record-cross-field-invariant
     state: "terminal",
     createdAt: "2026-07-25T00:00:01.000Z",
     updatedAt: "2026-07-25T00:00:00.000Z",
-    executor: { id: "executor-01", type: "process" },
+    target: generationOneTarget,
     result: {
       taskId: parseTaskId("wrong-task"),
       attemptId: identity.attemptId,
@@ -1164,6 +1201,52 @@ test("@spec:runtime-operations/task-operations/task-record-cross-field-invariant
   assert.throws(
     () => parseRunTaskRequest({ ...request, deadline: "2026-02-30T00:00:00.000Z" }),
     /canonical UTC timestamp/u,
+  );
+});
+
+test("@spec:runtime-operations/task-operations/task-result-cannot-cross-its-target-worker", () => {
+  const terminal = {
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "terminal",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    result: {
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      status: "succeeded",
+      startedAt: now.toISOString(),
+      completedAt: now.toISOString(),
+    },
+  } as const;
+  const remoteTarget = executorSelection(new ControlledExecutor("remote", "remote-01")).target;
+
+  assert.throws(() =>
+    parseTaskRecord({
+      ...terminal,
+      target: remoteTarget,
+      result: {
+        ...terminal.result,
+        executor: {
+          kind: "remote",
+          workerId: parseWorkerId("worker-02"),
+        },
+      },
+    }),
+  );
+  assert.throws(() =>
+    parseTaskRecord({
+      ...terminal,
+      target: generationOneTarget,
+      result: {
+        ...terminal.result,
+        executor: {
+          kind: "process",
+          workerId: parseWorkerId("worker-01"),
+        },
+      },
+    }),
   );
 });
 
@@ -1192,7 +1275,7 @@ test("@spec:runtime-operations/task-operations/admission-does-not-follow-a-gener
     selectExecutor: async () => {
       const selection = { target: activeTarget, executor };
       activeTarget = generationTwoTarget;
-      return selection as unknown as Executor;
+      return selection;
     },
     createIdentity: () => identity,
   });
@@ -1229,7 +1312,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fail
     clock,
     selectExecutor: async (_request, binding) => {
       resolvedBindings.push(binding);
-      return { target: generationTwoTarget, executor } as unknown as Executor;
+      return { target: generationTwoTarget, executor };
     },
     createIdentity: () => identity,
   });
@@ -1238,6 +1321,41 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fail
   await restarted.setAuthority(authority);
 
   assert.deepEqual(resolvedBindings, [generationOneTarget]);
+  assert.equal(executor.submitted.length, 0);
+  assert.equal((await restarted.status(identity.taskId))?.result?.status, "indeterminate");
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/legacy-binding-without-target-is-indeterminate", async () => {
+  const executor = new ControlledExecutor();
+  const state = new TransactionalState();
+  let selections = 0;
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "accepted",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      executor: { id: executor.id, type: executor.type },
+      authority,
+    }),
+    revision: 1,
+  });
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      selections += 1;
+      return executorSelection(executor);
+    },
+    createIdentity: () => identity,
+  });
+  await restarted.recover();
+
+  await restarted.setAuthority(authority);
+
+  assert.equal(selections, 0);
   assert.equal(executor.submitted.length, 0);
   assert.equal((await restarted.status(identity.taskId))?.result?.status, "indeterminate");
 });
@@ -1252,7 +1370,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/replays-durable-cancellat
       state: "running",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
-      executor: { id: executor.id, type: executor.type },
+      target: executorSelection(executor).target,
       authority,
       cancellation: { requestedAt: now.toISOString(), authority },
     }),
@@ -1281,7 +1399,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/local-observation-timeout
   const service = new TaskService({
     state,
     clock: runtimeClock,
-    selectExecutor: async () => executor,
+    selectExecutor: async () => executorSelection(executor),
     createIdentity: () => identity,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, {
@@ -1292,7 +1410,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/local-observation-timeout
       state: "accepted",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
-      executor: { id: executor.id, type: executor.type },
+      target: executorSelection(executor).target,
       authority,
     }),
     revision: 1,
@@ -1314,7 +1432,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/stale-completion-keeps-ne
   const service = new TaskService({
     state,
     clock,
-    selectExecutor: async () => selected,
+    selectExecutor: async () => executorSelection(selected),
     createIdentity: () => identity,
   });
   await service.setAuthority(authority);
@@ -1324,7 +1442,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/stale-completion-keeps-ne
   oldExecutor.result.resolve({
     taskId: identity.taskId,
     attemptId: identity.attemptId,
-    executor: { kind: "remote" },
+    executor: { kind: "remote", workerId: parseWorkerId("worker-01") },
     status: "succeeded",
     startedAt: now.toISOString(),
     completedAt: now.toISOString(),
@@ -1345,7 +1463,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
     result: {
       taskId: identity.taskId,
       attemptId: identity.attemptId,
-      executor: { kind: "remote" },
+      executor: { kind: "remote", workerId: parseWorkerId("worker-01") },
       status: "succeeded",
       startedAt: now.toISOString(),
       completedAt: now.toISOString(),
@@ -1364,7 +1482,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
       state: "running",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
-      executor: { id: oldExecutor.id, type: oldExecutor.type },
+      target: executorSelection(oldExecutor).target,
       authority,
     }),
     revision: 1,
@@ -1374,7 +1492,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
     clock,
     selectExecutor: async () => {
       selections += 1;
-      return selected;
+      return executorSelection(selected);
     },
     createIdentity: () => identity,
   });
@@ -1384,9 +1502,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
   selected = newExecutor;
   const newerAuthority = { ...authority, epoch: parseFencingEpoch("8") };
   const handover = service.setAuthority(newerAuthority);
-  while (selections < 2) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+  await eventually(() => assert.equal(selections, 2), { advance: advanceTurn });
   const selectionsAfterHandover = selections;
   gate.resolve();
   await Promise.all([oldActivation, handover]);
@@ -1399,7 +1515,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
       state: "running",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
-      executor: { id: newExecutor.id, type: newExecutor.type },
+      target: executorSelection(newExecutor).target,
       authority: newerAuthority,
     }),
     revision: 100,
@@ -1418,7 +1534,7 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
     result: {
       taskId: identity.taskId,
       attemptId: identity.attemptId,
-      executor: { kind: "remote" },
+      executor: { kind: "remote", workerId: parseWorkerId("worker-01") },
       status: "cancelled",
       startedAt: now.toISOString(),
       completedAt: now.toISOString(),
@@ -1434,7 +1550,7 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
     clock,
     selectExecutor: async () => {
       selections += 1;
-      return selected;
+      return executorSelection(selected);
     },
     createIdentity: () => identity,
   });
@@ -1444,9 +1560,9 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
   await state.terminalPutEntered.promise;
   selected = newExecutor;
   const handover = service.setAuthority({ ...authority, epoch: parseFencingEpoch("8") });
-  while (newExecutor.cancelled.length === 0) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+  await eventually(() => assert.equal(newExecutor.cancelled.length, 1), {
+    advance: advanceTurn,
+  });
   const selectionsAfterHandover = selections;
   gate.resolve();
   await handover;
@@ -1460,7 +1576,7 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
       state: "running",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
-      executor: { id: newExecutor.id, type: newExecutor.type },
+      target: executorSelection(newExecutor).target,
       authority: { ...authority, epoch: parseFencingEpoch("8") },
       cancellation: {
         requestedAt: now.toISOString(),
@@ -1486,7 +1602,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/authority-loss-during-res
     state: "running",
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
-    executor: { id: executor.id, type: executor.type },
+    target: executorSelection(executor).target,
     authority,
     cancellation: { requestedAt: now.toISOString(), authority },
   });
@@ -1496,7 +1612,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/authority-loss-during-res
     clock,
     selectExecutor: async () => {
       await gate.promise;
-      return executor;
+      return executorSelection(executor);
     },
     createIdentity: () => identity,
   });
@@ -1538,7 +1654,7 @@ test("@spec:runtime-operations/task-operations/keyed-rejected-replay-is-terminal
     clock,
     selectExecutor: async () => {
       selections += 1;
-      return executor;
+      return executorSelection(executor);
     },
     createIdentity: () => identity,
   });
@@ -1572,7 +1688,7 @@ test("@spec:runtime-operations/task-operations/unique-rejections-release-executo
     clock,
     selectExecutor: async () => {
       selections += 1;
-      return executor;
+      return executorSelection(executor);
     },
     createIdentity: () => {
       identities += 1;
@@ -1609,7 +1725,7 @@ test("@spec:runtime-operations/task-operations/unique-rejections-release-executo
         state: "running",
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
-        executor: record.executor,
+        target: record.target,
         authority,
       }),
       revision: 100 + index,

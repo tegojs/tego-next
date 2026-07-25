@@ -10,6 +10,8 @@ import {
   parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginId,
   parsePluginManifest,
   parseTaskId,
@@ -536,6 +538,12 @@ function request(input: JsonValue, suffix: string): ExecutionRequest {
   return {
     taskId: parseTaskId(`task-${suffix}`),
     attemptId: parseAttemptId(`attempt-${suffix}`),
+    target: {
+      instanceId: parseComponentInstanceId("app.org.example.process.echo.g1"),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: digest,
+      executor: { id: "process-local", type: "process" },
+    },
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.process"),
     componentId: parseComponentId("echo"),

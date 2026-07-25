@@ -5,6 +5,7 @@ import {
   DiagnosticError,
   diagnosticCode,
   type ExecutionHandle,
+  type ExecutionExecutor,
   type ExecutionResult,
   type Executor,
   indeterminateTaskDiagnostic,
@@ -14,6 +15,7 @@ import {
   parseRunTaskRequest,
   parseTaskId,
   parseTaskRecord,
+  parseWorkerId,
   type Revision,
   type RunTaskRequest,
   type RuntimeAuthority,
@@ -23,6 +25,7 @@ import {
   type StateKey,
   type StateStore,
   type TaskId,
+  type TaskExecutionTarget,
   type TaskRecord,
 } from "@tegojs/contracts";
 
@@ -34,13 +37,18 @@ export interface TaskIdentity {
   readonly attemptId: AttemptId;
 }
 
+export interface TaskExecutorSelection {
+  readonly target: TaskExecutionTarget;
+  readonly executor: Executor;
+}
+
 export interface TaskServiceOptions {
   readonly state: StateStore;
   readonly clock: Clock;
   readonly selectExecutor: (
     request: RunTaskRequest,
-    binding?: TaskRecord["executor"],
-  ) => Executor | Promise<Executor>;
+    target?: TaskExecutionTarget,
+  ) => TaskExecutorSelection | Promise<TaskExecutorSelection>;
   readonly createIdentity?: (request: RunTaskRequest) => TaskIdentity;
 }
 
@@ -103,6 +111,25 @@ function defaultIdentity(): TaskIdentity {
   };
 }
 
+function sameTarget(left: TaskExecutionTarget, right: TaskExecutionTarget): boolean {
+  return (
+    left.instanceId === right.instanceId &&
+    left.deploymentGeneration === right.deploymentGeneration &&
+    left.artifactDigest === right.artifactDigest &&
+    left.executor.id === right.executor.id &&
+    left.executor.type === right.executor.type &&
+    left.executor.workerId === right.executor.workerId
+  );
+}
+
+function resultExecutor(record: TaskRecord): ExecutionExecutor {
+  const target = record.target?.executor;
+  if (target?.type === "remote") {
+    return { kind: "remote", workerId: parseWorkerId(target.workerId) };
+  }
+  return { kind: target?.type ?? record.executor?.type ?? "process" };
+}
+
 export class TaskService implements RuntimeTaskLifecycle {
   readonly #state: StateStore;
   readonly #clock: Clock;
@@ -151,7 +178,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     await Promise.all(
       pending.map((record) =>
         this.#recoverRecord(record, authority).catch(async (error) => {
-          if (record.executor?.type !== "remote") {
+          if (record.target?.executor.type !== "remote") {
             await this.#settleUncertain(record, error, authority, true);
           }
         }),
@@ -173,11 +200,12 @@ export class TaskService implements RuntimeTaskLifecycle {
       return structuredClone((await this.status(replay.taskId)) ?? replay);
     }
     const selected = await this.#selectExecutor(request);
-    this.#assertAuthority(authority);
     const proposed = this.#createIdentity(request);
+    this.#validateSelection(selected, proposed.taskId);
+    this.#assertAuthority(authority);
     const admitted = await this.#admit(request, fingerprint, proposed, selected, authority);
-    if (admitted.executor?.id === selected.id && admitted.executor.type === selected.type) {
-      this.#executors.set(admitted.taskId, { executor: selected, authority });
+    if (admitted.target !== undefined && sameTarget(admitted.target, selected.target)) {
+      this.#executors.set(admitted.taskId, { executor: selected.executor, authority });
     }
     const existingDispatch = this.#dispatches.get(admitted.taskId);
     if (existingDispatch !== undefined) return structuredClone(await existingDispatch);
@@ -314,7 +342,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     request: RunTaskRequest,
     fingerprint: string,
     proposed: TaskIdentity,
-    executor: Executor,
+    selection: TaskExecutorSelection,
     authority: RuntimeAuthority,
   ): Promise<TaskRecord> {
     this.#assertAuthority(authority);
@@ -324,7 +352,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       attemptId: proposed.attemptId,
       request,
       state: "accepted",
-      executor: { id: executor.id, type: executor.type },
+      target: selection.target,
       createdAt,
       updatedAt: createdAt,
       authority,
@@ -402,6 +430,10 @@ export class TaskService implements RuntimeTaskLifecycle {
   async #dispatch(record: TaskRecord, authority: RuntimeAuthority): Promise<TaskRecord> {
     this.#assertAuthority(authority);
     const executor = await this.#resolveExecutor(record, authority);
+    const target = record.target;
+    if (target === undefined) {
+      throw this.#invalidResult(record.taskId, "Task execution target is missing");
+    }
     this.#assertAuthority(authority);
     const registration = { executor, authority };
     this.#executors.set(record.taskId, registration);
@@ -411,6 +443,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       applicationId: record.request.applicationId,
       pluginId: record.request.pluginId,
       componentId: record.request.componentId,
+      target,
       input: record.request.input,
       deadline: record.request.deadline,
       orphanPolicy: record.request.orphanPolicy,
@@ -460,7 +493,6 @@ export class TaskService implements RuntimeTaskLifecycle {
       running = await this.#transition(record.taskId, authority, (current) => ({
         ...current,
         state: "running",
-        executor: { id: executor.id, type: executor.type },
         authority,
         updatedAt: this.#clock.now().toISOString(),
       }));
@@ -526,10 +558,10 @@ export class TaskService implements RuntimeTaskLifecycle {
     record: TaskRecord,
     authority: RuntimeAuthority = this.#requireAuthority(),
   ): Promise<void> {
-    if (record.executor === undefined) {
+    if (record.target === undefined) {
       await this.#settleUncertain(
         record,
-        new Error("Task executor identity is missing"),
+        new Error("Task execution target is missing"),
         authority,
         true,
       );
@@ -539,7 +571,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     try {
       executor = await this.#resolveExecutor(record, authority);
     } catch (error) {
-      if (record.executor.type === "remote") {
+      if (record.target.executor.type === "remote") {
         await this.#markUnknown(record, authority, "EXECUTOR_OBSERVATION_UNKNOWN");
         return;
       }
@@ -563,7 +595,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       }
       observed = outcome.value;
     } catch (error) {
-      if (record.executor.type === "remote") return;
+      if (record.target.executor.type === "remote") return;
       await this.#settleUncertain(record, error, authority, true);
       return;
     }
@@ -577,7 +609,7 @@ export class TaskService implements RuntimeTaskLifecycle {
         authority,
         updatedAt: this.#clock.now().toISOString(),
       }));
-    } else if (observed === undefined && record.executor.type !== "remote") {
+    } else if (observed === undefined && record.target.executor.type !== "remote") {
       if (record.state === "accepted") {
         await this.#ensureDispatch(record, authority);
       } else {
@@ -594,28 +626,38 @@ export class TaskService implements RuntimeTaskLifecycle {
   }
 
   async #resolveExecutor(record: TaskRecord, authority: RuntimeAuthority): Promise<Executor> {
-    const binding = record.executor;
-    if (binding === undefined) {
-      throw this.#invalidResult(record.taskId, "Task executor binding is missing");
+    const target = record.target;
+    if (target === undefined) {
+      throw this.#invalidResult(record.taskId, "Task execution target is missing");
     }
     const registration = this.#executors.get(record.taskId);
     const retained = registration?.executor;
     if (
       registration?.authority.resource === authority.resource &&
       registration.authority.epoch === authority.epoch &&
-      retained?.id === binding.id &&
-      retained.type === binding.type
+      retained?.id === target.executor.id &&
+      retained.type === target.executor.type
     ) {
       return retained;
     }
-    const resolved = await this.#selectExecutor(record.request, binding);
-    if (resolved.id !== binding.id || resolved.type !== binding.type) {
+    const resolved = await this.#selectExecutor(record.request, target);
+    this.#validateSelection(resolved, record.taskId);
+    if (!sameTarget(resolved.target, target)) {
       throw this.#invalidResult(
         record.taskId,
-        "Resolved executor does not match the durable task binding",
+        "Resolved execution target does not match the durable task target",
       );
     }
-    return resolved;
+    return resolved.executor;
+  }
+
+  #validateSelection(selection: TaskExecutorSelection, taskId: TaskId): void {
+    if (
+      selection.executor.id !== selection.target.executor.id ||
+      selection.executor.type !== selection.target.executor.type
+    ) {
+      throw this.#invalidResult(taskId, "Selected executor does not match the execution target");
+    }
   }
 
   async #findReplay(request: RunTaskRequest, fingerprint: string): Promise<TaskRecord | undefined> {
@@ -686,7 +728,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       result: {
         taskId: record.taskId,
         attemptId: record.attemptId,
-        executor: { kind: record.executor?.type ?? "process" },
+        executor: resultExecutor(record),
         status: "indeterminate",
         diagnostic: indeterminateTaskDiagnostic(
           record.taskId,
@@ -788,7 +830,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       result: {
         taskId: record.taskId,
         attemptId: record.attemptId,
-        executor: { kind: record.executor?.type ?? "process" },
+        executor: resultExecutor(record),
         status: "rejected",
         diagnostic: runtimeDiagnostic({
           code,

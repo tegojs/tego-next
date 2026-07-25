@@ -5,11 +5,9 @@ import {
   parseAttemptId,
   parseComponentId,
   parseFencingEpoch,
-  parseGeneration,
   parseOperationId,
   parsePluginId,
   parseTaskId,
-  parseWorkerId,
   type ApplicationId,
   type ArtifactDigest,
   type AttemptId,
@@ -25,7 +23,12 @@ import {
   parsePluginDeployment,
   parseRuntimeDiagnostic,
 } from "./schema.js";
-import type { ExecutionResult, OrphanPolicy, TaskExecutionTarget } from "./execution.js";
+import {
+  type ExecutionResult,
+  type OrphanPolicy,
+  parseTaskExecutionTarget,
+  type TaskExecutionTarget,
+} from "./execution.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { Permission } from "./permission.js";
 import type { PluginDeployment, PluginDeploymentIdentity, PluginInstallation } from "./plugin.js";
@@ -152,6 +155,12 @@ function cloneStrictJson<T extends JsonValue>(value: T): T {
     const parsed = parseExecutionRequest({
       taskId: "validation-task",
       attemptId: "validation-attempt",
+      target: {
+        instanceId: "validation-instance",
+        deploymentGeneration: "0",
+        artifactDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        executor: { id: "validation-executor", type: "thread" },
+      },
       applicationId: "validation-application",
       pluginId: "validation-plugin",
       componentId: "validation-component",
@@ -330,44 +339,7 @@ export function parseTaskRecord(input: unknown): TaskRecord {
             type: entry.type as TaskExecutorReference["type"],
           };
         })();
-  const target =
-    value.target === undefined
-      ? undefined
-      : (() => {
-          const entry = objectValue(value.target);
-          exactKeys(entry, [
-            "instanceId",
-            "deploymentGeneration",
-            "artifactDigest",
-            "executor",
-          ]);
-          if (typeof entry.instanceId !== "string" || entry.instanceId.length === 0) {
-            throw operationError("Task execution target instance is invalid");
-          }
-          const targetExecutor = objectValue(entry.executor);
-          exactKeys(targetExecutor, ["id", "type"], ["workerId"]);
-          if (
-            typeof targetExecutor.id !== "string" ||
-            targetExecutor.id.length === 0 ||
-            (targetExecutor.type !== "process" &&
-              targetExecutor.type !== "remote" &&
-              targetExecutor.type !== "thread")
-          ) {
-            throw operationError("Task execution target executor is invalid");
-          }
-          return {
-            instanceId: entry.instanceId,
-            deploymentGeneration: parseGeneration(entry.deploymentGeneration),
-            artifactDigest: parseArtifactDigest(entry.artifactDigest),
-            executor: {
-              id: targetExecutor.id,
-              type: targetExecutor.type,
-              ...(targetExecutor.workerId === undefined
-                ? {}
-                : { workerId: parseWorkerId(targetExecutor.workerId) }),
-            },
-          } satisfies TaskExecutionTarget;
-        })();
+  const target = value.target === undefined ? undefined : parseTaskExecutionTarget(value.target);
   const authority =
     value.authority === undefined
       ? undefined
@@ -416,7 +388,13 @@ export function parseTaskRecord(input: unknown): TaskRecord {
     result !== undefined &&
     (result.taskId !== taskId ||
       result.attemptId !== attemptId ||
-      (executor !== undefined && result.executor.kind !== executor.type))
+      (target !== undefined && result.executor.kind !== target.executor.type) ||
+      (target === undefined && executor !== undefined && result.executor.kind !== executor.type) ||
+      (target?.executor.type === "remote" &&
+        result.executor.workerId !== target.executor.workerId) ||
+      (target !== undefined &&
+        target.executor.type !== "remote" &&
+        result.executor.workerId !== undefined))
   ) {
     throw operationError("Task result identity or executor does not match its record");
   }

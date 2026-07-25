@@ -12,7 +12,7 @@ import {
   type RemoteAttemptStore,
 } from "../src/index.js";
 import {
-  executionRequest,
+  executionRequest as createExecutionRequest,
   flush,
   memorySessionPair,
   TestDurableRemoteResultStore,
@@ -20,6 +20,14 @@ import {
 } from "./remote-test-support.js";
 
 const workerId = parseWorkerId("worker-reconnect");
+
+function executionRequest(
+  input: Parameters<typeof createExecutionRequest>[0],
+  suffix: Parameters<typeof createExecutionRequest>[1],
+  orphanPolicy: Parameters<typeof createExecutionRequest>[2] = "cancel",
+) {
+  return createExecutionRequest(input, suffix, orphanPolicy, workerId);
+}
 
 async function reconnect(
   remote: RemoteExecutor,

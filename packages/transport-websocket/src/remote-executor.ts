@@ -1,5 +1,7 @@
 import {
+  parseAttemptId,
   parseExecutionResult,
+  parseTaskId,
   type AttemptId,
   type AttemptStatus,
   type Clock,
@@ -1377,17 +1379,7 @@ function parseIdentities(value: JsonValue, limit: number): ReadonlySet<string> {
   const keys = new Set<string>();
   for (const item of value) {
     const record = asObject(item, "attempt identity");
-    const request = parseRemoteRequest({
-      taskId: record.taskId,
-      attemptId: record.attemptId,
-      applicationId: "remote-inventory",
-      pluginId: "remote.inventory",
-      componentId: "inventory",
-      input: null,
-      deadline: new Date(0).toISOString(),
-      orphanPolicy: "cancel",
-    });
-    keys.add(attemptKey(request.taskId, request.attemptId));
+    keys.add(attemptKey(parseTaskId(record.taskId), parseAttemptId(record.attemptId)));
   }
   return keys;
 }

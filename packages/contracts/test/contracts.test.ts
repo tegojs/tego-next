@@ -25,6 +25,7 @@ import {
   parseCapabilityIdentity,
   parseCapabilityName,
   parseComponentId,
+  parseComponentInstanceId,
   parseExecutionRequest,
   parseExecutionResult,
   parseGeneration,
@@ -46,6 +47,7 @@ import {
   parseSequence,
   parseSessionId,
   parseTaskId,
+  parseTaskExecutionTarget,
   parseWorkerEnvelope,
   type RuntimeConfiguration,
   type RuntimeDiagnostic,
@@ -95,6 +97,14 @@ const validManifest = {
 const validExecutionRequest = {
   taskId: parseTaskId("task-01"),
   attemptId: parseAttemptId("attempt-01"),
+  target: {
+    instanceId: parseComponentInstanceId("detector.org.example.echo.echo.1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: parseArtifactDigest(
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    ),
+    executor: { id: "executor-01", type: "process" },
+  },
   applicationId: parseApplicationId("detector"),
   pluginId: parsePluginId("org.example.echo"),
   componentId: parseComponentId("echo"),
@@ -365,6 +375,46 @@ test("execution request validation preserves JsonValue payloads", () => {
   assert.throws(
     () => parseExecutionRequest({ ...validExecutionRequest, input: undefined }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_INVALID",
+  );
+});
+
+test("task execution targets share one strict persisted and wire contract", () => {
+  assert.deepEqual(
+    parseTaskExecutionTarget(validExecutionRequest.target),
+    validExecutionRequest.target,
+  );
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        target: {
+          ...validExecutionRequest.target,
+          executor: {
+            ...validExecutionRequest.target.executor,
+            workerId: "worker-01",
+          },
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_EXECUTION_TARGET_INVALID",
+  );
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        target: {
+          ...validExecutionRequest.target,
+          executor: { id: "remote-01", type: "remote" },
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_EXECUTION_TARGET_INVALID",
+  );
+  assert.throws(
+    () =>
+      parseTaskExecutionTarget({
+        ...validExecutionRequest.target,
+        instanceId: "x".repeat(129),
+      }),
+    (error: unknown) => diagnosticCode(error) === "PROTOCOL_IDENTITY_INVALID",
   );
 });
 

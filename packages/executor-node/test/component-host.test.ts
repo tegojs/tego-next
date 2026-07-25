@@ -8,6 +8,8 @@ import {
   parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginId,
   parsePluginManifest,
   parseRuntimeId,
@@ -29,6 +31,12 @@ import {
 const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
 const otherDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
 const futureDeadline = "2099-01-01T00:00:00.000Z";
+const componentTarget = {
+  instanceId: parseComponentInstanceId("app-01.org.example.component.component.g1"),
+  deploymentGeneration: parseGeneration("1"),
+  artifactDigest: digest,
+  executor: { id: "component-host", type: "process" },
+} as const;
 
 interface ArtifactFixture {
   readonly directory: string;
@@ -260,6 +268,7 @@ async function attachmentLimitResult(
       execution: {
         taskId: parseTaskId("task-attachment-limit"),
         attemptId: parseAttemptId("attempt-attachment-limit"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -340,6 +349,7 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sd
       execution: {
         taskId: parseTaskId("isolated-task"),
         attemptId: parseAttemptId("isolated-attempt"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -928,6 +938,7 @@ test("failed stop cleanup is terminal and repeats its canonical result without r
       execution: {
         taskId: parseTaskId("task-after-terminal-stop"),
         attemptId: parseAttemptId("attempt-after-terminal-stop"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1047,6 +1058,7 @@ test("a plugin-created AsyncResource cannot self-await an active transition", as
       execution: {
         taskId: parseTaskId("task-create-async-resource"),
         attemptId: parseAttemptId("attempt-create-async-resource"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1100,6 +1112,7 @@ test("drain closes run intake synchronously before its hook settles", async (t) 
       execution: {
         taskId: parseTaskId("task-after-drain"),
         attemptId: parseAttemptId("attempt-after-drain"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1139,6 +1152,7 @@ test("non-cooperative runs respect hard capacity while cancel and drain remain a
         execution: {
           taskId: parseTaskId(`task-hard-capacity-${index}`),
           attemptId: parseAttemptId(`attempt-hard-capacity-${index}`),
+          target: componentTarget,
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
@@ -1249,6 +1263,7 @@ test("duplicate task attempts compare full execution fingerprints and completed 
   const execution = {
     taskId: parseTaskId("task-fingerprint"),
     attemptId: parseAttemptId("attempt-fingerprint"),
+    target: componentTarget,
     applicationId: parseApplicationId("app-01"),
     pluginId: parsePluginId("org.example.component"),
     componentId: parseComponentId("component"),
@@ -1344,6 +1359,7 @@ test("deadline acceptance and chunked timers use the same injected clock", async
         execution: {
           taskId: parseTaskId("task-clock"),
           attemptId: parseAttemptId("attempt-clock"),
+          target: componentTarget,
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
@@ -1459,6 +1475,7 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-invalid"),
         attemptId: parseAttemptId("attempt-invalid"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1479,6 +1496,7 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-response"),
         attemptId: parseAttemptId("attempt-response"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1535,6 +1553,7 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
     execution: {
       taskId: parseTaskId("task-cancel"),
       attemptId: parseAttemptId("attempt-cancel"),
+      target: componentTarget,
       applicationId: parseApplicationId("app-01"),
       pluginId: parsePluginId("org.example.component"),
       componentId: parseComponentId("component"),
@@ -1597,6 +1616,7 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
         execution: {
           taskId: parseTaskId("task-deadline"),
           attemptId: parseAttemptId("attempt-deadline"),
+          target: componentTarget,
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
@@ -1692,6 +1712,7 @@ test("secret access requires manifest request and deployment grant and never lea
       execution: {
         taskId: parseTaskId("task-secret"),
         attemptId: parseAttemptId("attempt-secret"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),

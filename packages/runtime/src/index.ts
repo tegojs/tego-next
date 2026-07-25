@@ -78,6 +78,7 @@ export {
 } from "./runtime-operations.js";
 export {
   TaskService,
+  type TaskExecutorSelection,
   type TaskIdentity,
   type TaskServiceOptions,
 } from "./tasks/task-service.js";

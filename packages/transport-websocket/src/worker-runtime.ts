@@ -1,5 +1,7 @@
 import {
+  parseAttemptId,
   parseExecutionResult,
+  parseTaskId,
   type Clock,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -1324,15 +1326,8 @@ function identityFrom(payload: Record<string, JsonValue>): {
   readonly taskId: ExecutionRequest["taskId"];
   readonly attemptId: ExecutionRequest["attemptId"];
 } {
-  const request = parseRemoteRequest({
-    taskId: payload.taskId,
-    attemptId: payload.attemptId,
-    applicationId: "remote-identity",
-    pluginId: "remote.identity",
-    componentId: "identity",
-    input: null,
-    deadline: new Date(0).toISOString(),
-    orphanPolicy: "cancel",
-  });
-  return identity(request);
+  return {
+    taskId: parseTaskId(payload.taskId),
+    attemptId: parseAttemptId(payload.attemptId),
+  };
 }

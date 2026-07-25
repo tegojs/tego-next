@@ -10,6 +10,8 @@ import {
   parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginId,
   parsePluginManifest,
   parseTaskId,
@@ -353,6 +355,12 @@ function request(input: JsonValue, suffix: string): ExecutionRequest {
   return {
     taskId: parseTaskId(`thread-task-${suffix}`),
     attemptId: parseAttemptId(`thread-attempt-${suffix}`),
+    target: {
+      instanceId: parseComponentInstanceId("app.org.example.thread.echo.g1"),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: digest,
+      executor: { id: "thread-local", type: "thread" },
+    },
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.thread"),
     componentId: parseComponentId("echo"),

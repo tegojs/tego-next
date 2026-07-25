@@ -7,6 +7,7 @@ export type ApplicationId = Brand<string, "ApplicationId">;
 export type NodeId = Brand<string, "NodeId">;
 export type PluginId = Brand<string, "PluginId">;
 export type ComponentId = Brand<string, "ComponentId">;
+export type ComponentInstanceId = Brand<string, "ComponentInstanceId">;
 export type OperationId = Brand<string, "OperationId">;
 export type TaskId = Brand<string, "TaskId">;
 export type AttemptId = Brand<string, "AttemptId">;
@@ -70,6 +71,10 @@ export function parsePluginId(value: unknown): PluginId {
 
 export function parseComponentId(value: unknown): ComponentId {
   return parseIdentity(value, "ComponentId");
+}
+
+export function parseComponentInstanceId(value: unknown): ComponentInstanceId {
+  return parseIdentity(value, "ComponentInstanceId");
 }
 
 export function parseOperationId(value: unknown): OperationId {

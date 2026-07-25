@@ -8,6 +8,8 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 import {
   parseArtifactDigest,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginManifest,
   parseWorkerId,
   type ExecutionRequest,
@@ -263,6 +265,18 @@ function assignment(pluginId: string): ExecutionRequest {
   return {
     taskId: "task-artifact-selection" as ExecutionRequest["taskId"],
     attemptId: "attempt-artifact-selection" as ExecutionRequest["attemptId"],
+    target: {
+      instanceId: parseComponentInstanceId("application-artifact-selection.plugin.echo.g1"),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: parseArtifactDigest(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+      executor: {
+        id: "remote-01",
+        type: "remote",
+        workerId: parseWorkerId("worker-01"),
+      },
+    },
     applicationId: "application-artifact-selection" as ExecutionRequest["applicationId"],
     pluginId: pluginId as ExecutionRequest["pluginId"],
     componentId: "echo" as ExecutionRequest["componentId"],
