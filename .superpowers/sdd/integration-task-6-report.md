@@ -4,10 +4,11 @@
 
 `DONE_WITH_CONCERNS`
 
-Task 6 is implemented and locally verified. The only validation concern is that
-the configured PostgreSQL integration service at `127.0.0.1:55432` was not
-available in this environment, so PostgreSQL-dependent integration tests could
-not run successfully. The non-PostgreSQL integration suite passed.
+Task 6 and all nine review hardening items are implemented and locally
+verified. PostgreSQL integration now passes against the review-provided local
+database. The only remaining validation concern is platform coverage: the
+Windows-runnable named-pipe access/cleanup contract is included, but this macOS
+host cannot execute that conditional test.
 
 ## Commit Range
 
@@ -160,3 +161,143 @@ plan.
 - Temporary runtime directories and generated example build output were
   removed.
 - No debug logging or temporary source files remain.
+
+## Review Hardening Addendum
+
+This addendum supersedes the original PostgreSQL concern and records the
+REQUEST CHANGES remediation based on review commit `26c83d1`.
+
+### Commits
+
+- Review base: `26c83d1` (`docs: record integration task 6 evidence`)
+- Control hardening RED: `a0548ee`
+  (`test: expose control channel hardening gaps`)
+- Runtime cleanup RED: `a8a2e77`
+  (`test: expose runtime process cleanup gaps`)
+- GREEN implementation: `b34058a`
+  (`fix: harden local control and runtime cleanup`)
+- Report addendum: the commit containing this update
+
+### Review RED
+
+Control-channel tests were committed before production changes and run with:
+
+```text
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+54 tests: 48 passed, 6 failed
+```
+
+The six expected failures demonstrated:
+
+- accepted incomplete connections did not reserve capacity or expire;
+- fragmented reads repeatedly copied accumulated bytes (`67,527` copied);
+- an unsupported operation lost its valid request ID;
+- control diagnostics exposed secrets, an absolute path, and a stack;
+- a Unix socket could bind beneath an owner-public parent directory;
+- permission initialization failure did not roll back the listener.
+
+Runtime/process tests were then committed separately and run against the same
+unfixed implementation:
+
+```text
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+60 tests: 48 passed, 11 failed, 1 skipped
+```
+
+The five additional expected failures demonstrated:
+
+- CLI diagnostics exposed raw host error content;
+- Windows default pipe identities collided and lacked the required full scope;
+- a runtime stop failure skipped or failed to aggregate server cleanup;
+- foreground SIGTERM exited by signal and left the endpoint behind;
+- detached timeout returned before a TERM-resistant child had exited.
+
+The skipped test is the conditional native Windows named-pipe access/cleanup
+contract.
+
+### GREEN Behavior
+
+The implementation now:
+
+- reserves control capacity on accept, enforces an explicit read deadline, and
+  uses one bounded preallocated buffer per connection;
+- extracts a valid request ID before operation validation;
+- sanitizes nested control results, responses, server failures, client connect
+  failures, CLI errors, and Main IPC failures through stable diagnostics;
+- verifies a private, owner-controlled Unix parent before bind and performs
+  type/owner/device/inode checks for stale endpoint cleanup;
+- rolls back listener, accepted sockets, and endpoint state when permission
+  setup fails, while retaining later server errors for close;
+- attempts both runtime and control-server shutdown and aggregates failures;
+- scopes foreground signal handlers around an abort-driven awaited cleanup;
+- confirms detached child exit with bounded SIGTERM-to-SIGKILL escalation
+  before cleanup/return and only unreferences successful live children;
+- derives Windows pipe names from SHA-256 over the complete normalized data
+  directory plus stable user and runtime scopes.
+
+Focused GREEN command:
+
+```text
+volta run --node 26.5.0 npm run test:unit --workspace @tegojs/cli
+60 tests: 59 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run typecheck --workspace @tegojs/cli
+exit 0
+```
+
+### Final Review Verification
+
+```text
+volta run --node 26.5.0 npm run build
+exit 0
+
+volta run --node 26.5.0 npm run typecheck
+exit 0
+
+volta run --node 26.5.0 npm test
+601 tests: 601 passed, 0 failed, 1 Windows-only skipped
+
+volta run --node 26.5.0 npm run format:check
+189 files checked, 0 errors
+
+volta run --node 26.5.0 npm run lint
+189 files checked, 0 errors
+
+volta run --node 26.5.0 npm run commitlint:ci
+0 problems, 0 warnings
+
+git diff --check
+exit 0
+```
+
+PostgreSQL integration used the review-provided database:
+
+```text
+TEGO_POSTGRES_URL=postgresql://tego_test:tego_test@127.0.0.1:5432/tego_next_test \
+  volta run --node 26.5.0 npm run test:integration
+108 tests: 108 passed, 0 failed
+```
+
+The 108 tests comprise 52 repository system/local-driver integration tests and
+56 PostgreSQL driver integration tests.
+
+### Real Process Evidence
+
+The CLI test suite includes two real child-process regressions:
+
+- foreground SIGTERM exits normally after awaited cleanup and leaves no control
+  endpoint;
+- detached readiness timeout escalates from SIGTERM to SIGKILL for a resistant
+  fixture, proves the PID no longer exists, and leaves no endpoint.
+
+A separate built-executable smoke run verified:
+
+- detached start and status both reported lifecycle `running`, readiness
+  `true`, and authority epoch `1`;
+- the Unix control endpoint was a socket with mode `600`;
+- first stop returned `{"stopped":true}`;
+- second stop returned `{"alreadyStopped":true,"stopped":true}`;
+- the endpoint was absent after stop.
+
+No smoke process, socket, temporary runtime directory, generated example build
+output, or debug code remained after verification.
