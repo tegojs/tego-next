@@ -4,11 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import {
-  type JsonValue,
-  parseTaskRecord,
-  type RuntimeOperations,
-} from "@tegojs/contracts";
+import { type JsonValue, parseTaskRecord, type RuntimeOperations } from "@tegojs/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { startControlServer } from "../src/control/server.js";
