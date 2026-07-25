@@ -3,43 +3,43 @@ import { createReadStream } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
-  DiagnosticError,
-  parseArtifactDigest,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parseWorkerId,
-  runtimeDiagnostic,
-  serializeWireValue,
   type ArtifactDigest,
+  DiagnosticError,
   type ExecutionRequest,
   type Executor,
   type ExecutorCapabilities,
   type Permission,
   type PluginComponent,
+  parseArtifactDigest,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parseWorkerId,
   type RuntimeDrivers,
+  runtimeDiagnostic,
   type StateKey,
   type StateStore,
+  serializeWireValue,
   type WorkerId,
 } from "@tegojs/contracts";
 import { createLocalDrivers } from "@tegojs/drivers-local";
 import {
   ProcessExecutor,
-  ThreadExecutor,
   type ResolvedThreadComponent,
+  ThreadExecutor,
 } from "@tegojs/executor-node";
-import { ArtifactService, PreparedArtifactCache, type PreparedArtifact } from "@tegojs/runtime";
+import { ArtifactService, type PreparedArtifact, PreparedArtifactCache } from "@tegojs/runtime";
 import {
   connectWorker,
   createWorkerEndpoint,
   listenForWorker,
   parseAttemptRevision,
-  requestFingerprint,
-  WorkerRuntime,
   type RemoteAttemptCommitCondition,
   type RemoteAttemptRecord,
   type RemoteAttemptStore,
+  requestFingerprint,
   type WebSocketListener,
   type WorkerAssignmentRejection,
+  WorkerRuntime,
   type WorkerSession,
 } from "@tegojs/transport-websocket";
 import type { WorkerStartCommand } from "../parse-command.js";
@@ -321,6 +321,39 @@ export interface PreparedArtifactSelection {
   validateAssignment(request: ExecutionRequest): WorkerAssignmentRejection | undefined;
 }
 
+function createWorkerLocalExecutor(executor: Executor): Executor {
+  if (executor.type !== "process" && executor.type !== "thread") {
+    throw new TypeError("Worker local executor must use process or thread isolation");
+  }
+  const localType = executor.type;
+  const local: Executor = {
+    id: executor.id,
+    type: localType,
+    probe: () => executor.probe(),
+    submit: (request) =>
+      executor.submit(
+        parseExecutionRequest({
+          ...request,
+          target: {
+            instanceId: request.target.instanceId,
+            deploymentGeneration: request.target.deploymentGeneration,
+            artifactDigest: request.target.artifactDigest,
+            executor: {
+              id: executor.id,
+              type: localType,
+            },
+          },
+        }),
+      ),
+    observe: (taskId, attemptId) => executor.observe(taskId, attemptId),
+    cancel: (taskId, attemptId) => executor.cancel(taskId, attemptId),
+    drain: (options) => executor.drain(options),
+    health: () => executor.health(),
+    close: () => executor.close(),
+  };
+  return Object.freeze(local);
+}
+
 function artifactSelectionError(message: string): WorkerAssignmentRejection {
   return {
     code: "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED",
@@ -352,7 +385,12 @@ export function createPreparedArtifactSelection(
         }),
       );
     }
-    const artifact = (byPlugin.get(request.pluginId) as readonly [PreparedArtifact])[0];
+    const artifact = byPlugin
+      .get(request.pluginId)
+      ?.find((candidate) => candidate.digest === request.target.artifactDigest);
+    if (artifact === undefined) {
+      throw new Error("Validated Worker artifact selection is unavailable");
+    }
     const component = artifact.manifest.components.find(
       (candidate) => candidate.componentId === request.componentId,
     ) as PluginComponent;
@@ -360,12 +398,14 @@ export function createPreparedArtifactSelection(
   };
 
   const validateAssignment = (request: ExecutionRequest): WorkerAssignmentRejection | undefined => {
-    const candidates = byPlugin.get(request.pluginId) ?? [];
+    const candidates = (byPlugin.get(request.pluginId) ?? []).filter(
+      (candidate) => candidate.digest === request.target.artifactDigest,
+    );
     if (candidates.length === 0) {
-      return artifactSelectionError("No prepared artifact matches the assignment plugin");
+      return artifactSelectionError("No prepared artifact matches the assignment target");
     }
     if (candidates.length !== 1) {
-      return artifactSelectionError("Multiple prepared artifacts match the assignment plugin");
+      return artifactSelectionError("Multiple prepared artifacts match the assignment target");
     }
     const components = candidates[0]?.manifest.components.filter(
       (component) => component.componentId === request.componentId,
@@ -623,8 +663,8 @@ export async function runWorkerProcess(
       secretProvider: drivers.secrets,
     });
     const executors = new Map<"process" | "thread", Executor>([
-      ["thread", thread],
-      ["process", processExecutor],
+      ["thread", createWorkerLocalExecutor(thread)],
+      ["process", createWorkerLocalExecutor(processExecutor)],
     ]);
     const capabilities = await Promise.all([thread.probe(), processExecutor.probe()]);
     runtime = new WorkerRuntime({
