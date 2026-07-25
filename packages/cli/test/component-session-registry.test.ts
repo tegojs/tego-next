@@ -134,3 +134,25 @@ test("local session registry keys exact targets and keeps draining sessions reco
   assert.throws(() => registry.resolveExact(threadTarget), /missing|unavailable/iu);
   await registry.close();
 });
+
+test("local session registry owns deeply frozen target snapshots", async () => {
+  const Registry = (
+    cli as typeof cli & {
+      readonly LocalComponentSessionRegistry?: SessionRegistryConstructor;
+    }
+  ).LocalComponentSessionRegistry;
+  assert.equal(typeof Registry, "function", "CLI must export LocalComponentSessionRegistry");
+  const registry = new (Registry as SessionRegistryConstructor)("runtime-local");
+  const executionTarget = target("1", "thread");
+  registry.register(registration(executionTarget));
+
+  const resolved = registry.resolveExact(executionTarget);
+  assert.equal(Object.isFrozen(resolved.target), true);
+  assert.equal(Object.isFrozen(resolved.target.executor), true);
+  assert.throws(() => {
+    (resolved.target.executor as { id: string }).id = "node-mutated:thread";
+  }, TypeError);
+  assert.deepEqual(registry.resolveExact(executionTarget).target, executionTarget);
+
+  await registry.close();
+});
