@@ -19,6 +19,7 @@ interface SessionRegistration {
   readonly componentId: ReturnType<typeof parseComponentId>;
   readonly target: TaskExecutionTarget;
   readonly executor: Executor;
+  readonly drainLifecycle: Executor["drain"];
 }
 
 interface SessionRegistry {
@@ -86,6 +87,7 @@ function registration(executionTarget: TaskExecutionTarget): SessionRegistration
     componentId: parseComponentId("echo"),
     target: executionTarget,
     executor: executor(executionTarget),
+    drainLifecycle: async () => undefined,
   };
 }
 

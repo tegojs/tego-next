@@ -1775,6 +1775,9 @@ export async function createProcessComponentSession(
           clock,
         );
       },
+      async drain(): Promise<void> {
+        await hostCommand(artifactCommand("drain", `session-drain-${++commandSequence}`));
+      },
       close,
       terminate,
     };

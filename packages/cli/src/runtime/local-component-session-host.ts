@@ -132,6 +132,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
       ...identity,
       target,
       executor,
+      drainLifecycle: (options) => executor.drainLifecycle(options),
     };
     try {
       this.#options.registry.register(registration);
@@ -152,7 +153,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
     const target = this.#target(binding);
     const registration = this.#options.registry.resolveExact(target);
     this.#options.registry.markDraining(target);
-    await registration.executor.drain({});
+    await registration.drainLifecycle({});
   }
 
   async stop(binding: ComponentBinding): Promise<void> {

@@ -33,6 +33,7 @@ export interface ComponentSessionTransport {
     readonly status: ExecutorHealth["status"];
     readonly message?: string;
   }>;
+  drain(): Promise<void>;
   close(): Promise<void>;
   terminate(): Promise<void>;
 }
@@ -161,6 +162,7 @@ export class ComponentSandboxSession implements Executor {
   #active = 0;
   #accepting = true;
   #drainPromise: Promise<void> | undefined;
+  #lifecycleDrainPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
 
   constructor(options: ComponentSandboxSessionOptions) {
@@ -308,6 +310,14 @@ export class ComponentSandboxSession implements Executor {
     this.#accepting = false;
     this.#drainPromise ??= this.#converge(deadline);
     return this.#drainPromise;
+  }
+
+  drainLifecycle(options: DrainOptions): Promise<void> {
+    this.#lifecycleDrainPromise ??= (async () => {
+      await this.drain(options);
+      await this.#transport.drain();
+    })();
+    return this.#lifecycleDrainPromise;
   }
 
   close(): Promise<void> {

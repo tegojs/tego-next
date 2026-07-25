@@ -2079,6 +2079,9 @@ export async function createThreadComponentSession(
           clock,
         );
       },
+      async drain(): Promise<void> {
+        await hostCommand(artifactCommand("drain", `session-drain-${++commandSequence}`));
+      },
       close,
       terminate,
     };

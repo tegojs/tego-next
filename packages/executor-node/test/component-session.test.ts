@@ -67,6 +67,7 @@ function hangingTransport() {
     async health() {
       return { status: "healthy" as const };
     },
+    async drain() {},
     async close() {},
     async terminate() {
       terminateCalls += 1;
@@ -121,6 +122,7 @@ test("component session close does not await a non-settling transport terminatio
     async health() {
       return { status: "healthy" as const };
     },
+    async drain() {},
     async close() {},
     terminate: () => new Promise<void>(() => {}),
   };
@@ -154,6 +156,7 @@ test("component session prunes terminal attempt retention at its hard bound", as
     async health() {
       return { status: "healthy" as const };
     },
+    async drain() {},
     async close() {},
     async terminate() {},
   };
@@ -179,6 +182,7 @@ test("component session diagnostics do not expose raw transport error messages",
     async health() {
       return { status: "healthy" as const };
     },
+    async drain() {},
     async close() {},
     async terminate() {},
   };

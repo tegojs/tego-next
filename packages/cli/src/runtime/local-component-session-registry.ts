@@ -14,6 +14,7 @@ export interface LocalComponentSessionRegistration {
   readonly componentId: RunTaskRequest["componentId"];
   readonly target: TaskExecutionTarget;
   readonly executor: Executor;
+  readonly drainLifecycle: Executor["drain"];
 }
 
 interface RegisteredLocalComponentSession extends LocalComponentSessionRegistration {
@@ -191,6 +192,7 @@ export class LocalComponentSessionRegistry {
       componentId: session.componentId,
       target: deepFreeze(structuredClone(session.target)),
       executor: session.executor,
+      drainLifecycle: session.drainLifecycle,
     });
   }
 }
