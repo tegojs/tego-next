@@ -1,4 +1,9 @@
-import { parseFencingEpoch, parseWorkerId, type FencingEpoch, type WorkerId } from "@tegojs/contracts";
+import {
+  parseFencingEpoch,
+  parseWorkerId,
+  type FencingEpoch,
+  type WorkerId,
+} from "@tegojs/contracts";
 import { systemWorkerClock } from "./clock.js";
 import { assertWorkerProtocolVersion } from "./codec.js";
 import type { WorkerEndpointOptions, WorkerRegistrationInput } from "./main-endpoint.js";
