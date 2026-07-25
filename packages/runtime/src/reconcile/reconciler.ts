@@ -313,6 +313,14 @@ export class Reconciler {
   #interrupted = false;
   #lastCommitAuthority: RuntimeAuthority | undefined;
   #replanCount = 0;
+  #nextWakeAt: number | undefined;
+  #deferredWake:
+    | {
+        readonly at: number;
+        readonly controller: AbortController;
+        readonly promise: Promise<void>;
+      }
+    | undefined;
 
   constructor(options: ReconcilerOptions) {
     this.#options = options;
@@ -342,12 +350,20 @@ export class Reconciler {
     try {
       await this.#restoreReadyComponents();
       await this.wake();
+      if (this.#running && !this.#interrupted) {
+        this.#deferUntil(this.#options.clock.now().getTime() + claimLeaseMs);
+        this.#armDeferredWake();
+      }
     } catch (error) {
+      const cleanupRequired = this.#running;
       this.#running = false;
-      try {
-        await this.#componentLifecycle?.close(this.#options.authority);
-      } catch (closeError) {
-        throw new AggregateError([error, closeError], "Reconciler startup cleanup failed");
+      this.#cancelDeferredWake();
+      if (cleanupRequired) {
+        try {
+          await this.#componentLifecycle?.close(this.#options.authority);
+        } catch (closeError) {
+          throw new AggregateError([error, closeError], "Reconciler startup cleanup failed");
+        }
       }
       throw error;
     }
@@ -355,13 +371,29 @@ export class Reconciler {
 
   wake(): Promise<void> {
     if (!this.#running) return Promise.resolve();
-    const pass = this.#tail.then(() => this.#reconcileUntilQuiescent());
+    this.#cancelDeferredWake();
+    const pass = this.#tail.then(async () => {
+      if (!this.#running) return;
+      try {
+        await this.#reconcileUntilQuiescent();
+      } catch (error) {
+        this.#running = false;
+        this.#cancelDeferredWake();
+        try {
+          await this.#componentLifecycle?.close(this.#options.authority);
+        } catch (closeError) {
+          throw new AggregateError([error, closeError], "Reconciler failure cleanup failed");
+        }
+        throw error;
+      }
+    });
     this.#tail = pass.catch(() => undefined);
     return pass;
   }
 
   async stop(): Promise<void> {
     this.#running = false;
+    this.#cancelDeferredWake();
     await this.#tail;
     await this.#componentLifecycle?.close(this.#options.authority);
   }
@@ -387,9 +419,15 @@ export class Reconciler {
 
   async #reconcileUntilQuiescent(): Promise<void> {
     this.#diagnosticsByDeployment.clear();
+    this.#nextWakeAt = undefined;
     for (let pass = 0; pass < this.#maxConvergencePasses; pass += 1) {
       if (!this.#running) return;
-      if (!(await this.#reconcilePass())) return;
+      const pending = await this.#reconcilePass();
+      if (!this.#running || this.#interrupted) return;
+      if (!pending) {
+        this.#armDeferredWake();
+        return;
+      }
     }
     if (!this.#running) return;
     throw new DiagnosticError(
@@ -405,11 +443,14 @@ export class Reconciler {
 
   async #reconcilePass(): Promise<boolean> {
     if (!this.#running) return false;
+    const replanCount = this.#replanCount;
     let [deployments, installations, loadedInstances] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstallations(),
       this.#loadInstances(),
     ]);
+    if (!this.#running) return false;
+    this.#deferRetries(loadedInstances);
     this.#deployments = deployments;
     this.#readyDeployments.clear();
 
@@ -417,11 +458,14 @@ export class Reconciler {
     let performedImmediateWork = existingClaim !== undefined;
     if (existingClaim !== undefined) {
       await this.#executeClaim(existingClaim);
+      if (!this.#running || this.#interrupted) return false;
       [deployments, installations, loadedInstances] = await Promise.all([
         this.#loadDeployments(),
         this.#loadInstallations(),
         this.#loadInstances(),
       ]);
+      if (!this.#running) return false;
+      this.#deferRetries(loadedInstances);
       this.#deployments = deployments;
     }
 
@@ -438,6 +482,12 @@ export class Reconciler {
     const invalidByDeployment = new Map<string, readonly ComponentInstance[]>();
     const gates = new Map<string, ArtifactDeploymentGate | DiagnosticError>();
     const orderRanks = new Map<string, number>();
+    const currentDeploymentKeys = new Set(lexicalDeployments.map(deploymentKey));
+    for (const key of this.#diagnosticsByDeployment.keys()) {
+      if (!key.startsWith("outbox/") && !currentDeploymentKeys.has(key)) {
+        this.#diagnosticsByDeployment.delete(key);
+      }
+    }
     for (const deployment of lexicalDeployments) {
       this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
       const invalidInstances = loadedInstances
@@ -458,6 +508,7 @@ export class Reconciler {
         installations,
         canonicalInstances,
       );
+      if (!this.#running) return false;
       gates.set(deploymentKey(deployment), gate);
       if (!(gate instanceof DiagnosticError)) {
         for (const [index, identity] of (gate.capabilityResolution.order ?? []).entries()) {
@@ -549,6 +600,7 @@ export class Reconciler {
         continue;
       }
       for (const step of plan.steps) {
+        if (!this.#running) return false;
         await this.#persistStep(deployment, step);
       }
     }
@@ -560,11 +612,28 @@ export class Reconciler {
         await this.#executeClaim(claim);
       }
     }
+    if (!this.#running || this.#interrupted) return false;
     await this.#refreshReadiness();
-    return performedImmediateWork;
+    if (!this.#running) return false;
+    const latestInstances = await this.#loadInstances();
+    this.#deferRetries(latestInstances);
+    const canonicalLatestInstances = latestInstances.filter((record) =>
+      isInstanceContextConsistent(record, this.#deployments),
+    );
+    return (
+      this.#replanCount !== replanCount ||
+      (performedImmediateWork &&
+        (canonicalLatestInstances.some(
+          (record) =>
+            !this.#isDeploymentPlanningBlocked(record.value) &&
+            this.#needsImmediateReconcile(record.value),
+        ) ||
+          this.diagnostics().some((diagnostic) => diagnostic.code.startsWith("CAPABILITY_"))))
+    );
   }
 
   async #claimNext(): Promise<OutboxClaim | undefined> {
+    if (!this.#running) return undefined;
     const claims = await this.#options.state.claimOutbox({
       owner: this.#owner,
       leaseDurationMs: claimLeaseMs,
@@ -572,6 +641,7 @@ export class Reconciler {
       topic: "component.lifecycle",
       ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
     });
+    if (!this.#running) return undefined;
     return claims[0];
   }
 
@@ -873,6 +943,15 @@ export class Reconciler {
   ): Promise<void> {
     const key = observationKey(deployment);
     const current = await this.#options.state.read(key);
+    if (
+      current?.value.applicationId === deployment.applicationId &&
+      current.value.pluginId === deployment.pluginId &&
+      current.value.generation === deployment.generation &&
+      current.value.status === status &&
+      JSON.stringify(current.value.diagnostics) === JSON.stringify(diagnostics)
+    ) {
+      return;
+    }
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
       await transaction.put(
         key,
@@ -891,6 +970,7 @@ export class Reconciler {
   }
 
   async #persistStep(deployment: PluginDeployment, step: ReconcilePlanStep): Promise<void> {
+    if (!this.#running) return;
     const desired = (await this.#loadDeployments()).find(
       (candidate) =>
         candidate.applicationId === deployment.applicationId &&
@@ -947,6 +1027,7 @@ export class Reconciler {
       if (next !== instance.lifecycle) instance = { ...instance, lifecycle: next };
     }
     const now = this.#options.clock.now().toISOString();
+    if (!this.#running) return;
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
         await transaction.put(key, instance, {
@@ -972,7 +1053,7 @@ export class Reconciler {
     } catch (error) {
       const code = conflictCode(error);
       if (code !== "STATE_REVISION_CONFLICT" && code !== "STATE_IDEMPOTENCY_CONFLICT") throw error;
-      this.#replanCount += 1;
+      if (code === "STATE_REVISION_CONFLICT") this.#replanCount += 1;
     }
     void deployment;
   }
@@ -1015,6 +1096,7 @@ export class Reconciler {
   }
 
   async #executeClaim(claim: OutboxClaim): Promise<void> {
+    if (!this.#running) return;
     let effect: ReconcileEffect;
     try {
       effect = parseReconcileEffect(claim);
@@ -1089,6 +1171,7 @@ export class Reconciler {
     if (desired !== undefined) {
       currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
     }
+    if (!this.#running) return;
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
@@ -1194,6 +1277,7 @@ export class Reconciler {
       retryableFailure && (effect.kind === "start" || effect.kind === "stop")
         ? expectedLifecycle
         : undefined;
+    if (!this.#running) return;
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
         if (retryPreState !== undefined) {
@@ -1230,6 +1314,7 @@ export class Reconciler {
       }
       return;
     }
+    if (!this.#running) return;
     try {
       await this.#options.effects.perform(effect);
     } catch (error) {
@@ -1461,6 +1546,93 @@ export class Reconciler {
     }
   }
 
+  #needsImmediateReconcile(instance: PersistedComponentInstance): boolean {
+    if (
+      instance.lifecycle === "created" ||
+      instance.lifecycle === "preparing" ||
+      instance.lifecycle === "starting" ||
+      instance.lifecycle === "draining" ||
+      instance.lifecycle === "stopping"
+    ) {
+      return true;
+    }
+    return (
+      instance.lifecycle === "failed" &&
+      instance.retryEffect !== undefined &&
+      (instance.retryAt === undefined ||
+        instance.retryAt <= this.#options.clock.now().toISOString())
+    );
+  }
+
+  #isDeploymentPlanningBlocked(instance: PersistedComponentInstance): boolean {
+    return (
+      this.#diagnosticsByDeployment
+        .get(`${instance.applicationId}/${instance.pluginId}`)
+        ?.some(
+          (diagnostic) =>
+            diagnostic.code.startsWith("ARTIFACT_") ||
+            diagnostic.code.startsWith("CAPABILITY_") ||
+            diagnostic.code.startsWith("DEPLOYMENT_") ||
+            diagnostic.code.startsWith("PERMISSION_"),
+        ) ?? false
+    );
+  }
+
+  #deferRetries(instances: readonly LoadedComponentInstance[]): void {
+    const now = this.#options.clock.now().getTime();
+    for (const { value } of instances) {
+      if (
+        value.lifecycle !== "failed" ||
+        value.retryEffect === undefined ||
+        value.retryAt === undefined
+      ) {
+        continue;
+      }
+      const retryAt = Date.parse(value.retryAt);
+      if (Number.isFinite(retryAt) && retryAt > now) this.#deferUntil(retryAt);
+    }
+  }
+
+  #deferUntil(at: number): void {
+    if (!this.#running || !Number.isFinite(at)) return;
+    this.#nextWakeAt = this.#nextWakeAt === undefined ? at : Math.min(this.#nextWakeAt, at);
+  }
+
+  #armDeferredWake(): void {
+    const at = this.#nextWakeAt;
+    if (!this.#running || at === undefined) return;
+    if (this.#deferredWake !== undefined && this.#deferredWake.at <= at) return;
+    this.#cancelDeferredWake();
+    const controller = new AbortController();
+    const delay = Math.max(0, at - this.#options.clock.now().getTime());
+    const promise = this.#options.clock
+      .sleep(delay, controller.signal)
+      .then(async () => {
+        if (
+          controller.signal.aborted ||
+          !this.#running ||
+          this.#deferredWake?.controller !== controller
+        ) {
+          return;
+        }
+        this.#deferredWake = undefined;
+        if (this.#options.clock.now().getTime() < at) return;
+        await this.wake();
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) throw error;
+      });
+    this.#deferredWake = { at, controller, promise };
+    void promise.catch(() => undefined);
+  }
+
+  #cancelDeferredWake(): void {
+    const deferred = this.#deferredWake;
+    if (deferred === undefined) return;
+    this.#deferredWake = undefined;
+    deferred.controller.abort("reconciler-deferred-wake-cancelled");
+  }
+
   #transactionOptions(): {
     readonly fencing?: RuntimeAuthority;
   } {
@@ -1495,13 +1667,15 @@ export class Reconciler {
   }
 
   async #retryClaim(claim: OutboxClaim): Promise<void> {
+    const retryAt = this.#options.clock.now().getTime() + 60_000;
     await this.#options.state.acknowledgeOutbox({
       messageId: claim.message.messageId,
       owner: claim.owner,
       claimEpoch: claim.claimEpoch,
       outcome: "retry",
-      retryAt: new Date(this.#options.clock.now().getTime() + 60_000).toISOString(),
+      retryAt: new Date(retryAt).toISOString(),
       ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
     });
+    this.#deferUntil(retryAt);
   }
 }

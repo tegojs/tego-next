@@ -2190,7 +2190,13 @@ test("stale desired state invalidates a planned effect before it is journaled", 
 
   await reconciler.start();
 
-  assert.deepEqual(effects.calls, []);
+  assert.deepEqual(
+    effects.calls.map((effect) => [effect.deploymentGeneration, effect.kind]),
+    [
+      ["2", "prepare"],
+      ["2", "start"],
+    ],
+  );
   assert.equal(reconciler.replanCount, 1);
   await reconciler.stop();
 });
@@ -2253,16 +2259,21 @@ test("deployment observations are ready when wake convergence completes", async 
   });
 
   await reconciler.start();
-  const status = () =>
-    (
-      [...state.records.values()].find(
-        (entry) => entry.key.collection === "deployment-observations",
-      )?.value as { readonly status?: string } | undefined
-    )?.status;
-  assert.equal(status(), "ready");
+  const observation = () =>
+    [...state.records.values()].find((entry) => entry.key.collection === "deployment-observations");
+  assert.equal((observation()?.value as { readonly status?: string } | undefined)?.status, "ready");
+  const settledRevision = observation()?.revision;
+  const settledUpdatedAt = (observation()?.value as { readonly updatedAt?: string } | undefined)
+    ?.updatedAt;
 
+  clock.advance(1_000);
   await reconciler.wake();
-  assert.equal(status(), "ready");
+  assert.equal((observation()?.value as { readonly status?: string } | undefined)?.status, "ready");
+  assert.equal(observation()?.revision, settledRevision);
+  assert.equal(
+    (observation()?.value as { readonly updatedAt?: string } | undefined)?.updatedAt,
+    settledUpdatedAt,
+  );
   await reconciler.stop();
 });
 
@@ -2304,6 +2315,31 @@ test("wake fails closed when immediate lifecycle work exceeds its pass budget", 
   });
 
   await assert.rejects(reconciler.start(), /did not converge within 1 pass/u);
+  assert.equal(reconciler.kernelRunning, false);
+  assert.equal(effects.live.size, 0);
+});
+
+test("a later wake budget failure stops an already-started reconciler", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  let deployments: readonly PluginDeployment[] = [];
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 1,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  assert.equal(reconciler.kernelRunning, true);
+
+  deployments = [deployment()];
+  await assert.rejects(reconciler.wake(), /did not converge within 1 pass/u);
+
   assert.equal(reconciler.kernelRunning, false);
   assert.equal(effects.live.size, 0);
 });
@@ -2430,6 +2466,51 @@ test("failed lifecycle effects wake automatically when retryAt becomes due", asy
   );
   assert.equal(reconciler.applicationReady(), true);
   await reconciler.stop();
+});
+
+test("an abandoned lifecycle claim is recovered automatically after its lease expires", async () => {
+  const clock = new ScheduledClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const options = {
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  };
+  const abandoned = new Reconciler({
+    ...options,
+    interruptAfterEffect: true,
+    owner: "abandoned-runtime",
+  });
+
+  await abandoned.start();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare"],
+  );
+  await abandoned.stop();
+
+  const recovered = new Reconciler({ ...options, owner: "replacement-runtime" });
+  await recovered.start();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare"],
+  );
+
+  clock.advance(30_001);
+  for (let turn = 0; turn < 20 && effects.calls.length < 3; turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "prepare", "start"],
+  );
+  assert.equal(recovered.applicationReady(), true);
+  await recovered.stop();
 });
 
 test("deployment observations distinguish unavailable, inconsistent, and degraded states", async () => {
