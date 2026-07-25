@@ -313,6 +313,18 @@ const generationOneTarget = {
   },
 } as const;
 
+const generationTwoTarget = {
+  instanceId: "application-01.echo.echo.2",
+  deploymentGeneration: "2",
+  artifactDigest: parseArtifactDigest(
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  ),
+  executor: {
+    id: "executor-01",
+    type: "process",
+  },
+} as const;
+
 function serviceFixture(executor = new ControlledExecutor()) {
   const state = new TransactionalState();
   const service = new TaskService({
@@ -1168,6 +1180,66 @@ test("@spec:runtime-operations/task-operations/task-record-preserves-immutable-e
   });
 
   assert.deepEqual(record.target, generationOneTarget);
+});
+
+test("@spec:runtime-operations/task-operations/admission-does-not-follow-a-generation-upgrade", async () => {
+  const executor = new ControlledExecutor();
+  const state = new TransactionalState();
+  let activeTarget: typeof generationOneTarget | typeof generationTwoTarget = generationOneTarget;
+  const service = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      const selection = { target: activeTarget, executor };
+      activeTarget = generationTwoTarget;
+      return selection as unknown as Executor;
+    },
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+
+  const running = await service.run(request);
+
+  assert.deepEqual(running.target, generationOneTarget);
+  assert.deepEqual(
+    (executor.submitted[0] as ExecutionRequest & { readonly target?: unknown }).target,
+    generationOneTarget,
+  );
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fails-closed", async () => {
+  const executor = new ControlledExecutor();
+  const state = new TransactionalState();
+  const resolvedBindings: unknown[] = [];
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "accepted",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      target: generationOneTarget,
+      authority,
+    }),
+    revision: 1,
+  });
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async (_request, binding) => {
+      resolvedBindings.push(binding);
+      return { target: generationTwoTarget, executor } as unknown as Executor;
+    },
+    createIdentity: () => identity,
+  });
+  await restarted.recover();
+
+  await restarted.setAuthority(authority);
+
+  assert.deepEqual(resolvedBindings, [generationOneTarget]);
+  assert.equal(executor.submitted.length, 0);
+  assert.equal((await restarted.status(identity.taskId))?.result?.status, "indeterminate");
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/replays-durable-cancellation-intent", async () => {
