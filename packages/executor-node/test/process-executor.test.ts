@@ -2238,6 +2238,41 @@ test("process component session bounds activation hooks and awaits rollback clea
   }
 });
 
+test("process session parent bounds a silent bootstrap and non-settling authoritative wait", async () => {
+  const processHost = new NonSettlingWaitProcessHost();
+  const fixture = await artifact();
+  const hangingEntrypoint = join(fixture.artifactRoot, "silent-process.js");
+  await writeFile(hangingEntrypoint, "setInterval(() => {}, 1000);");
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-silent-bootstrap");
+  const executorOptions = await options({
+    processHost,
+    processEntrypoint: hangingEntrypoint,
+    cleanupGraceMs: 25,
+    componentControlTimeoutMs: 25,
+  });
+  const createSession = await loadProcessComponentSessionFactory();
+  let rejection: unknown;
+  void createSession({
+    target: execution.target,
+    identity: execution,
+    component: await executorOptions.resolveComponent(execution),
+    executorOptions,
+  }).catch((error: unknown) => {
+    rejection = error;
+  });
+
+  try {
+    for (let index = 0; index < 6 && rejection === undefined; index += 1) {
+      clock.advanceBy(25);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.notEqual(rejection, undefined);
+    assert.equal(processHost.activeProcessCount, 0);
+  } finally {
+    await processHost.close();
+  }
+});
+
 test("process component session preserves drain and stop failures while terminating", async () => {
   const processHost = new TestProcessHost();
   const fixture = await artifact({ source: cleanupFailureComponentSource });

@@ -97,6 +97,78 @@ class TrackingWorkerFactory implements ThreadWorkerFactory {
   }
 }
 
+class NonSettlingProtocolWorker implements ThreadWorker {
+  readonly #listeners = new Map<
+    string,
+    { readonly listener: (...arguments_: readonly unknown[]) => void; readonly once: boolean }[]
+  >();
+  readonly #ports: { close(): void; unref?(): void }[] = [];
+  readonly #exited = Promise.withResolvers<number>();
+  terminateCalls = 0;
+  active = true;
+
+  postMessage(_value: unknown, transferList: readonly Transferable[] = []): void {
+    for (const transferable of transferList) {
+      if (
+        typeof transferable === "object" &&
+        transferable !== null &&
+        "close" in transferable &&
+        typeof transferable.close === "function"
+      ) {
+        const port = transferable as { close(): void; unref?(): void };
+        port.unref?.();
+        this.#ports.push(port);
+      }
+    }
+  }
+
+  on(
+    event: "error" | "exit" | "message" | "messageerror" | "online",
+    listener: (...arguments_: readonly unknown[]) => void,
+  ): this {
+    const listeners = this.#listeners.get(event) ?? [];
+    listeners.push({ listener, once: false });
+    this.#listeners.set(event, listeners);
+    return this;
+  }
+
+  once(
+    event: "error" | "exit" | "message" | "messageerror" | "online",
+    listener: (...arguments_: readonly unknown[]) => void,
+  ): this {
+    const listeners = this.#listeners.get(event) ?? [];
+    listeners.push({ listener, once: true });
+    this.#listeners.set(event, listeners);
+    return this;
+  }
+
+  terminate(): Promise<number> {
+    this.terminateCalls += 1;
+    return this.#exited.promise;
+  }
+
+  finishExit(): void {
+    if (!this.active) return;
+    this.active = false;
+    for (const port of this.#ports) port.close();
+    const listeners = this.#listeners.get("exit") ?? [];
+    this.#listeners.set(
+      "exit",
+      listeners.filter((entry) => !entry.once),
+    );
+    for (const entry of listeners) entry.listener(0);
+    this.#exited.resolve(0);
+  }
+}
+
+class NonSettlingProtocolWorkerFactory implements ThreadWorkerFactory {
+  readonly worker = new NonSettlingProtocolWorker();
+
+  create(): ThreadWorker {
+    return this.worker;
+  }
+}
+
 class GatedTerminationFactory extends TrackingWorkerFactory {
   readonly gate = Promise.withResolvers<void>();
   terminationStarted = Promise.withResolvers<void>();
@@ -1546,6 +1618,40 @@ test("thread component session bounds activation hooks and awaits rollback clean
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
   );
   assert.equal(factory.active, 0);
+});
+
+test("thread session parent bounds a silent bootstrap and retains custody until authoritative exit", async () => {
+  const factory = new NonSettlingProtocolWorkerFactory();
+  const execution = request({ mode: "echo", value: "must-not-run" }, "session-silent-bootstrap");
+  const executorOptions = await options(factory, {
+    cleanupGraceMs: 25,
+    componentControlTimeoutMs: 25,
+  });
+  const createSession = await loadThreadComponentSessionFactory();
+  let rejection: unknown;
+  const creation = createSession({
+    target: execution.target,
+    identity: execution,
+    component: await executorOptions.resolveComponent(execution),
+    executorOptions,
+  }).catch((error: unknown) => {
+    rejection = error;
+    throw error;
+  });
+
+  try {
+    for (let index = 0; index < 6 && rejection === undefined; index += 1) {
+      clock.advanceBy(25);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.notEqual(rejection, undefined);
+    assert.equal(factory.worker.terminateCalls, 1);
+    assert.equal(factory.worker.active, true);
+  } finally {
+    factory.worker.finishExit();
+    await creation.catch(() => undefined);
+  }
+  assert.equal(factory.worker.active, false);
 });
 
 test("thread component session preserves drain and stop failures while terminating", async () => {
