@@ -537,6 +537,9 @@ export default {
   async start(context) {
     await context.events.emit("lifecycle.start", {});
   },
+  async drain(context) {
+    await context.events.emit("lifecycle.drain", {});
+  },
   async stop(context) {
     await context.events.emit("lifecycle.stop", {});
   },
@@ -610,6 +613,7 @@ async function artifact(
 
 interface TestComponentSession extends Executor {
   readonly target: ExecutionRequest["target"];
+  readonly drainLifecycle?: Executor["drain"];
 }
 
 type CreateProcessComponentSession = (input: {
@@ -2163,13 +2167,16 @@ test("process component session owns one child across same-target attempts and r
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
     assert.deepEqual(lifecycle, ["lifecycle.start"]);
+    assert.equal(typeof session.drainLifecycle, "function");
+    await session.drainLifecycle?.({});
+    assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.drain"]);
   } finally {
     await session.close();
     await processHost.close();
   }
 
   assert.equal(processHost.activeProcessCount, 0);
-  assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.stop"]);
+  assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.drain", "lifecycle.stop"]);
 });
 
 test("process component session refuses unhealthy activation before accepting a run", async () => {

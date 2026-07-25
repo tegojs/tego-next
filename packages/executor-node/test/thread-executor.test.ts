@@ -421,6 +421,9 @@ export default {
   async start(context) {
     await context.events.emit("lifecycle.start", {});
   },
+  async drain(context) {
+    await context.events.emit("lifecycle.drain", {});
+  },
   async stop(context) {
     await context.events.emit("lifecycle.stop", {});
   },
@@ -509,6 +512,7 @@ async function artifact(
 
 interface TestComponentSession extends Executor {
   readonly target: ExecutionRequest["target"];
+  readonly drainLifecycle?: Executor["drain"];
 }
 
 type CreateThreadComponentSession = (input: {
@@ -1556,12 +1560,15 @@ test("thread component session owns one Worker across same-target attempts and r
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
     assert.deepEqual(lifecycle, ["lifecycle.start"]);
+    assert.equal(typeof session.drainLifecycle, "function");
+    await session.drainLifecycle?.({});
+    assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.drain"]);
   } finally {
     await session.close();
   }
 
   await eventually(() => assert.equal(factory.active, 0));
-  assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.stop"]);
+  assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.drain", "lifecycle.stop"]);
 });
 
 test("thread component session refuses unhealthy activation before accepting a run", async () => {
