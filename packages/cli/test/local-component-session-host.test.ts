@@ -4,20 +4,13 @@ import {
   diagnosticCode,
   parseExecutorId,
   parsePluginManifest,
-  type JsonValue,
   type PluginManifest,
 } from "@tegojs/contracts";
-import * as localHost from "../src/runtime/local-component-session-host.js";
-
-type LocalComponentExecutorId = (nodeId: string, executor: "process" | "thread") => string;
-type AssertLocalManifestSupported = (manifest: PluginManifest) => void;
-type CanonicalJsonEqual = (left: JsonValue, right: JsonValue) => boolean;
-
-function helper<Name extends keyof typeof localHost>(name: Name): (typeof localHost)[Name] {
-  const value = localHost[name];
-  assert.equal(typeof value, "function", `local session host must export ${name}`);
-  return value;
-}
+import {
+  assertLocalComponentManifestSupported,
+  canonicalJsonEqual,
+  localComponentExecutorId,
+} from "../src/runtime/local-component-session-host.js";
 
 function manifest(
   input: {
@@ -53,63 +46,47 @@ function manifest(
 }
 
 test("local executor ids hash maximum-length NodeIds into stable bounded identities", () => {
-  const executorId = helper(
-    "localComponentExecutorId" as keyof typeof localHost,
-  ) as unknown as LocalComponentExecutorId;
   const nodeId = `n${"x".repeat(127)}`;
-  const first = executorId(nodeId, "thread");
-  const second = executorId(nodeId, "thread");
+  const first = localComponentExecutorId(nodeId, "thread");
+  const second = localComponentExecutorId(nodeId, "thread");
 
   assert.equal(first, second);
   assert.notEqual(first.includes(nodeId), true);
   assert.equal(first.length <= 128, true);
   assert.equal(parseExecutorId(first), first);
-  assert.notEqual(first, executorId(nodeId, "process"));
+  assert.notEqual(first, localComponentExecutorId(nodeId, "process"));
 });
 
 test("local task manifests without capabilities remain supported", () => {
-  const assertSupported = helper(
-    "assertLocalComponentManifestSupported" as keyof typeof localHost,
-  ) as unknown as AssertLocalManifestSupported;
-  assert.doesNotThrow(() => assertSupported(manifest()));
+  assert.doesNotThrow(() => assertLocalComponentManifestSupported(manifest()));
 });
 
 test("local capability-bearing manifests fail closed without real schema definitions", () => {
-  const assertSupported = helper(
-    "assertLocalComponentManifestSupported" as keyof typeof localHost,
-  ) as unknown as AssertLocalManifestSupported;
   for (const candidate of [
     manifest({ provides: [{ name: "example.echo", protocolVersion: "1.0.0" }] }),
     manifest({ requires: [{ name: "example.echo", protocolRange: "^1.0.0" }] }),
   ]) {
     assert.throws(
-      () => assertSupported(candidate),
+      () => assertLocalComponentManifestSupported(candidate),
       (error: unknown) => diagnosticCode(error) === "CAPABILITY_DEFINITION_UNAVAILABLE",
     );
   }
 });
 
 test("local service components fail closed before lifecycle session activation", () => {
-  const assertSupported = helper(
-    "assertLocalComponentManifestSupported" as keyof typeof localHost,
-  ) as unknown as AssertLocalManifestSupported;
   assert.throws(
-    () => assertSupported(manifest({ kind: "service" })),
+    () => assertLocalComponentManifestSupported(manifest({ kind: "service" })),
     (error: unknown) => diagnosticCode(error) === "LIFECYCLE_COMPONENT_KIND_UNSUPPORTED",
   );
 });
 
 test("durable manifest comparison ignores object key order but preserves JSON semantics", () => {
-  const equal = helper(
-    "canonicalJsonEqual" as keyof typeof localHost,
-  ) as unknown as CanonicalJsonEqual;
-
   assert.equal(
-    equal(
+    canonicalJsonEqual(
       { nested: { alpha: 1, beta: true }, values: ["a", "b"] },
       { values: ["a", "b"], nested: { beta: true, alpha: 1 } },
     ),
     true,
   );
-  assert.equal(equal({ values: ["a", "b"] }, { values: ["b", "a"] }), false);
+  assert.equal(canonicalJsonEqual({ values: ["a", "b"] }, { values: ["b", "a"] }), false);
 });
