@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { isPortableStateString, stateStringOrderKey } from "@tegojs/contracts";
 
 const migrations = [
   `
@@ -135,6 +136,27 @@ const migrations = [
     CREATE INDEX outbox_delivery
       ON outbox(available_at, enqueue_sequence, message_id);
   `,
+  `
+    ALTER TABLE records
+      ADD COLUMN record_id_order_key BLOB;
+
+    CREATE INDEX records_scan_order
+      ON records(namespace, collection_name, record_id_order_key);
+
+    CREATE TRIGGER records_order_key_insert
+    BEFORE INSERT ON records
+    WHEN NEW.record_id_order_key IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'record_id_order_key is required');
+    END;
+
+    CREATE TRIGGER records_order_key_update
+    BEFORE UPDATE OF record_id_order_key ON records
+    WHEN NEW.record_id_order_key IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'record_id_order_key is required');
+    END;
+  `,
 ] as const;
 
 export const sqliteSchemaVersion = migrations.length;
@@ -176,6 +198,39 @@ export function applySqliteMigrations(database: DatabaseSync, now: Date): void {
       }
       database.exec(migrations[index] ?? "");
       record.run(version, now.toISOString());
+    }
+
+    const missingOrderKeys = database
+      .prepare(
+        `
+          SELECT namespace, collection_name, record_id
+          FROM records
+          WHERE record_id_order_key IS NULL
+        `,
+      )
+      .all();
+    const updateOrderKey = database.prepare(
+      `
+        UPDATE records
+        SET record_id_order_key = ?
+        WHERE namespace = ? AND collection_name = ? AND record_id = ?
+      `,
+    );
+    for (const row of missingOrderKeys) {
+      const namespace = row.namespace;
+      const collection = row.collection_name;
+      const id = row.record_id;
+      if (
+        typeof namespace !== "string" ||
+        typeof collection !== "string" ||
+        typeof id !== "string" ||
+        !isPortableStateString(namespace) ||
+        !isPortableStateString(collection) ||
+        !isPortableStateString(id)
+      ) {
+        throw new Error("SQLite state contains a non-portable state key");
+      }
+      updateOrderKey.run(Buffer.from(stateStringOrderKey(id)), namespace, collection, id);
     }
     database.exec("COMMIT");
   } catch (error) {

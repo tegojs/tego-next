@@ -5,6 +5,7 @@ import {
   OUTBOX_TOPIC_MAX_LENGTH,
   STATE_QUERY_MAX_LIMIT,
   compareOperationJournalCursors,
+  isPortableStateString,
   parseFencingEpoch,
   parseRevision,
   runtimeDiagnostic,
@@ -122,16 +123,46 @@ function compareCodeUnits(left: string, right: string): number {
 
 function assertStateQuery(query: StateQuery<JsonValue>, clock: Clock): void {
   if (
-    query.limit !== undefined &&
-    (!Number.isSafeInteger(query.limit) || query.limit <= 0 || query.limit > STATE_QUERY_MAX_LIMIT)
+    !isPortableStateString(query.namespace) ||
+    !isPortableStateString(query.collection) ||
+    (query.idPrefix !== undefined && !isPortableStateString(query.idPrefix)) ||
+    (query.afterId !== undefined && !isPortableStateString(query.afterId)) ||
+    (query.limit !== undefined &&
+      (!Number.isSafeInteger(query.limit) ||
+        query.limit <= 0 ||
+        query.limit > STATE_QUERY_MAX_LIMIT))
   ) {
     throw stateError(
       "STATE_QUERY_INVALID",
-      `State query limit must be a positive safe integer no greater than ${STATE_QUERY_MAX_LIMIT}`,
-      { limit: query.limit },
+      `State query strings must be portable and limit must be between 1 and ${STATE_QUERY_MAX_LIMIT}`,
+      { limit: query.limit ?? null },
       clock,
     );
   }
+}
+
+function assertStateKey(
+  key: StateKey<JsonValue>,
+  operation: "query" | "write",
+  clock: Clock,
+): void {
+  if (
+    isPortableStateString(key.namespace) &&
+    isPortableStateString(key.collection) &&
+    isPortableStateString(key.id)
+  ) {
+    return;
+  }
+  throw stateError(
+    operation === "query" ? "STATE_QUERY_INVALID" : "STATE_DATA_INVALID",
+    "State keys must not contain NUL or ill-formed Unicode",
+    {
+      namespace: key.namespace,
+      collection: key.collection,
+      id: key.id,
+    },
+    clock,
+  );
 }
 
 function validTimestamp(value: string): boolean {
@@ -308,6 +339,7 @@ class MemoryTransaction implements StateTransaction {
 
   async get<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertActive();
+    assertStateKey(key, "query", this.#clock);
     const identifier = serializedKey(key);
     const mutation = this.#mutations.get(identifier);
     if (mutation?.kind === "delete") {
@@ -363,6 +395,7 @@ class MemoryTransaction implements StateTransaction {
     options: StateWriteOptions,
   ): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write", this.#clock);
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
     this.#mutations.set(serializedKey(storedKey), {
       kind: "put",
@@ -374,6 +407,7 @@ class MemoryTransaction implements StateTransaction {
 
   async delete<T extends JsonValue>(key: StateKey<T>, options: StateWriteOptions): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write", this.#clock);
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
     this.#mutations.set(serializedKey(storedKey), {
       kind: "delete",
@@ -561,6 +595,7 @@ export class MemoryStateStore implements StateStore {
 
   async read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertOpen();
+    assertStateKey(key, "query", this.#clock);
     const record = this.#records.get(serializedKey(key));
     return record === undefined
       ? undefined

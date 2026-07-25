@@ -11,6 +11,7 @@ import {
   parseMessageId,
   parseOperationId,
   parseRevision,
+  stateStringOrderKey,
   type JsonObject,
   type OperationJournalEntry,
   type PersistedOperationJournalEntry,
@@ -260,7 +261,7 @@ test("migrations are idempotent and configure WAL mode", async () => {
       .prepare("SELECT version FROM schema_migrations ORDER BY version")
       .all()
       .map((row) => row.version);
-    assert.deepEqual(migrations, [1, 2, 3]);
+    assert.deepEqual(migrations, [1, 2, 3, 4]);
     assert.equal(database.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
     const tables = database
       .prepare(
@@ -380,9 +381,9 @@ test("decoded database values are validated before they escape", async () => {
   database.prepare("INSERT INTO revisions DEFAULT VALUES").run();
   database
     .prepare(
-      "INSERT INTO records(namespace, collection_name, record_id, value_json, revision) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO records(namespace, collection_name, record_id, record_id_order_key, value_json, revision) VALUES (?, ?, ?, ?, ?, ?)",
     )
-    .run("invalid", "examples", "record", '{"not":', 1);
+    .run("invalid", "examples", "record", Buffer.from(stateStringOrderKey("record")), '{"not":', 1);
   database.close();
 
   const reopened = await openStore(databasePath);

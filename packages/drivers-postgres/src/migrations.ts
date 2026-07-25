@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import { isPortableStateString, stateStringOrderKey } from "@tegojs/contracts";
 
 const migrations = [
   `
@@ -138,6 +139,21 @@ const migrations = [
       ADD CONSTRAINT tego_artifacts_size_limit
       CHECK (size_bytes <= 16777216);
   `,
+  `
+    ALTER TABLE tego_records
+      ADD COLUMN record_id_order_key bytea;
+
+    CREATE INDEX tego_records_scan_order
+      ON tego_records(
+        driver_namespace,
+        namespace,
+        collection_name,
+        record_id_order_key
+      );
+
+    CREATE INDEX tego_operations_scan_order
+      ON tego_operations(driver_namespace, revision, operation_id COLLATE "C");
+  `,
 ] as const;
 
 export const postgresSchemaVersion = migrations.length;
@@ -181,6 +197,57 @@ export async function applyPostgresMigrations(pool: Pool): Promise<void> {
     }
     for (let index = 0; index < migrations.length; index += 1) {
       await applyMigration(client, index + 1, migrations[index] ?? "");
+    }
+    const missingOrderKeys = await client.query<{
+      driver_namespace: string;
+      namespace: string;
+      collection_name: string;
+      record_id: string;
+    }>(
+      `
+        SELECT driver_namespace, namespace, collection_name, record_id
+        FROM tego_records
+        WHERE record_id_order_key IS NULL
+      `,
+    );
+    for (const row of missingOrderKeys.rows) {
+      if (
+        !isPortableStateString(row.driver_namespace) ||
+        !isPortableStateString(row.namespace) ||
+        !isPortableStateString(row.collection_name) ||
+        !isPortableStateString(row.record_id)
+      ) {
+        throw new Error("PostgreSQL state contains a non-portable state key");
+      }
+      await client.query(
+        `
+          UPDATE tego_records
+          SET record_id_order_key = $1
+          WHERE driver_namespace = $2
+            AND namespace = $3
+            AND collection_name = $4
+            AND record_id = $5
+        `,
+        [
+          Buffer.from(stateStringOrderKey(row.record_id)),
+          row.driver_namespace,
+          row.namespace,
+          row.collection_name,
+          row.record_id,
+        ],
+      );
+    }
+    const orderKeyColumn = await client.query<{ is_nullable: "NO" | "YES" }>(
+      `
+        SELECT is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'tego_records'
+          AND column_name = 'record_id_order_key'
+      `,
+    );
+    if (orderKeyColumn.rows[0]?.is_nullable === "YES") {
+      await client.query("ALTER TABLE tego_records ALTER COLUMN record_id_order_key SET NOT NULL");
     }
     await client.query("COMMIT");
   } catch (error) {

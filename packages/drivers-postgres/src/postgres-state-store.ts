@@ -7,6 +7,7 @@ import {
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
   STATE_QUERY_MAX_LIMIT,
+  isPortableStateString,
   type OutboxAcknowledgement,
   type OutboxAcknowledgementRequest,
   type OutboxClaim,
@@ -17,6 +18,7 @@ import {
   parseMessageId,
   parseOperationId,
   parseRevision,
+  stateStringOrderKey,
   type Revision,
   type ScannedState,
   type StateChange,
@@ -69,16 +71,42 @@ function compareCodeUnits(left: string, right: string): number {
 
 function assertStateQuery(query: StateQuery<JsonValue>): void {
   if (
-    query.limit !== undefined &&
-    (!Number.isSafeInteger(query.limit) || query.limit <= 0 || query.limit > STATE_QUERY_MAX_LIMIT)
+    !isPortableStateString(query.namespace) ||
+    !isPortableStateString(query.collection) ||
+    (query.idPrefix !== undefined && !isPortableStateString(query.idPrefix)) ||
+    (query.afterId !== undefined && !isPortableStateString(query.afterId)) ||
+    (query.limit !== undefined &&
+      (!Number.isSafeInteger(query.limit) ||
+        query.limit <= 0 ||
+        query.limit > STATE_QUERY_MAX_LIMIT))
   ) {
     throw postgresError(
       "STATE_QUERY_INVALID",
-      `State query limit must be a positive safe integer no greater than ${STATE_QUERY_MAX_LIMIT}`,
+      `State query strings must be portable and limit must be between 1 and ${STATE_QUERY_MAX_LIMIT}`,
       "state",
-      { limit: query.limit },
+      { limit: query.limit ?? null },
     );
   }
+}
+
+function assertStateKey(key: StateKey<JsonValue>, operation: "query" | "write"): void {
+  if (
+    isPortableStateString(key.namespace) &&
+    isPortableStateString(key.collection) &&
+    isPortableStateString(key.id)
+  ) {
+    return;
+  }
+  throw postgresError(
+    operation === "query" ? "STATE_QUERY_INVALID" : "STATE_DATA_INVALID",
+    "State keys must not contain NUL or ill-formed Unicode",
+    "state",
+    {
+      namespace: key.namespace,
+      collection: key.collection,
+      id: key.id,
+    },
+  );
 }
 
 function validTimestamp(value: string): boolean {
@@ -397,6 +425,7 @@ class PostgresTransaction implements StateTransaction {
 
   async get<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertActive();
+    assertStateKey(key, "query");
     const result = await this.#client.query(
       `
         SELECT namespace, collection_name, record_id, value_json, revision::text
@@ -422,17 +451,20 @@ class PostgresTransaction implements StateTransaction {
         WHERE driver_namespace = $1
           AND namespace = $2 AND collection_name = $3
           AND ($4::text IS NULL OR starts_with(record_id, $4))
+          AND ($5::bytea IS NULL OR record_id_order_key > $5)
+        ORDER BY record_id_order_key
+        LIMIT $6
       `,
-      [this.#namespace, query.namespace, query.collection, query.idPrefix ?? null],
+      [
+        this.#namespace,
+        query.namespace,
+        query.collection,
+        query.idPrefix ?? null,
+        query.afterId === undefined ? null : Buffer.from(stateStringOrderKey(query.afterId)),
+        query.limit ?? null,
+      ],
     );
-    const matching = result.rows
-      .filter(
-        (row) =>
-          query.afterId === undefined || compareCodeUnits(String(row.record_id), query.afterId) > 0,
-      )
-      .sort((left, right) => compareCodeUnits(String(left.record_id), String(right.record_id)));
-    const rows = query.limit === undefined ? matching : matching.slice(0, query.limit);
-    for (const row of rows) {
+    for (const row of result.rows) {
       this.#assertActive();
       const record = stateRecord(row);
       yield { key: record.key as StateKey<T>, value: record.value as T, revision: record.revision };
@@ -445,6 +477,7 @@ class PostgresTransaction implements StateTransaction {
     options: StateWriteOptions,
   ): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write");
     const current = await this.#lockedRevision(key);
     if (!expectedMatches(current, options.expectedRevision)) {
       throw this.#revisionConflict(key, options.expectedRevision, current);
@@ -454,13 +487,28 @@ class PostgresTransaction implements StateTransaction {
     await this.#client.query(
       `
         INSERT INTO tego_records(
-          driver_namespace, namespace, collection_name, record_id, value_json, revision
-        ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+          driver_namespace,
+          namespace,
+          collection_name,
+          record_id,
+          record_id_order_key,
+          value_json,
+          revision
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
         ON CONFLICT(driver_namespace, namespace, collection_name, record_id) DO UPDATE SET
+          record_id_order_key = EXCLUDED.record_id_order_key,
           value_json = EXCLUDED.value_json,
           revision = EXCLUDED.revision
       `,
-      [this.#namespace, key.namespace, key.collection, key.id, canonicalJson(cloned), revision],
+      [
+        this.#namespace,
+        key.namespace,
+        key.collection,
+        key.id,
+        Buffer.from(stateStringOrderKey(key.id)),
+        canonicalJson(cloned),
+        revision,
+      ],
     );
     await this.#client.query(
       `
@@ -474,6 +522,7 @@ class PostgresTransaction implements StateTransaction {
 
   async delete<T extends JsonValue>(key: StateKey<T>, options: StateWriteOptions): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write");
     const current = await this.#lockedRevision(key);
     if (!expectedMatches(current, options.expectedRevision)) {
       throw this.#revisionConflict(key, options.expectedRevision, current);
@@ -836,6 +885,7 @@ export class PostgresStateStore implements StateStore {
 
   async read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertOpen();
+    assertStateKey(key, "query");
     const result = await this.#pool.query(
       `
         SELECT namespace, collection_name, record_id, value_json, revision::text
@@ -861,17 +911,20 @@ export class PostgresStateStore implements StateStore {
         WHERE driver_namespace = $1
           AND namespace = $2 AND collection_name = $3
           AND ($4::text IS NULL OR starts_with(record_id, $4))
+          AND ($5::bytea IS NULL OR record_id_order_key > $5)
+        ORDER BY record_id_order_key
+        LIMIT $6
       `,
-      [this.#namespace, query.namespace, query.collection, query.idPrefix ?? null],
+      [
+        this.#namespace,
+        query.namespace,
+        query.collection,
+        query.idPrefix ?? null,
+        query.afterId === undefined ? null : Buffer.from(stateStringOrderKey(query.afterId)),
+        query.limit ?? null,
+      ],
     );
-    const matching = result.rows
-      .filter(
-        (row) =>
-          query.afterId === undefined || compareCodeUnits(String(row.record_id), query.afterId) > 0,
-      )
-      .sort((left, right) => compareCodeUnits(String(left.record_id), String(right.record_id)));
-    const rows = query.limit === undefined ? matching : matching.slice(0, query.limit);
-    for (const row of rows) {
+    for (const row of result.rows) {
       this.#assertOpen();
       const record = stateRecord(row);
       yield { key: record.key as StateKey<T>, value: record.value as T, revision: record.revision };
@@ -928,34 +981,25 @@ export class PostgresStateStore implements StateStore {
         FROM tego_operations
         WHERE driver_namespace = $1
           ${recoverableOnly ? "AND status IN ('executing', 'planned')" : ""}
+          AND (
+            $2::bigint IS NULL
+            OR revision > $2
+            OR (
+              revision = $2
+              AND operation_id COLLATE "C" > $3::text COLLATE "C"
+            )
+          )
+        ORDER BY revision, operation_id COLLATE "C"
+        LIMIT $4
       `,
-      [this.#namespace],
+      [
+        this.#namespace,
+        query.after?.revision ?? null,
+        query.after?.operationId ?? null,
+        query.limit ?? null,
+      ],
     );
-    const after = query.after;
-    const orderedRows = result.rows
-      .map((row) => ({
-        row,
-        operationId: String(row.operation_id),
-        revision: decimal(row.revision, "revision"),
-      }))
-      .filter(({ operationId, revision }) => {
-        if (after === undefined) return true;
-        const revisionOrder = BigInt(revision) - BigInt(after.revision);
-        return (
-          revisionOrder > 0n ||
-          (revisionOrder === 0n && compareCodeUnits(operationId, after.operationId) > 0)
-        );
-      })
-      .sort(
-        (left, right) =>
-          (BigInt(left.revision) < BigInt(right.revision)
-            ? -1
-            : BigInt(left.revision) > BigInt(right.revision)
-              ? 1
-              : 0) || compareCodeUnits(left.operationId, right.operationId),
-      );
-    const rows = query.limit === undefined ? orderedRows : orderedRows.slice(0, query.limit);
-    for (const { row } of rows) {
+    for (const row of result.rows) {
       this.#assertOpen();
       yield {
         operationId: parseOperationId(String(row.operation_id)),

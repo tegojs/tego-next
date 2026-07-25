@@ -30,6 +30,38 @@ export interface StateQuery<_T extends JsonValue> {
 
 export const STATE_QUERY_MAX_LIMIT = 100;
 
+export function isPortableStateString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit === 0) {
+      return false;
+    }
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const trailing = value.charCodeAt(index + 1);
+      if (!Number.isInteger(trailing) || trailing < 0xdc00 || trailing > 0xdfff) {
+        return false;
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function stateStringOrderKey(value: string): Uint8Array {
+  if (!isPortableStateString(value)) {
+    throw new TypeError("State strings must not contain NUL or ill-formed Unicode");
+  }
+  const key = new Uint8Array(value.length * 2);
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    key[index * 2] = codeUnit >>> 8;
+    key[index * 2 + 1] = codeUnit & 0xff;
+  }
+  return key;
+}
+
 export interface StateChange {
   readonly revision: Revision;
   readonly key: StateKey<JsonValue>;

@@ -1,18 +1,20 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DiagnosticError,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
   STATE_QUERY_MAX_LIMIT,
+  isPortableStateString,
   parseFencingEpoch,
   parseMessageId,
   parseOperationId,
   parseRevision,
   runtimeDiagnostic,
   serializeWireValue,
+  stateStringOrderKey,
   type Clock,
   type DriverHealth,
   type ExpectedRevision,
@@ -130,16 +132,46 @@ function compareCodeUnits(left: string, right: string): number {
 
 function assertStateQuery(query: StateQuery<JsonValue>, clock: Clock): void {
   if (
-    query.limit !== undefined &&
-    (!Number.isSafeInteger(query.limit) || query.limit <= 0 || query.limit > STATE_QUERY_MAX_LIMIT)
+    !isPortableStateString(query.namespace) ||
+    !isPortableStateString(query.collection) ||
+    (query.idPrefix !== undefined && !isPortableStateString(query.idPrefix)) ||
+    (query.afterId !== undefined && !isPortableStateString(query.afterId)) ||
+    (query.limit !== undefined &&
+      (!Number.isSafeInteger(query.limit) ||
+        query.limit <= 0 ||
+        query.limit > STATE_QUERY_MAX_LIMIT))
   ) {
     throw stateError(
       "STATE_QUERY_INVALID",
-      `State query limit must be a positive safe integer no greater than ${STATE_QUERY_MAX_LIMIT}`,
-      { limit: query.limit },
+      `State query strings must be portable and limit must be between 1 and ${STATE_QUERY_MAX_LIMIT}`,
+      { limit: query.limit ?? null },
       clock,
     );
   }
+}
+
+function assertStateKey(
+  key: StateKey<JsonValue>,
+  operation: "query" | "write",
+  clock: Clock,
+): void {
+  if (
+    isPortableStateString(key.namespace) &&
+    isPortableStateString(key.collection) &&
+    isPortableStateString(key.id)
+  ) {
+    return;
+  }
+  throw stateError(
+    operation === "query" ? "STATE_QUERY_INVALID" : "STATE_DATA_INVALID",
+    "State keys must not contain NUL or ill-formed Unicode",
+    {
+      namespace: key.namespace,
+      collection: key.collection,
+      id: key.id,
+    },
+    clock,
+  );
 }
 
 function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): number {
@@ -353,6 +385,7 @@ class SqliteTransaction implements StateTransaction {
 
   async get<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertActive();
+    assertStateKey(key, "query", this.#clock);
     const mutation = this.#mutations.get(serializedKey(key));
     if (mutation?.kind === "delete") {
       return undefined;
@@ -419,6 +452,7 @@ class SqliteTransaction implements StateTransaction {
     options: StateWriteOptions,
   ): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write", this.#clock);
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
     this.#mutations.set(serializedKey(key), {
       kind: "put",
@@ -430,6 +464,7 @@ class SqliteTransaction implements StateTransaction {
 
   async delete<T extends JsonValue>(key: StateKey<T>, options: StateWriteOptions): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write", this.#clock);
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
     this.#mutations.set(serializedKey(key), {
       kind: "delete",
@@ -688,6 +723,7 @@ export class SqliteStateStore implements StateStore {
 
   async read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertOpen();
+    assertStateKey(key, "query", this.#clock);
     const record = this.#readRecord(key);
     return record === undefined
       ? undefined
@@ -1314,16 +1350,27 @@ export class SqliteStateStore implements StateStore {
             database
               .prepare(
                 `
-                  INSERT INTO records(namespace, collection_name, record_id, value_json, revision)
-                  VALUES (?, ?, ?, ?, ?)
+                  INSERT INTO records(
+                    namespace,
+                    collection_name,
+                    record_id,
+                    record_id_order_key,
+                    value_json,
+                    revision
+                  )
+                  VALUES (?, ?, ?, ?, ?, ?)
                   ON CONFLICT(namespace, collection_name, record_id)
-                  DO UPDATE SET value_json = excluded.value_json, revision = excluded.revision
+                  DO UPDATE SET
+                    record_id_order_key = excluded.record_id_order_key,
+                    value_json = excluded.value_json,
+                    revision = excluded.revision
                 `,
               )
               .run(
                 mutation.key.namespace,
                 mutation.key.collection,
                 mutation.key.id,
+                Buffer.from(stateStringOrderKey(mutation.key.id)),
                 canonicalJson(mutation.value),
                 revisionInteger,
               );
@@ -1480,24 +1527,33 @@ export class SqliteStateStore implements StateStore {
 
   #scanRecords(query: StateQuery<JsonValue>): readonly StoredRecord[] {
     assertStateQuery(query, this.#clock);
-    const matching = this.#database()
+    const predicates = ["namespace = ?", "collection_name = ?"];
+    const parameters: SQLInputValue[] = [query.namespace, query.collection];
+    if (query.idPrefix !== undefined) {
+      predicates.push("substr(record_id, 1, length(?)) = ?");
+      parameters.push(query.idPrefix, query.idPrefix);
+    }
+    if (query.afterId !== undefined) {
+      predicates.push("record_id_order_key > ?");
+      parameters.push(Buffer.from(stateStringOrderKey(query.afterId)));
+    }
+    const limitClause = query.limit === undefined ? "" : "LIMIT ?";
+    if (query.limit !== undefined) {
+      parameters.push(query.limit);
+    }
+    return this.#database()
       .prepare(
         `
           SELECT namespace, collection_name, record_id, value_json, revision
           FROM records
-          WHERE namespace = ? AND collection_name = ?
+          WHERE ${predicates.join(" AND ")}
+          ORDER BY record_id_order_key
+          ${limitClause}
         `,
         { readBigInts: true },
       )
-      .all(query.namespace, query.collection)
-      .map((row) => this.#decodeRecord(row))
-      .filter(
-        (record) =>
-          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
-          (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
-      )
-      .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
-    return query.limit === undefined ? matching : matching.slice(0, query.limit);
+      .all(...parameters)
+      .map((row) => this.#decodeRecord(row));
   }
 
   #snapshotRecords(): ReadonlyMap<string, StoredRecord> {
