@@ -2,6 +2,7 @@ import { DiagnosticError, runtimeDiagnostic, type RuntimeDiagnostic } from "./di
 import {
   parseArtifactDigest,
   parseComponentInstanceId,
+  parseExecutorId,
   parseGeneration,
   parseWorkerId,
   type ApplicationId,
@@ -77,11 +78,7 @@ export function parseTaskExecutionTarget(input: unknown): TaskExecutionTarget {
   targetKeys(value, ["instanceId", "deploymentGeneration", "artifactDigest", "executor"]);
   const executor = targetObject(value.executor);
   targetKeys(executor, ["id", "type"], ["workerId"]);
-  if (
-    typeof executor.id !== "string" ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(executor.id) ||
-    (executor.type !== "process" && executor.type !== "remote" && executor.type !== "thread")
-  ) {
+  if (executor.type !== "process" && executor.type !== "remote" && executor.type !== "thread") {
     throw targetError("Task execution target executor is invalid");
   }
   if (
@@ -93,12 +90,12 @@ export function parseTaskExecutionTarget(input: unknown): TaskExecutionTarget {
   const targetExecutor: TaskExecutionTarget["executor"] =
     executor.type === "remote"
       ? {
-          id: executor.id,
+          id: parseExecutorId(executor.id),
           type: "remote" as const,
           workerId: parseWorkerId(executor.workerId),
         }
       : {
-          id: executor.id,
+          id: parseExecutorId(executor.id),
           type: executor.type,
         };
   return {

@@ -12,6 +12,7 @@ export type OperationId = Brand<string, "OperationId">;
 export type TaskId = Brand<string, "TaskId">;
 export type AttemptId = Brand<string, "AttemptId">;
 export type WorkerId = Brand<string, "WorkerId">;
+export type ExecutorId = Brand<string, "ExecutorId">;
 export type SessionId = Brand<string, "SessionId">;
 export type MessageId = Brand<string, "MessageId">;
 export type CapabilityName = Brand<string, "CapabilityName">;
@@ -22,8 +23,11 @@ export type Sequence = Brand<string, "Sequence">;
 export type FencingEpoch = Brand<string, "FencingEpoch">;
 
 const IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const EXECUTOR_ID_PATTERN =
+  /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9])?$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9]\d*)$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+const UINT64_MAX = "18446744073709551615";
 
 function invalidIdentity(name: string, value: unknown): DiagnosticError {
   return new DiagnosticError(
@@ -93,6 +97,13 @@ export function parseWorkerId(value: unknown): WorkerId {
   return parseIdentity(value, "WorkerId");
 }
 
+export function parseExecutorId(value: unknown): ExecutorId {
+  if (typeof value !== "string" || !EXECUTOR_ID_PATTERN.test(value)) {
+    throw invalidIdentity("ExecutorId", value);
+  }
+  return value as ExecutorId;
+}
+
 export function parseSessionId(value: unknown): SessionId {
   return parseIdentity(value, "SessionId");
 }
@@ -117,7 +128,14 @@ export function parseRevision(value: unknown): Revision {
 }
 
 export function parseGeneration(value: unknown): Generation {
-  return parseDecimalIdentity(value, "Generation");
+  const generation = parseDecimalIdentity(value, "Generation");
+  if (
+    generation.length > UINT64_MAX.length ||
+    (generation.length === UINT64_MAX.length && generation > UINT64_MAX)
+  ) {
+    throw invalidIdentity("Generation", value);
+  }
+  return generation;
 }
 
 export function parseSequence(value: unknown): Sequence {

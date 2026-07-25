@@ -5,6 +5,7 @@ import {
   parseAttemptId,
   parseComponentId,
   parseFencingEpoch,
+  parseExecutorId,
   parseOperationId,
   parsePluginId,
   parseTaskId,
@@ -328,18 +329,22 @@ export function parseTaskRecord(input: unknown): TaskRecord {
       : (() => {
           const entry = objectValue(value.executor);
           exactKeys(entry, ["id", "type"]);
-          if (
-            typeof entry.id !== "string" ||
-            (entry.type !== "process" && entry.type !== "remote" && entry.type !== "thread")
-          ) {
+          if (entry.type !== "process" && entry.type !== "remote" && entry.type !== "thread") {
             throw operationError("Task executor is invalid");
           }
           return {
-            id: entry.id,
+            id: parseExecutorId(entry.id),
             type: entry.type as TaskExecutorReference["type"],
           };
         })();
   const target = value.target === undefined ? undefined : parseTaskExecutionTarget(value.target);
+  if (
+    target !== undefined &&
+    executor !== undefined &&
+    (target.executor.id !== executor.id || target.executor.type !== executor.type)
+  ) {
+    throw operationError("Task target and legacy executor bindings must match exactly");
+  }
   const authority =
     value.authority === undefined
       ? undefined

@@ -170,6 +170,19 @@ export class TaskService implements RuntimeTaskLifecycle {
 
   async setAuthority(authority: RuntimeAuthority | undefined): Promise<void> {
     this.#assertOpen();
+    const previous = this.#authority;
+    if (
+      previous !== undefined &&
+      (authority === undefined ||
+        previous.resource !== authority.resource ||
+        previous.epoch !== authority.epoch)
+    ) {
+      const reason =
+        authority === undefined
+          ? this.#notLeaderError()
+          : this.#fenceRejectedError(previous.resource);
+      for (const controller of this.#observationControllers) controller.abort(reason);
+    }
     this.#authority = authority === undefined ? undefined : structuredClone(authority);
     if (authority === undefined) return;
     const pending = [...this.#records.values()]
@@ -640,15 +653,54 @@ export class TaskService implements RuntimeTaskLifecycle {
     ) {
       return retained;
     }
-    const resolved = await this.#selectExecutor(record.request, target);
+    const resolved = await this.#selectExactTarget(record, authority);
     this.#validateSelection(resolved, record.taskId);
     if (!sameTarget(resolved.target, target)) {
-      throw this.#invalidResult(
-        record.taskId,
-        "Resolved execution target does not match the durable task target",
-      );
+      throw this.#targetMismatch(record.taskId, target.executor.id, resolved.target.executor.id);
     }
     return resolved.executor;
+  }
+
+  async #selectExactTarget(
+    record: TaskRecord & { readonly target?: TaskExecutionTarget },
+    authority: RuntimeAuthority,
+  ): Promise<TaskExecutorSelection> {
+    const target = record.target;
+    if (target === undefined) {
+      throw this.#targetUnavailable(record.taskId, undefined, undefined);
+    }
+    const controller = new AbortController();
+    this.#observationControllers.add(controller);
+    const selection = Promise.resolve()
+      .then(() => this.#selectExecutor(record.request, target))
+      .then(
+        (value) => ({ kind: "selected" as const, value }),
+        (error: unknown) => ({ kind: "failed" as const, error }),
+      );
+    const timeout = this.#clock.sleep(5_000, controller.signal).then(
+      () => ({ kind: "timeout" as const }),
+      (error: unknown) => ({ kind: "aborted" as const, error }),
+    );
+    const outcome = await Promise.race([selection, timeout]);
+    controller.abort();
+    this.#observationControllers.delete(controller);
+    if (outcome.kind === "selected") {
+      this.#assertAuthority(authority);
+      return outcome.value;
+    }
+    if (outcome.kind === "aborted") throw outcome.error;
+    if (outcome.kind === "failed") {
+      const code = diagnosticCode(outcome.error);
+      if (
+        code === "BOOTSTRAP_STOPPED" ||
+        code === "COORDINATION_FENCE_REJECTED" ||
+        code === "COORDINATION_NOT_LEADER"
+      ) {
+        throw outcome.error;
+      }
+      throw this.#targetUnavailable(record.taskId, target.executor.id, outcome.error);
+    }
+    throw this.#targetUnavailable(record.taskId, target.executor.id, undefined);
   }
 
   #validateSelection(selection: TaskExecutorSelection, taskId: TaskId): void {
@@ -656,7 +708,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       selection.executor.id !== selection.target.executor.id ||
       selection.executor.type !== selection.target.executor.type
     ) {
-      throw this.#invalidResult(taskId, "Selected executor does not match the execution target");
+      throw this.#targetMismatch(taskId, selection.target.executor.id, selection.executor.id);
     }
   }
 
@@ -721,6 +773,12 @@ export class TaskService implements RuntimeTaskLifecycle {
       return;
     }
     const timestamp = this.#clock.now().toISOString();
+    const specificDiagnostic =
+      _error instanceof DiagnosticError &&
+      (_error.diagnostic.code === "EXECUTOR_TARGET_MISMATCH" ||
+        _error.diagnostic.code === "EXECUTOR_TARGET_UNAVAILABLE")
+        ? _error.diagnostic
+        : undefined;
     const indeterminate = parseTaskRecord({
       ...record,
       state: "terminal",
@@ -730,11 +788,13 @@ export class TaskService implements RuntimeTaskLifecycle {
         attemptId: record.attemptId,
         executor: resultExecutor(record),
         status: "indeterminate",
-        diagnostic: indeterminateTaskDiagnostic(
-          record.taskId,
-          "The execution or persistence boundary cannot prove an authoritative task result",
-          timestamp,
-        ),
+        diagnostic:
+          specificDiagnostic ??
+          indeterminateTaskDiagnostic(
+            record.taskId,
+            "The execution or persistence boundary cannot prove an authoritative task result",
+            timestamp,
+          ),
         startedAt: record.createdAt,
         completedAt: timestamp,
       },
@@ -902,14 +962,7 @@ export class TaskService implements RuntimeTaskLifecycle {
   #requireAuthority(): RuntimeAuthority {
     const authority = this.#authority;
     if (authority === undefined) {
-      throw new DiagnosticError(
-        runtimeDiagnostic({
-          code: "COORDINATION_NOT_LEADER",
-          message: "Task mutation requires active runtime leadership",
-          source: { kind: "coordination", id: "tasks" },
-          observedAt: this.#clock.now().toISOString(),
-        }),
-      );
+      throw this.#notLeaderError();
     }
     return structuredClone(authority);
   }
@@ -918,14 +971,7 @@ export class TaskService implements RuntimeTaskLifecycle {
     const current = this.#authority;
     if (current?.resource !== expected.resource || current.epoch !== expected.epoch) {
       this.#requireAuthority();
-      throw new DiagnosticError(
-        runtimeDiagnostic({
-          code: "COORDINATION_FENCE_REJECTED",
-          message: "Task authority changed while the operation was active",
-          source: { kind: "coordination", id: expected.resource },
-          observedAt: this.#clock.now().toISOString(),
-        }),
-      );
+      throw this.#fenceRejectedError(expected.resource);
     }
   }
 
@@ -989,6 +1035,68 @@ export class TaskService implements RuntimeTaskLifecycle {
         code: "EXECUTOR_RESULT_INVALID",
         message,
         source: { kind: "executor", id: taskId },
+        observedAt: this.#clock.now().toISOString(),
+      }),
+    );
+  }
+
+  #notLeaderError(): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "COORDINATION_NOT_LEADER",
+        message: "Task mutation requires active runtime leadership",
+        source: { kind: "coordination", id: "tasks" },
+        observedAt: this.#clock.now().toISOString(),
+      }),
+    );
+  }
+
+  #fenceRejectedError(resource: string): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "COORDINATION_FENCE_REJECTED",
+        message: "Task authority changed while the operation was active",
+        source: { kind: "coordination", id: resource },
+        observedAt: this.#clock.now().toISOString(),
+      }),
+    );
+  }
+
+  #targetMismatch(
+    taskId: TaskId,
+    expectedExecutorId: string,
+    selectedExecutorId: string,
+  ): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "EXECUTOR_TARGET_MISMATCH",
+        message: "Selected executor does not match the immutable execution target",
+        source: { kind: "executor", id: taskId },
+        retryable: false,
+        details: { expectedExecutorId, selectedExecutorId },
+        observedAt: this.#clock.now().toISOString(),
+      }),
+    );
+  }
+
+  #targetUnavailable(
+    taskId: TaskId,
+    executorId: string | undefined,
+    cause: unknown,
+  ): DiagnosticError {
+    const causeCode = diagnosticCode(cause);
+    const causeDetails = cause instanceof DiagnosticError ? cause.diagnostic.details : undefined;
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "EXECUTOR_TARGET_UNAVAILABLE",
+        message: "The immutable execution target is unavailable",
+        source: { kind: "executor", id: taskId },
+        retryable: false,
+        details: {
+          ...(causeCode === undefined ? {} : { causeCode }),
+          ...(causeDetails === undefined ? {} : { causeDetails }),
+          ...(executorId === undefined ? {} : { executorId }),
+        },
         observedAt: this.#clock.now().toISOString(),
       }),
     );

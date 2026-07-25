@@ -211,6 +211,9 @@ class TransactionalState implements StateStore {
   scanRecoverableOperations(): AsyncIterable<never> {
     return { async *[Symbol.asyncIterator]() {} };
   }
+  scanOperations(): AsyncIterable<never> {
+    return { async *[Symbol.asyncIterator]() {} };
+  }
   claimOutbox(): Promise<readonly []> {
     return Promise.resolve([]);
   }

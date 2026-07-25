@@ -32,6 +32,8 @@ export interface SchemaIssue {
 }
 
 const IDENTITY_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
+const EXECUTOR_ID_PATTERN =
+  "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9])?$";
 const DECIMAL_PATTERN = "^(?:0|[1-9]\\d*)$";
 const SEMVER_PATTERN =
   "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$";
@@ -670,14 +672,14 @@ const executionRequestSchema = {
       required: ["instanceId", "deploymentGeneration", "artifactDigest", "executor"],
       properties: {
         instanceId: { $ref: "#/$defs/identity" },
-        deploymentGeneration: { type: "string", pattern: DECIMAL_PATTERN },
+        deploymentGeneration: { type: "string", pattern: DECIMAL_PATTERN, maxLength: 20 },
         artifactDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
         executor: {
           type: "object",
           additionalProperties: false,
           required: ["id", "type"],
           properties: {
-            id: { $ref: "#/$defs/identity" },
+            id: { type: "string", pattern: EXECUTOR_ID_PATTERN },
             type: { enum: ["process", "remote", "thread"] },
             workerId: { $ref: "#/$defs/identity" },
           },
