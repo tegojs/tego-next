@@ -66,7 +66,7 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
     ],
     stdout: stdout.stream,
     stderr: stderr.stream,
-    requestControl: async (request) => {
+    requestControl: async (request: ControlClientOptions) => {
       requests.push(request);
       return request.operation === "task.run"
         ? response(taskRecord("accepted"))
@@ -256,6 +256,242 @@ test("@spec:runtime-operations/task-operations/direct-and-socket-json-parity", a
   } finally {
     await server.close();
     await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/task-operations/direct-and-socket-success-values-are-sanitized", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-task-command-sanitize-"));
+  const endpoint =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\tego-task-sanitize-${process.pid}-${Date.now()}`
+      : join(directory, "control.sock");
+  const secret = "postgresql://user:hunter2@localhost/private /Users/alice/private";
+  const record = parseTaskRecord(
+    taskRecord("terminal", {
+      taskId: "task-cli-test",
+      attemptId: "attempt-cli-test",
+      status: "indeterminate",
+      diagnostic: {
+        code: "EXECUTOR_RESULT_INDETERMINATE",
+        message: secret,
+        severity: "error",
+        retryable: false,
+        observedAt: "2026-07-25T00:00:01.000Z",
+        source: { kind: "executor", id: secret },
+      },
+      executor: { kind: "remote" },
+      startedAt: "2026-07-25T00:00:00.000Z",
+      completedAt: "2026-07-25T00:00:01.000Z",
+    }),
+  );
+  const unused = () => Promise.reject(new Error("TEST_OPERATION_UNUSED"));
+  const operations: RuntimeOperations = {
+    installPlugin: unused,
+    deployPlugin: unused,
+    pluginStatus: unused,
+    runTask: unused,
+    taskStatus: async () => record,
+    waitTask: unused,
+    cancelTask: unused,
+    recoveredOperations: async () => [],
+  };
+  const server = await startControlServer({
+    endpoint,
+    operations: { operations, status: unused, stop: unused },
+  });
+  const directStdout = capture();
+  const socketStdout = capture();
+  const stderr = capture();
+  try {
+    assert.equal(
+      await runCli({
+        argv: ["task", "status", "task-cli-test", "--json"],
+        stdout: directStdout.stream,
+        stderr: stderr.stream,
+        requestControl: async () => response(record),
+      }),
+      0,
+    );
+    assert.equal(
+      await runCli({
+        argv: ["task", "status", "task-cli-test", "--endpoint", endpoint, "--json"],
+        stdout: socketStdout.stream,
+        stderr: stderr.stream,
+      }),
+      0,
+    );
+
+    assert.equal(stderr.read(), "");
+    assert.deepEqual(JSON.parse(directStdout.read()), JSON.parse(socketStdout.read()));
+    assert.doesNotMatch(directStdout.read(), /hunter2|\/Users\/alice|postgresql:/u);
+  } finally {
+    await server.close();
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/task-operations/rejects-success-without-result", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const exitCode = await runCli({
+    argv: ["task", "status", "task-cli-test", "--json"],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async () => ({
+      protocolVersion: "1.0",
+      requestId: "request-task-command-test",
+      ok: true,
+    }),
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(stdout.read(), "");
+  assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_CONTROL_FRAME_INVALID");
+});
+
+test("@spec:runtime-operations/task-operations/no-wait-uses-short-submission-timeout", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const timeouts: number[] = [];
+  const exitCode = await runCli({
+    argv: [
+      "task",
+      "run",
+      "org.example.echo/echo",
+      "--deadline",
+      "2099-01-01T00:00:00.000Z",
+      "--no-wait",
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async (request) => {
+      timeouts.push(request.timeoutMs);
+      return response(taskRecord("accepted"));
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(stderr.read(), "");
+  assert.deepEqual(timeouts, [5_000]);
+});
+
+test("@spec:runtime-operations/task-operations/run-and-wait-share-one-time-budget", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const timeouts: number[] = [];
+  let monotonicTime = 10_000;
+  const runOptions = {
+    argv: [
+      "task",
+      "run",
+      "org.example.echo/echo",
+      "--deadline",
+      "2099-01-01T00:00:00.000Z",
+      "--timeout-ms",
+      "1000",
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    monotonicNow: () => monotonicTime,
+    requestControl: async (request: ControlClientOptions) => {
+      timeouts.push(request.timeoutMs);
+      if (request.operation === "task.run") {
+        monotonicTime += 650;
+        return response(taskRecord("accepted"));
+      }
+      return response(
+        taskRecord("terminal", {
+          taskId: "task-cli-test",
+          attemptId: "attempt-cli-test",
+          status: "succeeded",
+          output: { message: "hi" },
+          executor: { kind: "thread" },
+          startedAt: "2026-07-25T00:00:00.000Z",
+          completedAt: "2026-07-25T00:00:01.000Z",
+        }),
+      );
+    },
+  };
+  const exitCode = await runCli(runOptions);
+
+  assert.equal(exitCode, 0);
+  assert.equal(stderr.read(), "");
+  assert.deepEqual(timeouts, [1_000, 350]);
+});
+
+test("@spec:runtime-operations/task-operations/rejects-mismatched-task-identities", async () => {
+  for (const command of ["status", "wait", "cancel"] as const) {
+    const stdout = capture();
+    const stderr = capture();
+    const exitCode = await runCli({
+      argv: ["task", command, "task-cli-test", "--json"],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      requestControl: async () =>
+        response({
+          ...(taskRecord("accepted") as Record<string, JsonValue>),
+          taskId: "task-other",
+        }),
+    });
+
+    assert.equal(exitCode, 1, command);
+    assert.equal(stdout.read(), "");
+    assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_CONTROL_REQUEST_MISMATCH");
+  }
+});
+
+test("@spec:runtime-operations/task-operations/rejects-run-request-and-wait-identity-mismatches", async () => {
+  for (const mismatch of ["request", "wait"] as const) {
+    const stdout = capture();
+    const stderr = capture();
+    const deadline = new Date(Date.now() + 60_000).toISOString();
+    let submittedInput: JsonValue = null;
+    const exitCode = await runCli({
+      argv: [
+        "task",
+        "run",
+        "org.example.echo/echo",
+        "--input",
+        '{"message":"hi"}',
+        "--deadline",
+        deadline,
+        "--json",
+      ],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      requestControl: async (request) => {
+        if (request.operation === "task.run") {
+          submittedInput = request.input;
+          const accepted = taskRecord("accepted") as Record<string, JsonValue>;
+          return response({
+            ...accepted,
+            request:
+              mismatch === "request"
+                ? { ...(accepted.request as Record<string, JsonValue>), componentId: "other" }
+                : request.input,
+          });
+        }
+        const terminal = taskRecord("terminal", {
+          taskId: "task-cli-test",
+          attemptId: "attempt-cli-test",
+          status: "succeeded",
+          executor: { kind: "thread" },
+          startedAt: "2026-07-25T00:00:00.000Z",
+          completedAt: "2026-07-25T00:00:01.000Z",
+        }) as Record<string, JsonValue>;
+        return response({
+          ...terminal,
+          attemptId: mismatch === "wait" ? "attempt-other" : "attempt-cli-test",
+          request: submittedInput,
+        });
+      },
+    });
+
+    assert.equal(exitCode, 1, mismatch);
+    assert.equal(stdout.read(), "");
+    assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_CONTROL_REQUEST_MISMATCH");
   }
 });
 

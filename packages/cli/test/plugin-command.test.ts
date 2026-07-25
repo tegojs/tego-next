@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { generateKeyPairSync } from "node:crypto";
+import {
+  access,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -37,6 +48,42 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function createPackFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "tego-plugin-path-command-"));
+  const pluginDirectory = join(directory, "plugin");
+  await mkdir(join(pluginDirectory, "build"), { recursive: true });
+  await writeFile(
+    join(pluginDirectory, "manifest.json"),
+    JSON.stringify({
+      schemaVersion: "1.0",
+      pluginId: "org.example.path-test",
+      version: "1.0.0",
+      contractRange: "^1.0.0",
+      nodeRange: ">=26.0.0",
+      moduleFormat: "esm",
+      components: [
+        {
+          componentId: "echo",
+          kind: "task",
+          entrypoint: "component.js",
+          executors: ["thread"],
+        },
+      ],
+      permissions: [],
+      capabilities: { provides: [], requires: [] },
+    }),
+  );
+  await writeFile(
+    join(pluginDirectory, "build", "component.js"),
+    "export default { async run(_context, input) { return input; } };\n",
+  );
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const privateKeyText = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const privateKeyPath = join(directory, "private.pem");
+  await writeFile(privateKeyPath, privateKeyText);
+  return { directory, pluginDirectory, privateKeyPath, privateKeyText };
 }
 
 test("@spec:runtime-operations/plugin-development-operations/validate-before-pack", async () => {
@@ -303,4 +350,175 @@ test("@spec:runtime-operations/plugin-development-operations/human-and-json-use-
 
   assert.equal(stderr.read(), "");
   assert.deepEqual(JSON.parse(humanStdout.read()), JSON.parse(jsonStdout.read()));
+});
+
+test("@spec:runtime-operations/plugin-development-operations/rejects-lexical-output-collisions-before-write", async () => {
+  const fixture = await createPackFixture();
+  const stderr = capture();
+  const artifactPath = join(fixture.directory, "plugin.tego");
+  try {
+    const signatureCollision = await runCli({
+      argv: [
+        "plugin",
+        "pack",
+        fixture.pluginDirectory,
+        "--no-build",
+        "--output",
+        artifactPath,
+        "--private-key",
+        fixture.privateKeyPath,
+        "--key-id",
+        "test-key",
+        "--signature-output",
+        artifactPath,
+        "--json",
+      ],
+      stderr: stderr.stream,
+    });
+    assert.equal(signatureCollision, 1);
+    assert.equal(await exists(artifactPath), false);
+    assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
+
+    const keyCollision = await runCli({
+      argv: [
+        "plugin",
+        "pack",
+        fixture.pluginDirectory,
+        "--no-build",
+        "--output",
+        fixture.privateKeyPath,
+        "--private-key",
+        fixture.privateKeyPath,
+        "--key-id",
+        "test-key",
+        "--json",
+      ],
+      stderr: stderr.stream,
+    });
+    assert.equal(keyCollision, 1);
+    assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
+  } finally {
+    await rm(fixture.directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/rejects-hardlink-output-collision-before-write", async () => {
+  const fixture = await createPackFixture();
+  const artifactPath = join(fixture.directory, "artifact-alias.tego");
+  const stderr = capture();
+  try {
+    await link(fixture.privateKeyPath, artifactPath);
+    const exitCode = await runCli({
+      argv: [
+        "plugin",
+        "pack",
+        fixture.pluginDirectory,
+        "--no-build",
+        "--output",
+        artifactPath,
+        "--private-key",
+        fixture.privateKeyPath,
+        "--key-id",
+        "test-key",
+        "--json",
+      ],
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
+    assert.equal(await readFile(artifactPath, "utf8"), fixture.privateKeyText);
+  } finally {
+    await rm(fixture.directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/rejects-canonical-parent-alias-before-write", {
+  skip: process.platform === "win32" ? "directory symlink contract runs on Unix" : false,
+}, async () => {
+  const fixture = await createPackFixture();
+  const outputDirectory = join(fixture.directory, "output");
+  const outputAlias = join(fixture.directory, "output-alias");
+  const artifactPath = join(outputDirectory, "plugin.tego");
+  const signaturePath = join(outputAlias, "plugin.tego");
+  const stderr = capture();
+  try {
+    await mkdir(outputDirectory);
+    await symlink(outputDirectory, outputAlias, "dir");
+    const exitCode = await runCli({
+      argv: [
+        "plugin",
+        "pack",
+        fixture.pluginDirectory,
+        "--no-build",
+        "--output",
+        artifactPath,
+        "--private-key",
+        fixture.privateKeyPath,
+        "--key-id",
+        "test-key",
+        "--signature-output",
+        signaturePath,
+        "--json",
+      ],
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(await exists(artifactPath), false);
+    assert.equal(await readFile(fixture.privateKeyPath, "utf8"), fixture.privateKeyText);
+  } finally {
+    await rm(fixture.directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/rejects-mismatched-plugin-identities", async () => {
+  const digest = `sha256:${"c".repeat(64)}`;
+  for (const command of ["deploy", "status"] as const) {
+    const stdout = capture();
+    const stderr = capture();
+    const exitCode = await runCli({
+      argv:
+        command === "deploy"
+          ? [
+              "plugin",
+              "deploy",
+              "org.example.echo",
+              "--digest",
+              digest,
+              "--application-id",
+              "application-test",
+              "--json",
+            ]
+          : [
+              "plugin",
+              "status",
+              "org.example.echo",
+              "--application-id",
+              "application-test",
+              "--json",
+            ],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      requestControl: async (request) =>
+        command === "deploy"
+          ? response({
+              ...(request.input as Record<string, JsonValue>),
+              applicationId: "application-other",
+              version: "1.0.0",
+              generation: "1",
+              state: "active",
+            })
+          : response({
+              identity: {
+                applicationId: "application-other",
+                pluginId: "org.example.echo",
+              },
+            }),
+    });
+
+    assert.equal(exitCode, 1, command);
+    assert.equal(stdout.read(), "");
+    assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_CONTROL_REQUEST_MISMATCH");
+  }
 });
