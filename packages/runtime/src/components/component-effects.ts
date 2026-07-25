@@ -56,6 +56,12 @@ interface OperationFingerprint {
   readonly instanceId: string;
 }
 
+interface InFlightRestoration {
+  readonly effect: ReconcileEffect;
+  readonly fingerprint: string;
+  readonly result: Promise<void>;
+}
+
 const MAX_STOPPED_OPERATIONS = 256;
 const MAX_FAILED_OPERATIONS = 256;
 
@@ -71,6 +77,14 @@ function effectFingerprint(effect: ReconcileEffect): string {
     effect.executor,
     effect.workerId ?? null,
     effect.messageId,
+  ]);
+}
+
+function restorationFingerprint(instance: ComponentInstance, effect: ReconcileEffect): string {
+  return JSON.stringify([
+    effectFingerprint(effect),
+    instance.lifecycle,
+    instance.observedGeneration,
   ]);
 }
 
@@ -113,7 +127,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
   readonly #fingerprints = new Map<string, OperationFingerprint>();
   readonly #stoppedOperations: string[] = [];
   readonly #failedOperations: string[] = [];
-  readonly #restorations = new Map<string, Promise<void>>();
+  readonly #restorations = new Map<string, InFlightRestoration>();
 
   constructor(options: ComponentEffectsOptions) {
     this.#artifacts = options.artifacts;
@@ -189,27 +203,51 @@ export class ComponentEffects implements ComponentEffectExecutor {
     instance: ComponentInstance,
     authority: RuntimeAuthority | undefined = this.#authority(),
   ): Promise<void> {
+    let effect: ReconcileEffect;
+    try {
+      effect = this.#restorationEffect(instance, "start");
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const key = this.#restorationKey(instance.instanceId, authority);
+    const fingerprint = restorationFingerprint(instance, effect);
     const existing = this.#restorations.get(key);
-    if (existing !== undefined) return existing;
-    const restoration = this.#restore(instance, authority);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) {
+        return Promise.reject(
+          effectError(
+            "LIFECYCLE_RESTORE_CONFLICT",
+            "Concurrent component restoration reused an authority and instance with another identity",
+            effect,
+            {
+              existingComponentId: existing.effect.componentId,
+              existingDeploymentGeneration: existing.effect.deploymentGeneration,
+              existingExecutor: existing.effect.executor,
+            },
+          ),
+        );
+      }
+      return existing.result;
+    }
+    const result = this.#restore(instance, effect, authority);
+    const restoration = { effect, fingerprint, result };
     this.#restorations.set(key, restoration);
-    void restoration.then(
+    void result.then(
       () => {
-        if (this.#restorations.get(key) === restoration) this.#restorations.delete(key);
+        if (this.#restorations.get(key)?.result === result) this.#restorations.delete(key);
       },
       () => {
-        if (this.#restorations.get(key) === restoration) this.#restorations.delete(key);
+        if (this.#restorations.get(key)?.result === result) this.#restorations.delete(key);
       },
     );
-    return restoration;
+    return result;
   }
 
   async #restore(
     instance: ComponentInstance,
+    effect: ReconcileEffect,
     authority: RuntimeAuthority | undefined,
   ): Promise<void> {
-    const effect = this.#restorationEffect(instance, "start");
     this.#assertCurrentAuthority(effect, authority);
     let entry = this.#registry.get(instance.instanceId);
     if (entry !== undefined) {
@@ -254,7 +292,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
     await Promise.allSettled(
       [...this.#restorations.entries()]
         .filter(([key]) => key.startsWith(prefix))
-        .map(([, restoration]) => restoration),
+        .map(([, restoration]) => restoration.result),
     );
     const failures: unknown[] = [];
     for (const entry of this.#registry.entries()) {
