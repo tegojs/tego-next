@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  compareOperationJournalCursors,
   DiagnosticError,
   type JsonObject,
   type JsonValue,
+  type PersistedOperationJournalEntry,
   parseOperationId,
   parseRevision,
   type RuntimeOperations,
@@ -20,10 +22,7 @@ interface SnapshotRequest {
     readonly deployments?: string;
     readonly installations?: string;
     readonly instances?: string;
-    readonly operations?: {
-      readonly revision: string;
-      readonly operationId: string;
-    };
+    readonly operations?: string;
     readonly tasks?: string;
   };
   readonly projection?: {
@@ -35,7 +34,7 @@ interface SnapshotRequest {
 
 interface SnapshotPage {
   readonly items: readonly JsonObject[];
-  readonly nextCursor?: unknown;
+  readonly nextCursor?: string;
 }
 
 interface SnapshotResponse {
@@ -66,6 +65,7 @@ function record(id: string, value: JsonObject, revision: string): ScannedState<J
 
 function stateStore() {
   const scans: StateQuery<JsonValue>[] = [];
+  const latestOperationScans: unknown[] = [];
   const operationScans: unknown[] = [];
   const records = new Map<string, readonly ScannedState<JsonObject>[]>([
     [
@@ -108,7 +108,13 @@ function stateStore() {
             generation: "1",
             state: "active",
             essential: false,
-            configuration: { token: "deployment-secret" },
+            configuration: {
+              token: "deployment-secret",
+              authority: "configuration-authority",
+              epoch: "configuration-epoch",
+              session: "configuration-session",
+              sessionId: "configuration-session-id",
+            },
             permissionGrants: [],
             capabilityBindings: {},
           },
@@ -148,7 +154,13 @@ function stateStore() {
               applicationId: "application-a",
               pluginId: "plugin-a",
               componentId: "component-a",
-              input: { token: "task-input-secret" },
+              input: {
+                token: "task-input-secret",
+                authority: "input-authority",
+                epoch: "input-epoch",
+                session: "input-session",
+                sessionId: "input-session-id",
+              },
               deadline: "2026-07-25T01:00:00.000Z",
               orphanPolicy: "cancel",
             },
@@ -167,7 +179,13 @@ function stateStore() {
               startedAt: "2026-07-25T00:00:00.000Z",
               completedAt: "2026-07-25T00:00:01.000Z",
               status: "succeeded",
-              output: { token: "task-output-secret" },
+              output: {
+                token: "task-output-secret",
+                authority: "output-authority",
+                epoch: "output-epoch",
+                session: "output-session",
+                sessionId: "output-session-id",
+              },
             },
           },
           "5",
@@ -175,7 +193,7 @@ function stateStore() {
       ],
     ],
   ]);
-  const operations = [
+  const operations: PersistedOperationJournalEntry[] = [
     {
       operationId: parseOperationId("operation-a"),
       kind: "reconcile.prepare",
@@ -188,6 +206,30 @@ function stateStore() {
       revision: parseRevision("6"),
     },
   ];
+  const scanOperations = (
+    source: readonly PersistedOperationJournalEntry[],
+    query: {
+      readonly after?: { readonly revision: string; readonly operationId: string };
+      readonly limit?: number;
+    },
+  ) => {
+    const candidates = source
+      .filter(
+        (entry) =>
+          query.after === undefined ||
+          compareOperationJournalCursors(entry, {
+            revision: parseRevision(query.after.revision),
+            operationId: parseOperationId(query.after.operationId),
+          }) > 0,
+      )
+      .sort(compareOperationJournalCursors)
+      .slice(0, query.limit);
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield* candidates;
+      },
+    };
+  };
   const state = {
     scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
       scans.push(query as StateQuery<JsonValue>);
@@ -205,16 +247,24 @@ function stateStore() {
         },
       };
     },
-    scanOperations(query: unknown) {
+    scanOperations(query: {
+      readonly after?: { readonly revision: string; readonly operationId: string };
+      readonly limit?: number;
+    }) {
+      latestOperationScans.push(query);
+      const latest = new Map<string, PersistedOperationJournalEntry>();
+      for (const entry of operations) latest.set(entry.operationId, entry);
+      return scanOperations([...latest.values()], query);
+    },
+    scanOperationHistory(query: {
+      readonly after?: { readonly revision: string; readonly operationId: string };
+      readonly limit?: number;
+    }) {
       operationScans.push(query);
-      return {
-        async *[Symbol.asyncIterator]() {
-          yield* operations;
-        },
-      };
+      return scanOperations(operations, query);
     },
   } as unknown as StateStore;
-  return { operationScans, scans, state };
+  return { latestOperationScans, operationScans, operations, scans, state };
 }
 
 test("runtime snapshot pages durable sections with stable cursors and safe default projections", async () => {
@@ -227,10 +277,6 @@ test("runtime snapshot pages durable sections with stable cursors and safe defau
 
   const result = await snapshotOperation(controller)({
     limit: 1,
-    cursors: {
-      installations: "installation-0",
-      operations: { revision: "5", operationId: "operation-before" },
-    },
   });
 
   assert.deepEqual(
@@ -240,22 +286,34 @@ test("runtime snapshot pages durable sections with stable cursors and safe defau
       limit: query.limit,
     })),
     [
-      { collection: "installations", afterId: "installation-0", limit: 1 },
+      { collection: "installations", afterId: undefined, limit: 1 },
       { collection: "deployments", afterId: undefined, limit: 1 },
       { collection: "component-instances", afterId: undefined, limit: 1 },
       { collection: "tasks", afterId: undefined, limit: 1 },
     ],
   );
-  assert.deepEqual(fixture.operationScans, [
-    {
-      after: { revision: "5", operationId: "operation-before" },
-      limit: 1,
+  assert.deepEqual(fixture.operationScans, [{ limit: 1 }]);
+  assert.deepEqual(fixture.latestOperationScans, []);
+  assert.equal(typeof result.installations.nextCursor, "string");
+  assert.notEqual(result.installations.nextCursor, "installation-a");
+  assert.equal(typeof result.operations.nextCursor, "string");
+  assert.equal(result.operations.nextCursor?.includes("operation-a"), false);
+  const installationsCursor = result.installations.nextCursor;
+  const operationsCursor = result.operations.nextCursor;
+  assert.ok(installationsCursor);
+  assert.ok(operationsCursor);
+
+  await snapshotOperation(controller)({
+    limit: 1,
+    cursors: {
+      installations: installationsCursor,
+      operations: operationsCursor,
     },
-  ]);
-  assert.equal(result.installations.nextCursor, "installation-a");
-  assert.deepEqual(result.operations.nextCursor, {
-    revision: "6",
-    operationId: "operation-a",
+  });
+  assert.equal(fixture.scans[4]?.afterId, "installation-a");
+  assert.deepEqual(fixture.operationScans[1], {
+    after: { revision: "6", operationId: "operation-a" },
+    limit: 1,
   });
 
   const encoded = JSON.stringify(result);
@@ -288,8 +346,108 @@ test("runtime snapshot exposes sensitive task and deployment fields only through
   assert.equal(encoded.includes("deployment-secret"), true);
   assert.equal(encoded.includes("task-input-secret"), true);
   assert.equal(encoded.includes("task-output-secret"), true);
-  assert.equal(encoded.includes('"authority"'), false);
-  assert.equal(encoded.includes('"epoch"'), false);
+  assert.equal(encoded.includes("configuration-authority"), true);
+  assert.equal(encoded.includes("configuration-epoch"), true);
+  assert.equal(encoded.includes("configuration-session"), true);
+  assert.equal(encoded.includes("configuration-session-id"), true);
+  assert.equal(encoded.includes("input-authority"), true);
+  assert.equal(encoded.includes("input-epoch"), true);
+  assert.equal(encoded.includes("input-session"), true);
+  assert.equal(encoded.includes("input-session-id"), true);
+  assert.equal(encoded.includes("output-authority"), true);
+  assert.equal(encoded.includes("output-epoch"), true);
+  assert.equal(encoded.includes("output-session"), true);
+  assert.equal(encoded.includes("output-session-id"), true);
+  assert.equal(encoded.includes("runtime:one"), false);
+  assert.equal(encoded.includes('"19"'), false);
+});
+
+test("runtime snapshot rejects malformed and cross-section cursor tokens", async () => {
+  const fixture = stateStore();
+  const controller = new RuntimeOperationController({
+    clock: new FakeClock(new Date("2026-07-25T00:00:00.000Z")),
+    state: fixture.state,
+  });
+  controller.openReadOnly();
+  const first = await snapshotOperation(controller)({ limit: 1 });
+  assert.equal(typeof first.installations.nextCursor, "string");
+  const installationsCursor = first.installations.nextCursor;
+  assert.ok(installationsCursor);
+
+  for (const cursor of ["not-a-snapshot-cursor", installationsCursor]) {
+    await assert.rejects(
+      snapshotOperation(controller)({
+        cursors: { deployments: cursor },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "PROTOCOL_OPERATION_INVALID");
+        return true;
+      },
+    );
+  }
+});
+
+test("runtime snapshot pages immutable operation versions across a concurrent status update", async () => {
+  const fixture = stateStore();
+  fixture.operations.splice(
+    0,
+    fixture.operations.length,
+    {
+      operationId: parseOperationId("operation-a"),
+      kind: "task.run",
+      status: "planned",
+      state: {},
+      updatedAt: "2026-07-25T00:00:01.000Z",
+      revision: parseRevision("1"),
+    },
+    {
+      operationId: parseOperationId("operation-b"),
+      kind: "task.run",
+      status: "planned",
+      state: {},
+      updatedAt: "2026-07-25T00:00:02.000Z",
+      revision: parseRevision("2"),
+    },
+  );
+  const controller = new RuntimeOperationController({
+    clock: new FakeClock(new Date("2026-07-25T00:00:00.000Z")),
+    state: fixture.state,
+  });
+  controller.openReadOnly();
+
+  const first = await snapshotOperation(controller)({ limit: 1 });
+  const firstCursor = first.operations.nextCursor;
+  assert.ok(firstCursor);
+  fixture.operations.push({
+    operationId: parseOperationId("operation-a"),
+    kind: "task.run",
+    status: "completed",
+    state: {},
+    updatedAt: "2026-07-25T00:00:03.000Z",
+    revision: parseRevision("3"),
+  });
+  const second = await snapshotOperation(controller)({
+    limit: 1,
+    cursors: { operations: firstCursor },
+  });
+  const secondCursor = second.operations.nextCursor;
+  assert.ok(secondCursor);
+  const third = await snapshotOperation(controller)({
+    limit: 1,
+    cursors: { operations: secondCursor },
+  });
+
+  assert.deepEqual(
+    [first, second, third].map((page) => page.operations.items[0]?.revision),
+    ["1", "2", "3"],
+  );
+  assert.deepEqual(
+    [first, second, third].map((page) => page.operations.items[0]?.operationId),
+    ["operation-a", "operation-b", "operation-a"],
+  );
+  assert.equal(fixture.latestOperationScans.length, 0);
+  assert.equal(fixture.operationScans.length, 3);
 });
 
 test("runtime snapshot rejects an unbounded page limit", async () => {
