@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import type { JsonValue } from "@tegojs/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
@@ -124,7 +125,24 @@ test("@spec:runtime-operations/plugin-development-operations/install-sends-canon
         return response({
           digest: `sha256:${"a".repeat(64)}`,
           installedAt: "2026-07-25T00:00:00.000Z",
-          manifest: {},
+          manifest: {
+            schemaVersion: "1.0",
+            pluginId: "org.example.echo",
+            version: "1.0.0",
+            contractRange: "^1.0.0",
+            nodeRange: ">=26.0.0",
+            moduleFormat: "esm",
+            components: [
+              {
+                componentId: "echo",
+                kind: "task",
+                entrypoint: "component.js",
+                executors: ["thread"],
+              },
+            ],
+            permissions: [],
+            capabilities: { provides: [], requires: [] },
+          },
           pluginId: "org.example.echo",
           version: "1.0.0",
         });
@@ -150,7 +168,18 @@ test("@spec:runtime-operations/plugin-development-operations/deploy-and-status-u
   const digest = `sha256:${"b".repeat(64)}`;
   const requestControl = async (request: ControlClientOptions) => {
     requests.push(request);
-    return response(request.input);
+    if (request.operation === "plugin.deploy") {
+      return response({
+        ...(request.input as Record<string, JsonValue>),
+        version: "1.0.0",
+        generation: "1",
+        state: "active",
+      });
+    }
+    return response({
+      identity: request.input,
+      observation: { state: "running" },
+    });
   };
 
   assert.equal(
@@ -216,6 +245,33 @@ test("@spec:runtime-operations/plugin-development-operations/deploy-and-status-u
       },
     ],
   );
+});
+
+test("@spec:runtime-operations/plugin-development-operations/reject-invalid-deploy-before-control", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  let requests = 0;
+  const exitCode = await runCli({
+    argv: [
+      "plugin",
+      "deploy",
+      "org.example.echo",
+      "--digest",
+      "not-a-digest",
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async () => {
+      requests += 1;
+      return response(null);
+    },
+  });
+
+  assert.equal(exitCode, 2);
+  assert.equal(requests, 0);
+  assert.equal(stdout.read(), "");
+  assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_COMMAND_INVALID");
 });
 
 test("@spec:runtime-operations/plugin-development-operations/human-and-json-use-one-result", async () => {

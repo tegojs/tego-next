@@ -255,3 +255,57 @@ test("@spec:runtime-operations/task-operations/reject-invalid-json-before-contro
   assert.equal(stdout.read(), "");
   assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_COMMAND_INVALID");
 });
+
+test("@spec:runtime-operations/task-operations/reject-past-deadline-before-control", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  let requests = 0;
+  const exitCode = await runCli({
+    argv: [
+      "task",
+      "run",
+      "org.example.echo/echo",
+      "--deadline",
+      "2020-01-01T00:00:00.000Z",
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async () => {
+      requests += 1;
+      return response(null);
+    },
+  });
+
+  assert.equal(exitCode, 2);
+  assert.equal(requests, 0);
+  assert.equal(stdout.read(), "");
+  assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_COMMAND_INVALID");
+});
+
+test("@spec:runtime-operations/task-operations/reject-oversized-json-before-control", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  let requests = 0;
+  const exitCode = await runCli({
+    argv: [
+      "task",
+      "run",
+      "org.example.echo/echo",
+      "--input",
+      JSON.stringify("x".repeat(1_048_576)),
+      "--json",
+    ],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    requestControl: async () => {
+      requests += 1;
+      return response(null);
+    },
+  });
+
+  assert.equal(exitCode, 2);
+  assert.equal(requests, 0);
+  assert.equal(stdout.read(), "");
+  assert.equal(JSON.parse(stderr.read()).diagnostic.code, "PROTOCOL_COMMAND_INVALID");
+});
