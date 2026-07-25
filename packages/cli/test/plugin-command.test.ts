@@ -7,6 +7,7 @@ import { test } from "node:test";
 import type { JsonValue } from "@tegojs/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
+import { parseCommand } from "../src/parse-command.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { runCli } from "../src/run-cli.js";
 
@@ -63,6 +64,12 @@ test("@spec:runtime-operations/plugin-development-operations/validate-before-pac
   }
 });
 
+test("@spec:runtime-operations/plugin-development-operations/pack-can-reuse-a-build", () => {
+  const command = parseCommand(["plugin", "pack", ".", "--no-build"]);
+  assert.equal(command.kind, "plugin.pack");
+  assert.equal(command.build, false);
+});
+
 test("@spec:runtime-operations/plugin-development-operations/validate-and-inspect-locally", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-plugin-inspect-command-"));
   const artifactPath = join(directory, "echo.tego");
@@ -110,14 +117,7 @@ test("@spec:runtime-operations/plugin-development-operations/install-sends-canon
   try {
     await writeFile(artifactPath, "artifact-placeholder");
     const exitCode = await runCli({
-      argv: [
-        "plugin",
-        "install",
-        artifactPath,
-        "--endpoint",
-        "control.sock",
-        "--json",
-      ],
+      argv: ["plugin", "install", artifactPath, "--endpoint", "control.sock", "--json"],
       stdout: stdout.stream,
       stderr: stderr.stream,
       requestControl: async (request) => {
@@ -152,9 +152,11 @@ test("@spec:runtime-operations/plugin-development-operations/install-sends-canon
     assert.equal(exitCode, 0);
     assert.equal(stderr.read(), "");
     assert.equal(requests.length, 1);
-    assert.equal(requests[0]?.operation, "plugin.install-path");
-    assert.deepEqual(requests[0]?.input, { artifactPath: await realpath(artifactPath) });
-    assert.equal(isAbsolute((requests[0]?.input as { artifactPath: string }).artifactPath), true);
+    const request = requests[0];
+    assert.ok(request);
+    assert.equal(request.operation, "plugin.install-path");
+    assert.deepEqual(request.input, { artifactPath: await realpath(artifactPath) });
+    assert.equal(isAbsolute((request.input as { artifactPath: string }).artifactPath), true);
     assert.equal(JSON.parse(stdout.read()).pluginId, "org.example.echo");
   } finally {
     await rm(directory, { force: true, recursive: true });
@@ -252,14 +254,7 @@ test("@spec:runtime-operations/plugin-development-operations/reject-invalid-depl
   const stderr = capture();
   let requests = 0;
   const exitCode = await runCli({
-    argv: [
-      "plugin",
-      "deploy",
-      "org.example.echo",
-      "--digest",
-      "not-a-digest",
-      "--json",
-    ],
+    argv: ["plugin", "deploy", "org.example.echo", "--digest", "not-a-digest", "--json"],
     stdout: stdout.stream,
     stderr: stderr.stream,
     requestControl: async () => {
