@@ -301,6 +301,18 @@ const request = {
   orphanPolicy: "cancel" as const,
 };
 
+const generationOneTarget = {
+  instanceId: "application-01.echo.echo.1",
+  deploymentGeneration: "1",
+  artifactDigest: parseArtifactDigest(
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  ),
+  executor: {
+    id: "executor-01",
+    type: "process",
+  },
+} as const;
+
 function serviceFixture(executor = new ControlledExecutor()) {
   const state = new TransactionalState();
   const service = new TaskService({
@@ -1141,6 +1153,21 @@ test("@spec:runtime-operations/task-operations/task-record-cross-field-invariant
     () => parseRunTaskRequest({ ...request, deadline: "2026-02-30T00:00:00.000Z" }),
     /canonical UTC timestamp/u,
   );
+});
+
+test("@spec:runtime-operations/task-operations/task-record-preserves-immutable-execution-target", () => {
+  const record = parseTaskRecord({
+    taskId: identity.taskId,
+    attemptId: identity.attemptId,
+    request,
+    state: "accepted",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    target: generationOneTarget,
+    authority,
+  });
+
+  assert.deepEqual(record.target, generationOneTarget);
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/replays-durable-cancellation-intent", async () => {
