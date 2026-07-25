@@ -2,17 +2,17 @@ import assert from "node:assert/strict";
 import { chmod, lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
-import { resolve } from "node:path";
 import { test } from "node:test";
 import {
+  type ArtifactDigest,
+  type ExecutionRequest,
   parseArtifactDigest,
   parseComponentInstanceId,
   parseGeneration,
   parsePluginManifest,
   parseWorkerId,
-  type ExecutionRequest,
 } from "@tegojs/contracts";
 import { SqliteStateStore } from "@tegojs/drivers-local";
 import type { PreparedArtifact } from "@tegojs/runtime";
@@ -22,13 +22,13 @@ import {
   listenForMain,
   MemoryRemoteAttemptStore,
   MemoryWorkerEpochAllocator,
+  type RemoteAttemptRecord,
   RemoteExecutor,
   requestFingerprint,
   systemWorkerClock,
-  type RemoteAttemptRecord,
   type WorkerSession,
 } from "@tegojs/transport-websocket";
-import { type WorkerStartCommand, parseCommand } from "../src/parse-command.js";
+import { parseCommand, type WorkerStartCommand } from "../src/parse-command.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { runCli } from "../src/run-cli.js";
 import {
@@ -261,20 +261,32 @@ function preparedArtifact(
   };
 }
 
-function assignment(pluginId: string): ExecutionRequest {
+function assignment(
+  pluginId: string,
+  remote: {
+    readonly artifactDigest?: ArtifactDigest;
+    readonly id: string;
+    readonly workerId: ReturnType<typeof parseWorkerId>;
+  } = {
+    id: "remote-01",
+    workerId: parseWorkerId("worker-01"),
+  },
+): ExecutionRequest {
   return {
     taskId: "task-artifact-selection" as ExecutionRequest["taskId"],
     attemptId: "attempt-artifact-selection" as ExecutionRequest["attemptId"],
     target: {
       instanceId: parseComponentInstanceId("application-artifact-selection.plugin.echo.g1"),
       deploymentGeneration: parseGeneration("1"),
-      artifactDigest: parseArtifactDigest(
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      ),
+      artifactDigest:
+        remote.artifactDigest ??
+        parseArtifactDigest(
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
       executor: {
-        id: "remote-01",
+        id: remote.id,
         type: "remote",
-        workerId: parseWorkerId("worker-01"),
+        workerId: remote.workerId,
       },
     },
     applicationId: "application-artifact-selection" as ExecutionRequest["applicationId"],
@@ -301,7 +313,11 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
     [preparedArtifact("org.example.process-only", "c", ["process"])],
     "worker-runtime",
   );
-  const processRequest = assignment("org.example.process-only");
+  const processRequest = assignment("org.example.process-only", {
+    artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    id: "remote-01",
+    workerId: parseWorkerId("worker-01"),
+  });
   assert.equal(processOnly.selectExecutorKind(processRequest), "process");
   assert.deepEqual(processOnly.resolveComponent(processRequest).permissionGrants, [
     { kind: "executor", executors: ["process"] },
@@ -310,14 +326,26 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
   const missing = exact.validateAssignment(assignment("org.example.missing"));
   assert.equal(missing?.code, "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED");
 
-  const ambiguous = createPreparedArtifactSelection(
+  const multiple = createPreparedArtifactSelection(
     [
       preparedArtifact("org.example.ambiguous", "a"),
       preparedArtifact("org.example.ambiguous", "b"),
     ],
     "worker-runtime",
-  ).validateAssignment(assignment("org.example.ambiguous"));
-  assert.equal(ambiguous?.code, "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED");
+  );
+  assert.equal(multiple.validateAssignment(assignment("org.example.ambiguous")), undefined);
+  assert.equal(
+    multiple.resolveComponent(assignment("org.example.ambiguous")).artifactDigest,
+    `sha256:${"a".repeat(64)}`,
+  );
+  const missingDigest = multiple.validateAssignment(
+    assignment("org.example.ambiguous", {
+      artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+      id: "remote-01",
+      workerId: parseWorkerId("worker-01"),
+    }),
+  );
+  assert.equal(missingDigest?.code, "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED");
 });
 
 test("@spec:worker-protocol/independent-worker-command/requires-a-bounded-worker-identity", () => {
@@ -712,7 +740,11 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
     assert.deepEqual(main.registration(workerId)?.preparedArtifacts, [digest]);
 
     const request = {
-      ...assignment("org.example.worker-echo"),
+      ...assignment("org.example.worker-echo", {
+        artifactDigest: parseArtifactDigest(digest),
+        id: remote.id,
+        workerId,
+      }),
       input: { usable: true },
       deadline: new Date(Date.now() + 60_000).toISOString(),
     };
@@ -735,7 +767,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
 test("@spec:worker-protocol/independent-worker-command/process-only-artifact-executes-in-a-child-process", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-worker-process-only-"));
   const pluginId = "org.example.worker-process-only";
-  const { artifactPath } = await createWorkerArtifact(directory, {
+  const { artifactPath, digest } = await createWorkerArtifact(directory, {
     executors: ["process"],
     pluginId,
   });
@@ -781,7 +813,11 @@ test("@spec:worker-protocol/independent-worker-command/process-only-artifact-exe
     const result = await beforeDeadline(
       (
         await remote.submit({
-          ...assignment(pluginId),
+          ...assignment(pluginId, {
+            artifactDigest: parseArtifactDigest(digest),
+            id: remote.id,
+            workerId,
+          }),
           input: { processOnly: true },
           deadline: new Date(Date.now() + 60_000).toISOString(),
         })
@@ -1016,7 +1052,7 @@ test("@spec:worker-protocol/independent-worker-command/connect-authentication-fa
 
 test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered-result-after-network-loss", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-recovery-"));
-  const { artifactPath } = await createWorkerArtifact(directory);
+  const { artifactPath, digest } = await createWorkerArtifact(directory);
   const workerId = parseWorkerId("worker-connect-recovery");
   const main = createMainEndpoint({
     credential: "recovery-secret",
@@ -1083,7 +1119,11 @@ test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered
       if (state === "closed") firstSessionClosed.resolve();
     });
     const handle = await remote.submit({
-      ...assignment("org.example.worker-echo"),
+      ...assignment("org.example.worker-echo", {
+        artifactDigest: parseArtifactDigest(digest),
+        id: remote.id,
+        workerId,
+      }),
       input: { delayMs: 200, recovered: true },
       deadline: new Date(Date.now() + 60_000).toISOString(),
       orphanPolicy: "finish-and-buffer",
