@@ -21,6 +21,7 @@ import { ArtifactService, createRuntimeHost, Reconciler, TaskService } from "@te
 import {
   createMainEndpoint,
   listenForMain,
+  StateWorkerEpochAllocator,
 } from "@tegojs/transport-websocket";
 import type { LocalArtifactIngress } from "../control/server.js";
 
@@ -113,10 +114,7 @@ export async function createNodeRuntimeHost(
     clock: drivers.clock,
     selectExecutor: () => executor,
   });
-  const epochAllocator = {
-    next: (workerId: ReturnType<typeof parseWorkerId>) =>
-      drivers.coordination.nextEpoch(`worker-session:${workerId}`),
-  };
+  const epochAllocator = new StateWorkerEpochAllocator({ state: drivers.state });
   const mainEndpoint =
     options.worker === undefined
       ? undefined

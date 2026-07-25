@@ -7,5 +7,6 @@ export * from "./remote-executor.js";
 export * from "./remote-protocol.js";
 export * from "./result-buffer.js";
 export * from "./session.js";
+export * from "./state-worker-epoch-allocator.js";
 export * from "./worker-endpoint.js";
 export * from "./worker-runtime.js";
