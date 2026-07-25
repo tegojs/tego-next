@@ -400,6 +400,91 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
   assert.deepEqual(await service.status(identity.taskId), terminal);
 });
 
+test("@spec:runtime-operations/task-operations/fresh-selection-times-out", async () => {
+  const runtimeClock = new FakeClock(now);
+  let selectionSignal: AbortSignal | undefined;
+  const service = new TaskService({
+    state: new TransactionalState(),
+    clock: runtimeClock,
+    selectExecutor: (_request, _target, signal?: AbortSignal) => {
+      selectionSignal = signal;
+      return new Promise<TaskExecutorSelection>(() => {});
+    },
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+  const running = service.run(request);
+  await advanceTurn();
+
+  runtimeClock.advanceBy(5_000);
+  const outcome = await Promise.race([
+    running.then(
+      () => ({ kind: "resolved" as const }),
+      (error: unknown) => ({ kind: "rejected" as const, code: diagnosticCode(error) }),
+    ),
+    advanceTurn().then(() => ({ kind: "pending" as const })),
+  ]);
+
+  assert.deepEqual(outcome, { kind: "rejected", code: "EXECUTOR_TARGET_UNAVAILABLE" });
+  assert.equal(selectionSignal?.aborted, true);
+});
+
+test("@spec:runtime-operations/task-operations/fresh-selection-cancels-on-authority-loss", async () => {
+  let selectionSignal: AbortSignal | undefined;
+  const service = new TaskService({
+    state: new TransactionalState(),
+    clock,
+    selectExecutor: (_request, _target, signal?: AbortSignal) => {
+      selectionSignal = signal;
+      return new Promise<TaskExecutorSelection>(() => {});
+    },
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+  const running = service.run(request);
+  await advanceTurn();
+
+  await service.setAuthority(undefined);
+  const outcome = await Promise.race([
+    running.then(
+      () => ({ kind: "resolved" as const }),
+      (error: unknown) => ({ kind: "rejected" as const, code: diagnosticCode(error) }),
+    ),
+    advanceTurn().then(() => ({ kind: "pending" as const })),
+  ]);
+
+  assert.deepEqual(outcome, { kind: "rejected", code: "COORDINATION_NOT_LEADER" });
+  assert.equal(selectionSignal?.aborted, true);
+});
+
+test("@spec:runtime-operations/task-operations/fresh-selection-cancels-on-close", async () => {
+  let selectionSignal: AbortSignal | undefined;
+  const service = new TaskService({
+    state: new TransactionalState(),
+    clock,
+    selectExecutor: (_request, _target, signal?: AbortSignal) => {
+      selectionSignal = signal;
+      return new Promise<TaskExecutorSelection>(() => {});
+    },
+    createIdentity: () => identity,
+  });
+  await service.setAuthority(authority);
+  const running = service.run(request);
+  await advanceTurn();
+
+  await service.close();
+  const outcome = await Promise.race([
+    running.then(
+      () => ({ kind: "resolved" as const }),
+      (error: unknown) => ({ kind: "rejected" as const, code: diagnosticCode(error) }),
+    ),
+    advanceTurn().then(() => ({ kind: "pending" as const })),
+  ]);
+
+  assert.deepEqual(outcome, { kind: "rejected", code: "BOOTSTRAP_STOPPED" });
+  assert.equal(selectionSignal?.aborted, true);
+});
+
 test("@spec:runtime-operations/task-operations/idempotent-run-replay", async () => {
   const { executor, service, state } = serviceFixture();
   await service.setAuthority(authority);
@@ -1329,7 +1414,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fail
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-mismatch-is-diagnostic", async () => {
-  const executor = new ControlledExecutor();
+  const executor = new ControlledExecutor("remote", "remote-02");
   const state = new TransactionalState();
   state.records.set(`tego/tasks/${identity.taskId}`, {
     value: parseTaskRecord({
@@ -1347,7 +1432,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-mismatch-is-
   const restarted = new TaskService({
     state,
     clock,
-    selectExecutor: async () => ({ target: generationTwoTarget, executor }),
+    selectExecutor: async () => executorSelection(executor, generationTwoTarget),
   });
   await restarted.recover();
 
@@ -1356,9 +1441,94 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-mismatch-is-
   const terminal = await restarted.status(identity.taskId);
   assert.equal(terminal?.result?.diagnostic?.code, "EXECUTOR_TARGET_MISMATCH");
   assert.deepEqual(terminal?.result?.diagnostic?.details, {
-    expectedExecutorId: generationOneTarget.executor.id,
-    selectedExecutorId: generationTwoTarget.executor.id,
+    mismatchedFields: [
+      "artifactDigest",
+      "deploymentGeneration",
+      "executor.id",
+      "executor.type",
+      "executor.workerId",
+      "instanceId",
+    ],
   });
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-mismatch-settles-diagnostically", async () => {
+  const expectedExecutor = new ControlledExecutor("remote", "remote-01");
+  const selectedExecutor = new ControlledExecutor("remote", "remote-02");
+  const expectedTarget = executorSelection(expectedExecutor).target;
+  const selectedTarget = executorSelection(selectedExecutor, generationTwoTarget).target;
+  const state = new TransactionalState();
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "accepted",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      target: expectedTarget,
+      authority,
+    }),
+    revision: 1,
+  });
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => ({ target: selectedTarget, executor: selectedExecutor }),
+  });
+  await restarted.recover();
+
+  await restarted.setAuthority(authority);
+
+  const terminal = await restarted.status(identity.taskId);
+  assert.equal(terminal?.state, "terminal");
+  assert.equal(terminal?.result?.diagnostic?.code, "EXECUTOR_TARGET_MISMATCH");
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-unavailable-remains-recoverable", async () => {
+  const expectedExecutor = new ControlledExecutor("remote", "remote-01");
+  const state = new TransactionalState();
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "accepted",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      target: executorSelection(expectedExecutor).target,
+      authority,
+    }),
+    revision: 1,
+  });
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "EXECUTOR_DRAINING",
+          message: "private scheduler state",
+          source: { kind: "executor", id: "pool" },
+          details: { pool: "safe-pool-id" },
+        }),
+      );
+    },
+  });
+  await restarted.recover();
+
+  await restarted.setAuthority(authority);
+
+  const pending = await restarted.status(identity.taskId);
+  assert.equal(pending?.state, "accepted");
+  assert.equal(pending?.diagnostic?.code, "EXECUTOR_TARGET_UNAVAILABLE");
+  assert.equal(pending?.diagnostic?.retryable, true);
+  assert.deepEqual(pending?.diagnostic?.details, {
+    causeCode: "EXECUTOR_DRAINING",
+    causeDetails: { pool: "safe-pool-id" },
+    executorId: expectedExecutor.id,
+  });
+  assert.doesNotMatch(JSON.stringify(pending), /private scheduler state/u);
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-unavailable-preserves-safe-cause", async () => {

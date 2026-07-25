@@ -446,6 +446,35 @@ test("executor identifiers use one bounded wire-safe parser", () => {
   }
 });
 
+test("executor identifiers preserve legacy trailing delimiters in recovered task records", () => {
+  for (const executorId of ["legacy.", "legacy_", "legacy-"]) {
+    const target = {
+      ...validExecutionRequest.target,
+      executor: { ...validExecutionRequest.target.executor, id: executorId },
+    };
+    const record = parseTaskRecord({
+      taskId: validExecutionRequest.taskId,
+      attemptId: validExecutionRequest.attemptId,
+      request: {
+        applicationId: validExecutionRequest.applicationId,
+        pluginId: validExecutionRequest.pluginId,
+        componentId: validExecutionRequest.componentId,
+        input: validExecutionRequest.input,
+        deadline: validExecutionRequest.deadline,
+        orphanPolicy: validExecutionRequest.orphanPolicy,
+      },
+      state: "accepted",
+      createdAt: validExecutionRequest.deadline,
+      updatedAt: validExecutionRequest.deadline,
+      target,
+      executor: { id: executorId, type: "process" },
+    });
+
+    assert.equal(record.target?.executor.id, executorId);
+    assert.equal(record.executor?.id, executorId);
+  }
+});
+
 test("deployment generations are bounded to uint64", () => {
   assert.equal(parseGeneration("18446744073709551615"), "18446744073709551615");
   assert.throws(() => parseGeneration("18446744073709551616"), {
