@@ -104,6 +104,47 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value);
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
+    .map(
+      (key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+    )
+    .join(",")}}`;
+}
+
+export async function raceComponentSessionOperation<T>(
+  operation: Promise<T>,
+  clock: Clock,
+  timeoutMs: number,
+  timeoutError: () => Error,
+): Promise<T> {
+  const timeoutController = new AbortController();
+  try {
+    const outcome = await Promise.race([
+      operation.then(
+        (value) => ({ kind: "value" as const, value }),
+        (error: unknown) => ({ kind: "error" as const, error }),
+      ),
+      clock.sleep(timeoutMs, timeoutController.signal).then(() => ({ kind: "timeout" as const })),
+    ]);
+    if (outcome.kind === "error") throw outcome.error;
+    if (outcome.kind === "timeout") throw timeoutError();
+    return outcome.value;
+  } finally {
+    timeoutController.abort("parent-operation-settled");
+  }
+}
+
+function throwCollected(errors: readonly unknown[], message: string): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
+}
+
 export class ComponentSandboxSession implements Executor {
   readonly id: string;
   readonly type: "process" | "thread";
@@ -162,7 +203,7 @@ export class ComponentSandboxSession implements Executor {
     const request = Object.freeze(structuredClone(parseExecutionRequest(input)));
     this.#assertTarget(request);
     const key = attemptKey(request.taskId, request.attemptId);
-    const fingerprint = JSON.stringify(request);
+    const fingerprint = canonicalJson(request);
     const existing = this.#attempts.get(key);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -273,11 +314,18 @@ export class ComponentSandboxSession implements Executor {
     this.#accepting = false;
     this.#closePromise ??= (async () => {
       const deadline = new Date(this.#clock.now().getTime() + this.#shutdownGraceMs).toISOString();
+      const errors: unknown[] = [];
       try {
         await this.#converge(deadline);
-      } finally {
-        await this.#transport.close();
+      } catch (error) {
+        errors.push(error);
       }
+      try {
+        await this.#transport.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      throwCollected(errors, "Component session shutdown failed");
     })();
     return this.#closePromise;
   }
@@ -434,7 +482,7 @@ export class ComponentSandboxSession implements Executor {
       ]);
       if (outcome === "completed") return;
       for (const entry of entries) this.#cancelForShutdown(entry);
-      await this.#transport.terminate();
+      await this.#boundedTermination();
       await completed;
     } finally {
       deadlineController.abort("session-converged");
@@ -454,6 +502,34 @@ export class ComponentSandboxSession implements Executor {
     void this.#transport
       .cancel(entry.request.taskId, entry.request.attemptId, entry.cancellation)
       .catch(() => undefined);
+  }
+
+  async #boundedTermination(): Promise<void> {
+    const timeoutController = new AbortController();
+    try {
+      const outcome = await Promise.race([
+        this.#transport.terminate().then(
+          () => ({ kind: "terminated" as const }),
+          (error: unknown) => ({ kind: "error" as const, error }),
+        ),
+        this.#clock.sleep(this.#shutdownGraceMs, timeoutController.signal).then(() => ({
+          kind: "timeout" as const,
+        })),
+      ]);
+      if (outcome.kind === "error") throw outcome.error;
+      if (outcome.kind === "timeout") {
+        throw new DiagnosticError(
+          diagnostic(
+            "EXECUTOR_SESSION_TERMINATION_TIMEOUT",
+            "Component session transport termination exceeded its parent-side deadline",
+            this.type,
+            this.#clock.now(),
+          ),
+        );
+      }
+    } finally {
+      timeoutController.abort("termination-race-settled");
+    }
   }
 
   #touch(entry: SessionAttempt): void {

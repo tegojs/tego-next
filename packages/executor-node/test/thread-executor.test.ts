@@ -38,6 +38,13 @@ const digest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
 const clock = new FakeClock(new Date(0));
 const directories: string[] = [];
 
+function hasDiagnosticCode(error: unknown, code: string): boolean {
+  if (diagnosticCode(error) === code) return true;
+  return error instanceof AggregateError
+    ? error.errors.some((nested: unknown) => hasDiagnosticCode(nested, code))
+    : false;
+}
+
 class TrackingWorker implements ThreadWorker {
   readonly #worker: Worker;
   readonly #onExit: () => void;
@@ -1615,7 +1622,7 @@ test("thread component session bounds activation hooks and awaits rollback clean
       component: await executorOptions.resolveComponent(execution),
       executorOptions,
     }),
-    (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+    (error: unknown) => hasDiagnosticCode(error, "EXECUTOR_COMMAND_DEADLINE_EXCEEDED"),
   );
   assert.equal(factory.active, 0);
 });
@@ -1636,7 +1643,6 @@ test("thread session parent bounds a silent bootstrap and retains custody until 
     executorOptions,
   }).catch((error: unknown) => {
     rejection = error;
-    throw error;
   });
 
   try {
@@ -1649,7 +1655,7 @@ test("thread session parent bounds a silent bootstrap and retains custody until 
     assert.equal(factory.worker.active, true);
   } finally {
     factory.worker.finishExit();
-    await creation.catch(() => undefined);
+    await creation;
   }
   assert.equal(factory.worker.active, false);
 });

@@ -45,6 +45,13 @@ const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
 const clock = new FakeClock(new Date(0));
 const directories: string[] = [];
 
+function hasDiagnosticCode(error: unknown, code: string): boolean {
+  if (diagnosticCode(error) === code) return true;
+  return error instanceof AggregateError
+    ? error.errors.some((nested: unknown) => hasDiagnosticCode(nested, code))
+    : false;
+}
+
 class TestHostedProcess implements HostedProcess {
   readonly pid: number | undefined;
   readonly stdin: HostedProcess["stdin"];
@@ -2230,7 +2237,7 @@ test("process component session bounds activation hooks and awaits rollback clea
         component: await executorOptions.resolveComponent(execution),
         executorOptions,
       }),
-      (error: unknown) => diagnosticCode(error) === "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+      (error: unknown) => hasDiagnosticCode(error, "EXECUTOR_COMMAND_DEADLINE_EXCEEDED"),
     );
     assert.equal(processHost.activeProcessCount, 0);
   } finally {

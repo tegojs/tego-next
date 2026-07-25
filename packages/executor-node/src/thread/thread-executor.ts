@@ -37,6 +37,7 @@ import {
 import {
   COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
   ComponentSandboxSession,
+  raceComponentSessionOperation,
   type ComponentSessionRunResult,
   type ComponentSessionTransport,
   taskExecutionTargetsEqual,
@@ -254,6 +255,12 @@ function executorError(
   now: Date,
 ): DiagnosticError {
   return new DiagnosticError(diagnostic(code, message, now));
+}
+
+function throwSessionCleanupErrors(errors: readonly unknown[], message: string): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
 }
 
 function deepFreeze<T>(value: T): T {
@@ -1844,7 +1851,13 @@ export async function createThreadComponentSession(
   const worker = workerFactory.create(workerEntrypoint);
   const lease = createSessionWorkerLease(worker);
   let channel: ThreadChannel | undefined;
-  let closed = false;
+  let exited = false;
+  let terminationRequested = false;
+  let terminationError: unknown;
+  let closePromise: Promise<void> | undefined;
+  void lease.exited.then(() => {
+    exited = true;
+  });
   let commandSequence = 0;
   const controlDeadline = () =>
     new Date(clock.now().getTime() + componentControlTimeoutMs).toISOString();
@@ -1860,12 +1873,27 @@ export async function createThreadComponentSession(
   });
   const hostCommand = async (command: ComponentHostCommand): Promise<ComponentHostResult> => {
     if (channel === undefined) throw new Error("Thread component channel is unavailable");
-    const result = parseComponentHostResult(
-      await channel.request({
-        kind: "command",
-        command,
-      }),
+    const timeout = executorError(
+      "EXECUTOR_COMPONENT_CONTROL_TIMEOUT",
+      `Parent timed out waiting for component ${command.type}`,
+      clock.now(),
     );
+    let raw: unknown;
+    try {
+      raw = await raceComponentSessionOperation(
+        channel.request({
+          kind: "command",
+          command,
+        }),
+        clock,
+        Math.max(0, Date.parse(command.deadline) - clock.now().getTime()),
+        () => timeout,
+      );
+    } catch (error) {
+      if (error === timeout) channel.abort(timeout);
+      throw error;
+    }
+    const result = parseComponentHostResult(raw);
     if (!result.ok) {
       throw new DiagnosticError(
         result.diagnostics[0] ??
@@ -1879,30 +1907,90 @@ export async function createThreadComponentSession(
     return result;
   };
   const terminate = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
+    if (exited) {
+      if (terminationError !== undefined) throw terminationError;
+      return;
+    }
+    const terminationSignal = new Error("Thread component session is terminating");
+    channel?.abort(terminationSignal);
     channel?.close();
-    await worker.terminate();
-    await lease.exited;
+    if (!terminationRequested) {
+      terminationRequested = true;
+      void Promise.resolve()
+        .then(() => worker.terminate())
+        .catch((error: unknown) => {
+          terminationError = error;
+        });
+    }
+    const errors: unknown[] = [];
+    const timeout = executorError(
+      "EXECUTOR_SESSION_TERMINATION_TIMEOUT",
+      "Worker thread did not reach authoritative exit before its parent-side deadline",
+      clock.now(),
+    );
+    try {
+      await raceComponentSessionOperation(
+        lease.exited.then(() => undefined),
+        clock,
+        shutdownGraceMs,
+        () => timeout,
+      );
+    } catch (error) {
+      errors.push(error);
+    }
+    if (terminationError !== undefined) errors.push(terminationError);
+    throwSessionCleanupErrors(errors, "Worker thread termination failed");
   };
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    await hostCommand(artifactCommand("drain", "session-drain")).catch(() => undefined);
-    await hostCommand(artifactCommand("stop", "session-stop")).catch(() => undefined);
-    await terminate();
+  const close = (): Promise<void> => {
+    closePromise ??= (async () => {
+      const errors: unknown[] = [];
+      try {
+        await hostCommand(artifactCommand("drain", "session-drain"));
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await hostCommand(artifactCommand("stop", "session-stop"));
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await terminate();
+      } catch (error) {
+        errors.push(error);
+      }
+      throwSessionCleanupErrors(errors, "Thread component session cleanup failed");
+    })();
+    return closePromise;
   };
 
   try {
     channel = new ThreadChannel(lease, options, component, { bytes: 0, count: 0 });
-    const bootstrap = await channel.request({
-      kind: "bootstrap",
-      now: clock.now().toISOString(),
-      artifact: {
-        artifactDigest,
-        artifactRoot: component.artifactRoot,
-        manifest,
-      },
-    });
+    const bootstrapTimeout = executorError(
+      "EXECUTOR_COMPONENT_CONTROL_TIMEOUT",
+      "Parent timed out waiting for worker thread bootstrap",
+      clock.now(),
+    );
+    let bootstrap: unknown;
+    try {
+      bootstrap = await raceComponentSessionOperation(
+        channel.request({
+          kind: "bootstrap",
+          now: clock.now().toISOString(),
+          artifact: {
+            artifactDigest,
+            artifactRoot: component.artifactRoot,
+            manifest,
+          },
+        }),
+        clock,
+        componentControlTimeoutMs,
+        () => bootstrapTimeout,
+      );
+    } catch (error) {
+      if (error === bootstrapTimeout) channel.abort(bootstrapTimeout);
+      throw error;
+    }
     if (
       typeof bootstrap !== "object" ||
       bootstrap === null ||
@@ -2006,7 +2094,14 @@ export async function createThreadComponentSession(
       shutdownGraceMs,
     });
   } catch (error) {
-    await close().catch(() => terminate());
+    try {
+      await close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Thread component session activation rollback failed",
+      );
+    }
     throw error;
   }
 }

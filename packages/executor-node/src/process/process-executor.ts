@@ -38,6 +38,7 @@ import {
 import {
   COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
   ComponentSandboxSession,
+  raceComponentSessionOperation,
   type ComponentSessionRunResult,
   type ComponentSessionTransport,
   taskExecutionTargetsEqual,
@@ -194,6 +195,12 @@ function executorError(
   now: Date,
 ): DiagnosticError {
   return new DiagnosticError(diagnostic(code, message, now));
+}
+
+function throwSessionCleanupErrors(errors: readonly unknown[], message: string): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
 }
 
 function incoming(input: unknown): IncomingMessage {
@@ -1497,7 +1504,12 @@ export async function createProcessComponentSession(
     options.processEntrypoint ?? fileURLToPath(new URL("./process-entry.js", import.meta.url));
   let process_: HostedProcess | undefined;
   let channel: ProcessChannel | undefined;
-  let closed = false;
+  let authoritativeExit: Promise<Awaited<ReturnType<HostedProcess["wait"]>>> | undefined;
+  let exited = false;
+  let killRequested = false;
+  let killError: unknown;
+  let killSettled: Promise<boolean> | undefined;
+  let closePromise: Promise<void> | undefined;
   let commandSequence = 0;
   const controlDeadline = () =>
     new Date(clock.now().getTime() + componentControlTimeoutMs).toISOString();
@@ -1513,7 +1525,24 @@ export async function createProcessComponentSession(
   });
   const hostCommand = async (command: ComponentHostCommand): Promise<ComponentHostResult> => {
     if (channel === undefined) throw new Error("Process component channel is unavailable");
-    const result = parseComponentHostResult(await channel.request({ kind: "command", command }));
+    const timeout = executorError(
+      "EXECUTOR_COMPONENT_CONTROL_TIMEOUT",
+      `Parent timed out waiting for component ${command.type}`,
+      clock.now(),
+    );
+    let raw: unknown;
+    try {
+      raw = await raceComponentSessionOperation(
+        channel.request({ kind: "command", command }),
+        clock,
+        Math.max(0, Date.parse(command.deadline) - clock.now().getTime()),
+        () => timeout,
+      );
+    } catch (error) {
+      if (error === timeout) channel.abort(timeout);
+      throw error;
+    }
+    const result = parseComponentHostResult(raw);
     if (!result.ok) {
       throw new DiagnosticError(
         result.diagnostics[0] ??
@@ -1527,20 +1556,94 @@ export async function createProcessComponentSession(
     return result;
   };
   const terminate = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    if (process_ === undefined) return;
-    await process_.kill();
-    await process_.wait();
-  };
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    if (channel !== undefined) {
-      await hostCommand(artifactCommand("drain", "session-drain")).catch(() => undefined);
-      await hostCommand(artifactCommand("stop", "session-stop")).catch(() => undefined);
+    const activeProcess = process_;
+    const exit = authoritativeExit;
+    if (activeProcess === undefined || exit === undefined) return;
+    if (exited) {
+      if (killError !== undefined) throw killError;
+      return;
     }
-    await process_?.stdin.close().catch(() => undefined);
-    await terminate();
+    channel?.abort(new Error("Process component session is terminating"));
+    if (!killRequested) {
+      killRequested = true;
+      killSettled = Promise.resolve()
+        .then(() => activeProcess.kill())
+        .then(
+          () => {
+            exited = true;
+            return true;
+          },
+          (error: unknown) => {
+            killError = error;
+            return false;
+          },
+        );
+    }
+    const errors: unknown[] = [];
+    const timeout = executorError(
+      "EXECUTOR_SESSION_TERMINATION_TIMEOUT",
+      "Child process did not reach authoritative exit before its parent-side deadline",
+      clock.now(),
+    );
+    try {
+      const authoritativeTermination = Promise.race([
+        exit.then(() => undefined),
+        (killSettled as Promise<boolean>).then((killed) =>
+          killed ? undefined : new Promise<never>(() => {}),
+        ),
+      ]);
+      await raceComponentSessionOperation(
+        authoritativeTermination,
+        clock,
+        shutdownGraceMs,
+        () => timeout,
+      );
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length > 0 && killError !== undefined) errors.push(killError);
+    throwSessionCleanupErrors(errors, "Child process termination failed");
+  };
+  const close = (): Promise<void> => {
+    closePromise ??= (async () => {
+      const errors: unknown[] = [];
+      if (channel !== undefined) {
+        try {
+          await hostCommand(artifactCommand("drain", "session-drain"));
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
+          await hostCommand(artifactCommand("stop", "session-stop"));
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (process_ !== undefined) {
+        const timeout = executorError(
+          "EXECUTOR_SESSION_TERMINATION_TIMEOUT",
+          "Child process stdin did not close before its parent-side deadline",
+          clock.now(),
+        );
+        try {
+          await raceComponentSessionOperation(
+            process_.stdin.close(),
+            clock,
+            shutdownGraceMs,
+            () => timeout,
+          );
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      try {
+        await terminate();
+      } catch (error) {
+        errors.push(error);
+      }
+      throwSessionCleanupErrors(errors, "Process component session cleanup failed");
+    })();
+    return closePromise;
   };
 
   try {
@@ -1549,16 +1652,36 @@ export async function createProcessComponentSession(
       entrypoint: processEntrypoint,
       environment: {},
     });
-    channel = new ProcessChannel(process_, options, component);
-    const bootstrap = await channel.request({
-      kind: "bootstrap",
-      now: clock.now().toISOString(),
-      artifact: {
-        artifactDigest,
-        artifactRoot: component.artifactRoot,
-        manifest,
-      },
+    authoritativeExit = process_.wait();
+    void authoritativeExit.then(() => {
+      exited = true;
     });
+    channel = new ProcessChannel(process_, options, component);
+    const bootstrapTimeout = executorError(
+      "EXECUTOR_COMPONENT_CONTROL_TIMEOUT",
+      "Parent timed out waiting for child process bootstrap",
+      clock.now(),
+    );
+    let bootstrap: unknown;
+    try {
+      bootstrap = await raceComponentSessionOperation(
+        channel.request({
+          kind: "bootstrap",
+          now: clock.now().toISOString(),
+          artifact: {
+            artifactDigest,
+            artifactRoot: component.artifactRoot,
+            manifest,
+          },
+        }),
+        clock,
+        componentControlTimeoutMs,
+        () => bootstrapTimeout,
+      );
+    } catch (error) {
+      if (error === bootstrapTimeout) channel.abort(bootstrapTimeout);
+      throw error;
+    }
     if (
       typeof bootstrap !== "object" ||
       bootstrap === null ||
@@ -1667,7 +1790,14 @@ export async function createProcessComponentSession(
       shutdownGraceMs,
     });
   } catch (error) {
-    await close().catch(() => terminate());
+    try {
+      await close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Process component session activation rollback failed",
+      );
+    }
     throw error;
   }
 }
