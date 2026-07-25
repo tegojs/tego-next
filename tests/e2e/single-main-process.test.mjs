@@ -127,14 +127,22 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
   ]);
   assert.equal(deployment.generation, generation);
   await waitForDeployment(endpoint, generation);
+  return runTask({
+    endpoint,
+    operationId: `system-${executor}`,
+    value: input.value,
+  });
+}
+
+async function runTask({ endpoint, operationId, value }) {
   const accepted = await runCli([
     "task",
     "run",
     "org.example.echo/echo",
     "--input",
-    JSON.stringify(input.value),
+    JSON.stringify(value),
     "--operation-id",
-    `system-${executor}`,
+    operationId,
     "--no-wait",
     "--endpoint",
     endpoint,
@@ -159,7 +167,7 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
     "--json",
   ]);
   assert.equal(completed.result.status, "succeeded");
-  assert.deepEqual(completed.result.output, input.value);
+  assert.deepEqual(completed.result.output, value);
   assert.deepEqual(status, completed);
   return completed;
 }
@@ -187,9 +195,7 @@ async function runSystemFlow(runIndex) {
   let main;
   let worker;
   let restartedMain;
-  let restartedWorker;
   let workerUrl;
-  let restartedWorkerUrl;
   try {
     await mkdir(dirname(endpoint), { mode: 0o700, recursive: true });
     const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
@@ -230,7 +236,7 @@ async function runSystemFlow(runIndex) {
           dataDirectory: workerDataDirectory,
           direction: "connect",
           json: true,
-          prepare: [artifactPath],
+          prepare: [],
           url: workerUrl,
           workerId,
         }),
@@ -268,14 +274,16 @@ async function runSystemFlow(runIndex) {
     assert.equal(beforeRestart.installation.digest, installation.digest);
     assert.equal(beforeRestart.deployment.generation, "3");
     assert.equal(beforeRestart.instance.lifecycle, "ready");
+    assert.equal(beforeRestart.worker.workerId, workerId);
+    assert.equal(beforeRestart.worker.preparedArtifacts.includes(installation.digest), true);
+    const epochBeforeRestart = BigInt(beforeRestart.worker.epoch);
 
-    await stopProcess(worker);
-    worker = undefined;
     await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]);
     await main.assertClean();
     main = undefined;
     assert.equal(await exists(endpoint), false);
     await assertPortClosed(workerUrl);
+    const workerPort = Number(new URL(workerUrl).port);
 
     restartedMain = await spawnManagedProcess({
       artifacts,
@@ -289,7 +297,7 @@ async function runSystemFlow(runIndex) {
           mode: "single-main",
           nodeId: `node-system-${runIndex}`,
           runtimeId: `runtime-system-${runIndex}`,
-          worker: { credential, host: "127.0.0.1", port: 0, workerId },
+          worker: { credential, host: "127.0.0.1", port: workerPort, workerId },
         }),
       },
       name: "main-restart",
@@ -297,31 +305,17 @@ async function runSystemFlow(runIndex) {
     const restartedMainReady = await restartedMain.ready((event) => event.type === "main.ready", {
       timeoutMs: processDeadlineMs,
     });
-    restartedWorkerUrl = new URL(restartedMainReady.workerUrl).href;
-    restartedWorker = await spawnManagedProcess({
-      artifacts,
-      command: process.execPath,
-      args: [workerFixture],
-      env: {
-        TEGO_TEST_WORKER_COMMAND: JSON.stringify({
-          kind: "worker.start",
-          credential,
-          dataDirectory: workerDataDirectory,
-          direction: "connect",
-          json: true,
-          prepare: [artifactPath],
-          url: restartedWorkerUrl,
-          workerId,
-        }),
-      },
-      name: "worker-restart",
-    });
-    await restartedWorker.ready((event) => event.type === "worker.ready", {
-      timeoutMs: processDeadlineMs,
-    });
+    assert.equal(new URL(restartedMainReady.workerUrl).href, workerUrl);
     await waitForDeployment(endpoint, "3");
-    const afterRestart = await runtimeSnapshot(endpoint);
-    assert.deepEqual(afterRestart, beforeRestart);
+    const afterRestart = await eventually(async () => {
+      const snapshot = await runtimeSnapshot(endpoint);
+      return BigInt(snapshot.worker.epoch) > epochBeforeRestart ? snapshot : undefined;
+    }, "durable Worker epoch advancement after Main restart");
+    assert.deepEqual(afterRestart.installation, beforeRestart.installation);
+    assert.deepEqual(afterRestart.deployment, beforeRestart.deployment);
+    assert.deepEqual(afterRestart.instance, beforeRestart.instance);
+    assert.equal(afterRestart.worker.workerId, workerId);
+    assert.equal(afterRestart.worker.preparedArtifacts.includes(installation.digest), true);
     for (const task of tasks) {
       const status = await runCli([
         "task",
@@ -335,31 +329,42 @@ async function runSystemFlow(runIndex) {
       assert.equal(status.attemptId, task.attemptId);
       assert.deepEqual(status.result.output, task.result.output);
     }
+    const postRestartRemote = await runTask({
+      endpoint,
+      operationId: `system-remote-after-restart-${runIndex}`,
+      value: { executor: "remote", phase: "after-restart", runIndex },
+    });
+    assert.deepEqual(postRestartRemote.result.output, {
+      executor: "remote",
+      phase: "after-restart",
+      runIndex,
+    });
 
-    return { directory, endpoint, workerUrl, restartedWorkerUrl };
+    return { directory, endpoint, workerUrl };
   } finally {
-    await stopProcess(restartedWorker);
-    await stopProcess(worker);
-    if (restartedMain !== undefined) {
-      await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
-      await stopProcess(restartedMain);
+    try {
+      await stopProcess(worker);
+      if (restartedMain !== undefined) {
+        await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
+        await stopProcess(restartedMain);
+      }
+      if (main !== undefined) {
+        await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
+        await stopProcess(main);
+      }
+      assert.equal(await exists(endpoint), false);
+      if (workerUrl !== undefined) await assertPortClosed(workerUrl);
+      for (const name of ["main", "worker", "main-restart"]) {
+        const cleanupPath = artifacts.cleanup(name);
+        if (!(await exists(cleanupPath))) continue;
+        const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
+        assert.deepEqual(cleanup.streamErrors ?? [], []);
+        assert.deepEqual(cleanup.processingErrors ?? [], []);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+      await rm(pluginWorkspace, { force: true, recursive: true });
     }
-    if (main !== undefined) {
-      await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
-      await stopProcess(main);
-    }
-    assert.equal(await exists(endpoint), false);
-    if (workerUrl !== undefined) await assertPortClosed(workerUrl);
-    if (restartedWorkerUrl !== undefined) await assertPortClosed(restartedWorkerUrl);
-    for (const name of ["main", "worker", "main-restart", "worker-restart"]) {
-      const cleanupPath = artifacts.cleanup(name);
-      if (!(await exists(cleanupPath))) continue;
-      const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
-      assert.deepEqual(cleanup.streamErrors ?? [], []);
-      assert.deepEqual(cleanup.processingErrors ?? [], []);
-    }
-    await rm(directory, { force: true, recursive: true });
-    await rm(pluginWorkspace, { force: true, recursive: true });
   }
 }
 
@@ -368,5 +373,4 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/real-single-ma
   const second = await runSystemFlow(2);
   assert.notEqual(first.directory, second.directory);
   assert.notEqual(first.workerUrl, second.workerUrl);
-  assert.notEqual(first.restartedWorkerUrl, second.restartedWorkerUrl);
 });
