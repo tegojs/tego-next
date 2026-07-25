@@ -1,4 +1,6 @@
-import { join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { userInfo } from "node:os";
+import { join, resolve, win32 } from "node:path";
 import { cwd } from "node:process";
 import { parseArgs } from "node:util";
 import { DiagnosticError, type RuntimeMode, runtimeDiagnostic } from "@tegojs/contracts";
@@ -42,9 +44,32 @@ export function defaultDataDirectory(): string {
   return resolve(process.env.TEGO_DATA_DIR ?? join(cwd(), ".tego"));
 }
 
-export function defaultControlEndpoint(dataDirectory = defaultDataDirectory()): string {
-  if (process.platform === "win32") {
-    return `\\\\.\\pipe\\tego-${Buffer.from(dataDirectory).toString("hex").slice(-32)}`;
+export interface DefaultControlEndpointOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly runtimeScope?: string;
+  readonly userScope?: string;
+}
+
+function defaultUserScope(): string {
+  const userId = process.getuid?.();
+  return userId === undefined ? userInfo().username : String(userId);
+}
+
+export function defaultControlEndpoint(
+  dataDirectory = defaultDataDirectory(),
+  options: DefaultControlEndpointOptions = {},
+): string {
+  if ((options.platform ?? process.platform) === "win32") {
+    const normalizedDirectory = win32
+      .normalize(win32.resolve(dataDirectory))
+      .toLocaleLowerCase("en-US");
+    const identity = JSON.stringify({
+      dataDirectory: normalizedDirectory,
+      runtimeScope: options.runtimeScope ?? "main",
+      userScope: options.userScope ?? defaultUserScope(),
+    });
+    const digest = createHash("sha256").update(identity).digest("hex");
+    return `\\\\.\\pipe\\tego-${digest}`;
   }
   return join(dataDirectory, "control.sock");
 }

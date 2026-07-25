@@ -1,5 +1,6 @@
-import { chmod, rm } from "node:fs/promises";
+import { chmod, lstat, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
+import { dirname, resolve } from "node:path";
 import {
   type ArtifactDigest,
   DiagnosticError,
@@ -15,11 +16,15 @@ import {
   CONTROL_PROTOCOL_VERSION,
   type ControlRequest,
   type ControlResponse,
+  DEFAULT_CONTROL_READ_TIMEOUT_MS,
   diagnosticResponse,
+  extractControlRequestId,
   MAX_CONTROL_LINE_BYTES,
   MAX_CONTROL_OUTSTANDING_REQUESTS,
   parseControlRequest,
   protocolDiagnostic,
+  sanitizeControlValue,
+  UNKNOWN_CONTROL_REQUEST_ID,
 } from "./protocol.js";
 
 export interface LocalArtifactIngress {
@@ -38,6 +43,9 @@ export interface ControlServerOptions {
   readonly artifactIngress?: LocalArtifactIngress;
   readonly maxLineBytes?: number;
   readonly maxOutstandingRequests?: number;
+  readonly readTimeoutMs?: number;
+  readonly setEndpointPermissions?: (endpoint: string) => Promise<void>;
+  readonly onServerError?: (error: Error) => void;
 }
 
 export interface ControlServer {
@@ -69,7 +77,7 @@ function requiredString(input: JsonValue, key: string): string {
 
 function operationDiagnostic(error: unknown): RuntimeDiagnostic {
   if (error instanceof DiagnosticError) return error.diagnostic;
-  return protocolDiagnostic("PROTOCOL_OPERATION_FAILED", "Control operation failed", error);
+  return protocolDiagnostic("PROTOCOL_OPERATION_FAILED", "Control operation failed");
 }
 
 async function dispatch(
@@ -145,36 +153,136 @@ function writeResponse(socket: Socket, response: ControlResponse): void {
   socket.end(`${JSON.stringify(response)}\n`);
 }
 
+async function assertPrivateEndpointParent(endpoint: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const parent = resolve(dirname(endpoint));
+  const metadata = await lstat(parent);
+  const userId = process.getuid?.();
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    userId === undefined ||
+    metadata.uid !== userId ||
+    (metadata.mode & 0o077) !== 0
+  ) {
+    throw new DiagnosticError(
+      protocolDiagnostic(
+        "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE",
+        "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE",
+      ),
+    );
+  }
+}
+
+async function closeListener(server: Server, sockets: ReadonlySet<Socket>): Promise<void> {
+  for (const socket of sockets) socket.destroy();
+  if (!server.listening) return;
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => (error === undefined ? resolveClose() : rejectClose(error)));
+  });
+}
+
+export async function removeOwnedControlEndpoint(endpoint: string): Promise<void> {
+  if (process.platform === "win32") return;
+  let initial: Awaited<ReturnType<typeof lstat>>;
+  try {
+    initial = await lstat(endpoint);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  await assertPrivateEndpointParent(endpoint);
+  const metadata = await lstat(endpoint);
+  const userId = process.getuid?.();
+  if (
+    !initial.isSocket() ||
+    !metadata.isSocket() ||
+    userId === undefined ||
+    metadata.uid !== userId ||
+    metadata.dev !== initial.dev ||
+    metadata.ino !== initial.ino
+  ) {
+    throw new DiagnosticError(
+      protocolDiagnostic(
+        "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+        "Control endpoint is not an owner-owned socket",
+      ),
+    );
+  }
+  await unlink(endpoint);
+}
+
 export async function startControlServer(options: ControlServerOptions): Promise<ControlServer> {
   if (options.endpoint.length === 0) throw new TypeError("endpoint must not be empty");
   const maxLineBytes = options.maxLineBytes ?? MAX_CONTROL_LINE_BYTES;
   const maxOutstanding = options.maxOutstandingRequests ?? MAX_CONTROL_OUTSTANDING_REQUESTS;
+  const readTimeoutMs = options.readTimeoutMs ?? DEFAULT_CONTROL_READ_TIMEOUT_MS;
   if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
     throw new RangeError("maxLineBytes must be a positive safe integer");
   }
   if (!Number.isSafeInteger(maxOutstanding) || maxOutstanding < 1) {
     throw new RangeError("maxOutstandingRequests must be a positive safe integer");
   }
+  if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 1) {
+    throw new RangeError("readTimeoutMs must be a positive safe integer");
+  }
+  await assertPrivateEndpointParent(options.endpoint);
 
-  const clients = new Set<Socket>();
-  let outstanding = 0;
+  const sockets = new Set<Socket>();
+  let reservations = 0;
   let closing = false;
+  let terminalError: Error | undefined;
   const server: Server = createServer((socket) => {
-    clients.add(socket);
-    const chunks: Buffer[] = [];
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => undefined);
+    if (closing || reservations >= maxOutstanding) {
+      writeResponse(
+        socket,
+        diagnosticResponse(
+          UNKNOWN_CONTROL_REQUEST_ID,
+          protocolDiagnostic(
+            "PROTOCOL_CONTROL_CAPACITY_EXCEEDED",
+            "Control request capacity is exhausted",
+          ),
+        ),
+      );
+      return;
+    }
+
+    reservations += 1;
+    const frame = Buffer.allocUnsafe(maxLineBytes);
     let bytes = 0;
     let handled = false;
-    socket.on("close", () => clients.delete(socket));
-    socket.on("error", () => undefined);
+    const readTimer = setTimeout(() => {
+      if (handled) return;
+      handled = true;
+      writeResponse(
+        socket,
+        diagnosticResponse(
+          UNKNOWN_CONTROL_REQUEST_ID,
+          protocolDiagnostic(
+            "PROTOCOL_CONTROL_READ_TIMEOUT",
+            "Control request was not completed before its deadline",
+          ),
+        ),
+      );
+    }, readTimeoutMs);
+    readTimer.unref();
+    socket.once("close", () => {
+      clearTimeout(readTimer);
+      reservations -= 1;
+    });
     socket.on("data", (chunk: Buffer) => {
       if (handled || closing) return;
-      bytes += chunk.byteLength;
-      if (bytes > maxLineBytes) {
+      const newline = chunk.indexOf(0x0a);
+      const payloadBytes = newline === -1 ? chunk.byteLength : newline;
+      if (bytes + payloadBytes > maxLineBytes) {
         handled = true;
         writeResponse(
           socket,
           diagnosticResponse(
-            "",
+            UNKNOWN_CONTROL_REQUEST_ID,
             protocolDiagnostic(
               "PROTOCOL_CONTROL_FRAME_TOO_LARGE",
               "Control request exceeds the line limit",
@@ -183,16 +291,16 @@ export async function startControlServer(options: ControlServerOptions): Promise
         );
         return;
       }
-      chunks.push(chunk);
-      const frame = Buffer.concat(chunks);
-      const newline = frame.indexOf(0x0a);
+      chunk.copy(frame, bytes, 0, payloadBytes);
+      bytes += payloadBytes;
       if (newline === -1) return;
       handled = true;
-      if (newline !== frame.byteLength - 1) {
+      clearTimeout(readTimer);
+      if (newline !== chunk.byteLength - 1) {
         writeResponse(
           socket,
           diagnosticResponse(
-            "",
+            UNKNOWN_CONTROL_REQUEST_ID,
             protocolDiagnostic(
               "PROTOCOL_CONTROL_FRAME_INVALID",
               "Control connection must contain exactly one request line",
@@ -201,38 +309,28 @@ export async function startControlServer(options: ControlServerOptions): Promise
         );
         return;
       }
-      if (outstanding >= maxOutstanding) {
-        writeResponse(
-          socket,
-          diagnosticResponse(
-            "",
-            protocolDiagnostic(
-              "PROTOCOL_CONTROL_CAPACITY_EXCEEDED",
-              "Control request capacity is exhausted",
-            ),
-          ),
-        );
-        return;
-      }
-      outstanding += 1;
-      let requestId = "";
+      let requestId = UNKNOWN_CONTROL_REQUEST_ID;
       void (async () => {
         try {
-          const request = parseControlRequest(
-            JSON.parse(frame.subarray(0, newline).toString("utf8")),
-          );
-          requestId = request.requestId;
+          const decoded = JSON.parse(frame.subarray(0, bytes).toString("utf8"));
+          requestId = extractControlRequestId(decoded);
+          const request = parseControlRequest(decoded);
           const result = await dispatch(request, options.operations, options.artifactIngress);
           writeResponse(socket, {
             protocolVersion: CONTROL_PROTOCOL_VERSION,
             requestId,
             ok: true,
-            result,
+            result: sanitizeControlValue(result),
           });
         } catch (error) {
-          writeResponse(socket, diagnosticResponse(requestId, operationDiagnostic(error)));
-        } finally {
-          outstanding -= 1;
+          const diagnostic =
+            error instanceof SyntaxError
+              ? protocolDiagnostic(
+                  "PROTOCOL_CONTROL_FRAME_INVALID",
+                  "Control request is not valid JSON",
+                )
+              : operationDiagnostic(error);
+          writeResponse(socket, diagnosticResponse(requestId, diagnostic));
         }
       })();
     });
@@ -251,10 +349,35 @@ export async function startControlServer(options: ControlServerOptions): Promise
     server.once("listening", onListening);
     server.listen(options.endpoint);
   });
-  server.on("error", () => undefined);
+  server.on("error", (error) => {
+    terminalError ??= error;
+    try {
+      options.onServerError?.(error);
+    } catch (callbackError) {
+      terminalError = new AggregateError(
+        [terminalError, callbackError],
+        "Control listener error reporting failed",
+      );
+    }
+    for (const socket of sockets) socket.destroy();
+  });
 
-  if (process.platform !== "win32") {
-    await chmod(options.endpoint, 0o600);
+  try {
+    if (process.platform !== "win32") {
+      await (options.setEndpointPermissions ?? ((endpoint) => chmod(endpoint, 0o600)))(
+        options.endpoint,
+      );
+    }
+  } catch (error) {
+    try {
+      await closeListener(server, sockets);
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        "Control listener permission initialization rollback failed",
+      );
+    }
+    throw error;
   }
 
   let closePromise: Promise<void> | undefined;
@@ -263,13 +386,8 @@ export async function startControlServer(options: ControlServerOptions): Promise
     close() {
       closePromise ??= (async () => {
         closing = true;
-        for (const client of clients) client.destroy();
-        await new Promise<void>((resolve, reject) => {
-          server.close((error) => (error === undefined ? resolve() : reject(error)));
-        });
-        if (process.platform !== "win32") {
-          await rm(options.endpoint, { force: true });
-        }
+        await closeListener(server, sockets);
+        if (terminalError !== undefined) throw terminalError;
       })();
       return closePromise;
     },

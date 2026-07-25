@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
+import { mkdir, realpath, stat } from "node:fs/promises";
 import {
   DiagnosticError,
   type Executor,
@@ -53,6 +53,7 @@ function unavailableComponent(): never {
 export async function createNodeRuntimeHost(
   options: CreateNodeRuntimeHostOptions,
 ): Promise<NodeRuntimeHost> {
+  await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
   const local = await createLocalDrivers({ dataDirectory: options.dataDirectory });
   let drivers: RuntimeDrivers = local;
   if (options.postgresUrl !== undefined) {

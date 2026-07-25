@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { access, mkdtemp, readFile, rm, watch } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { Runtime, RuntimeStatus } from "@tegojs/contracts";
+import { startRuntimeDetached } from "../src/commands/runtime.js";
 import { requestControl } from "../src/control/client.js";
 import type { ControlServer } from "../src/control/server.js";
-import { startRuntimeDetached } from "../src/commands/runtime.js";
 import { parseCommand, type RuntimeStartCommand } from "../src/parse-command.js";
-import { runMainProcess, type MainProcessOptions } from "../src/runtime/main-process.js";
+import { type MainProcessOptions, runMainProcess } from "../src/runtime/main-process.js";
 
 const deadlineMs = 5_000;
 
@@ -95,10 +95,10 @@ test("@spec:runtime-operations/local-runtime-operations/stop-failure-still-aggre
     }),
     (error: unknown) => {
       assert.ok(error instanceof AggregateError);
-      assert.deepEqual(
-        error.errors.map((entry: unknown) => (entry as Error).message).sort(),
-        ["control close failed", "runtime stop failed"],
-      );
+      assert.deepEqual(error.errors.map((entry: unknown) => (entry as Error).message).sort(), [
+        "control close failed",
+        "runtime stop failed",
+      ]);
       return true;
     },
   );
@@ -175,9 +175,7 @@ test("@spec:runtime-operations/local-runtime-operations/detached-timeout-confirm
   try {
     await assert.rejects(
       configurableStart(command, {
-        mainProcessPath: fileURLToPath(
-          new URL("fixtures/stubborn-main.js", import.meta.url),
-        ),
+        mainProcessPath: fileURLToPath(new URL("fixtures/stubborn-main.js", import.meta.url)),
         readinessTimeoutMs: 50,
         terminationTimeoutMs: 100,
       }),

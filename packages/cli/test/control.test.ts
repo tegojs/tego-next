@@ -6,17 +6,18 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   type ArtifactDigest,
+  DiagnosticError,
   type InstallPluginRequest,
   type JsonValue,
-  DiagnosticError,
   parsePluginInstallation,
   parseRuntimeStatus,
-  runtimeDiagnostic,
   type RuntimeOperations,
+  runtimeDiagnostic,
 } from "@tegojs/contracts";
 import { requestControl } from "../src/control/client.js";
 import { type ControlResponse, MAX_CONTROL_LINE_BYTES } from "../src/control/protocol.js";
 import { type ControlRuntimeOperations, startControlServer } from "../src/control/server.js";
+import { defaultControlEndpoint } from "../src/parse-command.js";
 
 function runtimeStatus() {
   return parseRuntimeStatus({
@@ -434,12 +435,9 @@ test("@spec:runtime-operations/local-runtime-operations/rejects-public-unix-pare
     await chmod(directory, 0o755);
     let unexpected: Awaited<ReturnType<typeof startControlServer>> | undefined;
     try {
-      await assert.rejects(
-        async () => {
-          unexpected = await startControlServer({ endpoint, operations: fakeOperations() });
-        },
-        /PROTOCOL_CONTROL_PARENT_NOT_PRIVATE/u,
-      );
+      await assert.rejects(async () => {
+        unexpected = await startControlServer({ endpoint, operations: fakeOperations() });
+      }, /PROTOCOL_CONTROL_PARENT_NOT_PRIVATE/u);
     } finally {
       await unexpected?.close();
     }
@@ -460,19 +458,43 @@ test("@spec:runtime-operations/local-runtime-operations/permission-init-rolls-ba
     ) => ReturnType<typeof startControlServer>;
     let unexpected: Awaited<ReturnType<typeof startControlServer>> | undefined;
     try {
-      await assert.rejects(
-        async () => {
-          unexpected = await startWithPermissions({
-            endpoint,
-            operations: fakeOperations(),
-            setEndpointPermissions: () => Promise.reject(new Error("permission init failed")),
-          });
-        },
-        /permission init failed/u,
-      );
+      await assert.rejects(async () => {
+        unexpected = await startWithPermissions({
+          endpoint,
+          operations: fakeOperations(),
+          setEndpointPermissions: () => Promise.reject(new Error("permission init failed")),
+        });
+      }, /permission init failed/u);
     } finally {
       await unexpected?.close();
     }
     await assert.rejects(connect(endpoint));
   });
+});
+
+test("@spec:runtime-operations/local-runtime-operations/windows-pipe-access-cleanup-contract", async (context) => {
+  if (process.platform !== "win32") {
+    context.skip("Windows named-pipe contract runs on Windows");
+    return;
+  }
+  const directory = await mkdtemp(join(tmpdir(), "tego-windows-control-"));
+  const endpoint = defaultControlEndpoint(directory, {
+    platform: "win32",
+    runtimeScope: "main",
+    userScope: process.env.USERNAME ?? "current-user",
+  });
+  const server = await startControlServer({ endpoint, operations: fakeOperations() });
+  try {
+    const response = await requestControl({
+      endpoint,
+      operation: "runtime.status",
+      input: {},
+      timeoutMs: 1_000,
+    });
+    assert.equal(response.ok, true);
+  } finally {
+    await server.close();
+    await rm(directory, { force: true, recursive: true });
+  }
+  await assert.rejects(connect(endpoint));
 });

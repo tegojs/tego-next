@@ -18,6 +18,19 @@ export interface ControlClientOptions {
   readonly maxLineBytes?: number;
 }
 
+function safeConnectionError(error: Error): Error {
+  const safe = new Error("PROTOCOL_CONTROL_CONNECT_FAILED");
+  const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+  if (code !== undefined) {
+    Object.defineProperty(safe, "code", {
+      configurable: true,
+      enumerable: true,
+      value: code,
+    });
+  }
+  return safe;
+}
+
 export async function requestControl(options: ControlClientOptions): Promise<ControlResponse> {
   if (options.endpoint.length === 0) throw new TypeError("endpoint must not be empty");
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1) {
@@ -25,10 +38,13 @@ export async function requestControl(options: ControlClientOptions): Promise<Con
   }
   const requestId = options.requestId ?? randomUUID();
   const maxLineBytes = options.maxLineBytes ?? MAX_CONTROL_LINE_BYTES;
+  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
+    throw new RangeError("maxLineBytes must be a positive safe integer");
+  }
 
   return await new Promise<ControlResponse>((resolve, reject) => {
     const socket = createConnection(options.endpoint);
-    const chunks: Buffer[] = [];
+    const frame = Buffer.allocUnsafe(maxLineBytes);
     let bytes = 0;
     let settled = false;
     const finish = (
@@ -61,22 +77,22 @@ export async function requestControl(options: ControlClientOptions): Promise<Con
       );
     });
     socket.on("data", (chunk: Buffer) => {
-      bytes += chunk.byteLength;
-      if (bytes > maxLineBytes) {
+      const newline = chunk.indexOf(0x0a);
+      const payloadBytes = newline === -1 ? chunk.byteLength : newline;
+      if (bytes + payloadBytes > maxLineBytes) {
         finish({ error: new Error("PROTOCOL_CONTROL_FRAME_TOO_LARGE: response exceeds limit") });
         return;
       }
-      chunks.push(chunk);
-      const frame = Buffer.concat(chunks);
-      const newline = frame.indexOf(0x0a);
+      chunk.copy(frame, bytes, 0, payloadBytes);
+      bytes += payloadBytes;
       if (newline === -1) return;
-      if (newline !== frame.byteLength - 1) {
+      if (newline !== chunk.byteLength - 1) {
         finish({ error: new Error("PROTOCOL_CONTROL_FRAME_INVALID: trailing response data") });
         return;
       }
       try {
         const response = parseControlResponse(
-          JSON.parse(frame.subarray(0, newline).toString("utf8")),
+          JSON.parse(frame.subarray(0, bytes).toString("utf8")),
         );
         if (response.requestId !== requestId) {
           finish({ error: new Error("PROTOCOL_CONTROL_REQUEST_MISMATCH: request ID changed") });
@@ -92,7 +108,7 @@ export async function requestControl(options: ControlClientOptions): Promise<Con
         });
       }
     });
-    socket.on("error", (error) => finish({ error }));
+    socket.on("error", (error) => finish({ error: safeConnectionError(error) }));
     socket.on("close", () => {
       if (!settled) {
         finish({ error: new Error("PROTOCOL_CONTROL_CLOSED: response was not completed") });

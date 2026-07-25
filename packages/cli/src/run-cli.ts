@@ -1,13 +1,12 @@
 import type { Writable } from "node:stream";
-import {
-  DiagnosticError,
-  type RuntimeStatus,
-  runtimeDiagnostic,
-  serializeCause,
-} from "@tegojs/contracts";
+import { DiagnosticError, type RuntimeStatus, runtimeDiagnostic } from "@tegojs/contracts";
 import { startRuntimeDetached, startRuntimeForeground } from "./commands/runtime.js";
 import { type ControlClientOptions, requestControl } from "./control/client.js";
-import { type ControlResponse, DEFAULT_CONTROL_TIMEOUT_MS } from "./control/protocol.js";
+import {
+  type ControlResponse,
+  DEFAULT_CONTROL_TIMEOUT_MS,
+  sanitizeControlDiagnostic,
+} from "./control/protocol.js";
 import { type ParsedCommand, parseCommand, type RuntimeStartCommand } from "./parse-command.js";
 
 const help = `Usage: tego <command>
@@ -88,13 +87,14 @@ export async function runCli(options: CliRunOptions): Promise<number> {
     }
     const diagnostic =
       error instanceof DiagnosticError
-        ? error.diagnostic
-        : runtimeDiagnostic({
-            code: "PROTOCOL_CLI_FAILED",
-            message: error instanceof Error ? error.message : String(error),
-            source: { kind: "protocol", id: "cli" },
-            cause: serializeCause(error),
-          });
+        ? sanitizeControlDiagnostic(error.diagnostic)
+        : sanitizeControlDiagnostic(
+            runtimeDiagnostic({
+              code: "PROTOCOL_CLI_FAILED",
+              message: "CLI operation failed",
+              source: { kind: "protocol", id: "cli" },
+            }),
+          );
     stderr.write(`${JSON.stringify({ diagnostic })}\n`);
     return diagnostic.code === "PROTOCOL_COMMAND_INVALID" ? 2 : 1;
   }

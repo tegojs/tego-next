@@ -3,6 +3,7 @@ export {
   CONTROL_PROTOCOL_VERSION,
   type ControlRequest,
   type ControlResponse,
+  DEFAULT_CONTROL_READ_TIMEOUT_MS,
   DEFAULT_CONTROL_TIMEOUT_MS,
   MAX_CONTROL_LINE_BYTES,
   MAX_CONTROL_OUTSTANDING_REQUESTS,
@@ -18,6 +19,7 @@ export {
 export {
   defaultControlEndpoint,
   defaultDataDirectory,
+  type DefaultControlEndpointOptions,
   type ParsedCommand,
   parseCommand,
   type RuntimeStartCommand,

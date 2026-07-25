@@ -3,10 +3,7 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { parseRuntimeStatus, type RuntimeStatus } from "@tegojs/contracts";
 import type { ControlResponse } from "../src/control/protocol.js";
-import {
-  defaultControlEndpoint,
-  parseCommand,
-} from "../src/parse-command.js";
+import { defaultControlEndpoint, parseCommand } from "../src/parse-command.js";
 import { runCli } from "../src/run-cli.js";
 
 function runningStatus(): RuntimeStatus {
@@ -216,8 +213,7 @@ test("@spec:runtime-operations/local-runtime-operations/graceful-idempotent-stop
 test("@spec:runtime-operations/local-runtime-operations/cli-diagnostics-redact-host-secrets", async () => {
   const stdout = capture();
   const stderr = capture();
-  const secret =
-    "postgresql://user:hunter2@localhost/database?token=raw /Users/alice/private";
+  const secret = "postgresql://user:hunter2@localhost/database?token=raw /Users/alice/private";
   const error = new Error(secret);
   error.stack = `Error: ${secret}\n at /Users/alice/private/file.js:1:1`;
   const exitCode = await runCli({
@@ -229,10 +225,7 @@ test("@spec:runtime-operations/local-runtime-operations/cli-diagnostics-redact-h
 
   assert.equal(exitCode, 1);
   assert.equal(stdout.read(), "");
-  assert.doesNotMatch(
-    stderr.read(),
-    /hunter2|token=raw|\/Users\/alice|postgresql:\/\/user/u,
-  );
+  assert.doesNotMatch(stderr.read(), /hunter2|token=raw|\/Users\/alice|postgresql:\/\/user/u);
 });
 
 test("@spec:runtime-operations/local-runtime-operations/windows-pipe-uses-complete-scoped-path-hash", () => {
@@ -271,13 +264,4 @@ test("@spec:runtime-operations/local-runtime-operations/windows-pipe-uses-comple
       runtimeScope: "runtime-worker",
     }),
   );
-});
-
-test("@spec:runtime-operations/local-runtime-operations/windows-pipe-access-cleanup-contract", async (context) => {
-  if (process.platform !== "win32") {
-    context.skip("Windows named-pipe contract runs on Windows");
-    return;
-  }
-  const endpoint = defaultControlEndpoint(process.cwd());
-  assert.match(endpoint, /^\\\\\.\\pipe\\/u);
 });

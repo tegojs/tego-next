@@ -12,6 +12,7 @@ export interface MainProcessOptions {
   readonly artifactIngress?: LocalArtifactIngress;
   readonly signal?: AbortSignal;
   readonly onReady?: (status: RuntimeStatus) => void | Promise<void>;
+  readonly controlServerFactory?: typeof startControlServer;
 }
 
 async function waitForStop(runtime: Runtime, signal?: AbortSignal): Promise<void> {
@@ -33,9 +34,10 @@ async function waitForStop(runtime: Runtime, signal?: AbortSignal): Promise<void
 
 export async function runMainProcess(options: MainProcessOptions): Promise<void> {
   let server: Awaited<ReturnType<typeof startControlServer>> | undefined;
+  const errors: unknown[] = [];
   try {
     await options.runtime.start();
-    server = await startControlServer({
+    server = await (options.controlServerFactory ?? startControlServer)({
       endpoint: options.endpoint,
       operations: options.runtime,
       ...(options.artifactIngress === undefined
@@ -44,9 +46,23 @@ export async function runMainProcess(options: MainProcessOptions): Promise<void>
     });
     await options.onReady?.(await options.runtime.status());
     await waitForStop(options.runtime, options.signal);
+  } catch (error) {
+    errors.push(error);
   } finally {
-    await options.runtime.stop();
-    await server?.close();
+    try {
+      await options.runtime.stop();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await server?.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Main process shutdown failed");
   }
 }
 
@@ -90,10 +106,10 @@ async function runEntrypoint(): Promise<void> {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  void runEntrypoint().catch((error: unknown) => {
+  void runEntrypoint().catch(() => {
     process.send?.({
       type: "runtime.failed",
-      message: error instanceof Error ? error.message : String(error),
+      message: "Runtime Main process failed",
     });
     process.exitCode = 1;
   });
