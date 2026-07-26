@@ -171,6 +171,55 @@ function terminalResult(request) {
   };
 }
 
+async function readMarkerLoadCount(markerPath, read = readFile) {
+  try {
+    const contents = await read(markerPath, "utf8");
+    return contents.trim().split("\n").filter(Boolean).length;
+  } catch (error) {
+    if (error?.code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+async function cleanupPermissionFaultEvidence({ directory, host, primaryError, remove = rm }) {
+  let teardownComplete = host === undefined;
+  let teardownError;
+  try {
+    if (host !== undefined) {
+      await host.runtime.stop();
+      teardownComplete = true;
+    }
+  } catch (error) {
+    teardownError = error;
+  }
+
+  if (teardownError !== undefined) {
+    if (primaryError !== undefined) {
+      throw new AggregateError(
+        [primaryError, teardownError],
+        "Permission fault test and runtime teardown both failed",
+      );
+    }
+    throw teardownError;
+  }
+
+  assert.equal(teardownComplete, true, "runtime teardown must complete before evidence deletion");
+
+  try {
+    await remove(directory, { recursive: true, force: true });
+  } catch (removalError) {
+    if (primaryError !== undefined) {
+      throw new AggregateError(
+        [primaryError, removalError],
+        "Permission fault test and evidence removal both failed",
+      );
+    }
+    throw removalError;
+  }
+
+  if (primaryError !== undefined) throw primaryError;
+}
+
 test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-before-commit", async () => {
   const clock = new FakeClock(new Date(0));
   const backingState = new MemoryStateStore({ clock });
@@ -303,12 +352,48 @@ test("@spec:worker-protocol/durable-worker-attempts/duplicate-terminal-result-fa
 });
 
 test("@spec:plugin-deployment/pre-execution-deployment-gate/permission-before-import-fault", async () => {
+  const markerReadError = Object.assign(new Error("FAULT_INJECTED_MARKER_READ_FAILURE"), {
+    code: "EACCES",
+  });
+  await assert.rejects(
+    readMarkerLoadCount("unused", async () => {
+      throw markerReadError;
+    }),
+    (error) => error === markerReadError,
+  );
+
+  const primaryError = new Error("FAULT_INJECTED_PRIMARY_FAILURE");
+  const stopError = new Error("FAULT_INJECTED_STOP_FAILURE");
+  const cleanupEvents = [];
+  await assert.rejects(
+    cleanupPermissionFaultEvidence({
+      directory: "unused",
+      host: {
+        runtime: {
+          stop: async () => {
+            cleanupEvents.push("stop");
+            throw stopError;
+          },
+        },
+      },
+      primaryError,
+      remove: async () => cleanupEvents.push("remove"),
+    }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.length === 2 &&
+      error.errors[0] === primaryError &&
+      error.errors[1] === stopError,
+  );
+  assert.deepEqual(cleanupEvents, ["stop"]);
+
   const directory = await mkdtemp(join(tmpdir(), "tego-permission-fault-"));
   const pluginDirectory = join(directory, "plugin");
   const buildDirectory = join(pluginDirectory, "build", "components");
   const markerPath = join(directory, "plugin-loads.txt");
   const dataDirectory = join(directory, "runtime");
   let host;
+  let testError;
   try {
     await mkdir(buildDirectory, { recursive: true });
     await mkdir(dataDirectory, { recursive: true });
@@ -410,12 +495,15 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/permission-before-im
       ),
       true,
     );
-    const loadCount = await readFile(markerPath, "utf8")
-      .then((contents) => contents.trim().split("\n").filter(Boolean).length)
-      .catch(() => 0);
+    const loadCount = await readMarkerLoadCount(markerPath);
     assert.equal(loadCount, 0);
+  } catch (error) {
+    testError = error;
   } finally {
-    await host?.runtime.stop().catch(() => undefined);
-    await rm(directory, { recursive: true, force: true });
+    await cleanupPermissionFaultEvidence({
+      directory,
+      host,
+      primaryError: testError,
+    });
   }
 });
