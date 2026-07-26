@@ -801,7 +801,7 @@ test("request correlation is installed before a synchronous transport can respon
   }
 });
 
-test("one-way self-correlates and requests do not resolve from unrelated messages", async () => {
+test("self-correlated one-way and unrelated messages cannot resolve a pending request", async () => {
   const connection = await directConnection();
   try {
     await connection.mainSession.send("session.reconcile", { oneWay: true });
@@ -821,10 +821,31 @@ test("one-way self-correlates and requests do not resolve from unrelated message
     };
     assert.equal(request.correlationId, request.messageId);
 
+    connection.workerSocket.automaticDelivery = false;
+    await connection.workerSession.send("task.cancel", { selfCorrelated: true });
+    const selfCorrelated = JSON.parse(connection.workerSocket.sent[0] as string) as Record<
+      string,
+      JsonValue
+    >;
+    selfCorrelated.messageId = request.messageId;
+    selfCorrelated.correlationId = request.messageId;
+    connection.mainSocket.inject(JSON.stringify(selfCorrelated));
+    let pendingSettled = false;
+    void pending.then(() => {
+      pendingSettled = true;
+    });
+    await flush();
+    assert.deepEqual(
+      received.map((message) => message.payload),
+      [{ selfCorrelated: true }],
+    );
+    assert.equal(pendingSettled, false);
+
+    connection.workerSocket.automaticDelivery = true;
     await connection.workerSession.send("session.reconcile", { unrelated: true });
     assert.deepEqual(
       received.map((message) => message.payload),
-      [{ unrelated: true }],
+      [{ selfCorrelated: true }, { unrelated: true }],
     );
 
     await connection.workerSession.send(
@@ -833,6 +854,16 @@ test("one-way self-correlates and requests do not resolve from unrelated message
       { correlationId: request.messageId },
     );
     assert.deepEqual((await pending).payload, { response: true });
+
+    await connection.workerSession.send(
+      "session.reconcile",
+      { late: true },
+      { correlationId: request.messageId },
+    );
+    assert.deepEqual(
+      received.map((message) => message.payload),
+      [{ selfCorrelated: true }, { unrelated: true }, { late: true }],
+    );
   } finally {
     await cleanup(connection);
   }
