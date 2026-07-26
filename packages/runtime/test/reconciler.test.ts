@@ -1597,6 +1597,255 @@ test("a custom deployment loader does not destructively clean up persistent bind
   await reconciler.stop();
 });
 
+test("degrade persists lexical provider loss evidence and recovers only the same providers", async () => {
+  const providerZId = parsePluginId("z-provider");
+  const providerAId = parsePluginId("a-provider");
+  const alternateId = parsePluginId("alternate-provider");
+  const consumerId = parsePluginId("essential-consumer");
+  const capabilityZ = parseCapabilityName("org.example.zeta");
+  const capabilityA = parseCapabilityName("org.example.alpha");
+  const providerZDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const providerADigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const alternateDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"d".repeat(64)}`);
+  const consumerComponentId = parseComponentId("consumer-service");
+  const capabilityManifest = (
+    targetPluginId: PluginInstallation["pluginId"],
+    provides: PluginManifest["capabilities"]["provides"],
+    requires: PluginManifest["capabilities"]["requires"],
+    components: PluginManifest["components"] = [],
+  ): PluginManifest => ({
+    ...manifest("1.0.0", digestOne),
+    pluginId: targetPluginId,
+    components,
+    permissions: components.length === 0 ? [] : [{ kind: "executor", executors: ["process"] }],
+    capabilities: { provides, requires },
+  });
+  const providerZManifest = capabilityManifest(
+    providerZId,
+    [{ name: capabilityZ, protocolVersion: "1.0.0" }],
+    [],
+  );
+  const providerAManifest = capabilityManifest(
+    providerAId,
+    [{ name: capabilityA, protocolVersion: "1.0.0" }],
+    [],
+  );
+  const alternateManifest = capabilityManifest(
+    alternateId,
+    [
+      { name: capabilityZ, protocolVersion: "1.0.0" },
+      { name: capabilityA, protocolVersion: "1.0.0" },
+    ],
+    [],
+  );
+  const consumerManifest = capabilityManifest(
+    consumerId,
+    [],
+    [
+      {
+        name: capabilityZ,
+        protocolRange: "^1.0.0",
+        lossPolicy: "degrade",
+      },
+      {
+        name: capabilityA,
+        protocolRange: "^1.0.0",
+        lossPolicy: "degrade",
+      },
+    ],
+    [
+      {
+        componentId: consumerComponentId,
+        kind: "service",
+        entrypoint: "components/consumer.js",
+        executors: ["process"],
+      },
+    ],
+  );
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerZDigest),
+      pluginId: providerZId,
+      manifest: providerZManifest,
+    },
+    {
+      ...installation("1.0.0", providerADigest),
+      pluginId: providerAId,
+      manifest: providerAManifest,
+    },
+    {
+      ...installation("1.0.0", alternateDigest),
+      pluginId: alternateId,
+      manifest: alternateManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const providerZ = deployment("1", {
+    pluginId: providerZId,
+    artifactDigest: providerZDigest,
+    permissionGrants: [],
+  });
+  const providerA = deployment("1", {
+    pluginId: providerAId,
+    artifactDigest: providerADigest,
+    permissionGrants: [],
+  });
+  const alternate = deployment("1", {
+    pluginId: alternateId,
+    artifactDigest: alternateDigest,
+    permissionGrants: [],
+  });
+  const consumer = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    essential: true,
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
+  });
+  const deploymentRecordKey = (desired: PluginDeployment): StateKey<PluginDeployment> => ({
+    namespace: "tego",
+    collection: "deployments",
+    id: `${desired.applicationId}/${desired.pluginId}`,
+  });
+  const lossKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "provider-loss",
+    id: `${applicationId}/${consumerId}`,
+  };
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    for (const desired of [providerZ, providerA, consumer]) {
+      await transaction.put(deploymentRecordKey(desired), desired, {
+        expectedRevision: "absent",
+      });
+    }
+    return null;
+  });
+  const options = {
+    artifactGate: {
+      async validate(request: { readonly digest: ArtifactDigest }) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    state,
+    loadInstallations: async () => installations,
+  };
+  const firstEffects = new RecordingEffects();
+  const first = new Reconciler({ ...options, effects: firstEffects });
+
+  await first.start();
+
+  assert.equal(first.applicationReady(), true);
+  const readyInstance = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "component-instances" &&
+      (record.value as { readonly pluginId?: string }).pluginId === consumerId,
+  );
+  assert.ok(readyInstance);
+  const initialEffectCount = firstEffects.calls.length;
+  await state.transact({}, async (transaction) => {
+    for (const desired of [providerZ, providerA]) {
+      const key = deploymentRecordKey(desired);
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(key, { ...desired, state: "disabled" }, {
+        expectedRevision: current.revision,
+      });
+    }
+    await transaction.put(deploymentRecordKey(alternate), alternate, {
+      expectedRevision: "absent",
+    });
+    return null;
+  });
+
+  await first.wake();
+
+  const degraded = await state.read(readyInstance.key);
+  assert.equal((degraded?.value as { readonly lifecycle?: string }).lifecycle, "degraded");
+  assert.equal(first.applicationReady(), false);
+  assert.equal(firstEffects.calls.length, initialEffectCount);
+  const persistedLoss = await state.read(lossKey);
+  assert.deepEqual(persistedLoss?.value, {
+    consumer: { applicationId, pluginId: consumerId },
+    deploymentGeneration: parseGeneration("1"),
+    action: "degrade",
+    capabilities: [capabilityA, capabilityZ],
+    providers: [
+      { applicationId, pluginId: providerAId },
+      { applicationId, pluginId: providerZId },
+    ],
+    updatedAt: clock.now().toISOString(),
+  });
+  const observation = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "deployment-observations" &&
+      record.key.id === `${applicationId}/${consumerId}`,
+  );
+  assert.equal(
+    (observation?.value as { readonly status?: string } | undefined)?.status,
+    "degraded",
+  );
+
+  await first.wake();
+
+  assert.deepEqual(await state.read(lossKey), persistedLoss);
+  assert.equal(firstEffects.calls.length, initialEffectCount);
+  await first.stop();
+
+  const recoveredEffects = new RecordingEffects();
+  const recovered = new Reconciler({ ...options, effects: recoveredEffects });
+  await recovered.start();
+  assert.deepEqual(await state.read(lossKey), persistedLoss);
+  assert.equal(recovered.applicationReady(), false);
+  assert.equal(recoveredEffects.calls.length, 0);
+
+  await state.transact({}, async (transaction) => {
+    for (const desired of [providerZ, providerA]) {
+      const key = deploymentRecordKey(desired);
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(key, desired, { expectedRevision: current.revision });
+    }
+    return null;
+  });
+  await recovered.wake();
+
+  const readyAgain = await state.read(readyInstance.key);
+  assert.equal((readyAgain?.value as { readonly instanceId?: string }).instanceId, readyInstance.key.id);
+  assert.equal((readyAgain?.value as { readonly lifecycle?: string }).lifecycle, "ready");
+  assert.equal(await state.read(lossKey), undefined);
+  assert.equal(recovered.applicationReady(), true);
+  assert.equal(recoveredEffects.calls.length, 0);
+  const recoveredObservation = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "deployment-observations" &&
+      record.key.id === `${applicationId}/${consumerId}`,
+  );
+  assert.equal(
+    (recoveredObservation?.value as { readonly status?: string } | undefined)?.status,
+    "ready",
+  );
+  await recovered.stop();
+});
+
 test("non-canonical provider instances cannot satisfy execution-time capabilities", async () => {
   const providerId = parsePluginId("z-provider");
   const consumerId = parsePluginId("a-consumer");
