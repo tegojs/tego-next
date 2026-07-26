@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
-  parseArtifactDigest,
-  parseWorkerId,
   type ArtifactDigest,
   type Clock,
   type ExecutorKind,
   type FencingEpoch,
   type JsonObject,
   type JsonValue,
+  parseArtifactDigest,
+  parseWorkerId,
   type RuntimeDiagnostic,
   type SessionId,
+  type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-  type WorkerId,
 } from "@tegojs/contracts";
 import { FakeClock } from "./fake-clock.js";
 
@@ -453,7 +453,9 @@ export function workerSessionConformance(
         );
         const workerReceived: WorkerSessionMessage[] = [];
         const mainReceived: WorkerSessionMessage[] = [];
-        const unsubscribeWorker = workerSession.onMessage((message) => workerReceived.push(message));
+        const unsubscribeWorker = workerSession.onMessage((message) =>
+          workerReceived.push(message),
+        );
         const unsubscribeMain = mainSession.onMessage((message) => mainReceived.push(message));
         const messageId = await mainSession.send("session.reconcile", { running: [] });
         await new Promise<void>((resolve) => setImmediate(resolve));

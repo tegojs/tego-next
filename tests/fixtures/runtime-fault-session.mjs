@@ -19,10 +19,12 @@ export class DeterministicRemoteSession {
   }
 
   async request(type, payload) {
+    const correlationId = `request-${this.#sequence++}`;
     const messageId = `response-${this.#sequence++}`;
     if (type === "session.reconcile") {
       return {
         messageId,
+        correlationId,
         type,
         payload: {
           acknowledged: [],
@@ -37,6 +39,7 @@ export class DeterministicRemoteSession {
     if (type === "task.assign") {
       return {
         messageId,
+        correlationId,
         type: "task.acknowledge",
         payload: {
           accepted: true,
@@ -53,7 +56,7 @@ export class DeterministicRemoteSession {
     if (type === "task.acknowledge" && payload.kind === "result") {
       this.resultAcknowledgements.push({
         attemptId: payload.attemptId,
-        correlationId: options.correlationId,
+        correlationId: options.correlationId ?? messageId,
         taskId: payload.taskId,
       });
     }
@@ -63,6 +66,7 @@ export class DeterministicRemoteSession {
   emitResult(result, suffix) {
     const message = {
       messageId: `remote-result-${suffix}`,
+      correlationId: `remote-result-${suffix}`,
       type: "task.result",
       payload: { result },
     };

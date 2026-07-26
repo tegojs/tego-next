@@ -145,6 +145,21 @@ executorConformance(async () => {
   return (await connected({}, currentLocal)).remote;
 }, fixture);
 
+test("memory session peers allocate distinct self-correlated message identities", async () => {
+  const [main, worker] = memorySessionPair("1");
+  const mainReceived = Promise.withResolvers<string>();
+  const workerReceived = Promise.withResolvers<string>();
+  main.onMessage((message) => mainReceived.resolve(message.messageId));
+  worker.onMessage((message) => workerReceived.resolve(message.messageId));
+
+  await Promise.all([
+    main.send("session.reconcile", { source: "main" }),
+    worker.send("session.reconcile", { source: "worker" }),
+  ]);
+
+  assert.notEqual(await mainReceived.promise, await workerReceived.promise);
+});
+
 test("assignment is recorded before the Worker receives it", async () => {
   const events: string[] = [];
   const store = new MemoryRemoteAttemptStore({

@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseWorkerId, type ExecutionResult } from "@tegojs/contracts";
+import { type ExecutionResult, parseWorkerId } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import {
   MemoryRemoteAttemptStore,
   MemoryRemoteResultStore,
-  RemoteExecutor,
-  WorkerRuntime,
-  requestFingerprint,
   type RemoteAttemptRecord,
   type RemoteAttemptStore,
+  RemoteExecutor,
+  requestFingerprint,
+  WorkerRuntime,
 } from "../src/index.js";
 import {
   executionRequest as createExecutionRequest,
@@ -2492,6 +2492,7 @@ test("assignment and cancellation acknowledgements are bound to type and attempt
     if (type === "task.assign") {
       return {
         messageId: "wrong-assignment-ack",
+        correlationId: "assignment",
         type: "task.acknowledge",
         payload: {
           accepted: true,
@@ -2504,6 +2505,7 @@ test("assignment and cancellation acknowledgements are bound to type and attempt
     if (type === "task.cancel") {
       return {
         messageId: "wrong-cancel-ack",
+        correlationId: "cancel",
         type: "task.acknowledge",
         payload: {
           taskId: wrong.taskId,
@@ -2521,6 +2523,7 @@ test("assignment and cancellation acknowledgements are bound to type and attempt
     if (type === "task.cancel") {
       return {
         messageId: "wrong-cancel-ack",
+        correlationId: "cancel",
         type: "task.acknowledge",
         payload: {
           taskId: wrong.taskId,
