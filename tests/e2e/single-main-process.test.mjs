@@ -392,7 +392,7 @@ async function runSystemFlow(runIndex) {
     assert.equal(interruptedRemote.state, "running");
 
     process.kill(main.pid, "SIGKILL");
-    await main.assertClean();
+    await main.assertClean({ timeoutMs: processDeadlineMs });
     main = undefined;
     await assertPortClosed(workerUrl);
     const workerPort = Number(new URL(workerUrl).port);
@@ -674,7 +674,7 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
 
     killedLeader = leader.candidate.handle;
     process.kill(killedLeader.pid, "SIGKILL");
-    await killedLeader.assertClean();
+    await killedLeader.assertClean({ timeoutMs: processDeadlineMs });
     const oldEpoch = BigInt(leader.status.authority.epoch);
     const promoted = await eventually(async () => {
       const status = await runtimeStatus(follower.candidate.configuration.endpoint);

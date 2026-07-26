@@ -241,6 +241,10 @@ test("managed process reports a live child without waiting for exit", async (t) 
   registerCleanup(t, child);
   await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
   await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_STILL_RUNNING/u);
+  await assert.rejects(
+    settleTestPromiseWithin(child.assertClean({ timeoutMs: 20 }), 200),
+    /PROCESS_STILL_RUNNING/u,
+  );
 });
 
 test("managed process can wait boundedly for an externally killed child to exit", async (t) => {

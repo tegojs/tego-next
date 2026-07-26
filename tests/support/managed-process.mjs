@@ -182,7 +182,8 @@ export class ManagedProcess {
     await this.#waitForFinalization(timeoutMs);
   }
 
-  async assertClean({ timeoutMs = 2_000 } = {}) {
+  async assertClean(options = {}) {
+    const timeoutMs = options.timeoutMs ?? 2_000;
     if (!(await settleWithin(this.#spawnState.promise, timeoutMs))) {
       throw new Error(`PROCESS_SPAWN_STATE_TIMEOUT:${this.#name}:${timeoutMs}ms`);
     }
@@ -190,7 +191,10 @@ export class ManagedProcess {
       await this.#waitForFinalization(timeoutMs);
       throw processSpawnDiagnostic(this.#spawnError, this.#name);
     }
-    if (!this.#exit.settled) {
+    if (
+      !this.#exit.settled &&
+      (options.timeoutMs === undefined || !(await settleWithin(this.#exit.promise, timeoutMs)))
+    ) {
       throw new Error(`PROCESS_STILL_RUNNING:${this.#name}:${this.pid}`);
     }
     const exit = await this.#exit.promise;
