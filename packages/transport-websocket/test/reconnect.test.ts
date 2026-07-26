@@ -874,51 +874,62 @@ test("persisted attempt epochs fence stale sessions after Main restart", async (
 
 test("a correlated assignment result must match the assigned attempt identity", async () => {
   const clock = new FakeClock(new Date(0));
-  const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
     id: "remote",
     workerId,
     clock,
+    orphanTimeoutMs: 100,
     attemptStore: new MemoryRemoteAttemptStore(),
-  });
-  const runtime = new WorkerRuntime({
-    workerId,
-    clock,
-    attemptStore: new MemoryRemoteAttemptStore(),
-    selectExecutor: () => local,
   });
   const [main, worker] = memorySessionPair("1");
-  await runtime.attach(worker);
+  worker.onMessage((message) => {
+    if (message.type !== "session.reconcile") return;
+    void worker.send(
+      "session.reconcile",
+      {
+        epoch: worker.epoch,
+        attemptPersistenceAvailable: true,
+        acknowledged: [],
+        running: [],
+        terminalUnacknowledged: [],
+        preparedArtifacts: [],
+      },
+      { correlationId: message.messageId },
+    );
+  });
   await remote.attach(main);
-  const originalRequest = main.request.bind(main);
   const assigned = executionRequest({ mode: "wait" }, "identity-a");
   const forged = executionRequest({ mode: "wait" }, "identity-b");
-  main.request = async (type, payload) => {
-    if (type !== "task.assign") return originalRequest(type, payload);
-    const now = clock.now().toISOString();
-    return {
-      messageId: "forged-result",
-      correlationId: "assignment",
-      type: "task.acknowledge",
-      payload: {
-        accepted: false,
-        result: {
-          taskId: forged.taskId,
-          attemptId: forged.attemptId,
-          status: "rejected",
-          executor: { kind: "remote", workerId },
-          startedAt: now,
-          completedAt: now,
-        },
-      },
-    };
-  };
-
+  const assignment = Promise.withResolvers<string>();
+  worker.onMessage((message) => {
+    if (message.type === "task.assign") assignment.resolve(message.messageId);
+  });
   const handle = await remote.submit(assigned);
+  const assignmentMessageId = await assignment.promise;
+  const now = clock.now().toISOString();
+  const forgedResponseId = await worker.send(
+    "task.acknowledge",
+    {
+      accepted: false,
+      result: {
+        taskId: forged.taskId,
+        attemptId: forged.attemptId,
+        status: "rejected",
+        executor: { kind: "remote", workerId },
+        startedAt: now,
+        completedAt: now,
+      },
+    },
+    { correlationId: "assignment" },
+  );
+  assert.notEqual(forgedResponseId, assignmentMessageId);
+  main.close();
+  await flush();
+  clock.advanceBy(101);
   const result = await handle.result;
   assert.equal(result.status, "failed");
   assert.match(result.diagnostic?.code ?? "", /IDENTITY/iu);
-  await Promise.all([remote.close(), runtime.close()]);
+  await remote.close();
 });
 
 test("drain observes a submit whose durable assignment save is still in progress", async () => {
