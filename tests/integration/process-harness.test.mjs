@@ -40,6 +40,22 @@ function nextEventLoopTurn(signal) {
   });
 }
 
+function settleTestPromiseWithin(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("ASSERT_CLEAN_TIMEOUT")), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function waitForPidDeath(pid, { timeoutMs }) {
   const signal = AbortSignal.timeout(timeoutMs);
   while (isProcessAlive(pid)) {
@@ -211,15 +227,7 @@ test("managed process reports spawn failure without waiting for exit", async (t)
     name: "missing-child",
   });
   registerExpectedDiagnosticCleanup(t, child, /PROCESS_SPAWN_ERROR/u);
-  await assert.rejects(
-    Promise.race([
-      child.assertClean(),
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("ASSERT_CLEAN_TIMEOUT")), 200);
-      }),
-    ]),
-    /PROCESS_SPAWN_ERROR/u,
-  );
+  await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_SPAWN_ERROR/u);
 });
 
 test("managed process reports a live child without waiting for exit", async (t) => {
@@ -232,7 +240,7 @@ test("managed process reports a live child without waiting for exit", async (t) 
   });
   registerCleanup(t, child);
   await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
-  await assert.rejects(child.assertClean(), /PROCESS_STILL_RUNNING/u);
+  await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_STILL_RUNNING/u);
 });
 
 test("managed process gives stdin EOF a bounded graceful stop phase", async () => {
