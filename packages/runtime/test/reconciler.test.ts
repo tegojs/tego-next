@@ -5977,14 +5977,14 @@ test("recovery start is reauthorized after its executing journal commit", async 
   };
   await reconciler.wake();
 
-  assert.equal(
-    effects.calls.some(
+  assert.deepEqual(
+    effects.calls.filter(
       (effect) =>
         effect.pluginId === fixture.consumerId &&
         effect.activation === "2" &&
         effect.kind === "prepare",
     ),
-    false,
+    [],
   );
   const loss = await fixture.state.read(fixture.lossKey);
   assert.equal((loss?.value as { readonly action?: string } | undefined)?.action, "suspend");
@@ -6016,7 +6016,10 @@ test("recovery effect is fenced by the current consumer instance revision", asyn
       assert.ok(current);
       await transaction.put(
         key,
-        { ...(current.value as Record<string, JsonValue>), lifecycle: "stopped" },
+        {
+          ...(current.value as Record<string, JsonValue>),
+          artifactDigest: digestOne,
+        },
         { expectedRevision: current.revision },
       );
       return null;
@@ -6024,14 +6027,14 @@ test("recovery effect is fenced by the current consumer instance revision", asyn
   };
   await reconciler.wake();
 
-  assert.equal(
-    effects.calls.some(
+  assert.deepEqual(
+    effects.calls.filter(
       (effect) =>
         effect.pluginId === fixture.consumerId &&
         effect.activation === "2" &&
         effect.kind === "prepare",
     ),
-    false,
+    [],
   );
   await reconciler.stop();
 });

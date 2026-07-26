@@ -209,8 +209,9 @@ function parsePersistedActivation(instance: PersistedComponentInstance): Activat
   return parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1");
 }
 
-function hasStarted(instance: PersistedComponentInstance): boolean {
-  if (instance.hasStarted !== undefined) return instance.hasStarted;
+function hasStarted(instance: Pick<ComponentInstance, "hasStarted" | "lifecycle">): boolean {
+  if (instance.hasStarted === true) return true;
+  if (instance.hasStarted === false) return false;
   return (
     instance.lifecycle === "ready" ||
     instance.lifecycle === "degraded" ||
@@ -1060,10 +1061,13 @@ export class Reconciler {
       | "artifactDigest"
       | "componentId"
       | "deploymentGeneration"
+      | "instanceId"
       | "pluginId"
     >,
     fallbackDeployments: readonly PluginDeployment[],
     fallbackInstallations: readonly PluginInstallation[],
+    expectedLifecycle: PersistedComponentInstance["lifecycle"],
+    expectedRevision: Revision,
   ): Promise<boolean> {
     const currentLoss = await transaction.get(
       providerLossKey({
@@ -1123,6 +1127,23 @@ export class Reconciler {
         ...(legacyActivation ? { legacyActivation: true } : {}),
         revision: record.revision,
       });
+    }
+    const consumerInstance = instances.find(
+      (instance) =>
+        instance.instanceId === effect.instanceId &&
+        instance.activation === effect.activation &&
+        instance.applicationId === effect.applicationId &&
+        instance.pluginId === effect.pluginId &&
+        instance.componentId === effect.componentId &&
+        instance.deploymentGeneration === effect.deploymentGeneration &&
+        instance.observedGeneration === effect.deploymentGeneration &&
+        instance.artifactDigest === effect.artifactDigest,
+    );
+    if (
+      consumerInstance?.lifecycle !== expectedLifecycle ||
+      consumerInstance.revision !== expectedRevision
+    ) {
+      return false;
     }
     const bindings: LoadedCapabilityBinding[] = [];
     for await (const record of transaction.scan<PersistedCapabilityBinding>({
@@ -2025,7 +2046,14 @@ export class Reconciler {
       if (
         recoveryInstance &&
         !(await this.#options.state.transact(this.#transactionOptions(), (transaction) =>
-          this.#authorizeRecoveryEffect(transaction, instance, deployments, installations),
+          this.#authorizeRecoveryEffect(
+            transaction,
+            instance,
+            deployments,
+            installations,
+            instance.lifecycle,
+            instance.revision,
+          ),
         ))
       ) {
         this.#replanCount += 1;
@@ -2397,9 +2425,7 @@ export class Reconciler {
         },
         activated: candidateInstallation.manifest.components.every((component) =>
           candidateInstances.some(
-            (instance) =>
-              instance.componentId === component.componentId &&
-              hasStarted(instance as PersistedComponentInstance),
+            (instance) => instance.componentId === component.componentId && hasStarted(instance),
           ),
         ),
         ready:
@@ -3091,7 +3117,14 @@ export class Reconciler {
         async (transaction) => {
           if (
             exactRecoveryEffect &&
-            !(await this.#authorizeRecoveryEffect(transaction, effect, deployments, installations))
+            !(await this.#authorizeRecoveryEffect(
+              transaction,
+              effect,
+              deployments,
+              installations,
+              instance.lifecycle,
+              current.revision,
+            ))
           ) {
             return false;
           }
@@ -3139,7 +3172,14 @@ export class Reconciler {
     if (
       exactRecoveryEffect &&
       !(await this.#options.state.transact(this.#transactionOptions(), (transaction) =>
-        this.#authorizeRecoveryEffect(transaction, effect, deployments, installations),
+        this.#authorizeRecoveryEffect(
+          transaction,
+          effect,
+          deployments,
+          installations,
+          retryPreState ?? instance.lifecycle,
+          current.revision,
+        ),
       ))
     ) {
       this.#replanCount += 1;
