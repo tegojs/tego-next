@@ -4477,7 +4477,7 @@ test("restoration skips ready instances whose observed generation is stale", asy
   await reconciler.stop();
 });
 
-test("recovery restoration requires bindings for the consumer manifest's full required set", async () => {
+test("recovery restoration reauthorizes the full required provider set after its snapshot", async () => {
   const clock = new ManualClock();
   const state = await createHarnessStore(clock);
   const providerAId = parsePluginId("full-set-provider-a");
@@ -4628,6 +4628,11 @@ test("recovery restoration requires bindings for the consumer manifest's full re
             provider: { applicationId, pluginId: providerAId },
             providerGeneration: providerA.generation,
           },
+          {
+            capability: otherCapability,
+            provider: { applicationId, pluginId: providerBId },
+            providerGeneration: providerB.generation,
+          },
         ],
         recoveryActivations: { [consumerComponentId]: "2" },
         updatedAt: clock.now().toISOString(),
@@ -4650,11 +4655,50 @@ test("recovery restoration requires bindings for the consumer manifest's full re
       },
       { expectedRevision: "absent" },
     );
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "capability-bindings",
+        id: `${applicationId}/${consumerId}/${otherCapability}`,
+      },
+      {
+        consumer: { applicationId, pluginId: consumerId },
+        capability: otherCapability,
+        provider: { applicationId, pluginId: providerBId },
+        source: "automatic",
+        deploymentGeneration: consumer.generation,
+        updatedAt: clock.now().toISOString(),
+      },
+      { expectedRevision: "absent" },
+    );
     return null;
   });
   const effects = new RecordingEffects();
   effects.live.add(providerAInstance.instanceId);
   effects.live.add(providerBInstance.instanceId);
+  const isLive = effects.isLive.bind(effects);
+  let droppedAfterSnapshot = false;
+  effects.isLive = (instance) => {
+    const live = isLive(instance);
+    if (instance.instanceId === providerBInstance.instanceId && !droppedAfterSnapshot) {
+      droppedAfterSnapshot = true;
+      const key = stateIdentifier({
+        namespace: "tego",
+        collection: "component-instances",
+        id: providerBInstance.instanceId,
+      });
+      const current = state.records.get(key);
+      assert.ok(current);
+      state.records.set(key, {
+        ...current,
+        value: {
+          ...(current.value as Record<string, JsonValue>),
+          lifecycle: "degraded",
+        },
+      });
+    }
+    return live;
+  };
   const reconciler = new Reconciler({
     artifactGate: {
       validate: async (request) => {
