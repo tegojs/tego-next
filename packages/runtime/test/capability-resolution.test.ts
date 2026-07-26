@@ -6,6 +6,7 @@ import {
   parseCapabilityName,
   parsePluginId,
 } from "@tegojs/contracts";
+import { type ProviderLossDecision, strongestProviderLoss } from "../src/capabilities/resolver.js";
 import {
   type CapabilityResolutionDeployment,
   isValidVersion,
@@ -13,10 +14,6 @@ import {
   resolveCapabilities,
   satisfiesVersionRange,
 } from "../src/index.js";
-import {
-  type ProviderLossDecision,
-  strongestProviderLoss,
-} from "../src/capabilities/resolver.js";
 
 const applicationId = parseApplicationId("application-01");
 
@@ -69,12 +66,13 @@ test("provider loss precedence is explicit and independent of action order", () 
     );
   }
 
-  assert.equal(
-    strongestProviderLoss(
-      (["degrade", "suspend"] as const).toReversed().map(providerLossDecision),
-    ),
-    "suspend",
-  );
+  for (const actions of permutations(["degrade", "suspend"] as const)) {
+    assert.equal(
+      strongestProviderLoss(actions.map(providerLossDecision)),
+      "suspend",
+      actions.join(","),
+    );
+  }
   assert.equal(strongestProviderLoss([]), undefined);
 });
 

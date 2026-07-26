@@ -580,7 +580,9 @@ class TestStateStore implements StateStore {
   failNextFailureCommit = false;
   failNextExecutionPreStateCommit = false;
   failNextAcknowledgement = false;
+  failNextProviderLossScan = false;
   beforeNextCapabilityBindingScan: (() => Promise<void>) | undefined;
+  beforeNextProviderLossCommit: (() => Promise<void>) | undefined;
   capabilityBindingRaceWinner:
     | {
         readonly key: StateKey<JsonValue>;
@@ -658,6 +660,14 @@ class TestStateStore implements StateStore {
       },
     };
     const result = await work(transaction);
+    if (
+      this.beforeNextProviderLossCommit !== undefined &&
+      [...puts, ...deletes].some((mutation) => mutation.key.collection === "provider-loss")
+    ) {
+      const beforeCommit = this.beforeNextProviderLossCommit;
+      this.beforeNextProviderLossCommit = undefined;
+      await beforeCommit();
+    }
     if (
       this.capabilityBindingRaceWinner !== undefined &&
       puts.some((put) => put.key.collection === "capability-bindings")
@@ -785,6 +795,10 @@ class TestStateStore implements StateStore {
   }
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
+    if (query.collection === "provider-loss" && this.failNextProviderLossScan) {
+      this.failNextProviderLossScan = false;
+      throw new Error("provider loss scan unavailable");
+    }
     if (
       query.collection === "capability-bindings" &&
       this.beforeNextCapabilityBindingScan !== undefined
@@ -1766,9 +1780,13 @@ test("degrade persists lexical provider loss evidence and recovers only the same
       const key = deploymentRecordKey(desired);
       const current = await transaction.get(key);
       assert.ok(current);
-      await transaction.put(key, { ...desired, state: "disabled" }, {
-        expectedRevision: current.revision,
-      });
+      await transaction.put(
+        key,
+        { ...desired, state: "disabled" },
+        {
+          expectedRevision: current.revision,
+        },
+      );
     }
     await transaction.put(deploymentRecordKey(alternate), alternate, {
       expectedRevision: "absent",
@@ -1779,7 +1797,8 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   await first.wake();
 
   const degraded = await state.read(readyInstance.key);
-  assert.equal((degraded?.value as { readonly lifecycle?: string }).lifecycle, "degraded");
+  assert.ok(degraded);
+  assert.equal((degraded.value as { readonly lifecycle?: string }).lifecycle, "degraded");
   assert.equal(first.applicationReady(), false);
   assert.equal(firstEffects.calls.length, initialEffectCount);
   const persistedLoss = await state.read(lossKey);
@@ -1826,11 +1845,50 @@ test("degrade persists lexical provider loss evidence and recovers only the same
     }
     return null;
   });
+  state.beforeNextProviderLossCommit = async () => {
+    await state.transact({}, async (transaction) => {
+      const providerKey = deploymentRecordKey(providerA);
+      const currentProvider = await transaction.get(providerKey);
+      const currentLoss = await transaction.get(lossKey);
+      assert.ok(currentProvider);
+      assert.ok(currentLoss);
+      await transaction.put(
+        providerKey,
+        { ...providerA, state: "disabled" },
+        {
+          expectedRevision: currentProvider.revision,
+        },
+      );
+      await transaction.put(lossKey, currentLoss.value, {
+        expectedRevision: currentLoss.revision,
+      });
+      return null;
+    });
+  };
+  await recovered.wake();
+
+  assert.ok(await state.read(lossKey));
+  const stillDegraded = await state.read(readyInstance.key);
+  assert.ok(stillDegraded);
+  assert.equal((stillDegraded.value as { readonly lifecycle?: string }).lifecycle, "degraded");
+  assert.equal(recovered.applicationReady(), false);
+  assert.equal(recoveredEffects.calls.length, 0);
+  await state.transact({}, async (transaction) => {
+    const key = deploymentRecordKey(providerA);
+    const current = await transaction.get(key);
+    assert.ok(current);
+    await transaction.put(key, providerA, { expectedRevision: current.revision });
+    return null;
+  });
   await recovered.wake();
 
   const readyAgain = await state.read(readyInstance.key);
-  assert.equal((readyAgain?.value as { readonly instanceId?: string }).instanceId, readyInstance.key.id);
-  assert.equal((readyAgain?.value as { readonly lifecycle?: string }).lifecycle, "ready");
+  assert.ok(readyAgain);
+  assert.equal(
+    (readyAgain.value as { readonly instanceId?: string }).instanceId,
+    readyInstance.key.id,
+  );
+  assert.equal((readyAgain.value as { readonly lifecycle?: string }).lifecycle, "ready");
   assert.equal(await state.read(lossKey), undefined);
   assert.equal(recovered.applicationReady(), true);
   assert.equal(recoveredEffects.calls.length, 0);
@@ -1844,6 +1902,69 @@ test("degrade persists lexical provider loss evidence and recovers only the same
     "ready",
   );
   await recovered.stop();
+});
+
+test("provider loss load and parse failures preserve durable evidence", async (context) => {
+  const consumerId = parsePluginId("consumer");
+  const providerId = parsePluginId("provider");
+  const capability = parseCapabilityName("org.example.durable-loss");
+  const lossKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "provider-loss",
+    id: `${applicationId}/${consumerId}`,
+  };
+  const options = (state: TestStateStore, clock: Clock) => ({
+    artifactGate: {
+      async validate() {
+        assert.fail("provider loss loading precedes artifact validation");
+      },
+    },
+    clock,
+    effects: new RecordingEffects(),
+    state,
+    loadInstallations: async () => [],
+  });
+
+  await context.test("transient load failure", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    const value = {
+      consumer: { applicationId, pluginId: consumerId },
+      deploymentGeneration: parseGeneration("1"),
+      action: "degrade",
+      capabilities: [capability],
+      providers: [{ applicationId, pluginId: providerId }],
+      updatedAt: clock.now().toISOString(),
+    } as const;
+    await state.transact({}, async (transaction) => {
+      await transaction.put(lossKey, value, { expectedRevision: "absent" });
+      return null;
+    });
+    const persisted = await state.read(lossKey);
+    state.failNextProviderLossScan = true;
+    const reconciler = new Reconciler(options(state, clock));
+
+    await assert.rejects(reconciler.start(), /provider loss scan unavailable/);
+
+    assert.deepEqual(await state.read(lossKey), persisted);
+    await reconciler.stop();
+  });
+
+  await context.test("parse failure", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    await state.transact({}, async (transaction) => {
+      await transaction.put(lossKey, { action: "degrade" }, { expectedRevision: "absent" });
+      return null;
+    });
+    const persisted = await state.read(lossKey);
+    const reconciler = new Reconciler(options(state, clock));
+
+    await assert.rejects(reconciler.start(), /Persisted provider loss is invalid/);
+
+    assert.deepEqual(await state.read(lossKey), persisted);
+    await reconciler.stop();
+  });
 });
 
 test("non-canonical provider instances cannot satisfy execution-time capabilities", async () => {

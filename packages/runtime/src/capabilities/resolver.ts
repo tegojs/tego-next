@@ -1,5 +1,6 @@
 import type {
   CapabilityName,
+  Generation,
   JsonObject,
   PluginCapabilityProvision,
   PluginCapabilityRequirement,
@@ -76,6 +77,35 @@ export interface ProviderLossDecision extends JsonObject {
   readonly capability: CapabilityName;
   readonly consumer: PluginDeploymentIdentity;
   readonly provider: PluginDeploymentIdentity;
+}
+
+export type ProviderLossAction = ProviderLossDecision["action"];
+
+export interface PersistedProviderLoss extends JsonObject {
+  readonly consumer: PluginDeploymentIdentity;
+  readonly deploymentGeneration: Generation;
+  readonly action: ProviderLossAction;
+  readonly capabilities: readonly CapabilityName[];
+  readonly providers: readonly PluginDeploymentIdentity[];
+  readonly updatedAt: string;
+}
+
+const providerLossRank: Readonly<Record<ProviderLossAction, number>> = {
+  degrade: 1,
+  suspend: 2,
+  fail: 3,
+};
+
+export function strongestProviderLoss(
+  actions: readonly ProviderLossDecision[],
+): ProviderLossAction | undefined {
+  return actions.reduce<ProviderLossAction | undefined>(
+    (strongest, decision) =>
+      strongest === undefined || providerLossRank[decision.action] > providerLossRank[strongest]
+        ? decision.action
+        : strongest,
+    undefined,
+  );
 }
 
 export interface ResolutionResult extends JsonObject {
