@@ -1,25 +1,25 @@
 import { randomUUID } from "node:crypto";
 import {
+  type ArtifactDigest,
+  type Clock,
   DiagnosticError,
+  type ExecutorKind,
+  type FencingEpoch,
+  type JsonObject,
+  type JsonValue,
   parseArtifactDigest,
   parseFencingEpoch,
   parseMessageId,
   parseSequence,
   parseSessionId,
   parseWorkerId,
-  runtimeDiagnostic,
-  serializeWireValue,
-  type ArtifactDigest,
-  type Clock,
-  type ExecutorKind,
-  type FencingEpoch,
-  type JsonObject,
-  type JsonValue,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type SessionId,
+  serializeWireValue,
+  type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-  type WorkerId,
 } from "@tegojs/contracts";
 import {
   createAuthenticationNonce,
@@ -44,7 +44,7 @@ export interface WorkerRegistration extends JsonObject {
 
 export interface WorkerSessionMessage {
   readonly messageId: string;
-  readonly correlationId?: string;
+  readonly correlationId: string;
   readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
@@ -642,9 +642,16 @@ export class WorkerSession {
       }
     } catch (error) {
       this.#fail(
-        error instanceof DiagnosticError
+        error instanceof DiagnosticError && error.diagnostic.code !== "WORKER_ENVELOPE_INVALID"
           ? error
-          : diagnosticError("PROTOCOL_FRAME_INVALID", "Worker frame could not be processed"),
+          : diagnosticError(
+              error instanceof DiagnosticError
+                ? "PROTOCOL_MESSAGE_INVALID"
+                : "PROTOCOL_FRAME_INVALID",
+              error instanceof DiagnosticError
+                ? "Worker control message is invalid"
+                : "Worker frame could not be processed",
+            ),
       );
     }
   }
@@ -798,17 +805,14 @@ export class WorkerSession {
     }
     const message: WorkerSessionMessage = {
       messageId: envelope.messageId,
-      ...(envelope.correlationId === undefined ? {} : { correlationId: envelope.correlationId }),
+      correlationId: envelope.correlationId,
       type: envelope.type,
       payload: envelope.payload,
       ...(binary === undefined ? {} : { binary }),
     };
-    const request =
-      envelope.correlationId === undefined
-        ? undefined
-        : this.#pendingRequests.get(envelope.correlationId);
+    const request = this.#pendingRequests.get(envelope.correlationId);
     if (request !== undefined) {
-      this.#pendingRequests.delete(envelope.correlationId as string);
+      this.#pendingRequests.delete(envelope.correlationId);
       request.timeout.abort();
       request.resolve(message);
       return;
@@ -844,7 +848,7 @@ export class WorkerSession {
       Buffer.byteLength(
         JSON.stringify({
           messageId: message.messageId,
-          ...(message.correlationId === undefined ? {} : { correlationId: message.correlationId }),
+          correlationId: message.correlationId,
           type: message.type,
           payload: message.payload,
         }),
@@ -1160,9 +1164,7 @@ export class WorkerSession {
       messageId,
       sessionId: this.#sessionId,
       sequence: parseSequence(this.#nextSequence.toString()),
-      ...(options.correlationId === undefined
-        ? {}
-        : { correlationId: parseMessageId(options.correlationId) }),
+      correlationId: parseMessageId(options.correlationId ?? messageId),
       type,
       sentAt: this.#clock.now().toISOString(),
       payload: serializeWireValue(payload),

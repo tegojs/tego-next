@@ -8,15 +8,15 @@ import {
   type RuntimeDiagnostic,
   runtimeDiagnostic,
 } from "./diagnostic.js";
+import type { Leadership } from "./drivers.js";
 import {
   type ExecutionRequest,
   type ExecutionResult,
   parseTaskExecutionTarget,
 } from "./execution.js";
-import type { Leadership } from "./drivers.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
-import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
 import type { Permission } from "./permission.js";
+import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
 import type { RuntimeConfiguration, RuntimeEvent, RuntimeStatus } from "./runtime.js";
 import type { DriverHealth } from "./state.js";
 import type { WorkerEnvelope } from "./worker.js";
@@ -765,7 +765,16 @@ const workerEnvelopeSchema = {
     binaryBytes: ["binaryChunks"],
     binaryChunks: ["binaryBytes"],
   },
-  required: ["protocol", "messageId", "sessionId", "sequence", "type", "sentAt", "payload"],
+  required: [
+    "protocol",
+    "messageId",
+    "sessionId",
+    "sequence",
+    "correlationId",
+    "type",
+    "sentAt",
+    "payload",
+  ],
   properties: {
     protocol: { const: "1.0" },
     messageId: { $ref: "#/$defs/identity" },

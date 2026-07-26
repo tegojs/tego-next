@@ -1,18 +1,18 @@
 import { createHash } from "node:crypto";
 import {
   DiagnosticError,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parseSequence,
-  runtimeDiagnostic,
-  serializeWireValue,
   type ExecutionRequest,
   type ExecutionResult,
   type JsonObject,
   type JsonValue,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parseSequence,
   type RuntimeDiagnostic,
-  type WorkerMessageType,
+  runtimeDiagnostic,
+  serializeWireValue,
   type WorkerId,
+  type WorkerMessageType,
 } from "@tegojs/contracts";
 
 export const REMOTE_ASSIGN = "task.assign";
@@ -26,7 +26,7 @@ export const REMOTE_RESULT_ACK = REMOTE_ACK;
 
 export interface RemoteSessionMessage {
   readonly messageId: string;
-  readonly correlationId?: string;
+  readonly correlationId: string;
   readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;

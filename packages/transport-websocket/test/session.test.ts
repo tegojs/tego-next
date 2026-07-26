@@ -822,7 +822,10 @@ test("one-way self-correlates and requests do not resolve from unrelated message
     assert.equal(request.correlationId, request.messageId);
 
     await connection.workerSession.send("session.reconcile", { unrelated: true });
-    assert.deepEqual(received.map((message) => message.payload), [{ unrelated: true }]);
+    assert.deepEqual(
+      received.map((message) => message.payload),
+      [{ unrelated: true }],
+    );
 
     await connection.workerSession.send(
       "session.reconcile",
@@ -1230,6 +1233,7 @@ test("a peer hello arriving first cannot move authenticate before the local hell
       messageId: parseMessageId("peer-hello"),
       sessionId: parseSessionId("peer-session"),
       sequence: parseSequence("0"),
+      correlationId: parseMessageId("peer-hello"),
       type: "hello",
       sentAt: clock.now().toISOString(),
       payload: {
