@@ -810,7 +810,10 @@ export class WorkerSession {
       payload: envelope.payload,
       ...(binary === undefined ? {} : { binary }),
     };
-    const request = this.#pendingRequests.get(envelope.correlationId);
+    const request =
+      envelope.correlationId === envelope.messageId
+        ? undefined
+        : this.#pendingRequests.get(envelope.correlationId);
     if (request !== undefined) {
       this.#pendingRequests.delete(envelope.correlationId);
       request.timeout.abort();
