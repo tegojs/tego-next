@@ -2,7 +2,7 @@
 
 - [x] 1.1 Pin Node.js 26, npm, TypeScript 7, workspace metadata, ESM compiler settings, formatting, linting, and deterministic install configuration
 - [x] 1.2 Add the package dependency graph and an architecture test that rejects forbidden layer-two, frontend, and Tego 1.x imports
-- [ ] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, event-driven eventual assertions, real child-process orchestration, per-process logs, and leak detection
+- [x] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, event-driven eventual assertions, real child-process orchestration, per-process logs, and leak detection
 - [x] 1.4 Add separate GitHub Actions quality, integration, and system-E2E jobs using the exact pinned Node 26 version, PostgreSQL 16 service health checks, bounded timeouts, and diagnostic artifact upload
 
 ## 2. Runtime Contracts
