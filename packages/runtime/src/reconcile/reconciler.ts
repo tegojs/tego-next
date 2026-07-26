@@ -43,10 +43,12 @@ import {
   type PersistedProviderLoss,
   type PreviousCapabilityBinding,
   type ProviderLossDecision,
+  type ProviderRecoveryBindingPrerequisite,
   type ResolvedCapabilityBinding,
   resolveCapabilities,
   strongestProviderLoss,
 } from "../capabilities/resolver.js";
+import { satisfiesVersionRange } from "../capabilities/version.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
 import type { PlacementWorker } from "./placement.js";
@@ -338,6 +340,7 @@ function parsePersistedProviderLoss(value: PersistedProviderLoss): PersistedProv
     (value.action !== "degrade" && value.action !== "fail" && value.action !== "suspend") ||
     !Array.isArray(value.capabilities) ||
     !Array.isArray(value.providers) ||
+    (value.bindingPrerequisites !== undefined && !Array.isArray(value.bindingPrerequisites)) ||
     typeof value.updatedAt !== "string"
   ) {
     throw new TypeError("Persisted provider loss is invalid");
@@ -354,6 +357,18 @@ function parsePersistedProviderLoss(value: PersistedProviderLoss): PersistedProv
       applicationId: parseApplicationId(provider?.applicationId),
       pluginId: parsePluginId(provider?.pluginId),
     })),
+    ...(value.bindingPrerequisites === undefined
+      ? {}
+      : {
+          bindingPrerequisites: value.bindingPrerequisites.map((prerequisite) => ({
+            capability: parseCapabilityName(prerequisite?.capability),
+            provider: {
+              applicationId: parseApplicationId(prerequisite?.provider?.applicationId),
+              pluginId: parsePluginId(prerequisite?.provider?.pluginId),
+            },
+            providerGeneration: parseGeneration(prerequisite?.providerGeneration),
+          })),
+        }),
     ...(value.recoveryActivations === undefined
       ? {}
       : {
@@ -1139,25 +1154,150 @@ export class Reconciler {
     };
   }
 
+  #bindingPrerequisites(
+    deployment: PluginDeployment,
+    gate: ArtifactDeploymentGate | DiagnosticError | undefined,
+    deployments: readonly PluginDeployment[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+    lossCapabilities: ReadonlySet<CapabilityName>,
+  ): readonly ProviderRecoveryBindingPrerequisite[] | undefined {
+    if (gate === undefined || gate instanceof DiagnosticError) return undefined;
+    const prerequisites: ProviderRecoveryBindingPrerequisite[] = [];
+    for (const requirement of gate.artifact.manifest.capabilities.requires
+      .filter(
+        (candidate) =>
+          candidate.optional !== true || lossCapabilities.has(parseCapabilityName(candidate.name)),
+      )
+      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))) {
+      const matches = capabilityBindings.filter(
+        (record) =>
+          record.value.consumer.applicationId === deployment.applicationId &&
+          record.value.consumer.pluginId === deployment.pluginId &&
+          record.value.capability === requirement.name &&
+          record.value.deploymentGeneration === deployment.generation,
+      );
+      if (matches.length !== 1) return undefined;
+      const binding = matches[0];
+      if (binding === undefined) return undefined;
+      const provider = deployments.find(
+        (candidate) =>
+          candidate.applicationId === binding.value.provider.applicationId &&
+          candidate.pluginId === binding.value.provider.pluginId,
+      );
+      if (provider === undefined) return undefined;
+      prerequisites.push({
+        capability: parseCapabilityName(requirement.name),
+        provider: binding.value.provider,
+        providerGeneration: provider.generation,
+      });
+    }
+    return prerequisites;
+  }
+
   #recoveryBindingsAreExact(
     loss: PersistedProviderLoss,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
     capabilityBindings: readonly LoadedCapabilityBinding[],
   ): boolean {
-    return loss.capabilities.every((capability) => {
+    const prerequisites = loss.bindingPrerequisites;
+    const consumerDeployment = deployments.find(
+      (deployment) =>
+        deployment.applicationId === loss.consumer.applicationId &&
+        deployment.pluginId === loss.consumer.pluginId &&
+        deployment.generation === loss.deploymentGeneration,
+    );
+    if (consumerDeployment === undefined) return false;
+    const consumerInstallation = installations.find(
+      (installation) =>
+        installation.pluginId === consumerDeployment.pluginId &&
+        installation.version === consumerDeployment.version &&
+        installation.digest === consumerDeployment.artifactDigest,
+    );
+    if (consumerInstallation === undefined) return false;
+    const lossCapabilities = new Set(loss.capabilities);
+    const requirements = consumerInstallation.manifest.capabilities.requires.filter(
+      (requirement) =>
+        requirement.optional !== true ||
+        lossCapabilities.has(parseCapabilityName(requirement.name)),
+    );
+    if (prerequisites === undefined) {
+      return (
+        requirements.length === 0 && loss.capabilities.length === 0 && loss.providers.length === 0
+      );
+    }
+    if (prerequisites.length !== requirements.length) return false;
+    const prerequisiteCapabilities = prerequisites.map(({ capability }) => capability);
+    if (new Set(prerequisiteCapabilities).size !== prerequisiteCapabilities.length) return false;
+    const expectedCapabilities = [...requirements.map(({ name }) => name)].sort();
+    if (
+      JSON.stringify([...prerequisiteCapabilities].sort()) !== JSON.stringify(expectedCapabilities)
+    ) {
+      return false;
+    }
+    const lossPrerequisites: ProviderRecoveryBindingPrerequisite[] = [];
+    for (const capability of loss.capabilities) {
+      const prerequisite = prerequisites.find((candidate) => candidate.capability === capability);
+      if (prerequisite === undefined) return false;
+      lossPrerequisites.push(prerequisite);
+    }
+    const prerequisiteProviders = [
+      ...new Map(
+        lossPrerequisites.map(({ provider }) => [deploymentKey(provider), provider] as const),
+      ).values(),
+    ].sort((left, right) =>
+      deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0,
+    );
+    const lossProviders = [...loss.providers].sort((left, right) =>
+      deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0,
+    );
+    if (JSON.stringify(lossProviders) !== JSON.stringify(prerequisiteProviders)) return false;
+    return requirements.every((requirement) => {
+      const prerequisite = prerequisites.find(
+        (candidate) => candidate.capability === requirement.name,
+      );
+      if (prerequisite === undefined) return false;
       const matches = capabilityBindings.filter(
         (binding) =>
           binding.value.consumer.applicationId === loss.consumer.applicationId &&
           binding.value.consumer.pluginId === loss.consumer.pluginId &&
-          binding.value.capability === capability &&
+          binding.value.capability === requirement.name &&
           binding.value.deploymentGeneration === loss.deploymentGeneration,
       );
+      if (
+        matches.length !== 1 ||
+        matches[0]?.value.provider.applicationId !== prerequisite.provider.applicationId ||
+        matches[0]?.value.provider.pluginId !== prerequisite.provider.pluginId
+      ) {
+        return false;
+      }
+      const providerDeployment = deployments.find(
+        (deployment) =>
+          deployment.applicationId === prerequisite.provider.applicationId &&
+          deployment.pluginId === prerequisite.provider.pluginId &&
+          deployment.generation === prerequisite.providerGeneration,
+      );
+      if (providerDeployment === undefined) return false;
+      const providerInstallation = installations.find(
+        (installation) =>
+          installation.pluginId === providerDeployment.pluginId &&
+          installation.version === providerDeployment.version &&
+          installation.digest === providerDeployment.artifactDigest,
+      );
       return (
-        matches.length === 1 &&
-        loss.providers.some(
-          (provider) =>
-            provider.applicationId === matches[0]?.value.provider.applicationId &&
-            provider.pluginId === matches[0]?.value.provider.pluginId,
-        )
+        providerInstallation?.manifest.capabilities.provides.some(
+          (provision) =>
+            provision.name === requirement.name &&
+            satisfiesVersionRange(provision.protocolVersion, requirement.protocolRange),
+        ) === true
       );
     });
   }
@@ -1170,9 +1310,11 @@ export class Reconciler {
     capabilityBindings: readonly LoadedCapabilityBinding[],
   ): boolean {
     return (
-      this.#recoveryBindingsAreExact(loss, capabilityBindings) &&
-      loss.providers
-        .map((provider) => this.#providerReadiness(provider, deployments, installations, instances))
+      this.#recoveryBindingsAreExact(loss, deployments, installations, capabilityBindings) &&
+      (loss.bindingPrerequisites ?? [])
+        .map(({ provider }) =>
+          this.#providerReadiness(provider, deployments, installations, instances),
+        )
         .every(({ ready }) => ready)
     );
   }
@@ -1308,6 +1450,20 @@ export class Reconciler {
                   : 0,
       );
       const strongest = strongestProviderLoss(decisions);
+      const deploymentGate = gates.get(deploymentKey(deployment));
+      const lostCapabilities = [
+        ...new Set(decisions.map((decision) => decision.capability)),
+      ].sort();
+      const bindingPrerequisites =
+        strongest === undefined
+          ? current?.value.bindingPrerequisites
+          : this.#bindingPrerequisites(
+              deployment,
+              deploymentGate,
+              deployments,
+              capabilityBindings,
+              new Set(lostCapabilities),
+            );
       const desired =
         strongest === undefined
           ? current?.value
@@ -1315,7 +1471,7 @@ export class Reconciler {
               consumer,
               deploymentGeneration: deployment.generation,
               action: strongest,
-              capabilities: [...new Set(decisions.map((decision) => decision.capability))].sort(),
+              capabilities: lostCapabilities,
               providers: [
                 ...new Map(
                   decisions
@@ -1330,23 +1486,39 @@ export class Reconciler {
                     .map((provider) => [deploymentKey(provider), provider] as const),
                 ).values(),
               ],
+              ...(bindingPrerequisites === undefined ? {} : { bindingPrerequisites }),
               updatedAt: this.#options.clock.now().toISOString(),
             };
       if (desired === undefined) continue;
 
-      const providerReadiness = desired.providers.map((provider) =>
+      const providersToFence = [
+        ...new Map(
+          [
+            ...desired.providers,
+            ...(desired.bindingPrerequisites ?? []).map(({ provider }) => provider),
+          ].map((provider) => [deploymentKey(provider), provider] as const),
+        ).values(),
+      ];
+      const providerReadiness = providersToFence.map((provider) =>
         this.#providerReadiness(provider, deployments, installations, instances),
       );
       const stale = desired.deploymentGeneration !== deployment.generation;
       const recovered =
-        !stale && decisions.length === 0 && providerReadiness.every(({ ready }) => ready);
+        !stale &&
+        decisions.length === 0 &&
+        this.#recoveryPrerequisitesReady(
+          desired,
+          deployments,
+          installations,
+          instances,
+          capabilityBindings,
+        );
       const deploymentInstances = instances.filter(
         (instance) =>
           instance.applicationId === deployment.applicationId &&
           instance.pluginId === deployment.pluginId &&
           instance.deploymentGeneration === deployment.generation,
       );
-      const deploymentGate = gates.get(deploymentKey(deployment));
       const latestByComponent =
         deploymentGate === undefined || deploymentGate instanceof DiagnosticError
           ? []
@@ -1448,7 +1620,9 @@ export class Reconciler {
         current.value.deploymentGeneration === desired.deploymentGeneration &&
         current.value.action === desired.action &&
         JSON.stringify(current.value.capabilities) === JSON.stringify(desired.capabilities) &&
-        JSON.stringify(current.value.providers) === JSON.stringify(desired.providers);
+        JSON.stringify(current.value.providers) === JSON.stringify(desired.providers) &&
+        JSON.stringify(current.value.bindingPrerequisites) ===
+          JSON.stringify(desired.bindingPrerequisites);
       const recoverySteps = beginRecovery && recoveryPlanValid ? (recoveryPlan?.steps ?? []) : [];
       const recoveryRecord =
         beginRecovery && recoveryPlanValid && recoveryActivations !== undefined
@@ -1483,7 +1657,7 @@ export class Reconciler {
               return false;
             }
             if (!stale) {
-              for (const provider of desired.providers) {
+              for (const provider of providersToFence) {
                 const loadedProvider = deployments.find(
                   (candidate) =>
                     candidate.applicationId === provider.applicationId &&
@@ -1501,18 +1675,15 @@ export class Reconciler {
                   return false;
                 }
               }
-              for (const capability of desired.capabilities) {
+              for (const prerequisite of desired.bindingPrerequisites ?? []) {
                 const loadedBinding = capabilityBindings.find(
                   (record) =>
                     record.value.consumer.applicationId === consumer.applicationId &&
                     record.value.consumer.pluginId === consumer.pluginId &&
-                    record.value.capability === capability &&
+                    record.value.capability === prerequisite.capability &&
                     record.value.deploymentGeneration === deployment.generation &&
-                    desired.providers.some(
-                      (provider) =>
-                        provider.applicationId === record.value.provider.applicationId &&
-                        provider.pluginId === record.value.provider.pluginId,
-                    ),
+                    prerequisite.provider.applicationId === record.value.provider.applicationId &&
+                    prerequisite.provider.pluginId === record.value.provider.pluginId,
                 );
                 if (loadedBinding === undefined) return false;
                 const persistedBinding = await transaction.get(loadedBinding.key);

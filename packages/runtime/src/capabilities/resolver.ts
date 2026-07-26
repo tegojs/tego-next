@@ -82,12 +82,19 @@ export interface ProviderLossDecision extends JsonObject {
 
 export type ProviderLossAction = ProviderLossDecision["action"];
 
+export interface ProviderRecoveryBindingPrerequisite extends JsonObject {
+  readonly capability: CapabilityName;
+  readonly provider: PluginDeploymentIdentity;
+  readonly providerGeneration: Generation;
+}
+
 export interface PersistedProviderLoss extends JsonObject {
   readonly consumer: PluginDeploymentIdentity;
   readonly deploymentGeneration: Generation;
   readonly action: ProviderLossAction;
   readonly capabilities: readonly CapabilityName[];
   readonly providers: readonly PluginDeploymentIdentity[];
+  readonly bindingPrerequisites?: readonly ProviderRecoveryBindingPrerequisite[];
   readonly recoveryActivations?: Readonly<Record<string, Activation>>;
   readonly updatedAt: string;
 }

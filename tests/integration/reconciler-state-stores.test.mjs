@@ -1561,6 +1561,22 @@ test("recovery activation restart requires its exact durable capability binding"
                       { applicationId, pluginId: providerBId },
                     ]
                   : [{ applicationId, pluginId: providerAId }],
+              bindingPrerequisites: [
+                {
+                  capability,
+                  provider: { applicationId, pluginId: providerAId },
+                  providerGeneration: providerA.generation,
+                },
+                ...(bindingCase === "wrong-capability-provider"
+                  ? [
+                      {
+                        capability: otherCapability,
+                        provider: { applicationId, pluginId: providerBId },
+                        providerGeneration: providerB.generation,
+                      },
+                    ]
+                  : []),
+              ],
               recoveryActivations: { [consumerComponentId]: "2" },
               updatedAt: clock.now().toISOString(),
             },

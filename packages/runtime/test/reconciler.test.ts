@@ -1535,7 +1535,15 @@ test("suspended provider drains activation one, holds, and reactivates activatio
     components: [component(consumerComponentId)],
     capabilities: {
       provides: [],
-      requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+      requires: [
+        { name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" },
+        {
+          name: parseCapabilityName("org.example.optional-recovery"),
+          protocolRange: "^1.0.0",
+          optional: true,
+          lossPolicy: "suspend",
+        },
+      ],
     },
   };
   const provider = deployment("7", {
@@ -2678,6 +2686,18 @@ test("degrade persists lexical provider loss evidence and recovers only the same
     providers: [
       { applicationId, pluginId: providerAId },
       { applicationId, pluginId: providerZId },
+    ],
+    bindingPrerequisites: [
+      {
+        capability: capabilityA,
+        provider: { applicationId, pluginId: providerAId },
+        providerGeneration: providerA.generation,
+      },
+      {
+        capability: capabilityZ,
+        provider: { applicationId, pluginId: providerZId },
+        providerGeneration: providerZ.generation,
+      },
     ],
     updatedAt: clock.now().toISOString(),
   });
@@ -4588,6 +4608,13 @@ test("recovery restoration requires bindings for the consumer manifest's full re
         action: "suspend",
         capabilities: [lostCapability],
         providers: [{ applicationId, pluginId: providerAId }],
+        bindingPrerequisites: [
+          {
+            capability: lostCapability,
+            provider: { applicationId, pluginId: providerAId },
+            providerGeneration: providerA.generation,
+          },
+        ],
         recoveryActivations: { [consumerComponentId]: "2" },
         updatedAt: clock.now().toISOString(),
       },
