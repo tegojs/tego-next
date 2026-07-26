@@ -12,8 +12,70 @@ const documents = {
   security: "docs/security/threat-model.md",
 };
 
+const documentedContracts = [
+  {
+    document: "architecture",
+    required: [
+      "terminal -> expired",
+      "unknown remains a non-terminal reconciliation state and does not directly expire",
+      "correlation ID is mandatory",
+      "one-way messages and requests self-correlate",
+      "responses correlate to the triggering request's message ID",
+      "A Worker Thread has its own JavaScript thread and event loop",
+      "shares the Main operating-system process, address space, privileges, and process-wide resources",
+    ],
+    forbidden: ["unknown -> expired", "optional correlation"],
+  },
+  {
+    document: "security",
+    required: [
+      "no application-layer authentication",
+      "relies on operating-system access to its endpoint",
+      "owner-private parent directory",
+      "mode 0600",
+      "Windows named-pipe ACL hardening is not implemented",
+      "The endpoint is trusted",
+      "authorized local client",
+    ],
+  },
+  {
+    document: "operations",
+    required: ["immutable artifact bytes", "COORDINATION_NOT_LEADER", "storage denial of service"],
+  },
+];
+
+const documentedCliCommands = [
+  "runtime start",
+  "runtime status",
+  "runtime snapshot",
+  "runtime stop",
+  "plugin validate",
+  "plugin pack",
+  "plugin inspect",
+  "plugin install",
+  "plugin deploy",
+  "plugin status",
+  "task run",
+  "task status",
+  "task wait",
+  "task cancel",
+  "worker start",
+];
+
 async function read(relativePath) {
   return readFile(resolve(root, relativePath), "utf8");
+}
+
+function normalizeWhitespace(source) {
+  return source.replace(/\s+/gu, " ").trim();
+}
+
+function section(source, heading) {
+  const start = source.indexOf(`${heading}\n`);
+  assert.notEqual(start, -1, `${heading} must exist`);
+  const bodyStart = start + heading.length + 1;
+  const nextHeading = source.indexOf("\n### ", bodyStart);
+  return source.slice(bodyStart, nextHeading === -1 ? undefined : nextHeading);
 }
 
 test("@spec:runtime-operations/layer-one-dependency-boundary/architecture-documentation", async () => {
@@ -33,22 +95,6 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/architecture-docume
     "## Failure, indeterminate, and recovery semantics",
   ]) {
     assert.match(architecture, new RegExp(`^${heading}$`, "mu"));
-  }
-  for (const marker of [
-    "Tego 1.x",
-    "HTTP routing",
-    "authentication",
-    "ACL",
-    "cache",
-    "workflow",
-    "datasource",
-    "unknown",
-    "indeterminate",
-    "finish-and-buffer",
-    "finish-and-persist",
-    "PROTOCOL_VERSION_UNSUPPORTED",
-  ]) {
-    assert.match(architecture, new RegExp(marker, "u"));
   }
 });
 
@@ -102,28 +148,49 @@ test("@spec:runtime-operations/reproducible-development-environment/contributor-
   }
 });
 
-test("@spec:runtime-operations/plugin-development-operations/current-cli-workflow", async () => {
-  const source = Object.values(documents).map((path) => read(path));
-  const documentation = (await Promise.all(source)).join("\n");
-  for (const command of [
-    "runtime start",
-    "runtime snapshot",
-    "runtime status",
-    "runtime stop",
-    "plugin validate",
-    "plugin pack",
-    "plugin inspect",
-    "plugin install",
-    "plugin deploy",
-    "plugin status",
-    "task run",
-    "task status",
-    "task wait",
-    "task cancel",
-    "worker start",
-  ]) {
-    assert.match(documentation, new RegExp(command, "u"));
+test("@spec:runtime-operations/documented-contracts/exact-operator-claims", async (t) => {
+  for (const contract of documentedContracts) {
+    const source = normalizeWhitespace(await read(documents[contract.document]));
+    for (const required of contract.required) {
+      await t.test(`${contract.document}: ${required}`, () => {
+        assert.ok(
+          source.includes(required),
+          `${documents[contract.document]} must state: ${required}`,
+        );
+      });
+    }
+    for (const forbidden of contract.forbidden ?? []) {
+      await t.test(`${contract.document}: rejects ${forbidden}`, () => {
+        assert.ok(
+          !source.includes(forbidden),
+          `${documents[contract.document]} must not state: ${forbidden}`,
+        );
+      });
+    }
   }
+});
+
+test("@spec:runtime-operations/plugin-development-operations/exact-cli-inventory", async () => {
+  const contributor = await read(documents.contributor);
+  const inventory = section(contributor, "### Exact command inventory");
+  const commands = [...inventory.matchAll(/^- `([^`]+)`$/gmu)].map((match) => match[1]);
+  assert.equal(
+    commands.length,
+    new Set(commands).size,
+    "CLI inventory must not contain duplicates",
+  );
+  assert.deepEqual(commands.toSorted(), documentedCliCommands.toSorted());
+});
+
+test("@spec:runtime-operations/plugin-development-operations/executable-digest-example", async () => {
+  const contributor = await read(documents.contributor);
+  const installAndDeploy = section(contributor, "### Install and deploy");
+  const digestArguments = [...installAndDeploy.matchAll(/--digest\s+(\S+)/gu)].map(
+    (match) => match[1],
+  );
+  assert.deepEqual(digestArguments.length, 1);
+  assert.match(digestArguments[0], /^sha256:[0-9a-f]{64}$/u);
+  assert.doesNotMatch(installAndDeploy, /sha256:(?:sha256:|REPLACE_WITH_INSTALL_DIGEST)/u);
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/deployment-documentation", async () => {
@@ -144,17 +211,6 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/deployment-documentation"
   ]) {
     assert.match(operations, new RegExp(`^${heading}$`, "mu"));
   }
-  for (const marker of [
-    "state.sqlite",
-    "single-main",
-    "multi-main",
-    "--postgres-url",
-    "follower",
-    "fencing epoch",
-    "production release remains blocked until Node.js 26 enters LTS",
-  ]) {
-    assert.match(operations, new RegExp(marker, "iu"));
-  }
 });
 
 test("@spec:plugin-deployment/pre-execution-deployment-gate/threat-model-documentation", async () => {
@@ -168,21 +224,6 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/threat-model-documen
     "## Deferred security capabilities",
   ]) {
     assert.match(security, new RegExp(`^${heading}$`, "mu"));
-  }
-  for (const marker of [
-    "not a security boundary",
-    "not an operating-system sandbox",
-    "bootstrap credential",
-    "development-only",
-    "capability",
-    "executor",
-    "filesystem",
-    "network",
-    "secret",
-    "environment",
-    "Worker",
-  ]) {
-    assert.match(security, new RegExp(marker, "iu"));
   }
 });
 
