@@ -907,25 +907,29 @@ test("a correlated assignment result must match the assigned attempt identity", 
   const handle = await remote.submit(assigned);
   const assignmentMessageId = await assignment.promise;
   const now = clock.now().toISOString();
-  const forgedResponseId = await worker.send(
-    "task.acknowledge",
-    {
-      accepted: false,
-      result: {
-        taskId: forged.taskId,
-        attemptId: forged.attemptId,
-        status: "rejected",
-        executor: { kind: "remote", workerId },
-        startedAt: now,
-        completedAt: now,
-      },
+  const forgedPayload = {
+    accepted: false,
+    result: {
+      taskId: forged.taskId,
+      attemptId: forged.attemptId,
+      status: "rejected",
+      executor: { kind: "remote", workerId },
+      startedAt: now,
+      completedAt: now,
     },
-    { correlationId: "assignment" },
-  );
-  assert.notEqual(forgedResponseId, assignmentMessageId);
-  main.close();
+  } as const;
+  let resultSettled = false;
+  void handle.result.then(() => {
+    resultSettled = true;
+  });
+  const oneWayMessageId = await worker.send("task.acknowledge", forgedPayload);
   await flush();
-  clock.advanceBy(101);
+  assert.equal(resultSettled, false);
+  const forgedResponseId = await worker.send("task.acknowledge", forgedPayload, {
+    correlationId: assignmentMessageId,
+  });
+  assert.notEqual(forgedResponseId, assignmentMessageId);
+  assert.notEqual(forgedResponseId, oneWayMessageId);
   const result = await handle.result;
   assert.equal(result.status, "failed");
   assert.match(result.diagnostic?.code ?? "", /IDENTITY/iu);
@@ -2479,7 +2483,6 @@ test("WorkerRuntime rejects before pruning after revision corruption is latched"
 
 test("assignment and cancellation acknowledgements are bound to type and attempt identity", async () => {
   const clock = new FakeClock(new Date(0));
-  const local = new TestLocalExecutor();
   const remote = new RemoteExecutor({
     id: "remote",
     workerId,
@@ -2487,76 +2490,106 @@ test("assignment and cancellation acknowledgements are bound to type and attempt
     orphanTimeoutMs: 100,
     attemptStore: new MemoryRemoteAttemptStore(),
   });
-  const runtime = new WorkerRuntime({
-    workerId,
-    clock,
-    attemptStore: new MemoryRemoteAttemptStore(),
-    selectExecutor: () => local,
-  });
   const [main, worker] = memorySessionPair("1");
-  await runtime.attach(worker);
+  worker.onMessage((message) => {
+    if (message.type !== "session.reconcile") return;
+    void worker.send(
+      "session.reconcile",
+      {
+        epoch: worker.epoch,
+        attemptPersistenceAvailable: true,
+        acknowledged: [],
+        running: [],
+        terminalUnacknowledged: [],
+        preparedArtifacts: [],
+      },
+      { correlationId: message.messageId },
+    );
+  });
   await remote.attach(main);
-  const originalRequest = main.request.bind(main);
   const assigned = executionRequest({ mode: "wait" }, "ack-identity");
   const wrong = executionRequest(null, "ack-identity-wrong");
-  main.request = async (type, payload) => {
-    if (type === "task.assign") {
-      return {
-        messageId: "wrong-assignment-ack",
-        correlationId: "assignment",
-        type: "task.acknowledge",
-        payload: {
-          accepted: true,
-          taskId: wrong.taskId,
-          attemptId: wrong.attemptId,
-          state: "acknowledged",
-        },
-      };
-    }
-    if (type === "task.cancel") {
-      return {
-        messageId: "wrong-cancel-ack",
-        correlationId: "cancel",
-        type: "task.acknowledge",
-        payload: {
-          taskId: wrong.taskId,
-          attemptId: wrong.attemptId,
-        },
-      };
-    }
-    return originalRequest(type, payload);
-  };
+  const wrongAssignment = Promise.withResolvers<string>();
+  worker.onMessage((message) => {
+    if (message.type === "task.assign") wrongAssignment.resolve(message.messageId);
+  });
   const rejected = await remote.submit(assigned);
-  await flush();
+  const wrongAssignmentMessageId = await wrongAssignment.promise;
+  const wrongAssignmentResponseId = await worker.send(
+    "task.acknowledge",
+    {
+      accepted: true,
+      taskId: wrong.taskId,
+      attemptId: wrong.attemptId,
+      state: "acknowledged",
+    },
+    { correlationId: wrongAssignmentMessageId },
+  );
   assert.match((await rejected.result).diagnostic?.code ?? "", /identity/iu);
 
-  main.request = async (type, payload) => {
-    if (type === "task.cancel") {
-      return {
-        messageId: "wrong-cancel-ack",
-        correlationId: "cancel",
-        type: "task.acknowledge",
-        payload: {
-          taskId: wrong.taskId,
-          attemptId: wrong.attemptId,
-          found: true,
-        },
-      };
-    }
-    return originalRequest(type, payload);
-  };
   const cancelledRequest = executionRequest({ mode: "wait" }, "cancel-ack-identity");
+  const acceptedAssignment = Promise.withResolvers<string>();
+  worker.onMessage((message) => {
+    if (message.type === "task.assign") acceptedAssignment.resolve(message.messageId);
+  });
   const handle = await remote.submit(cancelledRequest);
-  await eventually(() => assert.equal(local.executions, 1));
-  await assert.rejects(
-    remote.cancel(cancelledRequest.taskId, cancelledRequest.attemptId),
-    /identity|acknowledge/iu,
+  const acceptedAssignmentMessageId = await acceptedAssignment.promise;
+  const acceptedAssignmentResponseId = await worker.send(
+    "task.acknowledge",
+    {
+      accepted: true,
+      taskId: cancelledRequest.taskId,
+      attemptId: cancelledRequest.attemptId,
+      state: "acknowledged",
+    },
+    { correlationId: acceptedAssignmentMessageId },
+  );
+  const cancellation = Promise.withResolvers<string>();
+  worker.onMessage((message) => {
+    if (message.type === "task.cancel") cancellation.resolve(message.messageId);
+  });
+  const cancelling = remote.cancel(cancelledRequest.taskId, cancelledRequest.attemptId);
+  const cancellationMessageId = await cancellation.promise;
+  let cancellationSettled = false;
+  void cancelling.then(
+    () => {
+      cancellationSettled = true;
+    },
+    () => {
+      cancellationSettled = true;
+    },
+  );
+  const wrongCancellationPayload = {
+    taskId: wrong.taskId,
+    attemptId: wrong.attemptId,
+    found: true,
+  };
+  const oneWayCancellationId = await worker.send("task.acknowledge", wrongCancellationPayload);
+  await flush();
+  assert.equal(cancellationSettled, false);
+  const wrongCancellationResponseId = await worker.send(
+    "task.acknowledge",
+    wrongCancellationPayload,
+    { correlationId: cancellationMessageId },
+  );
+  await assert.rejects(cancelling, /identity|acknowledge/iu);
+  assert.equal(
+    new Set([wrongAssignmentMessageId, acceptedAssignmentMessageId, cancellationMessageId]).size,
+    3,
+  );
+  assert.equal(
+    new Set([
+      wrongAssignmentResponseId,
+      acceptedAssignmentResponseId,
+      oneWayCancellationId,
+      wrongCancellationResponseId,
+    ]).size,
+    4,
   );
   main.close();
   await flush();
   clock.advanceBy(101);
   assert.equal((await handle.result).status, "failed");
-  await runtime.close();
   await remote.close();
 });
 
