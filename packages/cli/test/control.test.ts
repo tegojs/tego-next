@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
-import { createConnection, type Socket } from "node:net";
+import { access, chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -799,6 +799,121 @@ test("permission initialization rejects a non-socket path and closes its queued 
     }
     assert.equal(response, "");
     await assert.rejects(connect(endpoint));
+  });
+});
+
+test("permission initialization rejects a same-owner 0600 replacement socket", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket identity verification does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    let replacement: Server | undefined;
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        await chmod(path, 0o600);
+        await unlink(path);
+        replacement = createServer();
+        await new Promise<void>((resolve, reject) => {
+          replacement?.once("error", reject);
+          replacement?.listen(path, resolve);
+        });
+        await chmod(path, 0o600);
+      },
+    });
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    if (outcome.ok) await outcome.server.close();
+    await new Promise<void>((resolve, reject) => {
+      if (replacement === undefined || !replacement.listening) {
+        resolve();
+        return;
+      }
+      replacement.close((error) => (error === undefined ? resolve() : reject(error)));
+    });
+
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
+  });
+});
+
+test("permission initialization rejects a parent directory made public by its hook", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix directory permissions do not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint, directory) => {
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        await chmod(path, 0o600);
+        await chmod(directory, 0o777);
+      },
+    });
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    if (outcome.ok) await outcome.server.close();
+    await chmod(directory, 0o700);
+
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE");
+    }
+  });
+});
+
+test("permission initialization rejects a symlink endpoint", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket identity verification does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint, directory) => {
+    const target = join(directory, "replacement.sock");
+    const replacement = createServer();
+    await new Promise<void>((resolve, reject) => {
+      replacement.once("error", reject);
+      replacement.listen(target, resolve);
+    });
+    await chmod(target, 0o600);
+    try {
+      const startup = startControlServer({
+        endpoint,
+        operations: fakeOperations(),
+        setEndpointPermissions: async (path) => {
+          await chmod(path, 0o600);
+          await unlink(path);
+          await symlink(target, path);
+        },
+      });
+      const outcome = await startup.then(
+        (server) => ({ ok: true as const, server }),
+        (error: unknown) => ({ error, ok: false as const }),
+      );
+      if (outcome.ok) await outcome.server.close();
+
+      assert.equal(outcome.ok, false);
+      if (!outcome.ok) {
+        assert.ok(outcome.error instanceof DiagnosticError);
+        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        replacement.close((error) => (error === undefined ? resolve() : reject(error)));
+      });
+    }
   });
 });
 
