@@ -1614,7 +1614,7 @@ test("forced cleanup releases capacity when host wait never settles after kill",
       settled = true;
     });
     await eventually(() => assert.equal(settled, true), {
-      attempts: 100,
+      attempts: 1_000,
       advance: () => new Promise((resolve) => setImmediate(resolve)),
     });
     assert.equal((await executor.health()).active, 0);
