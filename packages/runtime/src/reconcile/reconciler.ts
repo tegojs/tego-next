@@ -209,16 +209,12 @@ function parsePersistedActivation(instance: PersistedComponentInstance): Activat
   return parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1");
 }
 
-function hasStarted(instance: Pick<ComponentInstance, "hasStarted" | "lifecycle">): boolean {
+export function inferComponentHasStarted(
+  instance: Pick<ComponentInstance, "hasStarted" | "lifecycle">,
+): boolean {
   if (instance.hasStarted === true) return true;
   if (instance.hasStarted === false) return false;
-  return (
-    instance.lifecycle === "ready" ||
-    instance.lifecycle === "degraded" ||
-    instance.lifecycle === "draining" ||
-    instance.lifecycle === "stopping" ||
-    instance.lifecycle === "stopped"
-  );
+  return instance.lifecycle === "ready" || instance.lifecycle === "degraded";
 }
 
 interface LoadedComponentInstance {
@@ -1064,8 +1060,6 @@ export class Reconciler {
       | "instanceId"
       | "pluginId"
     >,
-    fallbackDeployments: readonly PluginDeployment[],
-    fallbackInstallations: readonly PluginInstallation[],
     expectedLifecycle: PersistedComponentInstance["lifecycle"],
     expectedRevision: Revision,
   ): Promise<boolean> {
@@ -1091,9 +1085,7 @@ export class Reconciler {
     })) {
       persistedDeployments.push(parsePluginDeployment(record.value));
     }
-    const deployments =
-      persistedDeployments.length === 0 ? fallbackDeployments : persistedDeployments;
-    const consumer = deployments.find(
+    const consumer = persistedDeployments.find(
       (deployment) =>
         deployment.applicationId === effect.applicationId &&
         deployment.pluginId === effect.pluginId,
@@ -1113,8 +1105,6 @@ export class Reconciler {
     })) {
       persistedInstallations.push(parsePluginInstallation(record.value));
     }
-    const installations =
-      persistedInstallations.length === 0 ? fallbackInstallations : persistedInstallations;
     const instances: ComponentInstance[] = [];
     for await (const record of transaction.scan<PersistedComponentInstance>({
       namespace,
@@ -1152,7 +1142,13 @@ export class Reconciler {
     })) {
       bindings.push({ key: record.key, value: record.value, revision: record.revision });
     }
-    return this.#recoveryPrerequisitesReady(loss, deployments, installations, instances, bindings);
+    return this.#recoveryPrerequisitesReady(
+      loss,
+      persistedDeployments,
+      persistedInstallations,
+      instances,
+      bindings,
+    );
   }
 
   async #loadProviderLosses(): Promise<readonly LoadedProviderLoss[]> {
@@ -2049,8 +2045,6 @@ export class Reconciler {
           this.#authorizeRecoveryEffect(
             transaction,
             instance,
-            deployments,
-            installations,
             instance.lifecycle,
             instance.revision,
           ),
@@ -2425,7 +2419,8 @@ export class Reconciler {
         },
         activated: candidateInstallation.manifest.components.every((component) =>
           candidateInstances.some(
-            (instance) => instance.componentId === component.componentId && hasStarted(instance),
+            (instance) =>
+              instance.componentId === component.componentId && inferComponentHasStarted(instance),
           ),
         ),
         ready:
@@ -3120,8 +3115,6 @@ export class Reconciler {
             !(await this.#authorizeRecoveryEffect(
               transaction,
               effect,
-              deployments,
-              installations,
               instance.lifecycle,
               current.revision,
             ))
@@ -3150,7 +3143,7 @@ export class Reconciler {
       );
       if (!authorized) {
         this.#replanCount += 1;
-        await this.#retryClaim(claim);
+        await this.#acknowledge(claim, "completed");
         return;
       }
       if (retryPreState !== undefined) this.#lastCommitAuthority = this.#options.authority;
@@ -3175,15 +3168,13 @@ export class Reconciler {
         this.#authorizeRecoveryEffect(
           transaction,
           effect,
-          deployments,
-          installations,
           retryPreState ?? instance.lifecycle,
           current.revision,
         ),
       ))
     ) {
       this.#replanCount += 1;
-      await this.#retryClaim(claim);
+      await this.#acknowledge(claim, "completed");
       return;
     }
     try {

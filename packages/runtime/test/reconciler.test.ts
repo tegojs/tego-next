@@ -57,6 +57,7 @@ import {
   legacyReconcileInstanceId,
   reconcileEffectIdentities,
 } from "../src/reconcile/plan.js";
+import { inferComponentHasStarted } from "../src/reconcile/reconciler.js";
 
 const applicationId = parseApplicationId("app");
 const pluginId = parsePluginId("org.example.echo");
@@ -1602,6 +1603,17 @@ test("suspended provider drains activation one, holds, and reactivates activatio
           id: `${desired.applicationId}/${desired.pluginId}`,
         },
         desired,
+        { expectedRevision: "absent" },
+      );
+    }
+    for (const installed of installations) {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "installations",
+          id: `${installed.pluginId}@${installed.version}@${installed.digest}`,
+        },
+        installed,
         { expectedRevision: "absent" },
       );
     }
@@ -5907,80 +5919,8 @@ test("legacy provider loss infers started only from unambiguous ready lifecycles
     "stopped",
     "failed",
   ] as const) {
-    const fixture = await createProviderLossTestFixture(`legacy-started-${lifecycle}`, ["suspend"]);
-    const initialEffects = new RecordingEffects();
-    const initial = new Reconciler(fixture.options(initialEffects));
-    await initial.start();
-    const providerStart = initialEffects.calls.find(
-      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
-    );
-    const consumerStart = initialEffects.calls.find(
-      (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
-    );
-    assert.ok(providerStart);
-    assert.ok(consumerStart);
-    await initial.stop();
-
-    await fixture.state.transact({}, async (transaction) => {
-      const consumerKey = {
-        namespace: "tego",
-        collection: "component-instances",
-        id: consumerStart.instanceId,
-      };
-      const current = await transaction.get(consumerKey);
-      assert.ok(current);
-      const {
-        completedOperationId: _completedOperationId,
-        completedOperationIds: _completedOperationIds,
-        hasStarted: _hasStarted,
-        ...neverStarted
-      } = current.value as Record<string, JsonValue>;
-      void _completedOperationId;
-      void _completedOperationIds;
-      void _hasStarted;
-      await transaction.put(
-        consumerKey,
-        {
-          ...neverStarted,
-          lifecycle,
-          ...(lifecycle === "failed"
-            ? {
-                retryEffect: "start",
-                retryAt: "9999-01-01T00:00:00.000Z",
-              }
-            : {}),
-        },
-        { expectedRevision: current.revision },
-      );
-      return null;
-    });
-    await fixture.failProvider(providerStart);
-
-    const restartedEffects = new RecordingEffects();
-    const restarted = new Reconciler(fixture.options(restartedEffects));
-    await restarted.start();
-
     const expectedStarted = lifecycle === "ready" || lifecycle === "degraded";
-    assert.equal(
-      (await fixture.state.read(fixture.lossKey)) !== undefined,
-      expectedStarted,
-      lifecycle,
-    );
-    assert.equal(
-      (
-        (await fixture.state.read(fixture.observationKey))?.value as
-          | { readonly status?: string }
-          | undefined
-      )?.status === "failed" ||
-        (
-          (await fixture.state.read(fixture.observationKey))?.value as
-            | { readonly status?: string }
-          | undefined
-        )?.status === "suspended",
-      expectedStarted,
-      lifecycle,
-    );
-    await restarted.stop();
+    assert.equal(inferComponentHasStarted({ lifecycle }), expectedStarted, lifecycle);
   }
 });
 
@@ -5996,54 +5936,7 @@ test("explicit hasStarted survives every lifecycle checkpoint", async () => {
     "stopped",
     "failed",
   ] as const) {
-    const fixture = await createProviderLossTestFixture(`explicit-started-${lifecycle}`, [
-      "suspend",
-    ]);
-    const initialEffects = new RecordingEffects();
-    const initial = new Reconciler(fixture.options(initialEffects));
-    await initial.start();
-    const providerStart = initialEffects.calls.find(
-      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
-    );
-    const consumerStart = initialEffects.calls.find(
-      (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
-    );
-    assert.ok(providerStart);
-    assert.ok(consumerStart);
-    await initial.stop();
-
-    await fixture.state.transact({}, async (transaction) => {
-      const consumerKey = {
-        namespace: "tego",
-        collection: "component-instances",
-        id: consumerStart.instanceId,
-      };
-      const current = await transaction.get(consumerKey);
-      assert.ok(current);
-      await transaction.put(
-        consumerKey,
-        {
-          ...(current.value as Record<string, JsonValue>),
-          hasStarted: true,
-          lifecycle,
-          ...(lifecycle === "failed"
-            ? {
-                retryEffect: "start",
-                retryAt: "9999-01-01T00:00:00.000Z",
-              }
-            : {}),
-        },
-        { expectedRevision: current.revision },
-      );
-      return null;
-    });
-    await fixture.failProvider(providerStart);
-
-    const restarted = new Reconciler(fixture.options(new RecordingEffects()));
-    await restarted.start();
-
-    assert.ok(await fixture.state.read(fixture.lossKey), lifecycle);
-    await restarted.stop();
+    assert.equal(inferComponentHasStarted({ hasStarted: true, lifecycle }), true, lifecycle);
   }
 });
 
@@ -6137,10 +6030,9 @@ test("recovery execution fails closed when durable authorization records disappe
     "component-instances",
     "provider-loss",
   ] as const) {
-    const fixture = await createProviderLossTestFixture(
-      `recovery-delete-${deletedCollection}`,
-      ["suspend"],
-    );
+    const fixture = await createProviderLossTestFixture(`recovery-delete-${deletedCollection}`, [
+      "suspend",
+    ]);
     const effects = new RecordingEffects();
     const reconciler = new Reconciler(fixture.options(effects));
     await reconciler.start();

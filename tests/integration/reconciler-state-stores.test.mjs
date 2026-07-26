@@ -1286,6 +1286,17 @@ test("suspended provider hold survives Memory and SQLite reopen before activatio
           { expectedRevision: "absent" },
         );
       }
+      for (const installed of installations) {
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "installations",
+            id: `${installed.pluginId}@${installed.version}@${installed.digest}`,
+          },
+          installed,
+          { expectedRevision: "absent" },
+        );
+      }
       return null;
     });
     const options = (state, effects) => ({
@@ -1382,6 +1393,55 @@ test("suspended provider hold survives Memory and SQLite reopen before activatio
       (await readOnlyInstance(state, activationTwoStarts[0].instanceId))?.value.lifecycle,
       "ready",
     );
+
+    await state.transact({}, async (transaction) => {
+      const providerKey = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: providerStart.instanceId,
+      };
+      const currentProvider = await transaction.get(providerKey);
+      assert.ok(currentProvider);
+      await transaction.put(
+        providerKey,
+        { ...currentProvider.value, lifecycle: "degraded" },
+        { expectedRevision: currentProvider.revision },
+      );
+      return null;
+    });
+    await restarted.wake();
+    assert.equal((await readObservation(state, consumerId))?.value.status, "suspended");
+
+    await state.transact({}, async (transaction) => {
+      const providerKey = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: providerStart.instanceId,
+      };
+      const currentProvider = await transaction.get(providerKey);
+      assert.ok(currentProvider);
+      await transaction.put(
+        providerKey,
+        { ...currentProvider.value, lifecycle: "ready" },
+        { expectedRevision: currentProvider.revision },
+      );
+      for await (const record of transaction.scan({
+        namespace: "tego",
+        collection: "installations",
+      })) {
+        await transaction.delete(record.key, { expectedRevision: record.revision });
+      }
+      return null;
+    });
+    await restarted.wake();
+
+    assert.equal(
+      restartedEffects.calls.some(
+        (effect) => effect.pluginId === consumerId && effect.activation === "3",
+      ),
+      false,
+    );
+    assert.equal((await readObservation(state, consumerId))?.value.status, "suspended");
     await restarted.stop();
   });
 });
@@ -1686,6 +1746,28 @@ test("provider generation upgrade recovery requires its exact durable capability
         const providerBInstance = planned(providerB, installations[1]);
         const recoveryInstance = planned(consumer, installations[2], "2");
         await state.transact({}, async (transaction) => {
+          for (const desired of [providerA, providerB, consumer]) {
+            await transaction.put(
+              {
+                namespace: "tego",
+                collection: "deployments",
+                id: `${desired.applicationId}/${desired.pluginId}`,
+              },
+              desired,
+              { expectedRevision: "absent" },
+            );
+          }
+          for (const installed of installations) {
+            await transaction.put(
+              {
+                namespace: "tego",
+                collection: "installations",
+                id: `${installed.pluginId}@${installed.version}@${installed.digest}`,
+              },
+              installed,
+              { expectedRevision: "absent" },
+            );
+          }
           for (const effect of [providerAInstance, providerBInstance, recoveryInstance]) {
             await transaction.put(
               {
