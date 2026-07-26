@@ -686,6 +686,165 @@ test("upgrade and rollback tear down old components removed from the current man
   }
 });
 
+test("failed provider hold survives Memory and SQLite reopen with essential readiness", async (t) => {
+  await withRealStateStores(t, async (initialState, clock, reopen) => {
+    const providerId = parsePluginId("fail-store-provider");
+    const essentialId = parsePluginId("fail-store-essential");
+    const nonEssentialId = parsePluginId("fail-store-non-essential");
+    const capability = parseCapabilityName("org.example.fail-store");
+    const digests = ["c", "d", "e"].map((value) =>
+      parseArtifactDigest(`sha256:${value.repeat(64)}`),
+    );
+    const component = (name) => ({
+      componentId: parseComponentId(`${name}-service`),
+      kind: "service",
+      entrypoint: `components/${name}.js`,
+      executors: ["process"],
+    });
+    const providerManifest = {
+      ...manifest(),
+      pluginId: providerId,
+      components: [component("fail-store-provider")],
+      permissions: [{ kind: "executor", executors: ["process"] }],
+      capabilities: {
+        provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        requires: [],
+      },
+    };
+    const consumerManifest = (targetId, name) => ({
+      ...manifest(),
+      pluginId: targetId,
+      components: [component(name)],
+      permissions: [{ kind: "executor", executors: ["process"] }],
+      capabilities: {
+        provides: [],
+        requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "fail" }],
+      },
+    });
+    const manifests = [
+      providerManifest,
+      consumerManifest(essentialId, "fail-store-essential"),
+      consumerManifest(nonEssentialId, "fail-store-non-essential"),
+    ];
+    const ids = [providerId, essentialId, nonEssentialId];
+    const deployments = ids.map((targetId, index) => ({
+      ...deployment(),
+      pluginId: targetId,
+      artifactDigest: digests[index],
+      essential: index !== 2,
+      permissionGrants: [{ kind: "executor", executors: ["process"] }],
+    }));
+    const installations = ids.map((targetId, index) => ({
+      ...installation(),
+      pluginId: targetId,
+      digest: digests[index],
+      manifest: manifests[index],
+    }));
+    const artifacts = new Map(
+      installations.map((installed) => [
+        installed.digest,
+        {
+          digest: installed.digest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: installed.manifest,
+        },
+      ]),
+    );
+    const deploymentKey = (desired) => ({
+      namespace: "tego",
+      collection: "deployments",
+      id: `${desired.applicationId}/${desired.pluginId}`,
+    });
+    await initialState.transact({}, async (transaction) => {
+      for (const desired of deployments) {
+        await transaction.put(deploymentKey(desired), desired, { expectedRevision: "absent" });
+      }
+      return null;
+    });
+    const options = (state, effects) => ({
+      artifactGate: {
+        validate: async (request) => {
+          const artifact = artifacts.get(request.digest);
+          assert.ok(artifact);
+          return artifact;
+        },
+      },
+      clock,
+      effects,
+      state,
+      loadInstallations: async () => installations,
+    });
+    const firstEffects = new RecordingEffects();
+    firstEffects.supportedExecutors = ["process"];
+    const first = new Reconciler(options(initialState, firstEffects));
+    await first.start();
+    const providerStart = firstEffects.calls.find(
+      (effect) => effect.pluginId === providerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    const providerInstanceKey = {
+      namespace: "tego",
+      collection: "component-instances",
+      id: providerStart.instanceId,
+    };
+    await initialState.transact({}, async (transaction) => {
+      const current = await transaction.get(providerInstanceKey);
+      assert.ok(current);
+      await transaction.put(
+        providerInstanceKey,
+        { ...current.value, lifecycle: "degraded" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+    await first.wake();
+
+    assert.equal(first.applicationReady(), false);
+    assert.equal((await readObservation(initialState, essentialId))?.value.status, "failed");
+    assert.equal((await readObservation(initialState, nonEssentialId))?.value.status, "failed");
+    await first.stop();
+
+    const state = await reopen();
+    const restartedEffects = new RecordingEffects();
+    restartedEffects.supportedExecutors = ["process"];
+    const restarted = new Reconciler(options(state, restartedEffects));
+    await restarted.start();
+    assert.equal(restarted.applicationReady(), false);
+    assert.equal(
+      restartedEffects.calls.some(
+        (effect) =>
+          (effect.pluginId === essentialId || effect.pluginId === nonEssentialId) &&
+          (effect.kind === "prepare" || effect.kind === "start"),
+      ),
+      false,
+    );
+    await state.transact({}, async (transaction) => {
+      const providerCurrent = await transaction.get(providerInstanceKey);
+      assert.ok(providerCurrent);
+      await transaction.put(
+        providerInstanceKey,
+        { ...providerCurrent.value, lifecycle: "ready" },
+        { expectedRevision: providerCurrent.revision },
+      );
+      const essential = deployments[1];
+      const essentialCurrent = await transaction.get(deploymentKey(essential));
+      assert.ok(essentialCurrent);
+      await transaction.put(
+        deploymentKey(essential),
+        { ...essential, generation: parseGeneration("2") },
+        { expectedRevision: essentialCurrent.revision },
+      );
+      return null;
+    });
+    await restarted.wake();
+
+    assert.equal((await readObservation(state, essentialId))?.value.status, "ready");
+    assert.equal((await readObservation(state, nonEssentialId))?.value.status, "failed");
+    assert.equal(restarted.applicationReady(), true);
+    await restarted.stop();
+  });
+});
+
 test("failed prepare retries after retryAt and converges to ready", async (t) => {
   await withRealStateStores(t, async (state, clock) => {
     const desired = deployment();

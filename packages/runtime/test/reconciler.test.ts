@@ -5578,3 +5578,327 @@ test("failed effect conditional commits reread after a revision conflict", async
   assert.equal(reconciler.kernelRunning, true);
   await reconciler.stop();
 });
+
+async function createProviderLossTestFixture(
+  suffix: string,
+  policies: readonly ("degrade" | "fail" | "suspend")[],
+  essential = true,
+) {
+  const providerId = parsePluginId(`loss-provider-${suffix}`);
+  const consumerId = parsePluginId(`loss-consumer-${suffix}`);
+  const providerComponentId = parseComponentId(`loss-provider-${suffix}-service`);
+  const consumerComponentId = parseComponentId(`loss-consumer-${suffix}-service`);
+  const capabilities = policies.map((_, index) =>
+    parseCapabilityName(`org.example.loss-${suffix}-${index}`),
+  );
+  const providerDigest = parseArtifactDigest(`sha256:${"e".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"f".repeat(64)}`);
+  const component = (targetComponentId: ReturnType<typeof parseComponentId>) => ({
+    componentId: targetComponentId,
+    kind: "service" as const,
+    entrypoint: `components/${targetComponentId}.js`,
+    executors: ["process" as const],
+  });
+  const providerManifest: PluginManifest = {
+    ...manifest("1.0.0", providerDigest),
+    pluginId: providerId,
+    components: [component(providerComponentId)],
+    capabilities: {
+      provides: capabilities.map((name) => ({ name, protocolVersion: "1.0.0" })),
+      requires: [],
+    },
+  };
+  const consumerManifest: PluginManifest = {
+    ...manifest("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    components: [component(consumerComponentId)],
+    capabilities: {
+      provides: [],
+      requires: capabilities.map((name, index) => ({
+        name,
+        protocolRange: "^1.0.0",
+        lossPolicy: policies[index]!,
+      })),
+    },
+  };
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerDigest),
+      pluginId: providerId,
+      manifest: providerManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const provider = deployment("1", { pluginId: providerId, artifactDigest: providerDigest });
+  const consumer = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    essential,
+  });
+  const deploymentKey = (desired: PluginDeployment): StateKey<PluginDeployment> => ({
+    namespace: "tego",
+    collection: "deployments",
+    id: `${desired.applicationId}/${desired.pluginId}`,
+  });
+  const lossKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "provider-loss",
+    id: `${applicationId}/${consumerId}`,
+  };
+  const observationKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "deployment-observations",
+    id: `${applicationId}/${consumerId}`,
+  };
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    for (const desired of [provider, consumer]) {
+      await transaction.put(deploymentKey(desired), desired, { expectedRevision: "absent" });
+    }
+    return null;
+  });
+  const options = (effects: RecordingEffects) => ({
+    artifactGate: {
+      async validate(request: { readonly digest: ArtifactDigest }) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadInstallations: async () => installations,
+  });
+  const failProvider = async (providerStart: ReconcileEffect) => {
+    const key = {
+      namespace: "tego",
+      collection: "component-instances",
+      id: providerStart.instanceId,
+    };
+    await state.transact({}, async (transaction) => {
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        { ...(current.value as Record<string, JsonValue>), lifecycle: "degraded" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+  };
+  const recoverProvider = async (providerStart: ReconcileEffect) => {
+    const key = {
+      namespace: "tego",
+      collection: "component-instances",
+      id: providerStart.instanceId,
+    };
+    await state.transact({}, async (transaction) => {
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        { ...(current.value as Record<string, JsonValue>), lifecycle: "ready" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+  };
+  return {
+    consumer,
+    consumerId,
+    deploymentKey,
+    failProvider,
+    lossKey,
+    observationKey,
+    options,
+    providerId,
+    recoverProvider,
+    state,
+  };
+}
+
+test("failed provider loss drains and stops until a new desired generation", async () => {
+  const fixture = await createProviderLossTestFixture("generation", ["fail"]);
+  const effects = new RecordingEffects();
+  const first = new Reconciler(fixture.options(effects));
+  await first.start();
+  const providerStart = effects.calls.find(
+    (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+  );
+  const consumerStart = effects.calls.find(
+    (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
+  );
+  assert.ok(providerStart);
+  assert.ok(consumerStart);
+  await fixture.failProvider(providerStart);
+
+  await first.wake();
+
+  assert.deepEqual(
+    effects.calls
+      .filter(
+        (effect) =>
+          effect.pluginId === fixture.consumerId &&
+          (effect.kind === "drain" || effect.kind === "stop"),
+      )
+      .map((effect) => effect.kind),
+    ["drain", "stop"],
+  );
+  assert.equal(
+    (
+      (
+        await fixture.state.read({
+          namespace: "tego",
+          collection: "component-instances",
+          id: consumerStart.instanceId,
+        })
+      )?.value as { readonly lifecycle?: string } | undefined
+    )?.lifecycle,
+    "stopped",
+  );
+  const observation = await fixture.state.read(fixture.observationKey);
+  assert.equal((observation?.value as { readonly status?: string } | undefined)?.status, "failed");
+  assert.equal(
+    (
+      observation?.value as
+        | { readonly diagnostics?: readonly { readonly code?: string }[] }
+        | undefined
+    )?.diagnostics?.[0]?.code,
+    "CAPABILITY_PROVIDER_LOST",
+  );
+  assert.equal(first.applicationReady(), false);
+  const heldLoss = await fixture.state.read(fixture.lossKey);
+  await fixture.recoverProvider(providerStart);
+  const sameGenerationCallCount = effects.calls.length;
+  await first.wake();
+  assert.equal(effects.calls.length, sameGenerationCallCount);
+  assert.deepEqual(await fixture.state.read(fixture.lossKey), heldLoss);
+  await first.stop();
+
+  const restartedEffects = new RecordingEffects();
+  const restarted = new Reconciler(fixture.options(restartedEffects));
+  await restarted.start();
+  assert.equal(
+    restartedEffects.calls.some(
+      (effect) =>
+        effect.pluginId === fixture.consumerId &&
+        (effect.kind === "prepare" || effect.kind === "start"),
+    ),
+    false,
+  );
+  assert.equal(
+    (
+      (await fixture.state.read(fixture.observationKey))?.value as
+        | { readonly status?: string }
+        | undefined
+    )?.status,
+    "failed",
+  );
+  await fixture.state.transact({}, async (transaction) => {
+    const current = await transaction.get(fixture.deploymentKey(fixture.consumer));
+    assert.ok(current);
+    await transaction.put(
+      fixture.deploymentKey(fixture.consumer),
+      { ...fixture.consumer, generation: parseGeneration("2") },
+      { expectedRevision: current.revision },
+    );
+    return null;
+  });
+  await restarted.wake();
+
+  const generationTwoStart = restartedEffects.calls.find(
+    (effect) =>
+      effect.pluginId === fixture.consumerId &&
+      effect.kind === "start" &&
+      effect.deploymentGeneration === parseGeneration("2"),
+  );
+  assert.ok(generationTwoStart);
+  assert.equal(generationTwoStart.activation, "1");
+  assert.equal(await fixture.state.read(fixture.lossKey), undefined);
+  assert.equal(restarted.applicationReady(), true);
+  await restarted.stop();
+});
+
+test("mixed provider loss orders execute only fail and remain fail-held after restart", async () => {
+  for (const [suffix, policies] of [
+    ["forward", ["degrade", "suspend", "fail"]],
+    ["reverse", ["fail", "degrade", "suspend"]],
+  ] as const) {
+    const fixture = await createProviderLossTestFixture(suffix, policies);
+    const effects = new RecordingEffects();
+    const first = new Reconciler(fixture.options(effects));
+    await first.start();
+    const providerStart = effects.calls.find(
+      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+    );
+    const consumerStart = effects.calls.find(
+      (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    assert.ok(consumerStart);
+    await fixture.failProvider(providerStart);
+    await first.wake();
+
+    assert.equal(
+      ((await fixture.state.read(fixture.lossKey))?.value as { readonly action?: string } | undefined)
+        ?.action,
+      "fail",
+    );
+    assert.deepEqual(
+      effects.calls
+        .filter(
+          (effect) =>
+            effect.pluginId === fixture.consumerId &&
+            (effect.kind === "drain" || effect.kind === "stop"),
+        )
+        .map((effect) => effect.kind),
+      ["drain", "stop"],
+    );
+    assert.equal(
+      (
+        (await fixture.state.read(fixture.observationKey))?.value as
+          | { readonly status?: string }
+          | undefined
+      )?.status,
+      "failed",
+    );
+    await first.stop();
+
+    const restartedEffects = new RecordingEffects();
+    const restarted = new Reconciler(fixture.options(restartedEffects));
+    await restarted.start();
+    assert.equal(
+      restartedEffects.calls.some(
+        (effect) =>
+          effect.pluginId === fixture.consumerId &&
+          (effect.kind === "prepare" || effect.kind === "start"),
+      ),
+      false,
+    );
+    assert.equal(
+      (
+        (await fixture.state.read(fixture.observationKey))?.value as
+          | { readonly status?: string }
+          | undefined
+      )?.status,
+      "failed",
+    );
+    await restarted.stop();
+  }
+});
