@@ -16,6 +16,13 @@ first layer of the planned three-layer architecture.
 
 Only the runtime-kernel layer is implemented here.
 
+## Documentation
+
+- [Runtime kernel architecture](docs/architecture/runtime-kernel.md)
+- [Phase-one threat model](docs/security/threat-model.md)
+- [Deployment topologies](docs/operations/deployment-topologies.md)
+- [Contributing and plugin authoring](docs/guides/contributing-and-plugins.md)
+
 ## Implemented capabilities
 
 - Plugin manifests, artifacts, packaging, signing, and lifecycle
