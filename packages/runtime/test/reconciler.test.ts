@@ -633,6 +633,7 @@ function stateIdentifier(key: StateKey<JsonValue>): string {
 class TestStateStore implements StateStore {
   readonly scope = "local" as const;
   readonly records = new Map<string, TestRecord>();
+  readonly observationStatuses: Array<{ readonly id: string; readonly status: string }> = [];
   readonly operations = new Map<string, PersistedOperationJournalEntry>();
   readonly outbox = new Map<
     string,
@@ -845,6 +846,10 @@ class TestStateStore implements StateStore {
         value: structuredClone(put.value),
         revision,
       });
+      if (put.key.collection === "deployment-observations") {
+        const status = (put.value as { readonly status?: string }).status;
+        if (status !== undefined) this.observationStatuses.push({ id: put.key.id, status });
+      }
     }
     for (const deleted of deletes) {
       this.records.delete(stateIdentifier(deleted.key));
@@ -5614,10 +5619,10 @@ async function createProviderLossTestFixture(
     components: [component(consumerComponentId)],
     capabilities: {
       provides: [],
-      requires: capabilities.map((name, index) => ({
-        name,
+      requires: policies.map((lossPolicy, index) => ({
+        name: parseCapabilityName(`org.example.loss-${suffix}-${index}`),
         protocolRange: "^1.0.0",
-        lossPolicy: policies[index]!,
+        lossPolicy,
       })),
     },
   };
@@ -5852,12 +5857,16 @@ test("mixed provider loss orders execute only fail and remain fail-held after re
     );
     assert.ok(providerStart);
     assert.ok(consumerStart);
+    fixture.state.observationStatuses.length = 0;
     await fixture.failProvider(providerStart);
     await first.wake();
 
     assert.equal(
-      ((await fixture.state.read(fixture.lossKey))?.value as { readonly action?: string } | undefined)
-        ?.action,
+      (
+        (await fixture.state.read(fixture.lossKey))?.value as
+          | { readonly action?: string }
+          | undefined
+      )?.action,
       "fail",
     );
     assert.deepEqual(
@@ -5878,6 +5887,11 @@ test("mixed provider loss orders execute only fail and remain fail-held after re
       )?.status,
       "failed",
     );
+    const consumerStatuses = fixture.state.observationStatuses
+      .filter(({ id }) => id === fixture.observationKey.id)
+      .map(({ status }) => status);
+    assert.equal(consumerStatuses.includes("degraded"), false);
+    assert.equal(consumerStatuses.includes("suspended"), false);
     await first.stop();
 
     const restartedEffects = new RecordingEffects();

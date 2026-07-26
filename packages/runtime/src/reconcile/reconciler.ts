@@ -831,13 +831,15 @@ export class Reconciler {
         await this.#recordBlocked(deployment, [gate.diagnostic]);
         continue;
       }
-      const suspension = providerLosses.find(
+      const providerLossHold = providerLosses.find(
         (loss) =>
           loss.value.consumer.applicationId === deployment.applicationId &&
           loss.value.consumer.pluginId === deployment.pluginId &&
           loss.value.deploymentGeneration === deployment.generation &&
-          loss.value.action === "suspend",
+          (loss.value.action === "fail" || loss.value.action === "suspend"),
       );
+      const suspension =
+        providerLossHold?.value.action === "suspend" ? providerLossHold : undefined;
       const recoveryPrerequisitesReady =
         suspension?.value.recoveryActivations !== undefined &&
         this.#recoveryPrerequisitesReady(
@@ -861,7 +863,9 @@ export class Reconciler {
         instances: planningInstances,
         now: this.#options.clock.now().toISOString(),
         supportedExecutors: this.#options.effects.supportedExecutors,
-        suspended: suspension !== undefined && !recoveryPrerequisitesReady,
+        suspended:
+          providerLossHold?.value.action === "fail" ||
+          (suspension !== undefined && !recoveryPrerequisitesReady),
         ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
       });
       if (plan.blocked) {
@@ -1597,10 +1601,13 @@ export class Reconciler {
         !recoveryPlan.blocked &&
         recoveryPlan.steps.length === latestByComponent.length;
       const canRecover =
-        desired.action === "suspend"
-          ? recovered &&
-            (recoveryReady || (recoveryActivations === undefined && latestByComponent.length === 0))
-          : recovered && suspendStopped;
+        desired.action === "fail"
+          ? false
+          : desired.action === "suspend"
+            ? recovered &&
+              (recoveryReady ||
+                (recoveryActivations === undefined && latestByComponent.length === 0))
+            : recovered && suspendStopped;
       const nextLifecycle =
         canRecover && desired.action !== "suspend"
           ? "ready"
@@ -1860,13 +1867,15 @@ export class Reconciler {
         left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
       );
     for (const instance of restorable) {
-      const suspendedLoss = providerLosses.find(
+      const providerLossHold = providerLosses.find(
         (loss) =>
           loss.value.consumer.applicationId === instance.applicationId &&
           loss.value.consumer.pluginId === instance.pluginId &&
           loss.value.deploymentGeneration === instance.deploymentGeneration &&
-          loss.value.action === "suspend",
+          (loss.value.action === "fail" || loss.value.action === "suspend"),
       );
+      const suspendedLoss =
+        providerLossHold?.value.action === "suspend" ? providerLossHold : undefined;
       const recoveryInstance =
         suspendedLoss?.value.recoveryActivations?.[instance.componentId] === instance.activation;
       const recoveryPrerequisitesReady =
@@ -1880,7 +1889,7 @@ export class Reconciler {
         );
       if (suspendedLoss !== undefined && recoveryInstance) {
         if (!recoveryPrerequisitesReady) continue;
-      } else if (suspendedLoss !== undefined) {
+      } else if (providerLossHold !== undefined) {
         if (instance.lifecycle === "preparing") continue;
         if (this.#componentLifecycle.restoreTermination === undefined) continue;
         try {
@@ -2812,13 +2821,15 @@ export class Reconciler {
     }
     if (!this.#running) return;
     if (currentGate === capabilityBindingConflict) return capabilityBindingConflict;
-    const suspendedLoss = providerLosses.find(
+    const providerLossHold = providerLosses.find(
       (loss) =>
         loss.value.consumer.applicationId === effect.applicationId &&
         loss.value.consumer.pluginId === effect.pluginId &&
         loss.value.deploymentGeneration === effect.deploymentGeneration &&
-        loss.value.action === "suspend",
+        (loss.value.action === "fail" || loss.value.action === "suspend"),
     );
+    const suspendedLoss =
+      providerLossHold?.value.action === "suspend" ? providerLossHold : undefined;
     const recoveryActivation = suspendedLoss?.value.recoveryActivations?.[effect.componentId];
     const exactRecoveryEffect =
       recoveryActivation !== undefined && recoveryActivation === effect.activation;
@@ -2832,7 +2843,9 @@ export class Reconciler {
         instances,
         capabilityBindings,
       );
-    const suspended = suspendedLoss !== undefined && !recoveryPermitted;
+    const suspended =
+      providerLossHold?.value.action === "fail" ||
+      (suspendedLoss !== undefined && !recoveryPermitted);
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
@@ -3199,6 +3212,30 @@ export class Reconciler {
         await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
       if (deployment.state !== "active") continue;
+      const failedProviderLoss = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === deployment.applicationId &&
+          loss.value.consumer.pluginId === deployment.pluginId &&
+          loss.value.deploymentGeneration === deployment.generation &&
+          loss.value.action === "fail",
+      );
+      if (failedProviderLoss !== undefined) {
+        const diagnostic = runtimeDiagnostic({
+          code: "CAPABILITY_PROVIDER_LOST",
+          message: "A required capability provider was lost",
+          source: { kind: "deployment", id: deploymentKey(deployment) },
+          retryable: false,
+          details: {
+            capabilities: failedProviderLoss.value.capabilities,
+            deploymentGeneration: failedProviderLoss.value.deploymentGeneration,
+            providers: failedProviderLoss.value.providers,
+          },
+          observedAt: this.#options.clock.now().toISOString(),
+        });
+        this.#diagnosticsByDeployment.set(deploymentKey(deployment), [diagnostic]);
+        await this.#recordObservation(deployment, "failed", [diagnostic]);
+        continue;
+      }
       const suspendedLoss = providerLosses.find(
         (loss) =>
           loss.value.consumer.applicationId === deployment.applicationId &&
