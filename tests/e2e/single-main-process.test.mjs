@@ -249,6 +249,15 @@ async function runtimeSnapshot(endpoint) {
   return runCli(["runtime", "snapshot", "--endpoint", endpoint, "--json"]);
 }
 
+function semanticSnapshotItems(snapshot) {
+  return Object.fromEntries(
+    ["installations", "deployments", "instances", "operations", "tasks"].map((collection) => [
+      collection,
+      snapshot[collection].items,
+    ]),
+  );
+}
+
 async function runtimeStatus(endpoint) {
   return runCli(["runtime", "status", "--endpoint", endpoint, "--json"]);
 }

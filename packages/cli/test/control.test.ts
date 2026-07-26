@@ -338,6 +338,62 @@ test("@spec:runtime-operations/local-runtime-operations/path-ingress-stays-outsi
   });
 });
 
+test("artifact ingress occurs exactly once before follower installation is fenced", async () => {
+  await withEndpoint(async (endpoint, directory) => {
+    const artifactPath = join(directory, "plugin.tego");
+    const expectedDigest = `sha256:${"b".repeat(64)}` as ArtifactDigest;
+    const calls: string[] = [];
+    const semanticState = {
+      installations: [],
+      deployments: [],
+      instances: [],
+      operations: [],
+      tasks: [],
+    };
+    const semanticStateBefore = JSON.stringify(semanticState);
+    const operations = fakeOperations();
+    const server = await startControlServer({
+      endpoint,
+      artifactIngress: {
+        putPath: async (path: string) => {
+          calls.push(`putPath:${path}`);
+          return expectedDigest;
+        },
+      },
+      operations: {
+        ...operations,
+        operations: {
+          ...operations.operations,
+          installPlugin: async (request: InstallPluginRequest) => {
+            calls.push(`installPlugin:${request.digest}`);
+            throw new DiagnosticError(
+              runtimeDiagnostic({
+                code: "COORDINATION_NOT_LEADER",
+                message: "Operation requires the current leader",
+                source: { kind: "coordination" },
+              }),
+            );
+          },
+        },
+      },
+    });
+    try {
+      const response = await requestControl({
+        endpoint,
+        operation: "plugin.install-path",
+        input: { artifactPath },
+        timeoutMs: 1_000,
+      });
+      assert.equal(response.ok, false);
+      assert.equal(response.diagnostic?.code, "COORDINATION_NOT_LEADER");
+      assert.deepEqual(calls, [`putPath:${artifactPath}`, `installPlugin:${expectedDigest}`]);
+      assert.equal(JSON.stringify(semanticState), semanticStateBefore);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 test("@spec:runtime-operations/local-runtime-operations/control-cleanup", async () => {
   await withEndpoint(async (endpoint) => {
     const server = await startControlServer({ endpoint, operations: fakeOperations() });
