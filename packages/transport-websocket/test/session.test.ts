@@ -34,6 +34,7 @@ import {
   type WorkerEpochAllocator,
   WorkerRuntime,
   type WorkerSession,
+  type WorkerSessionMessage,
 } from "../src/index.js";
 import { executionRequest, flush, TestLocalExecutor } from "./remote-test-support.js";
 
@@ -73,6 +74,7 @@ const ENVELOPE: WorkerControlEnvelope = {
   messageId: parseMessageId("message-1"),
   sessionId: parseSessionId("session-1"),
   sequence: parseSequence("0"),
+  correlationId: parseMessageId("message-1"),
   type: "heartbeat",
   sentAt: new Date(0).toISOString(),
   payload: {},
@@ -795,6 +797,83 @@ test("request correlation is installed before a synchronous transport can respon
     ]);
     assert.deepEqual(response.payload, { accepted: true });
   } finally {
+    await cleanup(connection);
+  }
+});
+
+test("one-way self-correlates and requests do not resolve from unrelated messages", async () => {
+  const connection = await directConnection();
+  try {
+    await connection.mainSession.send("session.reconcile", { oneWay: true });
+    const oneWay = JSON.parse(connection.mainSocket.sent[0] as string) as {
+      messageId: string;
+      correlationId?: string;
+    };
+    assert.equal(oneWay.correlationId, oneWay.messageId);
+
+    connection.mainSocket.holdControlType = "session.reconcile";
+    const received: WorkerSessionMessage[] = [];
+    connection.mainSession.onMessage((message) => received.push(message));
+    const pending = connection.mainSession.request("session.reconcile", { request: true });
+    const request = JSON.parse(connection.mainSocket.held[0] as string) as {
+      messageId: string;
+      correlationId?: string;
+    };
+    assert.equal(request.correlationId, request.messageId);
+
+    await connection.workerSession.send("session.reconcile", { unrelated: true });
+    assert.deepEqual(received.map((message) => message.payload), [{ unrelated: true }]);
+
+    await connection.workerSession.send(
+      "session.reconcile",
+      { response: true },
+      { correlationId: request.messageId },
+    );
+    assert.deepEqual((await pending).payload, { response: true });
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("response correlates to the triggering request messageId", async () => {
+  const connection = await directConnection();
+  try {
+    connection.workerSession.onMessage((message) => {
+      void connection.workerSession.send(
+        "session.reconcile",
+        { accepted: true },
+        { correlationId: message.messageId },
+      );
+    });
+    await connection.mainSession.request("session.reconcile", { running: [] });
+    const request = JSON.parse(connection.mainSocket.sent[0] as string) as {
+      messageId: string;
+    };
+    const response = JSON.parse(connection.workerSocket.sent[0] as string) as {
+      correlationId?: string;
+    };
+    assert.equal(response.correlationId, request.messageId);
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("missing correlation closes the session as PROTOCOL_MESSAGE_INVALID", async () => {
+  for (const correlationId of [undefined, "invalid correlation"]) {
+    const connection = await directConnection();
+    connection.mainSocket.automaticDelivery = false;
+    await connection.mainSession.send("session.reconcile", { running: [] });
+    const envelope = JSON.parse(connection.mainSocket.sent[0] as string) as Record<
+      string,
+      JsonValue
+    >;
+    if (correlationId === undefined) {
+      delete envelope.correlationId;
+    } else {
+      envelope.correlationId = correlationId;
+    }
+    connection.workerSocket.inject(JSON.stringify(envelope));
+    assert.equal(connection.workerSession.diagnostic?.code, "PROTOCOL_MESSAGE_INVALID");
     await cleanup(connection);
   }
 });

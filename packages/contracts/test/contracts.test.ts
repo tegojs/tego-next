@@ -120,6 +120,7 @@ const validWorkerEnvelope = {
   messageId: parseMessageId("message-01"),
   sessionId: parseSessionId("session-01"),
   sequence: parseSequence("1"),
+  correlationId: parseMessageId("message-01"),
   type: "task.assign",
   sentAt: "2026-07-23T11:59:00.000Z",
   payload: validExecutionRequest,
@@ -563,6 +564,21 @@ test("worker envelopes preserve decimal sequence values and payloads", () => {
       return true;
     },
   );
+});
+
+test("worker envelope correlation is mandatory and preserves uint64 sequences", () => {
+  const { correlationId: _correlationId, ...withoutCorrelation } = validWorkerEnvelope;
+  assert.throws(
+    () => parseWorkerEnvelope(withoutCorrelation),
+    (error: unknown) => diagnosticCode(error) === "WORKER_ENVELOPE_INVALID",
+  );
+
+  const maximumSequenceEnvelope = {
+    ...validWorkerEnvelope,
+    sequence: parseSequence("18446744073709551615"),
+    correlationId: parseMessageId("correlation-maximum-sequence"),
+  };
+  assert.deepEqual(parseWorkerEnvelope(maximumSequenceEnvelope), maximumSequenceEnvelope);
 });
 
 test("the public Worker envelope owns handshake and binary wire metadata", () => {
