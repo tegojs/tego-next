@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Separate desired and observed plugin state
-The runtime SHALL persist mutable `PluginDeployment` desired state separately from immutable manifests and installations, and SHALL track an observed generation and activation for every component instance. An activation SHALL be a persisted unsigned decimal string scoped within `(applicationId, pluginId, componentId, generation)`, SHALL participate in stable instance, operation, and message identities, and MAY have a `suspended` observation.
+The runtime SHALL persist mutable `PluginDeployment` desired state separately from immutable manifests and installations, SHALL track an observed generation and activation for every component instance, and SHALL publish deployment observations separately from component activation lifecycle. An activation SHALL be a persisted unsigned decimal string scoped within `(applicationId, pluginId, componentId, generation)` and SHALL participate in stable instance, operation, and message identities. Provider-loss `suspend` and `fail` actions SHALL transition the affected activation through `draining`, `stopping`, and `stopped`; the deployment observation, not the activation lifecycle, SHALL become `suspended` or `failed`.
 
 #### Scenario: Deployment generation changes
 - **WHEN** an administrator changes a deployment
@@ -11,9 +11,9 @@ The runtime SHALL persist mutable `PluginDeployment` desired state separately fr
 - **WHEN** the reconciler creates a component activation for a desired deployment generation
 - **THEN** its unsigned decimal activation string is persisted within `(applicationId, pluginId, componentId, generation)` and is used by stable instance, operation, and message identities
 
-#### Scenario: Suspended activation is observed
-- **WHEN** a running activation is suspended for provider loss
-- **THEN** its observed component state records `suspended` without changing the desired generation
+#### Scenario: Suspended deployment is observed after activation stops
+- **WHEN** provider loss selects `suspend` for a running activation
+- **THEN** the activation transitions through `draining`, `stopping`, and `stopped`, then the deployment observation records `suspended` without changing the desired generation
 
 ### Requirement: Pre-execution deployment gate
 The reconciler SHALL validate artifact availability, runtime compatibility, capability bindings, permission grants, dependency cycles, placement, and executor support before loading plugin code.

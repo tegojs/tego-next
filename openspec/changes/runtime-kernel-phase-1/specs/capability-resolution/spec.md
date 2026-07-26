@@ -37,24 +37,24 @@ The resolver SHALL start providers before their consumers and SHALL reject cycle
 - **THEN** both deployments are blocked with a dependency-cycle diagnostic before either component starts
 
 ### Requirement: Provider loss propagation
-The runtime SHALL apply each consumer requirement's declared `degrade`, `suspend`, or `fail` loss policy when its persisted provider stops being ready. When simultaneous provider losses require different deployment actions, the reconciler SHALL apply exactly one action using `fail` before `suspend` before `degrade`.
+The runtime SHALL apply each consumer requirement's declared `degrade`, `suspend`, or `fail` loss policy when its persisted provider stops being ready. `degrade` SHALL change the current activation's lifecycle observation, while `suspend` and `fail` SHALL drain and stop the current activation before publishing the corresponding deployment observation. When simultaneous provider losses require different deployment actions, the reconciler SHALL apply exactly one action using `fail` before `suspend` before `degrade`.
 
-#### Scenario: Suspend on provider loss
+#### Scenario: Provider loss suspends deployment after activation stops
 - **WHEN** a ready consumer declares `suspend` and its provider becomes unavailable
-- **THEN** the reconciler drains the consumer and marks it `suspended` until the provider recovers
+- **THEN** the reconciler transitions the current activation through `draining`, `stopping`, and `stopped`, then records the deployment observation as `suspended` until the provider recovers
 
 #### Scenario: Multiple provider losses use deterministic precedence
 - **WHEN** one ready consumer simultaneously loses requirements declaring `degrade`, `suspend`, and `fail`
-- **THEN** the reconciler applies one deployment action using `fail` before `suspend` before `degrade`, independent of requirement order
+- **THEN** the reconciler applies only `fail`, transitions the current activation through `draining`, `stopping`, and `stopped`, and records the deployment observation as `failed`, independent of requirement order
 
 #### Scenario: Degraded provider recovers
 - **WHEN** a consumer degraded for provider loss observes its persisted provider ready again
 - **THEN** the same component activation returns to `ready` and application readiness is recomputed
 
-#### Scenario: Suspended provider recovers
-- **WHEN** a suspended consumer's persisted provider becomes ready again
-- **THEN** the reconciler starts a new activation in the same desired generation after the prior activation has drained and stopped
+#### Scenario: Suspended deployment starts next activation
+- **WHEN** a deployment observed as `suspended` sees its persisted provider become ready again
+- **THEN** the reconciler creates and starts the next activation in the same desired generation while the prior activation remains `stopped`
 
-#### Scenario: Failed provider recovers
-- **WHEN** a consumer failed for provider loss and the provider becomes ready without a desired deployment change
-- **THEN** the consumer remains failed and stopped until a higher desired generation is persisted
+#### Scenario: Failed deployment requires a new generation
+- **WHEN** a deployment observed as `failed` for provider loss sees its provider become ready without a desired deployment change
+- **THEN** its prior activation remains `stopped` and the deployment observation remains `failed` until a higher desired generation is persisted

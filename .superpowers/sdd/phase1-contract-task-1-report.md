@@ -11,11 +11,15 @@ The repaired contract now specifies:
   restart without silent rebinding;
 - deterministic simultaneous-loss precedence of `fail` before `suspend` before
   `degrade`;
-- distinct degraded, suspended, and failed provider-recovery behavior;
+- distinct degraded-activation, suspended-deployment, and failed-deployment
+  provider-recovery behavior;
 - persisted unsigned-decimal activation identity scoped within
   `(applicationId, pluginId, componentId, generation)`, including its use in
   stable instance, operation, and message identities;
-- `suspended` component observations;
+- separate component activation lifecycle and deployment observations, with
+  provider-loss suspension and failure draining the activation through
+  `draining`, `stopping`, and `stopped` before the deployment is observed as
+  `suspended` or `failed`;
 - mandatory protocol-1.0 correlation identity for one-way, request, and
   response envelopes;
 - trusted local control-endpoint scope, Unix owner-only `0600` sockets under an
@@ -54,10 +58,8 @@ affected checklist evidence is open.
 ## Commits
 
 - Contract correction:
-  `f29f1b1939c80943aa041cae08e50b089dda2b17`
-  (`spec: repair phase one runtime contracts`)
-
-The repository's commit-message hook rejects the required `spec:` type because
-its configured conventional type enum does not include `spec`. The mandated
-contract commit message was therefore created with only that hook bypassed
-after staged diff validation passed.
+  `47b7292da2de45cfebc588c8bc76cbe8a119fa39`
+  (`docs: repair phase one runtime contracts`)
+- Contract evidence:
+  `fbb13eadb84bb46e5ef836948e9e2aac9587f2a6`
+  (`docs: record phase one contract repair evidence`)

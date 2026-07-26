@@ -55,7 +55,7 @@
 - [ ] 7.2 Write lifecycle transition tests and implement the kernel-owned component lifecycle state machine
 - [ ] 7.3 Write reconciliation idempotency tests and implement stable instance identity, placement, retry scheduling, and convergence
 - [x] 7.4 Write enable, disable, upgrade, drain, and rollback plan tests and implement their reconciliation steps
-- [ ] 7.5 Write failure-isolation tests and implement structured blocked, failed, degraded, unavailable, and inconsistent states
+- [ ] 7.5 Write failure-isolation tests and implement structured blocked, failed, degraded, suspended, unavailable, and inconsistent deployment observation states
 - [ ] 7.6 Write restart-during-reconcile tests and implement operation-journal recovery without duplicate component instances
 
 ## 8. Local Executors
