@@ -29,16 +29,6 @@ function settleWithin(promise, timeoutMs) {
   });
 }
 
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === "ESRCH") return false;
-    throw error;
-  }
-}
-
 function endStream(stream) {
   if (stream.closed || stream.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
@@ -56,6 +46,10 @@ function fileExists(path) {
 
 function processExitDiagnostic(exit, name, stderrPath) {
   return new Error(`PROCESS_EXIT_NON_ZERO:${name}:code=${exit.code}:stderr=${stderrPath}`);
+}
+
+function processSpawnDiagnostic(error, name) {
+  return new Error(`PROCESS_SPAWN_ERROR:${name}:${error.code ?? "UNKNOWN"}:${error.message}`);
 }
 
 export async function spawnManagedProcess({ artifacts, command, args, env = {}, name }) {
@@ -79,6 +73,8 @@ export class ManagedProcess {
   #name;
   #processingErrors = [];
   #readyListeners = new Set();
+  #spawnError;
+  #spawnState = deferred();
   #stopActions = [];
   #streamErrors = [];
   #streams;
@@ -97,7 +93,15 @@ export class ManagedProcess {
     for (const [streamName, stream] of Object.entries(this.#streams)) {
       stream.on("error", (error) => this.#recordStreamError(streamName, error));
     }
-    child.on("error", (error) => this.#recordStreamError("process", error));
+    child.once("spawn", () => this.#spawnState.resolve({ kind: "spawned" }));
+    child.on("error", (error) => {
+      if (!this.#spawnState.settled) {
+        this.#spawnError = error;
+        this.#spawnState.resolve({ error, kind: "spawn-error" });
+        return;
+      }
+      this.#recordStreamError("process", error);
+    });
     child.stdin.on("error", (error) => this.#recordStreamError("stdin", error));
     child.stdout.on("error", (error) => this.#recordStreamError("stdout", error));
     child.stderr.on("error", (error) => this.#recordStreamError("stderr", error));
@@ -150,6 +154,13 @@ export class ManagedProcess {
   }
 
   async stop({ timeoutMs }) {
+    if (!(await settleWithin(this.#spawnState.promise, timeoutMs))) {
+      throw new Error(`PROCESS_SPAWN_STATE_TIMEOUT:${this.#name}:${timeoutMs}ms`);
+    }
+    if (this.#spawnError !== undefined) {
+      await this.#waitForFinalization(timeoutMs);
+      return;
+    }
     if (this.#exit.settled) {
       await this.#waitForFinalization(timeoutMs);
       return;
@@ -157,8 +168,10 @@ export class ManagedProcess {
 
     this.#stopActions.push("stdin:end");
     this.#child.stdin.end();
-    this.#stopActions.push("signal:SIGTERM");
-    this.#child.kill("SIGTERM");
+    if (!(await settleWithin(this.#exit.promise, timeoutMs))) {
+      this.#stopActions.push("signal:SIGTERM");
+      this.#child.kill("SIGTERM");
+    }
     if (!(await settleWithin(this.#exit.promise, timeoutMs))) {
       this.#stopActions.push("signal:SIGKILL");
       this.#child.kill("SIGKILL");
@@ -169,10 +182,20 @@ export class ManagedProcess {
     await this.#waitForFinalization(timeoutMs);
   }
 
-  async assertClean() {
+  async assertClean({ timeoutMs = 2_000 } = {}) {
+    if (!(await settleWithin(this.#spawnState.promise, timeoutMs))) {
+      throw new Error(`PROCESS_SPAWN_STATE_TIMEOUT:${this.#name}:${timeoutMs}ms`);
+    }
+    if (this.#spawnError !== undefined) {
+      await this.#waitForFinalization(timeoutMs);
+      throw processSpawnDiagnostic(this.#spawnError, this.#name);
+    }
+    if (!this.#exit.settled) {
+      throw new Error(`PROCESS_STILL_RUNNING:${this.#name}:${this.pid}`);
+    }
     const exit = await this.#exit.promise;
     if (this.#cleanupError !== undefined) throw this.#cleanupError;
-    await this.#finalized.promise;
+    await this.#waitForFinalization(timeoutMs);
     if (exit.code !== 0 && exit.signal === null) {
       throw processExitDiagnostic(exit, this.#name, this.#artifacts.stderr(this.#name));
     }
@@ -182,9 +205,6 @@ export class ManagedProcess {
     }
     if (this.#processingErrors.length > 0) {
       throw new Error(`PROCESS_EVENT_PROCESSING_ERROR:${this.#processingErrors[0].message}`);
-    }
-    if (this.pid !== undefined && isProcessAlive(this.pid)) {
-      throw new Error(`PROCESS_LEAK:${this.pid}`);
     }
   }
 
@@ -300,7 +320,6 @@ export class ManagedProcess {
       `PROCESS_CLEANUP_TIMEOUT:${this.#name}:${this.pid}:${timeoutMs}ms`,
     );
     this.#forceCloseResources();
-    void this.#finalize(await this.#exit.promise);
     await settleWithin(this.#finalized.promise, timeoutMs);
     throw this.#cleanupError;
   }
