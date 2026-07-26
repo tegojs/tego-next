@@ -181,7 +181,17 @@ snapshot remain available on the follower.
 
 Do not load-balance mutating CLI requests across both control sockets. The
 fencing check rejects stale or follower authority, but clients should discover
-the leader from status and retry only definite not-leader failures.
+the leader from status and retry only definite `COORDINATION_NOT_LEADER`
+failures.
+
+Path-based installation on a follower admits content-addressed immutable
+artifact bytes before the semantic installation crosses the leadership fence.
+The subsequent installation is rejected with `COORDINATION_NOT_LEADER`, so the
+follower cannot change installations, deployments, or other semantic state.
+Because the local control endpoint is trusted, an authorized local client can
+still consume shared artifact capacity this way. Operators must treat repeated
+follower ingress as a storage denial of service risk even though fencing
+protects semantic state.
 
 ### Worker connectivity
 

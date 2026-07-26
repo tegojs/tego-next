@@ -215,7 +215,7 @@ subset of the manifest request:
 
 ```sh
 node packages/cli/dist/src/bin.js plugin deploy org.example.echo \
-  --digest sha256:REPLACE_WITH_INSTALL_DIGEST \
+  --digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --permissions '[{"kind":"executor","executors":["process"]}]' \
   --endpoint .tego/main/control.sock --json
 ```
@@ -259,9 +259,25 @@ automatically retry it.
 
 ## Current CLI limitations
 
-The CLI exposes `runtime start`, `runtime snapshot`, `runtime status`, and
-`runtime stop`; plugin validate, pack, inspect, install, deploy, and status;
-task run, status, wait, and cancel; and `worker start`.
+### Exact command inventory
+
+The current parser accepts exactly these command names:
+
+- `runtime start`
+- `runtime status`
+- `runtime snapshot`
+- `runtime stop`
+- `plugin validate`
+- `plugin pack`
+- `plugin inspect`
+- `plugin install`
+- `plugin deploy`
+- `plugin status`
+- `task run`
+- `task status`
+- `task wait`
+- `task cancel`
+- `worker start`
 
 It does not yet expose trust-key configuration, signature-envelope installation,
 deployment disable/rollback controls, or Main-side Worker listener and

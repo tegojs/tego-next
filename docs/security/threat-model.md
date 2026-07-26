@@ -94,8 +94,18 @@ history or logs.
 ## Network exposure
 
 The local control endpoint is a Unix-domain socket or Windows named pipe, not an
-HTTP server. Its parent directory must be private, and each connection carries
-one bounded request.
+HTTP server. The local control protocol has no application-layer authentication
+and relies on operating-system access to its endpoint. On Unix, startup verifies
+an owner-private parent directory and applies mode 0600 to the socket. Windows
+named-pipe ACL hardening is not implemented in the built-in path; operators must
+provide an operating-system deployment boundary. Each connection carries one
+bounded request.
+
+The endpoint is trusted. A follower may admit content-addressed immutable bytes
+before semantic installation is rejected, so an authorized local client can
+consume artifact storage even though it cannot mutate installations or
+deployments. This is an authorized local storage denial of service risk, not a
+fencing bypass.
 
 Worker transport accepts `ws:` and `wss:` for outbound connections. The
 built-in Main listener uses a WebSocket upgrade on `node:http`, so deployments

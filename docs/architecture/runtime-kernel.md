@@ -80,6 +80,11 @@ Components execute through one request/result contract:
 - `process` uses an authenticated child-process channel;
 - `remote` uses the versioned WebSocket Worker protocol.
 
+A Worker Thread has its own JavaScript thread and event loop. It shares the
+Main operating-system process, address space, privileges, and process-wide
+resources; it does not run on the Main JavaScript event loop and is not a
+process isolation boundary.
+
 The runtime placement preference is process, then thread, then remote. Selection
 still requires manifest support, an explicit permission grant, healthy
 capacity, and sufficient declared resources.
@@ -179,13 +184,15 @@ A remote attempt uses the more detailed states:
 assigned -> acknowledged -> running -> terminal
                     \-> unknown
 unknown -> assigned|acknowledged|running|terminal
-unknown -> expired
+terminal -> expired
 ```
 
-`unknown` is non-terminal. It means the Main cannot yet prove what happened
-after session loss. Reconnect inventory reconciles running attempts, buffered
-terminal results, attempt revisions, and the Worker's persistence
-availability.
+The state unknown remains a non-terminal reconciliation state and does not
+directly expire. It means the Main cannot yet prove what happened after session
+loss. Reconnect inventory reconciles running attempts, buffered terminal
+results, attempt revisions, and the Worker's persistence availability.
+Acknowledged terminal results become `expired` retention tombstones after the
+configured retention period.
 
 ## Persistence, revisions, and fencing
 
@@ -211,9 +218,11 @@ replaced sessions and conditional attempt updates.
 
 The only implemented Worker protocol version is `1.0`. Every control envelope
 contains the protocol version, message ID, session ID, sequence, type,
-timestamp, payload, and optional correlation and binary metadata. Unsupported
-versions fail with `PROTOCOL_VERSION_UNSUPPORTED`; there is no version
-negotiation or compatibility downgrade.
+timestamp, payload, and a correlation ID. The correlation ID is mandatory:
+one-way messages and requests self-correlate to their own message ID, while
+responses correlate to the triggering request's message ID. Binary metadata is
+optional. Unsupported versions fail with `PROTOCOL_VERSION_UNSUPPORTED`; there
+is no version negotiation or compatibility downgrade.
 
 The session authenticates a Worker identity with a bootstrap credential before
 registration or task messages. Either endpoint may initiate the TCP/WebSocket
