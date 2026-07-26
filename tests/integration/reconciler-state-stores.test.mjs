@@ -1538,8 +1538,10 @@ test("suspension restart terminalizes ready, draining, and stopping checkpoints 
   });
 });
 
-test("recovery activation restart requires its exact durable capability binding", async (t) => {
+test("provider generation upgrade recovery requires its exact durable capability binding", async (t) => {
   for (const bindingCase of [
+    "generation-upgrade",
+    "generation-upgrade-incompatible",
     "missing",
     "mismatched",
     "incomplete-required-set",
@@ -1575,7 +1577,10 @@ test("recovery activation restart requires its exact durable capability binding"
           },
         });
         const providerAManifest = providerManifest(providerAId, providerAComponentId, [
-          { name: capability, protocolVersion: "1.0.0" },
+          {
+            name: capability,
+            protocolVersion: bindingCase === "generation-upgrade-incompatible" ? "2.0.0" : "1.0.0",
+          },
           ...(bindingCase === "wrong-capability-provider"
             ? [{ name: otherCapability, protocolVersion: "1.0.0" }]
             : []),
@@ -1617,6 +1622,10 @@ test("recovery activation restart requires its exact durable capability binding"
           ...deployment(),
           pluginId: providerAId,
           artifactDigest: providerADigest,
+          ...(bindingCase === "generation-upgrade" ||
+          bindingCase === "generation-upgrade-incompatible"
+            ? { generation: parseGeneration("2") }
+            : {}),
           permissionGrants: [{ kind: "executor", executors: ["process"] }],
         };
         const providerB = {
@@ -1724,7 +1733,11 @@ test("recovery activation restart requires its exact durable capability binding"
                 {
                   capability,
                   provider: { applicationId, pluginId: providerAId },
-                  providerGeneration: providerA.generation,
+                  providerGeneration:
+                    bindingCase === "generation-upgrade" ||
+                    bindingCase === "generation-upgrade-incompatible"
+                      ? parseGeneration("1")
+                      : providerA.generation,
                 },
                 ...(bindingCase === "wrong-capability-provider"
                   ? [
@@ -1759,7 +1772,12 @@ test("recovery activation restart requires its exact durable capability binding"
               { expectedRevision: "absent" },
             );
           };
-          if (bindingCase === "mismatched") {
+          if (
+            bindingCase === "generation-upgrade" ||
+            bindingCase === "generation-upgrade-incompatible"
+          ) {
+            await putBinding(capability, providerAId);
+          } else if (bindingCase === "mismatched") {
             await putBinding(capability, providerBId);
           } else if (bindingCase === "incomplete-required-set") {
             await putBinding(capability, providerAId);
@@ -1793,22 +1811,42 @@ test("recovery activation restart requires its exact durable capability binding"
 
         await reconciler.start();
 
-        assert.deepEqual(effects.restored, []);
-        assert.equal(
-          effects.calls.some(
-            (effect) =>
-              effect.instanceId === recoveryInstance.instanceId && effect.kind === "start",
-          ),
-          false,
-        );
-        assert.equal(
-          (await readOnlyInstance(restartedState, recoveryInstance.instanceId))?.value.lifecycle,
-          "preparing",
-        );
-        assert.equal(
-          (await readObservation(restartedState, consumerId))?.value.status,
-          "suspended",
-        );
+        if (bindingCase === "generation-upgrade") {
+          assert.equal(
+            effects.restored.some(
+              (instance) => instance.instanceId === recoveryInstance.instanceId,
+            ),
+            true,
+          );
+          assert.equal(
+            effects.calls.some(
+              (effect) =>
+                effect.instanceId === recoveryInstance.instanceId && effect.kind === "start",
+            ),
+            true,
+          );
+          assert.equal(
+            (await readOnlyInstance(restartedState, recoveryInstance.instanceId))?.value.lifecycle,
+            "ready",
+          );
+        } else {
+          assert.deepEqual(effects.restored, []);
+          assert.equal(
+            effects.calls.some(
+              (effect) =>
+                effect.instanceId === recoveryInstance.instanceId && effect.kind === "start",
+            ),
+            false,
+          );
+          assert.equal(
+            (await readOnlyInstance(restartedState, recoveryInstance.instanceId))?.value.lifecycle,
+            "preparing",
+          );
+          assert.equal(
+            (await readObservation(restartedState, consumerId))?.value.status,
+            "suspended",
+          );
+        }
         await reconciler.stop();
       });
     });

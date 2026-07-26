@@ -2696,12 +2696,10 @@ test("degrade persists lexical provider loss evidence and recovers only the same
       {
         capability: capabilityA,
         provider: { applicationId, pluginId: providerAId },
-        providerGeneration: providerA.generation,
       },
       {
         capability: capabilityZ,
         provider: { applicationId, pluginId: providerZId },
-        providerGeneration: providerZ.generation,
       },
     ],
     updatedAt: clock.now().toISOString(),
@@ -5726,6 +5724,7 @@ async function createProviderLossTestFixture(
   };
   return {
     consumer,
+    consumerComponentId,
     consumerId,
     deploymentKey,
     failProvider,
@@ -5777,10 +5776,9 @@ test("sequential provider loss upgrades one durable record after restart", async
           consumer: { applicationId, pluginId: fixture.consumerId },
           deploymentGeneration: fixture.consumer.generation,
           action: initialAction,
-          capabilities: [
-            parseCapabilityName(`org.example.loss-sequential-${initialAction}-0`),
-          ],
+          capabilities: [parseCapabilityName(`org.example.loss-prior-${initialAction}`)],
           providers: [{ applicationId, pluginId: fixture.providerId }],
+          recoveryActivations: { [fixture.consumerComponentId]: "2" },
           updatedAt: new ManualClock().now().toISOString(),
         },
         { expectedRevision: "absent" },
@@ -5794,9 +5792,25 @@ test("sequential provider loss upgrades one durable record after restart", async
     await restarted.start();
 
     const loss = await fixture.state.read(fixture.lossKey);
+    assert.equal((loss?.value as { readonly action?: string } | undefined)?.action, "fail");
+    assert.deepEqual(
+      (
+        loss?.value as
+          | { readonly capabilities?: readonly string[]; readonly recoveryActivations?: object }
+          | undefined
+      )?.capabilities,
+      [
+        parseCapabilityName(`org.example.loss-prior-${initialAction}`),
+        parseCapabilityName(`org.example.loss-sequential-${initialAction}-0`),
+      ],
+    );
     assert.equal(
-      (loss?.value as { readonly action?: string } | undefined)?.action,
-      "fail",
+      (
+        loss?.value as
+          | { readonly recoveryActivations?: Readonly<Record<string, string>> }
+          | undefined
+      )?.recoveryActivations,
+      undefined,
     );
     assert.equal(
       [...fixture.state.records.values()].filter(
@@ -5859,6 +5873,16 @@ test("provider generation upgrade recovers the same logical provider identity", 
           | undefined
       )?.status,
       "ready",
+    );
+    await fixture.failProvider(generationTwoProvider);
+    await reconciler.wake();
+    assert.equal(
+      (
+        (await fixture.state.read(fixture.lossKey))?.value as
+          | { readonly action?: string }
+          | undefined
+      )?.action,
+      policy,
     );
     await reconciler.stop();
   }

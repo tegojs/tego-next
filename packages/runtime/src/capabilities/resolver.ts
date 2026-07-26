@@ -12,6 +12,7 @@ import { isValidVersion, isValidVersionRange, satisfiesVersionRange } from "./ve
 
 export interface CapabilityResolutionDeployment extends JsonObject {
   readonly identity: PluginDeploymentIdentity;
+  readonly activated: boolean;
   readonly ready: boolean;
   readonly provides: readonly PluginCapabilityProvision[];
   readonly requires: readonly PluginCapabilityRequirement[];
@@ -85,7 +86,6 @@ export type ProviderLossAction = ProviderLossDecision["action"];
 export interface ProviderRecoveryBindingPrerequisite extends JsonObject {
   readonly capability: CapabilityName;
   readonly provider: PluginDeploymentIdentity;
-  readonly providerGeneration: Generation;
 }
 
 export interface PersistedProviderLoss extends JsonObject {
@@ -402,7 +402,7 @@ function providerLossDecisions(
     const requirementSource = consumer?.requires.find(
       (candidate) => candidate.name === previous.capability,
     );
-    if (consumer?.ready !== true || requirementSource === undefined) continue;
+    if (consumer?.activated !== true || requirementSource === undefined) continue;
     const explicit = ownBinding(consumer.bindings, previous.capability);
     if (explicit !== undefined && identityKey(explicit) !== identityKey(previous.provider)) {
       continue;

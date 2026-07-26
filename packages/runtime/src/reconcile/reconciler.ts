@@ -360,14 +360,21 @@ function parsePersistedProviderLoss(value: PersistedProviderLoss): PersistedProv
     ...(value.bindingPrerequisites === undefined
       ? {}
       : {
-          bindingPrerequisites: value.bindingPrerequisites.map((prerequisite) => ({
-            capability: parseCapabilityName(prerequisite?.capability),
-            provider: {
-              applicationId: parseApplicationId(prerequisite?.provider?.applicationId),
-              pluginId: parsePluginId(prerequisite?.provider?.pluginId),
-            },
-            providerGeneration: parseGeneration(prerequisite?.providerGeneration),
-          })),
+          bindingPrerequisites: value.bindingPrerequisites.map((prerequisite) => {
+            const legacy = prerequisite as ProviderRecoveryBindingPrerequisite & {
+              readonly providerGeneration?: unknown;
+            };
+            if (legacy.providerGeneration !== undefined) {
+              parseGeneration(legacy.providerGeneration);
+            }
+            return {
+              capability: parseCapabilityName(prerequisite?.capability),
+              provider: {
+                applicationId: parseApplicationId(prerequisite?.provider?.applicationId),
+                pluginId: parsePluginId(prerequisite?.provider?.pluginId),
+              },
+            };
+          }),
         }),
     ...(value.recoveryActivations === undefined
       ? {}
@@ -1192,7 +1199,6 @@ export class Reconciler {
       prerequisites.push({
         capability: parseCapabilityName(requirement.name),
         provider: binding.value.provider,
-        providerGeneration: provider.generation,
       });
     }
     return prerequisites;
@@ -1286,8 +1292,7 @@ export class Reconciler {
       const providerDeployment = deployments.find(
         (deployment) =>
           deployment.applicationId === prerequisite.provider.applicationId &&
-          deployment.pluginId === prerequisite.provider.pluginId &&
-          deployment.generation === prerequisite.providerGeneration,
+          deployment.pluginId === prerequisite.provider.pluginId,
       );
       if (providerDeployment === undefined) return false;
       const providerInstallation = installations.find(
@@ -1453,13 +1458,19 @@ export class Reconciler {
                   ? 1
                   : 0,
       );
-      const strongest = strongestProviderLoss(decisions);
+      const observedStrongest = strongestProviderLoss(decisions);
+      const strongest = (["fail", "suspend", "degrade"] as const).find(
+        (action) => current?.value.action === action || observedStrongest === action,
+      );
       const deploymentGate = gates.get(deploymentKey(deployment));
       const lostCapabilities = [
-        ...new Set(decisions.map((decision) => decision.capability)),
+        ...new Set([
+          ...(current?.value.capabilities ?? []),
+          ...decisions.map((decision) => decision.capability),
+        ]),
       ].sort();
       const bindingPrerequisites =
-        strongest === undefined
+        observedStrongest === undefined
           ? current?.value.bindingPrerequisites
           : this.#bindingPrerequisites(
               deployment,
@@ -1468,18 +1479,20 @@ export class Reconciler {
               capabilityBindings,
               new Set(lostCapabilities),
             );
-      const desired =
-        strongest === undefined
+      const desired: PersistedProviderLoss | undefined =
+        observedStrongest === undefined
           ? current?.value
           : {
               consumer,
               deploymentGeneration: deployment.generation,
-              action: strongest,
+              action: strongest ?? observedStrongest,
               capabilities: lostCapabilities,
               providers: [
                 ...new Map(
-                  decisions
-                    .map((decision) => decision.provider)
+                  [
+                    ...(current?.value.providers ?? []),
+                    ...decisions.map((decision) => decision.provider),
+                  ]
                     .sort((left, right) =>
                       deploymentKey(left) < deploymentKey(right)
                         ? -1
@@ -2278,6 +2291,9 @@ export class Reconciler {
           applicationId: candidate.applicationId,
           pluginId: candidate.pluginId,
         },
+        activated: candidateInstallation.manifest.components.every((component) =>
+          candidateInstances.some((instance) => instance.componentId === component.componentId),
+        ),
         ready:
           candidate.state === "active" &&
           candidateInstallation.manifest.components.every((component) =>

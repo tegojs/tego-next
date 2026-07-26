@@ -27,6 +27,7 @@ function deployment(
 ): CapabilityResolutionDeployment {
   return {
     identity: identity(pluginId),
+    activated: true,
     ready: true,
     provides: [],
     requires: [],
@@ -702,6 +703,7 @@ test("a consumer that was not ready does not receive provider loss actions", () 
   const result = resolveCapabilities({
     deployments: [
       deployment("consumer", {
+        activated: false,
         ready: false,
         requires: [{ name: echoName, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
       }),
