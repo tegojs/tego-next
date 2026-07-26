@@ -4,6 +4,7 @@ import {
   parseArtifactDigest,
   parsePluginManifest,
   runtimeDiagnostic,
+  serializeCause,
   type ArtifactDigest,
   type JsonObject,
   type PluginManifest,
@@ -39,6 +40,16 @@ export interface ReadPluginArtifact {
   readonly archiveDigest: ArtifactDigest;
   readonly manifest: PluginManifest;
   readonly files: ArtifactFilesMetadata;
+}
+
+export interface ArtifactEntryWriter {
+  write(chunk: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort?(cause: unknown): Promise<void>;
+}
+
+export interface ArtifactReadObserver {
+  open(entry: { readonly path: string; readonly size: number }): Promise<ArtifactEntryWriter>;
 }
 
 function artifactError(code: `ARTIFACT_${string}`, message: string, details?: JsonObject) {
@@ -246,21 +257,38 @@ function parseHeader(header: Uint8Array): ParsedHeader {
 
 async function readEntry(
   reader: BoundedStreamReader,
+  path: string,
   size: number,
   captureLimit: number | undefined,
+  observer: ArtifactReadObserver | undefined,
 ): Promise<{ readonly bytes?: Uint8Array; readonly digest: ArtifactDigest }> {
   const capture = captureLimit === undefined ? undefined : new Uint8Array(size);
   const hash = createHash("sha256");
+  const writer = await observer?.open({ path, size });
   let offset = 0;
-  while (offset < size) {
-    const length = Math.min(64 * 1024, size - offset);
-    const chunk = await reader.readExact(length);
-    if (chunk === undefined) {
-      throw artifactError("ARTIFACT_ARCHIVE_TRUNCATED", "Plugin archive is truncated");
+  try {
+    while (offset < size) {
+      const length = Math.min(64 * 1024, size - offset);
+      const chunk = await reader.readExact(length);
+      if (chunk === undefined) {
+        throw artifactError("ARTIFACT_ARCHIVE_TRUNCATED", "Plugin archive is truncated");
+      }
+      hash.update(chunk);
+      capture?.set(chunk, offset);
+      await writer?.write(chunk);
+      offset += length;
     }
-    hash.update(chunk);
-    capture?.set(chunk, offset);
-    offset += length;
+    await writer?.close();
+  } catch (error) {
+    try {
+      await writer?.abort?.(error);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Artifact entry read failed and its writer could not be aborted",
+      );
+    }
+    throw error;
   }
   const padding = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
   if (padding > 0) {
@@ -346,6 +374,7 @@ function parseFilesMetadata(input: unknown): ArtifactFilesMetadata {
 export async function readPluginArtifact(
   source: AsyncIterable<Uint8Array>,
   limits: ArtifactReadLimits = {},
+  observer?: ArtifactReadObserver,
 ): Promise<ReadPluginArtifact> {
   const maxArchiveBytes = boundedPositiveInteger(
     limits.maxArchiveBytes,
@@ -424,7 +453,7 @@ export async function readPluginArtifact(
           { maxEntryBytes: captureLimit, path: parsed.path, size: parsed.size },
         );
       }
-      const contents = await readEntry(reader, parsed.size, captureLimit);
+      const contents = await readEntry(reader, parsed.path, parsed.size, captureLimit, observer);
       entries.set(parsed.path, { digest: contents.digest, size: parsed.size });
       collisionKeys.set(collisionKey, parsed.path);
       if (parsed.path === "manifest.json") manifestBytes = contents.bytes;
@@ -485,7 +514,21 @@ export async function readPluginArtifact(
   } catch (error) {
     try {
       await reader.close();
-    } catch {}
+    } catch (cleanupError) {
+      throw artifactError(
+        "ARTIFACT_READER_CLEANUP_FAILED",
+        "Artifact parsing failed and its source iterator could not be closed",
+        {
+          causes: [
+            {
+              ...serializeCause(error),
+              ...(error instanceof DiagnosticError ? { code: error.diagnostic.code } : {}),
+            },
+            serializeCause(cleanupError),
+          ],
+        },
+      );
+    }
     throw error;
   }
   await reader.close();

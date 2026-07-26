@@ -1,5 +1,7 @@
 import {
+  parseAttemptId,
   parseExecutionResult,
+  parseTaskId,
   type Clock,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -43,6 +45,11 @@ const DEFAULT_MAX_INVENTORY = 512;
 const INVENTORY_ENVELOPE_RESERVE_BYTES = 4 * 1024;
 const MAX_PERSISTENCE_ATTEMPTS = 8;
 
+export interface WorkerAssignmentRejection {
+  readonly code: RuntimeDiagnostic["code"];
+  readonly message: string;
+}
+
 class AttemptPersistenceUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -56,6 +63,9 @@ export interface WorkerRuntimeOptions {
   readonly attemptStore: RemoteAttemptStore;
   readonly resultStore?: RemoteResultStore;
   readonly selectExecutor: (request: ExecutionRequest) => Executor | Promise<Executor>;
+  readonly validateAssignment?: (
+    request: ExecutionRequest,
+  ) => Promise<WorkerAssignmentRejection | undefined> | WorkerAssignmentRejection | undefined;
   readonly preparedArtifacts?: () => readonly string[] | Promise<readonly string[]>;
   readonly maxAssignments?: number;
   readonly maxAssignmentBytes?: number;
@@ -88,6 +98,7 @@ export class WorkerRuntime {
   readonly #attemptStore: RemoteAttemptStore;
   readonly #resultStore: RemoteResultStore | undefined;
   readonly #selectExecutor: WorkerRuntimeOptions["selectExecutor"];
+  readonly #validateAssignment: WorkerRuntimeOptions["validateAssignment"];
   readonly #preparedArtifacts: WorkerRuntimeOptions["preparedArtifacts"];
   readonly #maxAssignments: number;
   readonly #maxAssignmentBytes: number;
@@ -106,6 +117,7 @@ export class WorkerRuntime {
   #attachChain = Promise.resolve();
   #highestEpoch = 0n;
   #hydrated = false;
+  #initialization?: Promise<void>;
   #recovered = false;
   #closed = false;
   #reservedResults = 0;
@@ -119,6 +131,7 @@ export class WorkerRuntime {
     this.#attemptStore = options.attemptStore;
     this.#resultStore = options.resultStore;
     this.#selectExecutor = options.selectExecutor;
+    this.#validateAssignment = options.validateAssignment;
     this.#preparedArtifacts = options.preparedArtifacts;
     this.#maxAssignments = positiveLimit(
       options.maxAssignments,
@@ -180,6 +193,14 @@ export class WorkerRuntime {
     return this.#results.count;
   }
 
+  initialize(): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error("Worker runtime is closed"));
+    if (this.#initialization === undefined) {
+      this.#initialization = this.#hydrate();
+    }
+    return this.#initialization;
+  }
+
   attach(session: RemoteSession): Promise<void> {
     const attached = this.#attachChain.then(async () => this.#attach(session));
     this.#attachChain = attached.catch(() => undefined);
@@ -191,7 +212,7 @@ export class WorkerRuntime {
     if (session.state !== "ready" || !session.available) {
       throw new Error("Worker session must be ready before attaching execution");
     }
-    await this.#hydrate();
+    await this.initialize();
     const epoch = BigInt(session.epoch);
     if (epoch <= this.#highestEpoch && this.#session !== session) {
       throw new Error("Worker runtime session epoch is stale");
@@ -426,6 +447,30 @@ export class WorkerRuntime {
       throw new Error("Remote assignment exceeds maxAssignmentBytes");
     }
     const request = parseRemoteRequest(payload.request);
+    if (
+      request.target.executor.type !== "remote" ||
+      request.target.executor.workerId !== this.#workerId
+    ) {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        "PROTOCOL_EXECUTION_TARGET_INVALID",
+        "Execution request target does not match this Worker",
+      );
+      return;
+    }
+    const rejection = await this.#validateAssignment?.(request);
+    if (rejection !== undefined) {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        rejection.code,
+        rejection.message,
+      );
+      return;
+    }
     const key = attemptKey(request.taskId, request.attemptId);
     const fingerprint = requestFingerprint(request);
     if (await this.#rejectUnavailableAttemptStore(session, message.messageId, request)) return;
@@ -1294,15 +1339,8 @@ function identityFrom(payload: Record<string, JsonValue>): {
   readonly taskId: ExecutionRequest["taskId"];
   readonly attemptId: ExecutionRequest["attemptId"];
 } {
-  const request = parseRemoteRequest({
-    taskId: payload.taskId,
-    attemptId: payload.attemptId,
-    applicationId: "remote-identity",
-    pluginId: "remote.identity",
-    componentId: "identity",
-    input: null,
-    deadline: new Date(0).toISOString(),
-    orphanPolicy: "cancel",
-  });
-  return identity(request);
+  return {
+    taskId: parseTaskId(payload.taskId),
+    attemptId: parseAttemptId(payload.attemptId),
+  };
 }

@@ -1,9 +1,13 @@
 import {
   parseApplicationId,
+  parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginId,
   parseTaskId,
+  parseWorkerId,
   runtimeDiagnostic,
   type AttemptId,
   type AttemptStatus,
@@ -335,10 +339,23 @@ export function executionRequest(
   input: JsonValue,
   suffix: string,
   orphanPolicy: ExecutionRequest["orphanPolicy"] = "cancel",
+  targetWorkerId = parseWorkerId("worker-remote"),
 ): ExecutionRequest {
   return {
     taskId: parseTaskId(`remote-task-${suffix}`),
     attemptId: parseAttemptId(`remote-attempt-${suffix}`),
+    target: {
+      instanceId: parseComponentInstanceId("app.org.example.remote.echo.g1"),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: parseArtifactDigest(
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      ),
+      executor: {
+        id: "remote",
+        type: "remote",
+        workerId: targetWorkerId,
+      },
+    },
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.remote"),
     componentId: parseComponentId("echo"),

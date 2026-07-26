@@ -1,6 +1,8 @@
 import type { ApplicationId, FencingEpoch, NodeId, RuntimeId } from "./identity.js";
 import type { JsonObject } from "./json.js";
-import type { DriverHealth, PersistedOperationJournalEntry } from "./state.js";
+import type { RuntimeOperations } from "./operations.js";
+import type { WorkerResourceCeilings } from "./permission.js";
+import type { DriverHealth } from "./state.js";
 
 export type RuntimeMode = "multi-main" | "single-main";
 
@@ -48,6 +50,26 @@ export interface RuntimeAuthority extends JsonObject {
   readonly epoch: FencingEpoch;
 }
 
+export interface RuntimePlacementWorker extends JsonObject {
+  readonly workerId: string;
+  readonly labels: Readonly<Record<string, string>>;
+  readonly resources: WorkerResourceCeilings;
+}
+
+export interface RuntimeTaskLifecycle {
+  recover(): Promise<void>;
+  setAuthority(authority: RuntimeAuthority | undefined): Promise<void>;
+  count(): number;
+  close(): Promise<void>;
+}
+
+export interface RuntimeWorkerDirectory {
+  setAuthority(authority: RuntimeAuthority | undefined): Promise<void>;
+  count(): number;
+  placements(): readonly RuntimePlacementWorker[];
+  close(): Promise<void>;
+}
+
 export interface RuntimeStatus extends JsonObject {
   readonly identity: RuntimeIdentity;
   readonly mode: RuntimeMode;
@@ -69,10 +91,6 @@ export interface RuntimeEvent extends JsonObject {
   readonly previous: RuntimeLifecycleState;
   readonly current: RuntimeLifecycleState;
   readonly occurredAt: string;
-}
-
-export interface RuntimeOperations {
-  recoveredOperations(): Promise<readonly PersistedOperationJournalEntry[]>;
 }
 
 export interface Runtime {

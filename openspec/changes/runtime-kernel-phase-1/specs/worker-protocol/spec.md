@@ -46,3 +46,14 @@ The runtime SHALL apply `cancel`, `finish-and-buffer`, or `finish-and-persist` w
 #### Scenario: Cancel orphaned work
 - **WHEN** a session is lost for a task whose orphan policy is `cancel`
 - **THEN** the Worker cancels the attempt and reports the terminal state on reconnect
+
+### Requirement: Real process transport acceptance
+The certified WebSocket transport SHALL pass black-box system tests with Main and Worker running as independent operating-system processes.
+
+#### Scenario: Independent Worker process
+- **WHEN** a Worker process connects to a Main process through a real WebSocket TCP endpoint
+- **THEN** authentication, registration, heartbeat, assignment, acknowledgement, execution, and terminal-result delivery cross only the public transport and runtime boundaries
+
+#### Scenario: Network disconnect and reconnect
+- **WHEN** the system test interrupts the real WebSocket connection while an attempt is running
+- **THEN** the configured orphan policy is applied and reconnect reconciliation produces no duplicate authoritative result

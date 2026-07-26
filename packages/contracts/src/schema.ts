@@ -8,7 +8,11 @@ import {
   type RuntimeDiagnostic,
   runtimeDiagnostic,
 } from "./diagnostic.js";
-import type { ExecutionRequest, ExecutionResult } from "./execution.js";
+import {
+  type ExecutionRequest,
+  type ExecutionResult,
+  parseTaskExecutionTarget,
+} from "./execution.js";
 import type { Leadership } from "./drivers.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
 import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
@@ -28,6 +32,8 @@ export interface SchemaIssue {
 }
 
 const IDENTITY_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
+const EXECUTOR_ID_PATTERN =
+  "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9._-])?$";
 const DECIMAL_PATTERN = "^(?:0|[1-9]\\d*)$";
 const SEMVER_PATTERN =
   "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$";
@@ -649,6 +655,7 @@ const executionRequestSchema = {
   required: [
     "taskId",
     "attemptId",
+    "target",
     "applicationId",
     "pluginId",
     "componentId",
@@ -659,6 +666,26 @@ const executionRequestSchema = {
   properties: {
     taskId: { $ref: "#/$defs/identity" },
     attemptId: { $ref: "#/$defs/identity" },
+    target: {
+      type: "object",
+      additionalProperties: false,
+      required: ["instanceId", "deploymentGeneration", "artifactDigest", "executor"],
+      properties: {
+        instanceId: { $ref: "#/$defs/identity" },
+        deploymentGeneration: { type: "string", pattern: DECIMAL_PATTERN, maxLength: 20 },
+        artifactDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+        executor: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "type"],
+          properties: {
+            id: { type: "string", pattern: EXECUTOR_ID_PATTERN },
+            type: { enum: ["process", "remote", "thread"] },
+            workerId: { $ref: "#/$defs/identity" },
+          },
+        },
+      },
+    },
     applicationId: { $ref: "#/$defs/identity" },
     pluginId: { $ref: "#/$defs/identity" },
     componentId: { $ref: "#/$defs/identity" },
@@ -1029,13 +1056,15 @@ export function parseCapabilityBinding(input: unknown): CapabilityBinding {
 }
 
 export function parseExecutionRequest(input: unknown): ExecutionRequest {
-  return parseWithValidator(
+  const parsed = parseWithValidator<ExecutionRequest>(
     validateExecutionRequest,
     input,
     "EXECUTOR_REQUEST_INVALID",
     "Execution request is invalid",
     { kind: "executor", id: "request" },
   );
+  parseTaskExecutionTarget(parsed.target);
+  return parsed;
 }
 
 export function parseExecutionResult(input: unknown): ExecutionResult {

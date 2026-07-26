@@ -1,6 +1,8 @@
 import type { Stats } from "node:fs";
 import { lstat, realpath, stat } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import { extname, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 import {
   DiagnosticError,
@@ -26,6 +28,76 @@ interface RootDigestBinding {
 }
 
 const ROOT_DIGEST_BINDINGS = new Map<string, RootDigestBinding>();
+const PLUGIN_SDK_SPECIFIER = "@tegojs/plugin-sdk";
+const PLUGIN_SDK_URL = import.meta.resolve(PLUGIN_SDK_SPECIFIER);
+const SDK_RESOLUTION_STATE = Symbol.for("tego.executor-node.plugin-sdk-resolution");
+
+interface SdkResolutionState {
+  installed: boolean;
+  readonly activeRoots: Map<string, number>;
+}
+
+const globals = globalThis as typeof globalThis & {
+  [SDK_RESOLUTION_STATE]?: SdkResolutionState;
+};
+function sharedSdkResolutionState(): SdkResolutionState {
+  const existing = globals[SDK_RESOLUTION_STATE];
+  if (existing !== undefined) {
+    return existing;
+  }
+  const created = {
+    installed: false,
+    activeRoots: new Map<string, number>(),
+  };
+  globals[SDK_RESOLUTION_STATE] = created;
+  return created;
+}
+const sdkResolutionState = sharedSdkResolutionState();
+
+function isBoundArtifactParent(parentURL: string | undefined): boolean {
+  if (parentURL === undefined || !parentURL.startsWith("file:")) {
+    return false;
+  }
+  const parentPath = fileURLToPath(parentURL);
+  for (const root of sdkResolutionState.activeRoots.keys()) {
+    if (confined(root, parentPath)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function activateSdkResolution(root: string): () => void {
+  sdkResolutionState.activeRoots.set(root, (sdkResolutionState.activeRoots.get(root) ?? 0) + 1);
+  let active = true;
+  return () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    const references = sdkResolutionState.activeRoots.get(root);
+    if (references === undefined || references <= 1) {
+      sdkResolutionState.activeRoots.delete(root);
+      return;
+    }
+    sdkResolutionState.activeRoots.set(root, references - 1);
+  };
+}
+
+if (!sdkResolutionState.installed) {
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === PLUGIN_SDK_SPECIFIER && isBoundArtifactParent(context.parentURL)) {
+        return {
+          shortCircuit: true,
+          url: PLUGIN_SDK_URL,
+        };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  sdkResolutionState.installed = true;
+}
 
 export interface PreparedArtifactBinding {
   readonly [PREPARED_ARTIFACT]: true;
@@ -293,7 +365,10 @@ export async function loadPreparedComponent(
       "Component entrypoint resolves outside the prepared artifact root",
     );
   }
-  const namespace = (await import(pathToFileURL(entrypoint).href)) as Record<string, unknown>;
+  const deactivateSdkResolution = activateSdkResolution(root);
+  const namespace = (await import(pathToFileURL(entrypoint).href).finally(
+    deactivateSdkResolution,
+  )) as Record<string, unknown>;
   const descriptor = Object.getOwnPropertyDescriptor(namespace, "default");
   if (descriptor === undefined || !("value" in descriptor)) {
     throw loaderError(

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { isPortableStateString, stateStringOrderKey } from "@tegojs/contracts";
 
 const migrations = [
   `
@@ -135,51 +136,131 @@ const migrations = [
     CREATE INDEX outbox_delivery
       ON outbox(available_at, enqueue_sequence, message_id);
   `,
+  `
+    ALTER TABLE records
+      ADD COLUMN record_id_order_key BLOB;
+
+    CREATE INDEX records_scan_order
+      ON records(namespace, collection_name, record_id_order_key);
+
+    CREATE TRIGGER records_order_key_insert
+    BEFORE INSERT ON records
+    WHEN NEW.record_id_order_key IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'record_id_order_key is required');
+    END;
+
+    CREATE TRIGGER records_order_key_update
+    BEFORE UPDATE OF record_id_order_key ON records
+    WHEN NEW.record_id_order_key IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'record_id_order_key is required');
+    END;
+  `,
+  `
+    CREATE TABLE operation_history (
+      operation_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      state_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      revision INTEGER NOT NULL REFERENCES revisions(revision),
+      PRIMARY KEY (revision, operation_id)
+    ) STRICT, WITHOUT ROWID;
+
+    INSERT INTO operation_history(
+      operation_id,
+      kind,
+      status,
+      state_json,
+      updated_at,
+      revision
+    )
+    SELECT operation_id, kind, status, state_json, updated_at, revision
+    FROM operations;
+  `,
 ] as const;
 
 export const sqliteSchemaVersion = migrations.length;
 
 export function applySqliteMigrations(database: DatabaseSync, now: Date): void {
-  database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA journal_mode = WAL");
-  database.exec("PRAGMA synchronous = FULL");
-  database.exec("PRAGMA busy_timeout = 0");
-
-  database.exec("BEGIN IMMEDIATE");
+  database.exec("PRAGMA busy_timeout = 5000");
   try {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      ) STRICT
-    `);
+    database.exec("PRAGMA foreign_keys = ON");
+    database.exec("PRAGMA journal_mode = WAL");
+    database.exec("PRAGMA synchronous = FULL");
 
-    const latest = database
-      .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-      .get()?.version;
-    if (typeof latest === "number" && latest > sqliteSchemaVersion) {
-      throw new Error(
-        `SQLite state schema ${String(latest)} is newer than supported version ${String(sqliteSchemaVersion)}`,
-      );
-    }
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        ) STRICT
+      `);
 
-    const applied = database.prepare(
-      "SELECT 1 AS applied FROM schema_migrations WHERE version = ?",
-    );
-    const record = database.prepare(
-      "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-    );
-    for (let index = 0; index < migrations.length; index += 1) {
-      const version = index + 1;
-      if (applied.get(version) !== undefined) {
-        continue;
+      const latest = database
+        .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+        .get()?.version;
+      if (typeof latest === "number" && latest > sqliteSchemaVersion) {
+        throw new Error(
+          `SQLite state schema ${String(latest)} is newer than supported version ${String(sqliteSchemaVersion)}`,
+        );
       }
-      database.exec(migrations[index] ?? "");
-      record.run(version, now.toISOString());
+
+      const applied = database.prepare(
+        "SELECT 1 AS applied FROM schema_migrations WHERE version = ?",
+      );
+      const record = database.prepare(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+      );
+      for (let index = 0; index < migrations.length; index += 1) {
+        const version = index + 1;
+        if (applied.get(version) !== undefined) {
+          continue;
+        }
+        database.exec(migrations[index] ?? "");
+        record.run(version, now.toISOString());
+      }
+
+      const missingOrderKeys = database
+        .prepare(
+          `
+            SELECT namespace, collection_name, record_id
+            FROM records
+            WHERE record_id_order_key IS NULL
+          `,
+        )
+        .all();
+      const updateOrderKey = database.prepare(
+        `
+          UPDATE records
+          SET record_id_order_key = ?
+          WHERE namespace = ? AND collection_name = ? AND record_id = ?
+        `,
+      );
+      for (const row of missingOrderKeys) {
+        const namespace = row.namespace;
+        const collection = row.collection_name;
+        const id = row.record_id;
+        if (
+          typeof namespace !== "string" ||
+          typeof collection !== "string" ||
+          typeof id !== "string" ||
+          !isPortableStateString(namespace) ||
+          !isPortableStateString(collection) ||
+          !isPortableStateString(id)
+        ) {
+          throw new Error("SQLite state contains a non-portable state key");
+        }
+        updateOrderKey.run(Buffer.from(stateStringOrderKey(id)), namespace, collection, id);
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
     }
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
+  } finally {
+    database.exec("PRAGMA busy_timeout = 0");
   }
 }

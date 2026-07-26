@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  DiagnosticError,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
+  STATE_QUERY_MAX_LIMIT,
   diagnosticCode,
   compareOperationJournalCursors,
   parseFencingEpoch,
@@ -64,6 +66,39 @@ async function recoverableOperations(
     entries.push(entry);
   }
   return entries;
+}
+
+async function operations(
+  store: StateStore,
+  query: Parameters<StateStore["scanOperations"]>[0] = {},
+): Promise<readonly PersistedOperationJournalEntry[]> {
+  const entries = [];
+  for await (const entry of store.scanOperations(query)) {
+    entries.push(entry);
+  }
+  return entries;
+}
+
+async function operationHistory(
+  store: StateStore,
+  query: Parameters<StateStore["scanOperationHistory"]>[0] = {},
+): Promise<readonly PersistedOperationJournalEntry[]> {
+  const entries = [];
+  for await (const entry of store.scanOperationHistory(query)) {
+    entries.push(entry);
+  }
+  return entries;
+}
+
+async function scannedIds(
+  store: StateStore,
+  query: Parameters<StateStore["scan"]>[0],
+): Promise<readonly string[]> {
+  const ids = [];
+  for await (const entry of store.scan(query)) {
+    ids.push(entry.key.id);
+  }
+  return ids;
 }
 
 export function stateStoreConformance(
@@ -209,6 +244,183 @@ export function stateStoreConformance(
 
         assert.deepEqual(scanned, ["-", "A", "_", "a"]);
         assert.deepEqual(changed, ["-", "A", "_", "a"]);
+      });
+    });
+
+    test("state scans page exclusively in stable code-unit identifier order", async () => {
+      await withStore(factory, async (store) => {
+        await store.transact({}, async (transaction) => {
+          for (const id of ["A", "_", "a", "-"]) {
+            await transaction.put(key("state-pagination", id), { label: id }, {});
+          }
+          return null;
+        });
+
+        const first = await scannedIds(store, {
+          namespace: "state-pagination",
+          collection: "examples",
+          limit: 2,
+        });
+        const firstCursor = first.at(-1);
+        assert.notEqual(firstCursor, undefined);
+        const second = await scannedIds(store, {
+          namespace: "state-pagination",
+          collection: "examples",
+          afterId: firstCursor ?? "",
+          limit: 2,
+        });
+        const secondCursor = second.at(-1);
+        assert.notEqual(secondCursor, undefined);
+        const exhausted = await scannedIds(store, {
+          namespace: "state-pagination",
+          collection: "examples",
+          afterId: secondCursor ?? "",
+          limit: 2,
+        });
+
+        assert.deepEqual(first, ["-", "A"]);
+        assert.deepEqual(second, ["_", "a"]);
+        assert.deepEqual(exhausted, []);
+        assert.deepEqual([...first, ...second], ["-", "A", "_", "a"]);
+      });
+    });
+
+    test("state keys and queries reject NUL and ill-formed Unicode consistently", async () => {
+      await withStore(factory, async (store) => {
+        const valid = key("portable-state", "valid");
+        const invalidStrings = ["nul\u0000value", "high-\uD800", "low-\uDC00"];
+
+        for (const invalid of invalidStrings) {
+          for (const invalidKey of [
+            { ...valid, namespace: invalid },
+            { ...valid, collection: invalid },
+            { ...valid, id: invalid },
+          ]) {
+            await assert.rejects(store.read(invalidKey), expectDiagnostic("STATE_QUERY_INVALID"));
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                await transaction.get(invalidKey);
+                return null;
+              }),
+              expectDiagnostic("STATE_QUERY_INVALID"),
+            );
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                await transaction.put(invalidKey, { label: "invalid" }, {});
+                return null;
+              }),
+              expectDiagnostic("STATE_DATA_INVALID"),
+            );
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                await transaction.delete(invalidKey, {});
+                return null;
+              }),
+              expectDiagnostic("STATE_DATA_INVALID"),
+            );
+          }
+
+          for (const invalidQuery of [
+            { namespace: invalid, collection: "examples" },
+            { namespace: "portable-state", collection: invalid },
+            { namespace: "portable-state", collection: "examples", idPrefix: invalid },
+            { namespace: "portable-state", collection: "examples", afterId: invalid },
+          ]) {
+            await assert.rejects(
+              scannedIds(store, invalidQuery),
+              expectDiagnostic("STATE_QUERY_INVALID"),
+            );
+            await assert.rejects(
+              store.transact({}, async (transaction) => {
+                for await (const _entry of transaction.scan(invalidQuery)) {
+                  // Invalid queries must fail before yielding state.
+                }
+                return null;
+              }),
+              expectDiagnostic("STATE_QUERY_INVALID"),
+            );
+          }
+        }
+      });
+    });
+
+    test("state prefix and cursor pagination use exact ECMAScript UTF-16 order", async () => {
+      await withStore(factory, async (store) => {
+        const astral = "group-\u{10000}";
+        const privateUseBmp = "group-\uE000";
+        for (const id of [privateUseBmp, "group-A", "other", astral]) {
+          await store.transact({}, async (transaction) => {
+            await transaction.put(key("unicode-pagination", id), { label: id }, {});
+            return null;
+          });
+        }
+
+        const first = await scannedIds(store, {
+          namespace: "unicode-pagination",
+          collection: "examples",
+          idPrefix: "group-",
+          limit: 2,
+        });
+        const second = await scannedIds(store, {
+          namespace: "unicode-pagination",
+          collection: "examples",
+          idPrefix: "group-",
+          afterId: astral,
+          limit: 2,
+        });
+
+        assert.deepEqual(first, ["group-A", astral]);
+        assert.deepEqual(second, [privateUseBmp]);
+        assert.deepEqual(await store.read(key("unicode-pagination", astral)), {
+          revision: parseRevision("4"),
+          value: { label: astral },
+        });
+      });
+    });
+
+    test("transaction state scans apply pagination after staged mutations", async () => {
+      await withStore(factory, async (store) => {
+        const first = key("transaction-pagination", "A");
+        const second = key("transaction-pagination", "B");
+        const third = key("transaction-pagination", "C");
+        await store.transact({}, async (transaction) => {
+          await transaction.put(first, { label: "A" }, {});
+          await transaction.put(second, { label: "B" }, {});
+          await transaction.put(third, { label: "C" }, {});
+          return null;
+        });
+
+        await store.transact({}, async (transaction) => {
+          await transaction.delete(first, {});
+          await transaction.delete(second, {});
+          await transaction.put(key("transaction-pagination", "D"), { label: "D" }, {});
+          const ids = [];
+          for await (const entry of transaction.scan<ExampleRecord>({
+            namespace: "transaction-pagination",
+            collection: "examples",
+            afterId: "B",
+            limit: 1,
+          })) {
+            ids.push(entry.key.id);
+          }
+          assert.deepEqual(ids, ["C"]);
+          return null;
+        });
+      });
+    });
+
+    test("state scan limit is a positive safe integer within the public maximum", async () => {
+      await withStore(factory, async (store) => {
+        for (const limit of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, STATE_QUERY_MAX_LIMIT + 1]) {
+          await assert.rejects(
+            scannedIds(store, {
+              namespace: "state-pagination",
+              collection: "examples",
+              limit,
+            }),
+            expectDiagnostic("STATE_QUERY_INVALID"),
+          );
+        }
       });
     });
 
@@ -934,6 +1146,184 @@ export function stateStoreConformance(
         assert.deepEqual(
           secondPage.map(({ operationId, revision }) => [operationId, revision]),
           [["operation-b", parseRevision("2")]],
+        );
+      });
+    });
+
+    test("operation scans return every latest status while recoverable scans remain filtered", async () => {
+      await withStore(factory, async (store) => {
+        await store.transact({}, async (transaction) => {
+          for (const [operationId, status] of [
+            ["operation-completed", "completed"],
+            ["operation-executing", "executing"],
+            ["operation-failed", "failed"],
+            ["operation-transitioned", "planned"],
+          ] as const) {
+            await transaction.appendOperation({
+              operationId: parseOperationId(operationId),
+              kind: "deploy",
+              status,
+              state: { status },
+              updatedAt: "2026-07-23T00:00:00.000Z",
+            });
+          }
+          return null;
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.appendOperation({
+            operationId: parseOperationId("operation-transitioned"),
+            kind: "deploy",
+            status: "completed",
+            state: { status: "completed" },
+            updatedAt: "2026-07-23T00:00:01.000Z",
+          });
+          return null;
+        });
+
+        const firstPage = await operations(store, { limit: 2 });
+        const cursor = {
+          revision: firstPage.at(-1)?.revision ?? parseRevision("0"),
+          operationId:
+            firstPage.at(-1)?.operationId ?? parseOperationId("missing-operation-cursor"),
+        };
+        const secondPage = await operations(store, { after: cursor, limit: 2 });
+
+        assert.deepEqual(
+          [...firstPage, ...secondPage].map(({ operationId, revision, status }) => [
+            operationId,
+            revision,
+            status,
+          ]),
+          [
+            ["operation-completed", parseRevision("1"), "completed"],
+            ["operation-executing", parseRevision("1"), "executing"],
+            ["operation-failed", parseRevision("1"), "failed"],
+            ["operation-transitioned", parseRevision("2"), "completed"],
+          ],
+        );
+        assert.deepEqual(
+          (await recoverableOperations(store)).map(({ operationId, status }) => [
+            operationId,
+            status,
+          ]),
+          [["operation-executing", "executing"]],
+        );
+
+        const firstHistoryPage = await operationHistory(store, { limit: 3 });
+        const historyCursor = firstHistoryPage.at(-1);
+        assert.ok(historyCursor);
+        const secondHistoryPage = await operationHistory(store, {
+          after: {
+            revision: historyCursor.revision,
+            operationId: historyCursor.operationId,
+          },
+          limit: 3,
+        });
+        assert.deepEqual(
+          [...firstHistoryPage, ...secondHistoryPage].map(({ operationId, revision, status }) => [
+            operationId,
+            revision,
+            status,
+          ]),
+          [
+            ["operation-completed", parseRevision("1"), "completed"],
+            ["operation-executing", parseRevision("1"), "executing"],
+            ["operation-failed", parseRevision("1"), "failed"],
+            ["operation-transitioned", parseRevision("1"), "planned"],
+            ["operation-transitioned", parseRevision("2"), "completed"],
+          ],
+        );
+      });
+    });
+
+    test("duplicate operation appends reject atomically with one structured diagnostic", async () => {
+      await withStore(factory, async (store) => {
+        const duplicateId = parseOperationId("operation-duplicate");
+        let rejection: unknown;
+        try {
+          await store.transact({}, async (transaction) => {
+            await transaction.appendOperation({
+              operationId: duplicateId,
+              kind: "deploy",
+              status: "planned",
+              state: { step: 1 },
+              updatedAt: "2026-07-25T00:00:00.000Z",
+            });
+            await transaction.appendOperation({
+              operationId: duplicateId,
+              kind: "deploy",
+              status: "executing",
+              state: { step: 2 },
+              updatedAt: "2026-07-25T00:00:01.000Z",
+            });
+            return null;
+          });
+        } catch (error) {
+          rejection = error;
+        }
+
+        assert.ok(rejection instanceof DiagnosticError);
+        assert.deepEqual(
+          {
+            code: rejection.diagnostic.code,
+            message: rejection.diagnostic.message,
+            sourceKind: rejection.diagnostic.source.kind,
+            retryable: rejection.diagnostic.retryable,
+            details: rejection.diagnostic.details,
+          },
+          {
+            code: "STATE_DATA_INVALID",
+            message: "An operation may be appended only once per state transaction",
+            sourceKind: "state",
+            retryable: false,
+            details: { operationId: duplicateId },
+          },
+        );
+        assert.deepEqual(
+          (await operations(store)).filter((entry) => entry.operationId === duplicateId),
+          [],
+        );
+        assert.deepEqual(
+          (await operationHistory(store)).filter((entry) => entry.operationId === duplicateId),
+          [],
+        );
+
+        const firstId = parseOperationId("operation-a");
+        const secondId = parseOperationId("operation-b");
+        await store.transact({}, async (transaction) => {
+          for (const operationId of [firstId, secondId]) {
+            await transaction.appendOperation({
+              operationId,
+              kind: "deploy",
+              status: "planned",
+              state: { operationId },
+              updatedAt: "2026-07-25T00:00:02.000Z",
+            });
+          }
+          return null;
+        });
+        await store.transact({}, async (transaction) => {
+          await transaction.appendOperation({
+            operationId: firstId,
+            kind: "deploy",
+            status: "completed",
+            state: { operationId: firstId },
+            updatedAt: "2026-07-25T00:00:03.000Z",
+          });
+          return null;
+        });
+
+        assert.deepEqual(
+          (await operationHistory(store)).map(({ operationId, revision, status }) => [
+            operationId,
+            revision,
+            status,
+          ]),
+          [
+            [firstId, parseRevision("1"), "planned"],
+            [secondId, parseRevision("1"), "planned"],
+            [firstId, parseRevision("2"), "completed"],
+          ],
         );
       });
     });

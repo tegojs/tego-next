@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate as yieldToEventLoop, setTimeout as delay } from "node:timers/promises";
 import { diagnosticCode, parseRevision } from "@tegojs/contracts";
 import { Pool } from "pg";
 import { PostgresCoordinationProvider, PostgresStateStore } from "../src/index.js";
@@ -65,6 +65,48 @@ async function terminateNotificationBackends(sharedNamespace: string): Promise<v
   }
 }
 
+async function waitForAdvisoryWaiterCount(
+  sharedNamespace: string,
+  expected: number,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const admin = new Pool({ connectionString });
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      const result = await admin.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
+           FROM pg_stat_activity AS activity
+           JOIN pg_locks AS locks ON locks.pid = activity.pid
+          WHERE activity.application_name = $1
+            AND locks.locktype = 'advisory'
+            AND NOT locks.granted`,
+        [`tego:${sharedNamespace}:coordination`.slice(0, 63)],
+      );
+      if (result.rows[0]?.waiting === String(expected)) return;
+      await yieldToEventLoop();
+    }
+    throw new Error(`Timed out waiting for ${expected} blocked leadership campaigns`);
+  } finally {
+    await admin.end();
+  }
+}
+
+async function coordinationBackendCount(sharedNamespace: string): Promise<number> {
+  const admin = new Pool({ connectionString });
+  try {
+    const result = await admin.query<{ connections: string }>(
+      `SELECT count(*)::text AS connections
+         FROM pg_stat_activity AS activity
+        WHERE activity.application_name = $1`,
+      [`tego:${sharedNamespace}:coordination`.slice(0, 63)],
+    );
+    return Number(result.rows[0]?.connections ?? "-1");
+  } finally {
+    await admin.end();
+  }
+}
+
 test("a stale leader is fenced immediately after takeover before the new leader writes state", async () => {
   const sharedNamespace = namespace("takeover");
   const firstCoordination = new PostgresCoordinationProvider({
@@ -94,14 +136,18 @@ test("a stale leader is fenced immediately after takeover before the new leader 
     const takeover = secondCoordination.campaign({ resource: "runtime" });
     await terminateLeadershipBackend(sharedNamespace);
     const second = await within(takeover, "Timed out waiting for leadership takeover");
-    assert.ok(BigInt(second.epoch) > BigInt(first.epoch));
+    assert.ok(BigInt(second.leadership.epoch) > BigInt(first.leadership.epoch));
 
     const staleKey = { namespace: "runtime", collection: "authority", id: "stale" };
     await assert.rejects(
       staleState.transact(
-        { fencing: { resource: "runtime", epoch: first.epoch } },
+        { fencing: { resource: "runtime", epoch: first.leadership.epoch } },
         async (transaction) => {
-          await transaction.put(staleKey, { epoch: first.epoch }, { expectedRevision: "absent" });
+          await transaction.put(
+            staleKey,
+            { epoch: first.leadership.epoch },
+            { expectedRevision: "absent" },
+          );
           return null;
         },
       ),
@@ -110,11 +156,11 @@ test("a stale leader is fenced immediately after takeover before the new leader 
     assert.equal(await staleState.read(staleKey), undefined);
 
     await currentState.transact(
-      { fencing: { resource: "runtime", epoch: second.epoch } },
+      { fencing: { resource: "runtime", epoch: second.leadership.epoch } },
       async (transaction) => {
         await transaction.put(
           { namespace: "runtime", collection: "authority", id: "current" },
-          { epoch: second.epoch },
+          { epoch: second.leadership.epoch },
           { expectedRevision: "absent" },
         );
         return null;
@@ -130,7 +176,7 @@ test("a stale leader is fenced immediately after takeover before the new leader 
   }
 });
 
-test("unexpected leadership backend termination releases the advisory lock with a higher epoch", async () => {
+test("@spec:coordination-provider/fenced-leadership/observable-loss", async () => {
   const sharedNamespace = namespace("backend_death");
   const firstCoordination = new PostgresCoordinationProvider({
     connectionString,
@@ -147,26 +193,94 @@ test("unexpected leadership backend termination releases the advisory lock with 
 
     await terminateLeadershipBackend(sharedNamespace);
 
-    const second = await within(takeover, "Timed out waiting for the advisory lock to release");
-    assert.ok(BigInt(second.epoch) > BigInt(first.epoch));
+    const diagnostic = await within(first.lost, "Timed out waiting for leadership loss");
+    assert.equal(diagnostic.code, "COORDINATION_LEADERSHIP_LOST");
+    assert.equal(diagnostic.retryable, true);
 
-    let reacquisitionSettled = false;
-    const reacquisition = firstCoordination.campaign({ resource: "runtime" }).then((leadership) => {
-      reacquisitionSettled = true;
-      return leadership;
-    });
-    await delay(25);
-    assert.equal(reacquisitionSettled, false);
+    const second = await within(takeover, "Timed out waiting for the advisory lock to release");
+    assert.ok(BigInt(second.leadership.epoch) > BigInt(first.leadership.epoch));
+
+    const reacquisition = firstCoordination.campaign({ resource: "runtime" });
 
     await secondCoordination.close();
     const third = await within(reacquisition, "Timed out waiting for the terminated provider");
-    assert.ok(BigInt(third.epoch) > BigInt(second.epoch));
+    assert.ok(BigInt(third.leadership.epoch) > BigInt(second.leadership.epoch));
     assert.equal("terminateLeadershipConnectionForTest" in firstCoordination, false);
     assert.equal("interruptNotificationsForTest" in firstCoordination, false);
     assert.equal("scanChanges" in firstCoordination, false);
     assert.equal("removeWatch" in firstCoordination, false);
   } finally {
     await Promise.all([firstCoordination.close(), secondCoordination.close()]);
+  }
+});
+
+test("@spec:coordination-provider/fenced-leadership/close-during-acquisition", async () => {
+  const sharedNamespace = namespace("close_acquiring");
+  const providerA = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const providerB = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  await Promise.all([providerA.open(), providerB.open()]);
+  const first = await providerA.campaign({ resource: "runtime" });
+  const pending = providerB.campaign({ resource: "runtime" });
+  const pendingOutcome = pending.then(
+    () => {
+      throw new Error("Blocked leadership campaign unexpectedly acquired leadership");
+    },
+    (error: unknown) => error,
+  );
+  try {
+    await waitForAdvisoryWaiterCount(sharedNamespace, 1);
+    await within(providerB.close(), "Timed out closing a provider with a pending campaign");
+    const error = await within(pendingOutcome, "Timed out settling the pending campaign");
+    assert.ok(error instanceof Error);
+    await waitForAdvisoryWaiterCount(sharedNamespace, 0);
+  } finally {
+    await within(first.release(), "Timed out releasing the held leadership");
+    await Promise.all([providerA.close(), providerB.close()]);
+  }
+});
+
+test("@spec:coordination-provider/fenced-leadership/close-while-campaign-waits-for-pool", async () => {
+  const sharedNamespace = namespace("close_pool_waiter");
+  const providerA = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  const providerB = new PostgresCoordinationProvider({
+    connectionString,
+    namespace: sharedNamespace,
+  });
+  await Promise.all([providerA.open(), providerB.open()]);
+  const held = await providerA.campaign({ resource: "contended" });
+  await Promise.all(
+    Array.from({ length: 19 }, (_, index) =>
+      providerB.campaign({ resource: `pool-filler:${index}` }),
+    ),
+  );
+  assert.equal(await coordinationBackendCount(sharedNamespace), 22);
+
+  const pending = providerB.campaign({ resource: "contended" });
+  const pendingOutcome = pending.then(
+    () => {
+      throw new Error("Pool-blocked campaign unexpectedly acquired leadership");
+    },
+    (error: unknown) => error,
+  );
+  await waitForAdvisoryWaiterCount(sharedNamespace, 0);
+  const closePromise = providerB.close();
+  try {
+    await within(closePromise, "Timed out closing a provider with a pool-blocked campaign", 500);
+    const error = await within(pendingOutcome, "Timed out settling the pool-blocked campaign");
+    assert.equal(diagnosticCode(error), "COORDINATION_CLOSED");
+    await waitForAdvisoryWaiterCount(sharedNamespace, 0);
+  } finally {
+    await within(held.release(), "Timed out releasing the contended leadership");
+    await Promise.all([closePromise, providerA.close(), providerB.close()]);
   }
 });
 

@@ -2,8 +2,8 @@
 
 - [x] 1.1 Pin Node.js 26, npm, TypeScript 7, workspace metadata, ESM compiler settings, formatting, linting, and deterministic install configuration
 - [x] 1.2 Add the package dependency graph and an architecture test that rejects forbidden layer-two, frontend, and Tego 1.x imports
-- [ ] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, eventual assertions, and leak detection
-- [ ] 1.4 Add CI jobs for Node 26 static checks, unit tests, package tests, PostgreSQL integration tests, build, and smoke verification
+- [ ] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, event-driven eventual assertions, real child-process orchestration, per-process logs, and leak detection
+- [x] 1.4 Add separate GitHub Actions quality, integration, and system-E2E jobs using the exact pinned Node 26 version, PostgreSQL 16 service health checks, bounded timeouts, and diagnostic artifact upload
 
 ## 2. Runtime Contracts
 
@@ -21,14 +21,14 @@
 - [x] 3.4 Define the coordination-provider conformance suite for leadership, leases, fencing, CAS, watch, namespaces, idempotency, and close
 - [x] 3.5 Implement the local single-Main coordination provider until it passes all applicable conformance scenarios
 - [x] 3.6 Implement PostgreSQL schema migrations, leadership, lease, fencing, CAS, watch catch-up, and cleanup test-first
-- [ ] 3.7 Run PostgreSQL takeover and stale-leader fault tests against a pinned Docker image
+- [x] 3.7 Run PostgreSQL takeover and stale-leader fault tests against a pinned PostgreSQL 16 GitHub Actions service container
 
 ## 4. Runtime Bootstrap and Recovery
 
 - [x] 4.1 Write bootstrap state-machine tests and implement explicit driver construction, startup ordering, health aggregation, and cleanup on failure
 - [x] 4.2 Write empty-runtime tests and implement independent start, status, readiness, and stop behavior
-- [ ] 4.3 Write recovery tests and implement replay of installations, deployments, operation journals, and unfinished tasks
-- [ ] 4.4 Write multi-Main leadership tests and implement fenced leader-only reconciliation with follower diagnostics
+- [x] 4.3 Write restart tests and implement replay of installations, deployments, operation journals, and unfinished tasks before the local control endpoint reports recovery complete
+- [x] 4.4 Write real two-Main process tests and implement fenced leader-only reconciliation, task assignment, takeover, and follower diagnostics
 - [x] 4.5 Write essential-readiness tests and implement separate kernel liveness and application readiness
 
 ## 5. Plugin Artifacts
@@ -83,23 +83,23 @@
 - [x] 10.2 Write context tests and implement minimal identity, config, logger, event, capability, lifecycle, runtime-info, and disposable access
 - [ ] 10.3 Implement public manifest, lifecycle, executor, Worker, state-store, and coordination-provider conformance test kits
 - [ ] 10.4 Write testkit self-tests proving third-party implementations can use only public exports
-- [ ] 10.5 Add the TypeScript echo plugin with no executor-specific code and lifecycle/test fixtures
+- [x] 10.5 Add the TypeScript echo plugin with no executor-specific code and lifecycle/test fixtures
 
 ## 11. CLI and Usable Vertical Slice
 
-- [ ] 11.1 Write CLI parser and exit-code tests and implement JSON and human-readable output contracts
-- [ ] 11.2 Write runtime command tests and implement local start, status, stop, and recovery commands
-- [ ] 11.3 Write plugin command tests and implement validate, pack, inspect, install, deploy, and status commands
-- [ ] 11.4 Write task command tests and implement run, status, wait, and cancel commands
-- [ ] 11.5 Write Worker command tests and implement remote Worker startup in both connection directions
-- [ ] 11.6 Build and run an end-to-end single-Main flow that packs, installs, deploys, and executes the echo plugin through all three executors
-- [ ] 11.7 Build and run a two-Main PostgreSQL flow that proves leader takeover, fencing, Worker continuity, and final result uniqueness
+- [x] 11.1 Write CLI parser and exit-code tests and implement JSON and human-readable output contracts
+- [x] 11.2 Write runtime command tests and implement local start, status, stop, and recovery commands
+- [x] 11.3 Write plugin command tests and implement validate, pack, inspect, install, deploy, and status commands
+- [x] 11.4 Write task command tests and implement run, status, wait, and cancel commands
+- [x] 11.5 Write Worker command tests and implement independent-process remote Worker startup in both connection directions over real WebSocket sockets
+- [x] 11.6 Build and run a real-process single-Main flow that packs, installs, deploys, executes the same echo plugin through all three executors, restarts Main, and verifies durable recovery
+- [x] 11.7 Build and run a real-process two-Main PostgreSQL flow that proves leader-only work, takeover, stale-leader fencing, Worker reconnection, and final result uniqueness
 
 ## 12. Documentation, Review, and Release Evidence
 
 - [ ] 12.1 Document architecture boundaries, package graph, state machines, protocol compatibility, threat model, and failure semantics
 - [ ] 12.2 Document contributor setup, strict red-green-refactor workflow, plugin authoring, embedded deployment, and multi-Main deployment
-- [ ] 12.3 Add an executable release-verification command covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, and smoke flows
+- [x] 12.3 Add an executable release-verification command and authoritative GitHub Actions gates covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, single-Main smoke, and multi-Main takeover
 - [ ] 12.4 Run mutation or fault-injection checks on lifecycle, fencing, deduplication, and permission gates and close material test gaps
 - [ ] 12.5 Perform API, architecture, security, concurrency, and failure-recovery review and resolve all blocking findings
 - [ ] 12.6 Produce `0.1.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred capabilities

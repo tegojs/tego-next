@@ -3,7 +3,9 @@ import {
   DiagnosticError,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
+  STATE_QUERY_MAX_LIMIT,
   compareOperationJournalCursors,
+  isPortableStateString,
   parseFencingEpoch,
   parseRevision,
   runtimeDiagnostic,
@@ -117,6 +119,50 @@ function compareKeys(left: StateKey<JsonValue>, right: StateKey<JsonValue>): num
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function assertStateQuery(query: StateQuery<JsonValue>, clock: Clock): void {
+  if (
+    !isPortableStateString(query.namespace) ||
+    !isPortableStateString(query.collection) ||
+    (query.idPrefix !== undefined && !isPortableStateString(query.idPrefix)) ||
+    (query.afterId !== undefined && !isPortableStateString(query.afterId)) ||
+    (query.limit !== undefined &&
+      (!Number.isSafeInteger(query.limit) ||
+        query.limit <= 0 ||
+        query.limit > STATE_QUERY_MAX_LIMIT))
+  ) {
+    throw stateError(
+      "STATE_QUERY_INVALID",
+      `State query strings must be portable and limit must be between 1 and ${STATE_QUERY_MAX_LIMIT}`,
+      { limit: query.limit ?? null },
+      clock,
+    );
+  }
+}
+
+function assertStateKey(
+  key: StateKey<JsonValue>,
+  operation: "query" | "write",
+  clock: Clock,
+): void {
+  if (
+    isPortableStateString(key.namespace) &&
+    isPortableStateString(key.collection) &&
+    isPortableStateString(key.id)
+  ) {
+    return;
+  }
+  throw stateError(
+    operation === "query" ? "STATE_QUERY_INVALID" : "STATE_DATA_INVALID",
+    "State keys must not contain NUL or ill-formed Unicode",
+    {
+      namespace: key.namespace,
+      collection: key.collection,
+      id: key.id,
+    },
+    clock,
+  );
 }
 
 function validTimestamp(value: string): boolean {
@@ -283,6 +329,7 @@ class MemoryTransaction implements StateTransaction {
   readonly #clock: Clock;
   readonly #mutations = new Map<string, Mutation>();
   readonly #operations: OperationJournalEntry[] = [];
+  readonly #operationIds = new Set<string>();
   readonly #outbox: OutboxMessage[] = [];
   #active = true;
 
@@ -293,6 +340,7 @@ class MemoryTransaction implements StateTransaction {
 
   async get<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertActive();
+    assertStateKey(key, "query", this.#clock);
     const identifier = serializedKey(key);
     const mutation = this.#mutations.get(identifier);
     if (mutation?.kind === "delete") {
@@ -313,6 +361,7 @@ class MemoryTransaction implements StateTransaction {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertActive();
+    assertStateQuery(query, this.#clock);
     const records = new Map(this.#snapshot);
     for (const [identifier, mutation] of this.#mutations) {
       if (mutation.kind === "delete") {
@@ -331,10 +380,12 @@ class MemoryTransaction implements StateTransaction {
         (record) =>
           record.key.namespace === query.namespace &&
           record.key.collection === query.collection &&
-          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
+          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+          (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
       )
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
-    for (const record of matching) {
+    const limit = query.limit ?? matching.length;
+    for (const record of matching.slice(0, limit)) {
       yield scannedRecord<T>(record);
     }
   }
@@ -345,6 +396,7 @@ class MemoryTransaction implements StateTransaction {
     options: StateWriteOptions,
   ): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write", this.#clock);
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
     this.#mutations.set(serializedKey(storedKey), {
       kind: "put",
@@ -356,6 +408,7 @@ class MemoryTransaction implements StateTransaction {
 
   async delete<T extends JsonValue>(key: StateKey<T>, options: StateWriteOptions): Promise<void> {
     this.#assertActive();
+    assertStateKey(key, "write", this.#clock);
     const storedKey = cloneKey(key) as StateKey<JsonValue>;
     this.#mutations.set(serializedKey(storedKey), {
       kind: "delete",
@@ -366,6 +419,15 @@ class MemoryTransaction implements StateTransaction {
 
   async appendOperation(entry: OperationJournalEntry): Promise<void> {
     this.#assertActive();
+    if (this.#operationIds.has(entry.operationId)) {
+      throw stateError(
+        "STATE_DATA_INVALID",
+        "An operation may be appended only once per state transaction",
+        { operationId: entry.operationId },
+        this.#clock,
+      );
+    }
+    this.#operationIds.add(entry.operationId);
     this.#operations.push({
       operationId: entry.operationId,
       kind: entry.kind,
@@ -476,6 +538,7 @@ export class MemoryStateStore implements StateStore {
   readonly #clock: Clock;
   readonly #records = new Map<string, StoredRecord>();
   readonly #operations = new Map<string, PersistedOperationJournalEntry>();
+  readonly #operationHistory: PersistedOperationJournalEntry[] = [];
   readonly #outbox = new Map<string, StoredOutboxMessage>();
   #outboxSequence = 0n;
   readonly #fences = new Map<string, bigint>();
@@ -543,6 +606,7 @@ export class MemoryStateStore implements StateStore {
 
   async read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
     this.#assertOpen();
+    assertStateKey(key, "query", this.#clock);
     const record = this.#records.get(serializedKey(key));
     return record === undefined
       ? undefined
@@ -551,29 +615,63 @@ export class MemoryStateStore implements StateStore {
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
     this.#assertOpen();
+    assertStateQuery(query, this.#clock);
     const matching = [...this.#records.values()]
       .filter(
         (record) =>
           record.key.namespace === query.namespace &&
           record.key.collection === query.collection &&
-          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)),
+          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+          (query.afterId === undefined || compareCodeUnits(record.key.id, query.afterId) > 0),
       )
       .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
-    for (const record of matching) {
+    const limit = query.limit ?? matching.length;
+    for (const record of matching.slice(0, limit)) {
       this.#assertOpen();
       yield scannedRecord<T>(record);
+    }
+  }
+
+  async *scanOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, false);
+  }
+
+  async *scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    this.#assertOpen();
+    this.#assertOperationQuery(query);
+    const matching = this.#operationHistory
+      .filter(
+        (entry) =>
+          query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+      )
+      .sort(compareOperationJournalCursors);
+    const limit = query.limit ?? matching.length;
+    for (const entry of matching.slice(0, limit)) {
+      this.#assertOpen();
+      yield structuredClone(entry);
     }
   }
 
   async *scanRecoverableOperations(
     query: OperationJournalQuery = {},
   ): AsyncIterable<PersistedOperationJournalEntry> {
+    yield* this.#scanOperationJournal(query, true);
+  }
+
+  async *#scanOperationJournal(
+    query: OperationJournalQuery,
+    recoverableOnly: boolean,
+  ): AsyncIterable<PersistedOperationJournalEntry> {
     this.#assertOpen();
     this.#assertOperationQuery(query);
     const matching = [...this.#operations.values()]
       .filter(
         (entry) =>
-          (entry.status === "executing" || entry.status === "planned") &&
+          (!recoverableOnly || entry.status === "executing" || entry.status === "planned") &&
           (query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0),
       )
       .sort(compareOperationJournalCursors);
@@ -893,10 +991,12 @@ export class MemoryStateStore implements StateStore {
         this.#records.set(identifier, record);
       }
       for (const entry of staged.operations) {
-        this.#operations.set(entry.operationId, {
+        const persisted = {
           ...structuredClone(entry),
           revision,
-        });
+        };
+        this.#operationHistory.push(persisted);
+        this.#operations.set(entry.operationId, persisted);
       }
       for (const message of newOutbox) {
         this.#outboxSequence += 1n;

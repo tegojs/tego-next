@@ -1,9 +1,14 @@
 {
-  "name": "@tegojs/example-echo-plugin",
+  "name": "@tegojs/echo-plugin",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm exec --offline -- tsc -p tsconfig.json"
+    "build": "node scripts/build.mjs",
+    "test:unit": "node scripts/build.mjs --test",
+    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false && tsc --ignoreConfig --noEmit --pretty false --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --verbatimModuleSyntax --skipLibCheck test/component.test.ts"
+  },
+  "dependencies": {
+    "@tegojs/plugin-sdk": "0.0.0"
   }
 }

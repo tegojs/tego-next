@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
@@ -7,6 +8,8 @@ import {
   parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginId,
   parsePluginManifest,
   parseRuntimeId,
@@ -28,6 +31,12 @@ import {
 const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
 const otherDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
 const futureDeadline = "2099-01-01T00:00:00.000Z";
+const componentTarget = {
+  instanceId: parseComponentInstanceId("app-01.org.example.component.component.g1"),
+  deploymentGeneration: parseGeneration("1"),
+  artifactDigest: digest,
+  executor: { id: "component-host", type: "process" },
+} as const;
 
 interface ArtifactFixture {
   readonly directory: string;
@@ -40,10 +49,15 @@ async function artifactFixture(
   options: {
     readonly componentId?: string;
     readonly entrypoint?: string;
+    readonly isolated?: boolean;
     readonly permissions?: PluginManifest["permissions"];
   } = {},
 ): Promise<ArtifactFixture> {
-  const directory = await mkdtemp(join(process.cwd(), ".tego-component-host-"));
+  const directory = await mkdtemp(
+    options.isolated
+      ? join(tmpdir(), "tego-component-host-")
+      : join(process.cwd(), ".tego-component-host-"),
+  );
   t.after(() => rm(directory, { force: true, recursive: true }));
   const entrypoint = options.entrypoint ?? "components/component.js";
   const path = join(directory, ...entrypoint.split("/"));
@@ -254,6 +268,7 @@ async function attachmentLimitResult(
       execution: {
         taskId: parseTaskId("task-attachment-limit"),
         attemptId: parseAttemptId("attempt-attachment-limit"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -302,6 +317,51 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
   });
   assert.throws(() => parseComponentHostCommand(accessor), /data propert/u);
   assert.equal(calls, 0);
+});
+
+test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sdk", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      import { defineComponent } from "@tegojs/plugin-sdk";
+      export default defineComponent({
+        kind: "task",
+        run: async (_context, input) => input,
+      });
+    `,
+    { isolated: true },
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+
+  assert.equal((await host.handle(prepareCommand(fixture))).ok, true);
+  assert.equal(
+    (await host.handle(command("import", "isolated-import", { artifactDigest: digest }))).ok,
+    true,
+  );
+  assert.equal(
+    (await host.handle(command("start", "isolated-start", { artifactDigest: digest }))).ok,
+    true,
+  );
+  const input = { isolated: true };
+  const result = await host.handle(
+    command("run", "isolated-run", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("isolated-task"),
+        attemptId: parseAttemptId("isolated-attempt"),
+        target: componentTarget,
+        applicationId: parseApplicationId("app-01"),
+        pluginId: parsePluginId("org.example.component"),
+        componentId: parseComponentId("component"),
+        input,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.deepEqual((result.value as { readonly output?: JsonValue }).output, input);
 });
 
 test("component host rejects excessive attachment count before plugin execution", async (t) => {
@@ -878,6 +938,7 @@ test("failed stop cleanup is terminal and repeats its canonical result without r
       execution: {
         taskId: parseTaskId("task-after-terminal-stop"),
         attemptId: parseAttemptId("attempt-after-terminal-stop"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -997,6 +1058,7 @@ test("a plugin-created AsyncResource cannot self-await an active transition", as
       execution: {
         taskId: parseTaskId("task-create-async-resource"),
         attemptId: parseAttemptId("attempt-create-async-resource"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1050,6 +1112,7 @@ test("drain closes run intake synchronously before its hook settles", async (t) 
       execution: {
         taskId: parseTaskId("task-after-drain"),
         attemptId: parseAttemptId("attempt-after-drain"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1089,6 +1152,7 @@ test("non-cooperative runs respect hard capacity while cancel and drain remain a
         execution: {
           taskId: parseTaskId(`task-hard-capacity-${index}`),
           attemptId: parseAttemptId(`attempt-hard-capacity-${index}`),
+          target: componentTarget,
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
@@ -1199,6 +1263,7 @@ test("duplicate task attempts compare full execution fingerprints and completed 
   const execution = {
     taskId: parseTaskId("task-fingerprint"),
     attemptId: parseAttemptId("attempt-fingerprint"),
+    target: componentTarget,
     applicationId: parseApplicationId("app-01"),
     pluginId: parsePluginId("org.example.component"),
     componentId: parseComponentId("component"),
@@ -1294,6 +1359,7 @@ test("deadline acceptance and chunked timers use the same injected clock", async
         execution: {
           taskId: parseTaskId("task-clock"),
           attemptId: parseAttemptId("attempt-clock"),
+          target: componentTarget,
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
@@ -1409,6 +1475,7 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-invalid"),
         attemptId: parseAttemptId("attempt-invalid"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1429,6 +1496,7 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-response"),
         attemptId: parseAttemptId("attempt-response"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
@@ -1485,6 +1553,7 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
     execution: {
       taskId: parseTaskId("task-cancel"),
       attemptId: parseAttemptId("attempt-cancel"),
+      target: componentTarget,
       applicationId: parseApplicationId("app-01"),
       pluginId: parsePluginId("org.example.component"),
       componentId: parseComponentId("component"),
@@ -1547,6 +1616,7 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
         execution: {
           taskId: parseTaskId("task-deadline"),
           attemptId: parseAttemptId("attempt-deadline"),
+          target: componentTarget,
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
@@ -1642,6 +1712,7 @@ test("secret access requires manifest request and deployment grant and never lea
       execution: {
         taskId: parseTaskId("task-secret"),
         attemptId: parseAttemptId("attempt-secret"),
+        target: componentTarget,
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),

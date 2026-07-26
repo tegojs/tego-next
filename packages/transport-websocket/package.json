@@ -18,9 +18,11 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
-    "@tegojs/contracts": "0.0.0"
+    "@tegojs/contracts": "0.0.0",
+    "ws": "8.21.1"
   },
   "devDependencies": {
-    "@tegojs/testkit": "0.0.0"
+    "@tegojs/testkit": "0.0.0",
+    "@types/ws": "8.18.1"
   }
 }

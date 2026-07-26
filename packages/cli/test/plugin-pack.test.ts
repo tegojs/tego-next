@@ -17,6 +17,7 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DiagnosticError } from "@tegojs/contracts";
+import { readPluginArtifact } from "@tegojs/runtime";
 import { buildPlugin } from "../src/plugin/build-plugin.js";
 import { auditJavaScriptModules } from "../src/plugin/module-audit.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
@@ -82,6 +83,127 @@ test("packs unchanged ESM plugin inputs into identical deterministic archives", 
       `sha256:${createHash("sha256")
         .update(await readFile(firstPath))
         .digest("hex")}`,
+    );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:plugin-deployment/sdk-runtime-import/isolated-pack-resolves-the-public-sdk", async () => {
+  const directory = await temporaryFixture();
+  try {
+    await writeFile(
+      join(directory, "src/component.ts"),
+      `
+        import { defineComponent } from "@tegojs/plugin-sdk";
+        export default defineComponent({
+          kind: "task",
+          run: async (_context, input) => input,
+        });
+      `,
+    );
+    const artifactPath = join(directory, "sdk.tego");
+    await packPlugin({ artifactPath, pluginDirectory: directory });
+    const bytes = await readFile(artifactPath);
+    const entries = new Map<string, Buffer[]>();
+    await readPluginArtifact(
+      (async function* () {
+        yield bytes;
+      })(),
+      {},
+      {
+        async open(entry) {
+          const chunks: Buffer[] = [];
+          entries.set(entry.path, chunks);
+          return {
+            async write(chunk) {
+              chunks.push(Buffer.from(chunk));
+            },
+            async close() {},
+          };
+        },
+      },
+    );
+    const sbom = JSON.parse(
+      Buffer.concat(entries.get("metadata/sbom.json") ?? []).toString("utf8"),
+    ) as { readonly runtimeImports?: readonly string[] };
+    assert.deepEqual(sbom.runtimeImports, ["@tegojs/plugin-sdk"]);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("@spec:plugin-deployment/sdk-runtime-import/rejects-delayed-sdk-imports", async () => {
+  const directory = await temporaryFixture();
+  try {
+    await writeFile(
+      join(directory, "src/component.ts"),
+      `
+        import { defineComponent } from "@tegojs/plugin-sdk";
+        export default defineComponent({
+          kind: "task",
+          run: async (_context, input) => {
+            await import("@tegojs/plugin-sdk");
+            return input;
+          },
+        });
+      `,
+    );
+    await assert.rejects(
+      () =>
+        packPlugin({
+          artifactPath: join(directory, "dynamic-sdk.tego"),
+          pluginDirectory: directory,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_IMPORT_UNSUPPORTED");
+        return true;
+      },
+    );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("plugin-local declarations are checked even when host SDK declarations are isolated", async () => {
+  const directory = await temporaryFixture();
+  try {
+    await writeFile(
+      join(directory, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          declaration: false,
+          erasableSyntaxOnly: true,
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          outDir: "build/components",
+          rootDir: "src",
+          sourceMap: false,
+          strict: true,
+          target: "ES2024",
+        },
+        include: ["src/**/*"],
+      }),
+    );
+    await writeFile(
+      join(directory, "src/broken.d.ts"),
+      "export interface BrokenPluginDeclaration { value: MissingPluginLocalType }\n",
+    );
+    await assert.rejects(
+      () =>
+        buildPlugin({
+          pluginDirectory: directory,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_BUILD_FAILED");
+        return true;
+      },
+    );
+    assert.deepEqual(
+      (await readdir(directory)).filter((name) => name.startsWith(".tego-build-")),
+      [],
     );
   } finally {
     await rm(directory, { force: true, recursive: true });
@@ -240,6 +362,11 @@ test("rejects host-resolved bare module specifiers without false positives", asy
       "const load = () => `value: $" + '{import("left-pad")}`;\nexport default load;\n',
     ],
     ["fake node builtin", 'import value from "node:left-pad";\nexport default value;\n'],
+    ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
+    [
+      "dynamic plugin SDK import in template expression",
+      "const load = () => `sdk: $" + '{import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
+    ],
   ] as const) {
     await context.test(label, async () => {
       const directory = await temporaryFixture();
@@ -316,11 +443,6 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
     ],
     ["static plugin SDK import", 'import sdk from "@tegojs/plugin-sdk";\nexport default sdk;\n'],
     ["plugin SDK export", 'export { default } from "@tegojs/plugin-sdk";\n'],
-    ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
-    [
-      "plugin SDK import in template expression",
-      "const load = () => `sdk: $" + '{import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
-    ],
   ] as const) {
     await context.test(label, async () => {
       await withBuiltSource(source, async (directory) => {

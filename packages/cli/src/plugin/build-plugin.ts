@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { chmod, lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
 
 export interface BuildPluginOptions {
@@ -129,12 +130,29 @@ async function runCompiler(
 ): Promise<void> {
   const require = createRequire(import.meta.url);
   const compilerPath = join(dirname(require.resolve("typescript/package.json")), "bin", "tsc");
+  const compilerConfiguration = join(temporaryRoot, "tsconfig.json");
+  const sdkTypesPath = fileURLToPath(import.meta.resolve("@tegojs/plugin-sdk")).replace(
+    /\.js$/u,
+    ".d.ts",
+  );
+  await writeFile(
+    compilerConfiguration,
+    JSON.stringify({
+      extends: tsconfigPath,
+      compilerOptions: {
+        paths: {
+          "@tegojs/plugin-sdk": [sdkTypesPath],
+        },
+        skipLibCheck: false,
+      },
+    }),
+  );
   const child = spawn(
     process.execPath,
     [
       compilerPath,
       "-p",
-      tsconfigPath,
+      compilerConfiguration,
       "--rootDir",
       sourceRoot,
       "--outDir",
@@ -157,6 +175,8 @@ async function runCompiler(
       "false",
       "--emitDeclarationOnly",
       "false",
+      "--skipLibCheck",
+      "true",
       "--tsBuildInfoFile",
       join(temporaryRoot, ".tsbuildinfo"),
     ],
@@ -194,7 +214,6 @@ async function runCompiler(
       }),
     );
   });
-
   if (exitCode !== 0) {
     throw new DiagnosticError(
       runtimeDiagnostic({
@@ -202,6 +221,60 @@ async function runCompiler(
         message: "Plugin TypeScript compilation failed",
         source: { kind: "artifact", id: "build" },
         details: { exitCode, output: Buffer.concat(chunks).toString("utf8") },
+      }),
+    );
+  }
+  const validation = spawn(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./validate-plugin-declarations.js", import.meta.url)),
+      compilerConfiguration,
+      sourceRoot,
+    ],
+    {
+      cwd: pluginRoot,
+      env: process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const validationChunks: Buffer[] = [];
+  let validationBytes = 0;
+  const collectValidation = (chunk: Buffer) => {
+    if (validationBytes >= MAX_BUILD_OUTPUT_BYTES) return;
+    const remaining = MAX_BUILD_OUTPUT_BYTES - validationBytes;
+    validationChunks.push(Buffer.from(chunk.subarray(0, remaining)));
+    validationBytes += Math.min(chunk.byteLength, remaining);
+  };
+  validation.stdout?.on("data", collectValidation);
+  validation.stderr?.on("data", collectValidation);
+  const validationExitCode = await new Promise<number | null>((resolveExit, reject) => {
+    validation.once("error", reject);
+    validation.once("close", resolveExit);
+  }).catch((error: unknown) => {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ARTIFACT_BUILD_FAILED",
+        message: "Plugin declaration validator could not be started",
+        source: { kind: "artifact", id: "build" },
+        cause:
+          error instanceof Error
+            ? { name: error.name, message: error.message }
+            : { name: "UnknownCause", message: String(error) },
+      }),
+    );
+  });
+  await rm(compilerConfiguration, { force: true });
+  if (validationExitCode !== 0) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ARTIFACT_BUILD_FAILED",
+        message: "Plugin declaration validation failed",
+        source: { kind: "artifact", id: "build" },
+        details: {
+          exitCode: validationExitCode,
+          output: Buffer.concat(validationChunks).toString("utf8"),
+        },
       }),
     );
   }

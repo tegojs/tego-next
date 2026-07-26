@@ -1,20 +1,115 @@
-import type { RuntimeDiagnostic } from "./diagnostic.js";
-import type {
-  ApplicationId,
-  AttemptId,
-  ComponentId,
-  PluginId,
-  TaskId,
-  WorkerId,
+import { DiagnosticError, runtimeDiagnostic, type RuntimeDiagnostic } from "./diagnostic.js";
+import {
+  parseArtifactDigest,
+  parseComponentInstanceId,
+  parseExecutorId,
+  parseGeneration,
+  parseWorkerId,
+  type ApplicationId,
+  type ArtifactDigest,
+  type AttemptId,
+  type ComponentId,
+  type ComponentInstanceId,
+  type Generation,
+  type PluginId,
+  type TaskId,
+  type WorkerId,
 } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { DriverHealth } from "./state.js";
 
 export type OrphanPolicy = "cancel" | "finish-and-buffer" | "finish-and-persist";
 
+export interface TaskExecutionTarget extends JsonObject {
+  readonly instanceId: ComponentInstanceId;
+  readonly deploymentGeneration: Generation;
+  readonly artifactDigest: ArtifactDigest;
+  readonly executor:
+    | {
+        readonly id: string;
+        readonly type: "remote";
+        readonly workerId: WorkerId;
+      }
+    | {
+        readonly id: string;
+        readonly type: "process" | "thread";
+        readonly workerId?: never;
+      };
+}
+
+function targetError(message: string): DiagnosticError {
+  return new DiagnosticError(
+    runtimeDiagnostic({
+      code: "PROTOCOL_EXECUTION_TARGET_INVALID",
+      message,
+      source: { kind: "protocol", id: "task-execution-target" },
+    }),
+  );
+}
+
+function targetObject(value: unknown): Record<string, unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  ) {
+    throw targetError("Task execution target must be a plain object");
+  }
+  return value as Record<string, unknown>;
+}
+
+function targetKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const allowed = new Set([...required, ...optional]);
+  if (
+    required.some((key) => !Object.hasOwn(value, key)) ||
+    Object.keys(value).some((key) => !allowed.has(key))
+  ) {
+    throw targetError("Task execution target fields do not match the contract");
+  }
+}
+
+export function parseTaskExecutionTarget(input: unknown): TaskExecutionTarget {
+  const value = targetObject(input);
+  targetKeys(value, ["instanceId", "deploymentGeneration", "artifactDigest", "executor"]);
+  const executor = targetObject(value.executor);
+  targetKeys(executor, ["id", "type"], ["workerId"]);
+  if (executor.type !== "process" && executor.type !== "remote" && executor.type !== "thread") {
+    throw targetError("Task execution target executor is invalid");
+  }
+  if (
+    (executor.type === "remote" && executor.workerId === undefined) ||
+    (executor.type !== "remote" && executor.workerId !== undefined)
+  ) {
+    throw targetError("Task execution target worker binding is invalid");
+  }
+  const targetExecutor: TaskExecutionTarget["executor"] =
+    executor.type === "remote"
+      ? {
+          id: parseExecutorId(executor.id),
+          type: "remote" as const,
+          workerId: parseWorkerId(executor.workerId),
+        }
+      : {
+          id: parseExecutorId(executor.id),
+          type: executor.type,
+        };
+  return {
+    instanceId: parseComponentInstanceId(value.instanceId),
+    deploymentGeneration: parseGeneration(value.deploymentGeneration),
+    artifactDigest: parseArtifactDigest(value.artifactDigest),
+    executor: targetExecutor,
+  };
+}
+
 export interface ExecutionRequest extends JsonObject {
   readonly taskId: TaskId;
   readonly attemptId: AttemptId;
+  readonly target: TaskExecutionTarget;
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
   readonly componentId: ComponentId;

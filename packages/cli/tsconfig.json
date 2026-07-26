@@ -6,5 +6,13 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "references": [{ "path": "../contracts" }, { "path": "../runtime" }]
+  "references": [
+    { "path": "../contracts" },
+    { "path": "../drivers-local" },
+    { "path": "../drivers-postgres" },
+    { "path": "../executor-node" },
+    { "path": "../plugin-sdk" },
+    { "path": "../runtime" },
+    { "path": "../transport-websocket" }
+  ]
 }

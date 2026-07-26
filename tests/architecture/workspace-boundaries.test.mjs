@@ -275,6 +275,73 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
   });
 });
 
+test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-static-http-import-in-network-adapter", async (t) => {
+  const workspaces = {
+    "packages/contracts": { name: "@tegojs/contracts" },
+    "packages/transport-websocket": {
+      name: "@tegojs/transport-websocket",
+      dependencies: { "@tegojs/contracts": "0.0.0" },
+    },
+  };
+
+  await t.test("accepts the unique static import in the emitted network adapter", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("network.js", outputDirectory),
+        'import { createServer } from "node:http";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), []);
+    });
+  });
+
+  await t.test("rejects a second static import in the emitted network adapter", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("network.js", outputDirectory),
+        ['import { createServer } from "node:http";', 'import { request } from "node:http";'].join(
+          "\n",
+        ),
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/transport-websocket -> node:http",
+      ]);
+    });
+  });
+
+  await t.test("rejects the same import from another emitted file", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("session.js", outputDirectory),
+        'import { createServer } from "node:http";',
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/transport-websocket -> node:http",
+      ]);
+    });
+  });
+
+  await t.test("rejects a dynamic import from the emitted network adapter", async () => {
+    await withWorkspace(workspaces, async (root) => {
+      const outputDirectory = new URL("packages/transport-websocket/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(new URL("network.js", outputDirectory), 'await import("node:http");');
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/transport-websocket -> node:http",
+      ]);
+    });
+  });
+});
+
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-import-after-postfix-division", async () => {
   await withWorkspace(
     {
@@ -386,6 +453,45 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-rel
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
         "@tegojs/contracts -> ../../runtime/dist/index.js",
+      ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/cache-specifier-resolution", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: {
+          "@tegojs/contracts": "0.0.0",
+          "@vendor/cache": "1.0.0",
+          "@tegojs/cache-driver": "0.0.0",
+        },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/runtime/dist/src/artifacts/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.js", outputDirectory),
+        [
+          'export { PreparedArtifactCache } from "./prepared-artifact-cache.js";',
+          'import "@tegojs/runtime/cache";',
+          'import "@vendor/cache";',
+          'import "@tegojs/cache-driver";',
+        ].join("\n"),
+      );
+      await writeFile(
+        new URL("prepared-artifact-cache.js", outputDirectory),
+        "export class PreparedArtifactCache {}",
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/runtime -> @tegojs/cache-driver",
+        "@tegojs/runtime -> @tegojs/runtime/cache",
+        "@tegojs/runtime -> @vendor/cache",
       ]);
     },
   );

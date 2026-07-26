@@ -9,11 +9,15 @@ import {
   type FencingEpoch,
   type JsonValue,
   type Leadership,
+  type LeadershipHandle,
   type Lease,
   type LeaseRequest,
   parseFencingEpoch,
   parseRevision,
   type Revision,
+  runtimeDiagnostic,
+  type RuntimeDiagnostic,
+  serializeCause,
 } from "@tegojs/contracts";
 import type { Notification, Pool, PoolClient, QueryResultRow } from "pg";
 import {
@@ -58,6 +62,10 @@ interface ChangeRow extends QueryResultRow {
 interface LeadershipSession {
   readonly client: PoolClient;
   readonly leadership: Leadership;
+  readonly resolveLost: (diagnostic: RuntimeDiagnostic) => void;
+  readonly onError: (error: Error) => void;
+  readonly onEnd: () => void;
+  releasePromise?: Promise<void>;
 }
 
 interface PendingNext {
@@ -182,7 +190,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
   readonly scope = "distributed" as const;
   readonly #options: PostgresConnectionOptions;
   readonly #pool: Pool;
-  readonly #campaigns = new Map<string, Promise<Leadership>>();
+  readonly #campaigns = new Map<string, Promise<LeadershipHandle>>();
   readonly #leadership = new Map<string, LeadershipSession>();
   readonly #acquiringClients = new Set<PoolClient>();
   readonly #releasedClients = new WeakSet<PoolClient>();
@@ -216,7 +224,7 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     return opening;
   }
 
-  campaign(request: CampaignRequest): Promise<Leadership> {
+  campaign(request: CampaignRequest): Promise<LeadershipHandle> {
     this.#assertOpen();
     this.#assertResource(request.resource);
     const existing = this.#campaigns.get(request.resource);
@@ -485,37 +493,131 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     }));
   }
 
-  async #acquireLeadership(resource: string): Promise<Leadership> {
+  async #acquireLeadership(resource: string): Promise<LeadershipHandle> {
     const client = await this.#pool.connect();
-    const onError = () => {
-      this.#acquiringClients.delete(client);
-      const session = this.#leadership.get(resource);
-      if (session?.client === client) {
-        this.#leadership.delete(resource);
-        this.#campaigns.delete(resource);
-      }
+    if (this.#isClosed()) {
       this.#releaseClient(client, true);
+      throw this.#closedError();
+    }
+    let session: LeadershipSession | undefined;
+    const onError = (error: Error) => {
+      this.#acquiringClients.delete(client);
+      if (session !== undefined) {
+        this.#loseLeadership(session, "backend-error", error);
+      } else {
+        this.#releaseClient(client, true);
+      }
+    };
+    const onEnd = () => {
+      this.#acquiringClients.delete(client);
+      if (session !== undefined) {
+        this.#loseLeadership(session, "backend-close");
+      } else {
+        this.#releaseClient(client, true);
+      }
     };
     client.on("error", onError);
+    client.on("end", onEnd);
     this.#acquiringClients.add(client);
     try {
       await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
         `tego:${this.#options.namespace}:leadership:${resource}`,
       ]);
-      this.#acquiringClients.delete(client);
       this.#assertOpen();
       await client.query("BEGIN");
       const epoch = await this.#incrementEpoch(client, resource);
       await client.query("COMMIT");
       const leadership: Leadership = { resource, epoch };
-      this.#leadership.set(resource, { client, leadership });
-      return leadership;
+      let resolveLost!: (diagnostic: RuntimeDiagnostic) => void;
+      const lost = new Promise<RuntimeDiagnostic>((resolve) => {
+        resolveLost = resolve;
+      });
+      const handle: LeadershipHandle = {
+        leadership,
+        lost,
+        release: () => this.#releaseLeadership(session as LeadershipSession),
+      };
+      session = { client, leadership, resolveLost, onError, onEnd };
+      this.#leadership.set(resource, session);
+      this.#acquiringClients.delete(client);
+      return handle;
     } catch (error) {
       this.#acquiringClients.delete(client);
       await client.query("ROLLBACK").catch(() => undefined);
+      client.removeListener("error", onError);
+      client.removeListener("end", onEnd);
       this.#releaseClient(client, true);
       throw error;
     }
+  }
+
+  #releaseLeadership(session: LeadershipSession): Promise<void> {
+    if (session.releasePromise !== undefined) {
+      return session.releasePromise;
+    }
+    const releasing = Promise.resolve().then(async () => {
+      let failure: unknown;
+      try {
+        await session.client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+          `tego:${this.#options.namespace}:leadership:${session.leadership.resource}`,
+        ]);
+      } catch (error) {
+        failure = error;
+      } finally {
+        this.#finishLeadership(
+          session,
+          this.#leadershipLost(session.leadership.resource, "released", failure),
+          failure !== undefined,
+        );
+      }
+      if (failure !== undefined) throw failure;
+    });
+    session.releasePromise = releasing;
+    return releasing;
+  }
+
+  #loseLeadership(
+    session: LeadershipSession,
+    reason: "backend-close" | "backend-error" | "provider-close",
+    cause?: unknown,
+  ): void {
+    if (session.releasePromise === undefined) {
+      session.releasePromise = Promise.resolve();
+    }
+    this.#finishLeadership(
+      session,
+      this.#leadershipLost(session.leadership.resource, reason, cause),
+      true,
+    );
+  }
+
+  #finishLeadership(
+    session: LeadershipSession,
+    diagnostic: RuntimeDiagnostic,
+    destroy: boolean,
+  ): void {
+    if (this.#leadership.get(session.leadership.resource) !== session) return;
+    this.#leadership.delete(session.leadership.resource);
+    this.#campaigns.delete(session.leadership.resource);
+    session.client.removeListener("error", session.onError);
+    session.client.removeListener("end", session.onEnd);
+    session.resolveLost(diagnostic);
+    this.#releaseClient(session.client, destroy);
+  }
+
+  #leadershipLost(
+    resource: string,
+    reason: "backend-close" | "backend-error" | "provider-close" | "released",
+    cause?: unknown,
+  ): RuntimeDiagnostic {
+    return runtimeDiagnostic({
+      code: "COORDINATION_LEADERSHIP_LOST",
+      message: "PostgreSQL coordination leadership was lost",
+      source: { kind: "coordination", id: "postgres-coordination" },
+      retryable: true,
+      details: { resource, reason },
+      ...(cause === undefined ? {} : { cause: serializeCause(cause) }),
+    });
   }
 
   async #incrementEpoch(client: PoolClient, resource: string): Promise<FencingEpoch> {
@@ -611,13 +713,36 @@ export class PostgresCoordinationProvider implements CoordinationProvider {
     const listener = this.#listener;
     this.#listener = undefined;
     if (listener !== undefined) this.#releaseClient(listener, true);
-    for (const client of [...this.#acquiringClients]) this.#releaseClient(client, true);
+    const acquiringClients = [...this.#acquiringClients];
+    if (acquiringClients.length > 0) {
+      const cancellationPool = createPool(this.#options, "coordination-cancel", 1);
+      try {
+        await Promise.allSettled(
+          acquiringClients.map(async (client) => {
+            const processId = this.#backendProcessId(client);
+            if (processId === undefined) return;
+            await cancellationPool.query("SELECT pg_cancel_backend($1)", [processId]);
+          }),
+        );
+      } finally {
+        await cancellationPool.end();
+      }
+    }
+    for (const client of acquiringClients) this.#releaseClient(client, true);
     this.#acquiringClients.clear();
-    for (const session of this.#leadership.values()) this.#releaseClient(session.client, true);
-    this.#leadership.clear();
-    this.#campaigns.clear();
+    for (const session of [...this.#leadership.values()]) {
+      this.#loseLeadership(session, "provider-close");
+    }
     await Promise.allSettled(campaigns);
+    this.#campaigns.clear();
     await this.#pool.end();
+  }
+
+  #backendProcessId(client: PoolClient): number | undefined {
+    const processId = (client as PoolClient & { readonly processID?: unknown }).processID;
+    return typeof processId === "number" && Number.isInteger(processId) && processId > 0
+      ? processId
+      : undefined;
   }
 
   #releaseClient(client: PoolClient, destroy: boolean): void {

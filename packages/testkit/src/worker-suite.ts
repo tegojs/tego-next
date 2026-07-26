@@ -1,18 +1,104 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type {
-  Clock,
-  JsonObject,
-  JsonValue,
-  RuntimeDiagnostic,
-  SessionId,
-  WorkerMessageType,
-  WorkerProtocolVersion,
-  WorkerId,
+import {
+  parseArtifactDigest,
+  parseWorkerId,
+  type ArtifactDigest,
+  type Clock,
+  type ExecutorKind,
+  type FencingEpoch,
+  type JsonObject,
+  type JsonValue,
+  type RuntimeDiagnostic,
+  type SessionId,
+  type WorkerMessageType,
+  type WorkerProtocolVersion,
+  type WorkerId,
 } from "@tegojs/contracts";
 import { FakeClock } from "./fake-clock.js";
 
 export type WorkerConnectionDirection = "main-initiated" | "worker-initiated";
+
+export interface WorkerConformanceRegistration {
+  readonly workerId: WorkerId;
+  readonly executors: readonly ExecutorKind[];
+  readonly preparedArtifacts: readonly ArtifactDigest[];
+}
+
+export interface WorkerHeartbeatObservation {
+  readonly beforeExpiry: boolean;
+  readonly afterExpiry: boolean;
+}
+
+export interface WorkerReconnectObservation {
+  readonly previousEpoch: FencingEpoch;
+  readonly currentEpoch: FencingEpoch;
+  readonly authoritativeEpoch: FencingEpoch;
+}
+
+export interface WorkerConformanceFixture {
+  registration(): WorkerConformanceRegistration | Promise<WorkerConformanceRegistration>;
+  heartbeat(): WorkerHeartbeatObservation | Promise<WorkerHeartbeatObservation>;
+  reconnect(): WorkerReconnectObservation | Promise<WorkerReconnectObservation>;
+  deduplicate(payload: JsonValue): readonly JsonValue[] | Promise<readonly JsonValue[]>;
+  close(): void | Promise<void>;
+}
+
+export type WorkerConformanceFactory = () =>
+  | WorkerConformanceFixture
+  | Promise<WorkerConformanceFixture>;
+
+const CONFORMANCE_REGISTRATION: WorkerConformanceRegistration = {
+  workerId: parseWorkerId("conformance-worker"),
+  executors: ["process", "thread", "remote"],
+  preparedArtifacts: [parseArtifactDigest(`sha256:${"0".repeat(64)}`)],
+};
+
+async function withWorkerFixture<T>(
+  factory: WorkerConformanceFactory,
+  run: (fixture: WorkerConformanceFixture) => Promise<T>,
+): Promise<T> {
+  const fixture = await factory();
+  try {
+    return await run(fixture);
+  } finally {
+    await fixture.close();
+  }
+}
+
+export function workerConformance(factory: WorkerConformanceFactory): void {
+  describe("Worker directory conformance", () => {
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-registration", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        assert.deepEqual(await fixture.registration(), CONFORMANCE_REGISTRATION);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-heartbeat", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        assert.deepEqual(await fixture.heartbeat(), {
+          beforeExpiry: true,
+          afterExpiry: false,
+        });
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-reconnect", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        const reconnected = await fixture.reconnect();
+        assert.ok(BigInt(reconnected.currentEpoch) > BigInt(reconnected.previousEpoch));
+        assert.equal(reconnected.authoritativeEpoch, reconnected.currentEpoch);
+      });
+    });
+
+    test("@spec:runtime-operations/reusable-conformance-test-kits/worker-message-deduplication", async () => {
+      await withWorkerFixture(factory, async (fixture) => {
+        const payload = { value: 1 };
+        assert.deepEqual(await fixture.deduplicate(payload), [payload]);
+      });
+    });
+  });
+}
 
 export interface WorkerSocketMessage {
   readonly data: string | Uint8Array;
@@ -250,12 +336,12 @@ async function connect(
   return [mainSession, workerSession, mainSocket, workerSocket];
 }
 
-const WORKER_ID = "worker-1" as WorkerId;
+const WORKER_ID = parseWorkerId("worker-1");
 const REGISTRATION: WorkerRegistrationInput = {
   labels: { region: "test" },
   resources: { cpu: 2 },
   executors: ["process"],
-  preparedArtifacts: ["sha256:test"],
+  preparedArtifacts: [parseArtifactDigest(`sha256:${"0".repeat(64)}`)],
 };
 
 export function workerSessionConformance(

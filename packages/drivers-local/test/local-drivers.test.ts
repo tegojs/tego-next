@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { after, test } from "node:test";
+import { setTimeout as deadline } from "node:timers/promises";
 import {
   diagnosticCode,
   parseArtifactDigest,
@@ -47,12 +48,22 @@ async function* bytesSource(...chunks: readonly Uint8Array[]): AsyncIterable<Uin
   yield* chunks;
 }
 
+async function within<T>(promise: Promise<T>, message: string, timeoutMs = 2_000): Promise<T> {
+  return Promise.race([
+    promise,
+    deadline(timeoutMs).then(() => {
+      throw new Error(message);
+    }),
+  ]);
+}
+
 test("@spec:coordination-provider/single-main-authority/local-authority-is-immediate", async () => {
   const clock = new FakeClock(new Date("2026-07-23T10:00:00.000Z"));
   const coordination = new LocalCoordinationProvider({ clock });
   await coordination.open();
 
-  assert.deepEqual(await coordination.campaign({ resource: "runtime" }), {
+  const authority = await coordination.campaign({ resource: "runtime" });
+  assert.deepEqual(authority.leadership, {
     resource: "runtime",
     epoch: parseFencingEpoch("1"),
   });
@@ -71,6 +82,36 @@ test("@spec:coordination-provider/single-main-authority/local-authority-is-immed
     expiresAt: "2026-07-23T10:00:02.500Z",
   });
   await coordination.close();
+});
+
+test("@spec:coordination-provider/fenced-leadership/local-idempotent-release", async () => {
+  const coordination = new LocalCoordinationProvider();
+  await coordination.open();
+
+  const first = await coordination.campaign({ resource: "runtime" });
+  assert.equal(await coordination.campaign({ resource: "runtime" }), first);
+
+  await within(Promise.all([first.release(), first.release()]), "Timed out releasing leadership");
+  const diagnostic = await within(first.lost, "Timed out waiting for released leadership loss");
+  assert.equal(diagnostic.code, "COORDINATION_LEADERSHIP_LOST");
+  assert.equal(diagnostic.retryable, true);
+
+  const reacquired = await coordination.campaign({ resource: "runtime" });
+  assert.notEqual(reacquired, first);
+  await coordination.close();
+});
+
+test("@spec:coordination-provider/fenced-leadership/local-close-returns-ownership", async () => {
+  const coordination = new LocalCoordinationProvider();
+  await coordination.open();
+  const handle = await coordination.campaign({ resource: "runtime" });
+  const lost = within(handle.lost, "Timed out waiting for provider-close leadership loss");
+
+  await within(coordination.close(), "Timed out closing local coordination provider");
+  const diagnostic = await lost;
+  assert.equal(diagnostic.code, "COORDINATION_LEADERSHIP_LOST");
+  assert.equal(diagnostic.retryable, true);
+  await within(handle.release(), "Timed out returning closed local leadership ownership");
 });
 
 test("artifact digest mismatch removes the staged file", async () => {

@@ -1,18 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  parseApplicationId,
-  parseArtifactDigest,
-  parseCapabilityName,
-  parseComponentId,
-  parseFencingEpoch,
-  parseGeneration,
-  parseMessageId,
-  parseOperationId,
-  parsePluginId,
-  parseRevision,
   type ArtifactDigest,
   type Clock,
+  compareOperationJournalCursors,
   type DriverHealth,
   type ExecutorKind,
   type FencingEpoch,
@@ -27,6 +18,16 @@ import {
   type PluginDeployment,
   type PluginInstallation,
   type PluginManifest,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseCapabilityName,
+  parseComponentId,
+  parseFencingEpoch,
+  parseGeneration,
+  parseMessageId,
+  parseOperationId,
+  parsePluginId,
+  parseRevision,
   type Revision,
   type ScannedState,
   type StateChange,
@@ -38,14 +39,16 @@ import {
   type Versioned,
 } from "@tegojs/contracts";
 import {
-  deterministicRetryDelay,
-  planReconcile,
-  Reconciler,
   type ArtifactDeploymentGate,
   type ComponentEffectExecutor,
   type ComponentInstance,
+  deterministicRetryDelay,
+  type PlacementWorker,
+  planReconcile,
   type ReconcileEffect,
+  type ReconcileEffectKind,
   type ReconcilePlanStep,
+  Reconciler,
   type ReconcileSnapshot,
 } from "../src/index.js";
 
@@ -68,6 +71,71 @@ class ManualClock implements Clock {
 
   advance(milliseconds: number): void {
     this.#now += milliseconds;
+  }
+}
+
+class ScheduledClock implements Clock {
+  #now = Date.parse("2026-07-23T00:00:00.000Z");
+  readonly #sleepers = new Set<{
+    readonly dueAt: number;
+    readonly resolve: () => void;
+    readonly reject: (error: unknown) => void;
+    readonly signal?: AbortSignal;
+    readonly onAbort?: () => void;
+  }>();
+
+  now(): Date {
+    return new Date(this.#now);
+  }
+
+  sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (milliseconds <= 0) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      let sleeper!: {
+        readonly dueAt: number;
+        readonly resolve: () => void;
+        readonly reject: (error: unknown) => void;
+        readonly signal?: AbortSignal;
+        readonly onAbort?: () => void;
+      };
+      sleeper = {
+        dueAt: this.#now + milliseconds,
+        resolve,
+        reject,
+        ...(signal === undefined ? {} : { signal }),
+        ...(signal === undefined
+          ? {}
+          : {
+              onAbort: () => {
+                this.#sleepers.delete(sleeper);
+                reject(signal.reason);
+              },
+            }),
+      };
+      this.#sleepers.add(sleeper);
+      if (sleeper.onAbort !== undefined) {
+        signal?.addEventListener("abort", sleeper.onAbort, { once: true });
+      }
+    });
+  }
+
+  advance(milliseconds: number): void {
+    this.#now += milliseconds;
+    for (const sleeper of [...this.#sleepers]) {
+      if (sleeper.dueAt > this.#now) continue;
+      this.#sleepers.delete(sleeper);
+      if (sleeper.onAbort !== undefined) {
+        sleeper.signal?.removeEventListener("abort", sleeper.onAbort);
+      }
+      sleeper.resolve();
+    }
+  }
+}
+
+class RejectingSleepClock extends ManualClock {
+  override sleep(): Promise<void> {
+    return Promise.reject(new Error("scheduler unavailable"));
   }
 }
 
@@ -339,6 +407,76 @@ test("one unavailable component placement blocks every step for the deployment",
   assert.equal(result.diagnostics[0]?.code, "DEPLOYMENT_EXECUTOR_UNAVAILABLE");
 });
 
+test("remote placement requires the target artifact and a compatible Worker-local executor", () => {
+  const remoteInstallation = {
+    ...installation(),
+    manifest: {
+      ...manifest("1.0.0", digestOne, ["remote", "thread"]),
+      permissions: [
+        { kind: "executor" as const, executors: ["remote" as const] },
+        {
+          kind: "worker" as const,
+          labels: {},
+          resources: { cpuMillis: 1_000, memoryBytes: 1_024, storageBytes: 1_024 },
+        },
+      ],
+    },
+  };
+  const base = {
+    ...snapshot(deployment(), [], remoteInstallation),
+    supportedExecutors: ["remote" as const],
+  };
+  const worker = {
+    workerId: "worker-placement",
+    labels: {},
+    resources: { cpuMillis: 1_000, memoryBytes: 1_024, storageBytes: 1_024 },
+  };
+
+  for (const unavailable of [
+    worker,
+    {
+      ...worker,
+      executors: ["thread" as const],
+    },
+    {
+      ...worker,
+      preparedArtifacts: [digestOne],
+    },
+    {
+      ...worker,
+      executors: ["thread" as const],
+      preparedArtifacts: [digestTwo],
+    },
+    {
+      ...worker,
+      executors: ["process" as const],
+      preparedArtifacts: [digestOne],
+    },
+  ]) {
+    const result = planReconcile({
+      ...base,
+      workers: [unavailable as PlacementWorker],
+    });
+    assert.equal(result.blocked, true);
+    assert.deepEqual(result.steps, []);
+    assert.equal(result.diagnostics[0]?.code, "DEPLOYMENT_EXECUTOR_UNAVAILABLE");
+  }
+
+  const available = planReconcile({
+    ...base,
+    workers: [
+      {
+        ...worker,
+        executors: ["thread"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+  });
+  assert.equal(available.blocked, false);
+  assert.equal(available.steps[0]?.effect.executor, "remote");
+  assert.equal(available.steps[0]?.effect.workerId, worker.workerId);
+});
+
 test("stable instance identities cannot collide when identity segments contain dots", () => {
   function customSnapshot(app: string, plugin: string): ReconcileSnapshot {
     const customDeployment = {
@@ -436,6 +574,8 @@ class TestStateStore implements StateStore {
   >();
   revision = 0n;
   failNextObservedCommit = false;
+  failNextObservedCommitKind: ReconcileEffectKind | undefined;
+  observedCommitConflicts = 0;
   failNextFailureCommit = false;
   failNextExecutionPreStateCommit = false;
   failNextAcknowledgement = false;
@@ -496,11 +636,22 @@ class TestStateStore implements StateStore {
     };
     const result = await work(transaction);
     if (
-      this.failNextObservedCommit &&
+      (this.failNextObservedCommit || this.observedCommitConflicts > 0) &&
       puts.some((put) => put.key.collection === "component-instances") &&
-      operations.some((operation) => operation.status === "completed")
+      operations.some(
+        (operation) =>
+          operation.status === "completed" &&
+          (this.failNextObservedCommitKind === undefined ||
+            (
+              operation.state as {
+                readonly effect?: { readonly kind?: ReconcileEffectKind };
+              }
+            ).effect?.kind === this.failNextObservedCommitKind),
+      )
     ) {
       this.failNextObservedCommit = false;
+      this.failNextObservedCommitKind = undefined;
+      this.observedCommitConflicts = Math.max(0, this.observedCommitConflicts - 1);
       const error = new Error("state revision conflict") as Error & {
         diagnostic?: { code: string };
       };
@@ -607,6 +758,25 @@ class TestStateStore implements StateStore {
     for (const entry of entries) yield structuredClone(entry);
   }
 
+  async *scanOperations(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    const entries = [...this.operations.values()]
+      .sort(compareOperationJournalCursors)
+      .filter(
+        (entry) =>
+          query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+      )
+      .slice(0, query.limit);
+    for (const entry of entries) yield structuredClone(entry);
+  }
+
+  scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    return this.scanOperations(query);
+  }
+
   async claimOutbox(request: OutboxClaimRequest): Promise<readonly OutboxClaim[]> {
     const claimedAt = this.#clock.now().toISOString();
     const now = this.#clock.now().getTime();
@@ -704,7 +874,9 @@ class RecordingEffects implements ComponentEffectExecutor {
   readonly performed: ReconcileEffect[] = [];
   readonly uniqueOperations = new Set<string>();
   readonly calls: ReconcileEffect[] = [];
+  readonly live = new Set<string>();
   failStart = false;
+  failStop = false;
 
   async perform(effect: ReconcileEffect): Promise<void> {
     this.calls.push(effect);
@@ -714,6 +886,23 @@ class RecordingEffects implements ComponentEffectExecutor {
     if (effect.kind === "start" && this.failStart) {
       throw new Error("component start failed");
     }
+    if (effect.kind === "stop" && this.failStop) {
+      throw new Error("component stop failed");
+    }
+    if (effect.kind === "start") this.live.add(effect.instanceId);
+    if (effect.kind === "stop") this.live.delete(effect.instanceId);
+  }
+
+  async restore(instance: ComponentInstance): Promise<void> {
+    this.live.add(instance.instanceId);
+  }
+
+  isLive(instance: ComponentInstance): boolean {
+    return this.live.has(instance.instanceId);
+  }
+
+  async close(): Promise<void> {
+    this.live.clear();
   }
 }
 
@@ -830,10 +1019,16 @@ test("an unready capability consumer does not block its provider from bootstrapp
   await reconciler.start();
 
   assert.deepEqual(
-    effects.performed.map((effect) => effect.pluginId),
-    [providerId],
+    effects.performed.map((effect) => [effect.pluginId, effect.kind]),
+    [
+      [providerId, "prepare"],
+      [providerId, "start"],
+      [consumerId, "prepare"],
+      [consumerId, "start"],
+    ],
   );
-  assert.equal(reconciler.diagnostics()[0]?.code, "CAPABILITY_REQUIRED_UNAVAILABLE");
+  assert.deepEqual(reconciler.diagnostics(), []);
+  assert.equal(reconciler.applicationReady(), true);
   await reconciler.stop();
 });
 
@@ -1302,17 +1497,15 @@ test("claimed effects revalidate current placement before journaling or performi
 
   await reconciler.start();
 
-  assert.deepEqual(effects.calls, []);
+  assert.deepEqual(
+    effects.calls.map((candidate) => candidate.executor),
+    ["thread", "thread"],
+  );
   assert.equal(reconciler.replanCount, 1);
   assert.equal(
-    [...state.operations.values()].some((operation) => operation.status === "executing"),
+    effects.calls.some((candidate) => candidate.executor === effect.executor),
     false,
   );
-  effects.supportedExecutors = ["process"];
-  await reconciler.wake();
-  assert.deepEqual(effects.calls, []);
-  await reconciler.wake();
-  assert.equal(effects.performed.at(-1)?.kind, "prepare");
   await reconciler.stop();
 });
 
@@ -1330,7 +1523,7 @@ test("claimed remote effects require the current worker placement to match exact
         componentId,
         kind: "service",
         entrypoint: "components/echo.js",
-        executors: ["remote"],
+        executors: ["remote", "process"],
       },
     ],
     permissions: [{ kind: "executor", executors: ["remote"] }, workerPermission],
@@ -1354,7 +1547,15 @@ test("claimed remote effects require the current worker placement to match exact
     instances: [],
     now: "2026-07-23T00:00:00.000Z",
     supportedExecutors: ["remote"],
-    workers: [{ workerId: "worker-a", labels: { zone: "edge" }, resources }],
+    workers: [
+      {
+        workerId: "worker-a",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["process"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
   }).steps[0]?.effect;
   assert.ok(planned);
   const plannedWorkerId = planned.workerId;
@@ -1404,7 +1605,15 @@ test("claimed remote effects require the current worker placement to match exact
     clock,
     effects,
     state,
-    workers: [{ workerId: "worker-b", labels: { zone: "edge" }, resources }],
+    workers: [
+      {
+        workerId: "worker-b",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["process"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
     loadDeployments: async () => [desired],
     loadInstallations: async () => [
       {
@@ -1416,7 +1625,17 @@ test("claimed remote effects require the current worker placement to match exact
 
   await reconciler.start();
 
-  assert.deepEqual(effects.calls, []);
+  assert.deepEqual(
+    effects.calls.map((candidate) => [candidate.workerId, candidate.kind]),
+    [
+      ["worker-b", "prepare"],
+      ["worker-b", "start"],
+    ],
+  );
+  assert.equal(
+    effects.calls.some((candidate) => candidate.workerId === plannedWorkerId),
+    false,
+  );
   assert.equal(reconciler.replanCount, 1);
   await reconciler.stop();
 });
@@ -1585,6 +1804,564 @@ test("canonical instance values stored under non-canonical keys remain inconsist
   await reconciler.stop();
 });
 
+test("restores persisted ready local sessions before reconciliation and requires them to be live", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const instanceBefore = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  const restored: ComponentInstance[] = [];
+  const effects = new RecordingEffects() as RecordingEffects & {
+    restore(instance: ComponentInstance): Promise<void>;
+    isLive(instance: ComponentInstance): boolean;
+  };
+  effects.restore = async (instance) => {
+    restored.push(instance);
+  };
+  effects.isLive = () => false;
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    authority: { resource: "runtime:app", epoch: parseFencingEpoch("9") },
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    restored.map((instance) => instance.instanceId),
+    [planned.instanceId],
+  );
+  assert.equal(reconciler.applicationReady(), false);
+  assert.equal(state.operations.size, 1);
+  const failed = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  assert.notEqual(failed?.revision, instanceBefore?.revision);
+  assert.equal(
+    (
+      failed?.value as
+        | { readonly diagnostic?: { readonly code?: string }; readonly retryAt?: string }
+        | undefined
+    )?.diagnostic?.code,
+    "LIFECYCLE_RESTORE_FAILED",
+  );
+  await reconciler.stop();
+});
+
+test("remote restoration requires the persisted Worker to remain placement-eligible", async () => {
+  const resources = { cpuMillis: 1_000, memoryBytes: 1_000_000, storageBytes: 1_000_000 };
+  const workerPermission = {
+    kind: "worker" as const,
+    labels: { zone: "edge" },
+    resources,
+  };
+  const remoteManifest: PluginManifest = {
+    ...manifest("1.0.0", digestOne, ["remote", "thread"]),
+    permissions: [{ kind: "executor", executors: ["remote"] }, workerPermission],
+  };
+  const remoteInstallation: PluginInstallation = {
+    ...installation(),
+    manifest: remoteManifest,
+  };
+  const desired = deployment("1", {
+    permissionGrants: [{ kind: "executor", executors: ["remote"] }, workerPermission],
+  });
+  const planned = planReconcile({
+    deployment: desired,
+    gate: {
+      ...gate(remoteInstallation),
+      permissionDecision: {
+        allowed: true,
+        diagnostics: [],
+        granted: desired.permissionGrants,
+        requested: remoteManifest.permissions,
+      },
+    },
+    instances: [],
+    now: "2026-07-23T00:00:00.000Z",
+    supportedExecutors: ["remote"],
+    workers: [
+      {
+        workerId: "worker-restore",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["thread"],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+  }).steps[0]?.effect;
+  assert.ok(planned);
+
+  for (const workers of [
+    [
+      {
+        workerId: "worker-other",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["thread" as const],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+    [
+      {
+        workerId: "worker-restore",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["thread" as const],
+        preparedArtifacts: [digestTwo],
+      },
+    ],
+    [
+      {
+        workerId: "worker-restore",
+        labels: { zone: "edge" },
+        resources,
+        executors: ["process" as const],
+        preparedArtifacts: [digestOne],
+      },
+    ],
+  ]) {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: planned.instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: digestOne,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: "remote",
+          instanceId: planned.instanceId,
+          lifecycle: "ready",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+          workerId: "worker-restore",
+        },
+        { expectedRevision: "absent" },
+      );
+      return null;
+    });
+    const effects = new RecordingEffects();
+    effects.supportedExecutors = ["remote"];
+    const restored: string[] = [];
+    effects.restore = async (instance) => {
+      restored.push(instance.instanceId);
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate(remoteInstallation).artifact },
+      clock,
+      effects,
+      state,
+      workers,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [remoteInstallation],
+    });
+
+    await reconciler.start();
+
+    assert.deepEqual(restored, []);
+    await reconciler.stop();
+  }
+});
+
+test("persisted local restoration failures are isolated and durably retryable", async () => {
+  for (const essential of [false, true]) {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    const desired = deployment("1", { essential });
+    const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+    assert.ok(planned);
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: planned.instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: digestOne,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: planned.executor,
+          instanceId: planned.instanceId,
+          lifecycle: "ready",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+        },
+        { expectedRevision: "absent" },
+      );
+      return null;
+    });
+    const effects = new RecordingEffects();
+    effects.restore = async () => {
+      throw new Error("restore failed");
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+
+    const failed = await state.read({
+      namespace: "tego",
+      collection: "component-instances",
+      id: planned.instanceId,
+    });
+    const failedValue = failed?.value as
+      | {
+          readonly lifecycle?: string;
+          readonly retryAt?: string;
+          readonly diagnostic?: { readonly code?: string };
+        }
+      | undefined;
+    assert.equal(failedValue?.lifecycle, "ready");
+    assert.equal(typeof failedValue?.retryAt, "string");
+    assert.equal(failedValue?.diagnostic?.code, "LIFECYCLE_RESTORE_FAILED");
+    assert.equal(reconciler.kernelRunning, true);
+    assert.equal(reconciler.applicationReady(), !essential);
+    await reconciler.stop();
+  }
+});
+
+test("persisted preparing local sessions are restored before their start effect resumes", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "preparing",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects = new RecordingEffects();
+  const restored: ComponentInstance[] = [];
+  const restore = effects.restore.bind(effects);
+  effects.restore = async (instance) => {
+    restored.push(instance);
+    await restore(instance);
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    restored.map((instance) => instance.lifecycle),
+    ["preparing"],
+  );
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
+test("persisted local restoration retries automatically without reopening completed lifecycle messages", async () => {
+  const clock = new ScheduledClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  const startOperationId = parseOperationId(planned.operationId.replace(/prepare$/u, "start"));
+  const restoreOperationId = parseOperationId(planned.operationId.replace(/prepare$/u, "restore"));
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    for (const operationId of [planned.operationId, startOperationId]) {
+      await transaction.appendOperation({
+        operationId,
+        kind: "component.lifecycle",
+        status: "completed",
+        state: { instanceId: planned.instanceId },
+        updatedAt: clock.now().toISOString(),
+      });
+    }
+    return null;
+  });
+  const effects = new RecordingEffects();
+  const restore = effects.restore.bind(effects);
+  let restoreAttempts = 0;
+  effects.restore = async (instance) => {
+    restoreAttempts += 1;
+    if (restoreAttempts <= 2) throw new Error("transient restore failure");
+    await restore(instance);
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  assert.equal(reconciler.applicationReady(), false);
+  const firstFailure = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  const firstRetryAt = (firstFailure?.value as { readonly retryAt?: string } | undefined)?.retryAt;
+  assert.equal(typeof firstRetryAt, "string");
+  assert.equal(state.operations.get(planned.operationId)?.status, "completed");
+  assert.equal(state.operations.get(startOperationId)?.status, "completed");
+  assert.equal(state.operations.get(restoreOperationId)?.status, "failed");
+
+  clock.advance(Date.parse(firstRetryAt as string) - clock.now().getTime());
+  for (let turn = 0; turn < 20 && restoreAttempts < 2; turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+  const secondFailure = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  const secondRetryAt = (secondFailure?.value as { readonly retryAt?: string } | undefined)
+    ?.retryAt;
+  assert.equal(typeof secondRetryAt, "string");
+  assert.equal(Date.parse(secondRetryAt as string) > Date.parse(firstRetryAt as string), true);
+
+  clock.advance(Date.parse(secondRetryAt as string) - clock.now().getTime());
+  for (let turn = 0; turn < 20 && !reconciler.applicationReady(); turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+
+  assert.equal(restoreAttempts, 3);
+  assert.equal(reconciler.applicationReady(), true);
+  const recovered = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  assert.equal(
+    (recovered?.value as { readonly diagnostic?: unknown } | undefined)?.diagnostic,
+    undefined,
+  );
+  assert.equal(
+    (recovered?.value as { readonly attempt?: unknown } | undefined)?.attempt,
+    undefined,
+  );
+  assert.equal(
+    (recovered?.value as { readonly retryAt?: unknown } | undefined)?.retryAt,
+    undefined,
+  );
+  assert.equal(state.operations.get(planned.operationId)?.status, "completed");
+  assert.equal(state.operations.get(startOperationId)?.status, "completed");
+  assert.equal(state.operations.get(restoreOperationId)?.status, "completed");
+  await reconciler.stop();
+});
+
+test("persisted ready state is not live when the executor has no lifecycle capability", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("1"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects: ComponentEffectExecutor = {
+    supportedExecutors: ["process"],
+    perform: async () => {},
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.equal(reconciler.applicationReady(), false);
+  await reconciler.stop();
+});
+
+test("component lifecycle methods are accepted only as one complete capability", async () => {
+  const lifecycleMethods = {
+    restore: async (_instance: ComponentInstance) => {},
+    isLive: (_instance: ComponentInstance) => false,
+    close: async () => {},
+  };
+  for (let mask = 1; mask < 7; mask += 1) {
+    const effects = {
+      supportedExecutors: ["process"] as const,
+      perform: async (_effect: ReconcileEffect) => {},
+      ...(mask & 1 ? { restore: lifecycleMethods.restore } : {}),
+      ...(mask & 2 ? { isLive: lifecycleMethods.isLive } : {}),
+      ...(mask & 4 ? { close: lifecycleMethods.close } : {}),
+    };
+    assert.throws(
+      () =>
+        new Reconciler({
+          artifactGate: { validate: async () => gate().artifact },
+          clock: new ManualClock(),
+          effects,
+          state: new TestStateStore(new ManualClock()),
+        }),
+      /restore|isLive|close|lifecycle|capability/iu,
+      `partial lifecycle mask ${mask} must be rejected`,
+    );
+  }
+});
+
+test("restoration skips ready instances whose observed generation is stale", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1", { essential: true });
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("1"),
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("2"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects = new RecordingEffects();
+  const restored: string[] = [];
+  effects.restore = async (instance) => {
+    restored.push(instance.instanceId);
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(restored, []);
+  assert.equal(reconciler.applicationReady(), false);
+  await reconciler.stop();
+});
+
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();
@@ -1683,19 +2460,11 @@ test("retry pre-state revision conflicts replan before external execution", asyn
 
   await reconciler.start();
 
-  assert.equal(effects.calls.length, 0);
-  assert.equal(reconciler.replanCount >= 1, true);
-  assert.equal(
-    [...state.operations.values()].some((operation) => operation.status === "executing"),
-    false,
-  );
-
-  await reconciler.wake();
-
   assert.deepEqual(
     effects.calls.map((candidate) => candidate.kind),
     ["start"],
   );
+  assert.equal(reconciler.replanCount >= 1, true);
   const ready = await state.read({
     namespace: "tego",
     collection: "component-instances",
@@ -1770,10 +2539,11 @@ test("restart after observed commit but before acknowledgement does not repeat t
   const second = new Reconciler(options);
   await second.start();
 
-  assert.equal(effects.calls.length, 1);
+  assert.equal(effects.calls.filter((effect) => effect.kind === "prepare").length, 1);
+  assert.equal(effects.calls.filter((effect) => effect.kind === "start").length, 1);
   assert.equal(
     [...state.operations.values()].filter((entry) => entry.status === "completed").length,
-    1,
+    2,
   );
   await second.stop();
 });
@@ -1829,7 +2599,10 @@ test("a queued startup effect is discarded when desired state becomes disabled",
   await second.wake();
 
   assert.equal(effects.calls.filter((effect) => effect.kind === "prepare").length, 1);
-  assert.equal(effects.calls.at(-1)?.kind, "drain");
+  assert.deepEqual(
+    effects.calls.slice(-2).map((effect) => effect.kind),
+    ["drain", "stop"],
+  );
   assert.equal(second.replanCount, 1);
   await second.stop();
 });
@@ -1863,8 +2636,45 @@ test("disabled deployments can drain persisted instances after installation remo
   });
   await disabled.start();
 
-  assert.equal(effects.performed.at(-1)?.kind, "drain");
+  assert.deepEqual(
+    effects.performed.slice(-2).map((effect) => effect.kind),
+    ["drain", "stop"],
+  );
   await disabled.stop();
+});
+
+test("active upgrades retain failed teardown diagnostics from obsolete generations", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const effects = new RecordingEffects();
+  let desired = deployment();
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  desired = deployment("2");
+  effects.failStop = true;
+  await reconciler.wake();
+
+  assert.equal(
+    reconciler.diagnostics().some((diagnostic) => diagnostic.code === "LIFECYCLE_STOP_FAILED"),
+    true,
+  );
+  assert.equal(
+    (
+      [...state.records.values()].find(
+        (entry) => entry.key.collection === "deployment-observations",
+      )?.value as { readonly status?: string } | undefined
+    )?.status,
+    "failed",
+  );
+  await reconciler.stop();
 });
 
 test("stale desired state invalidates a planned effect before it is journaled", async () => {
@@ -1886,7 +2696,13 @@ test("stale desired state invalidates a planned effect before it is journaled", 
 
   await reconciler.start();
 
-  assert.deepEqual(effects.calls, []);
+  assert.deepEqual(
+    effects.calls.map((effect) => [effect.deploymentGeneration, effect.kind]),
+    [
+      ["2", "prepare"],
+      ["2", "start"],
+    ],
+  );
   assert.equal(reconciler.replanCount, 1);
   await reconciler.stop();
 });
@@ -1935,7 +2751,7 @@ test("component start failure records failure and only essential deployment read
   }
 });
 
-test("deployment observations progress from converging to ready", async () => {
+test("deployment observations are ready when wake convergence completes", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
@@ -1949,16 +2765,392 @@ test("deployment observations progress from converging to ready", async () => {
   });
 
   await reconciler.start();
-  const status = () =>
-    (
-      [...state.records.values()].find(
-        (entry) => entry.key.collection === "deployment-observations",
-      )?.value as { readonly status?: string } | undefined
-    )?.status;
-  assert.equal(status(), "converging");
+  const observation = () =>
+    [...state.records.values()].find((entry) => entry.key.collection === "deployment-observations");
+  assert.equal((observation()?.value as { readonly status?: string } | undefined)?.status, "ready");
+  const settledRevision = observation()?.revision;
+  const settledUpdatedAt = (observation()?.value as { readonly updatedAt?: string } | undefined)
+    ?.updatedAt;
 
+  clock.advance(1_000);
   await reconciler.wake();
-  assert.equal(status(), "ready");
+  assert.equal((observation()?.value as { readonly status?: string } | undefined)?.status, "ready");
+  assert.equal(observation()?.revision, settledRevision);
+  assert.equal(
+    (observation()?.value as { readonly updatedAt?: string } | undefined)?.updatedAt,
+    settledUpdatedAt,
+  );
+  await reconciler.stop();
+});
+
+test("stable blocked deployment observations do not churn only because observedAt advances", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [
+      deployment("1", {
+        permissionGrants: [{ kind: "executor", executors: ["thread"] }],
+      }),
+    ],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  const observation = () =>
+    [...state.records.values()].find((entry) => entry.key.collection === "deployment-observations");
+  const settledRevision = observation()?.revision;
+  const settledUpdatedAt = (observation()?.value as { readonly updatedAt?: string } | undefined)
+    ?.updatedAt;
+
+  clock.advance(1_000);
+  await reconciler.wake();
+
+  assert.equal(observation()?.revision, settledRevision);
+  assert.equal(
+    (observation()?.value as { readonly updatedAt?: string } | undefined)?.updatedAt,
+    settledUpdatedAt,
+  );
+  await reconciler.stop();
+});
+
+test("one wake converges immediately available lifecycle effects to quiescence", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    effects.performed.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
+test("wake fails closed when immediate lifecycle work exceeds its pass budget", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 1,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await assert.rejects(reconciler.start(), /did not converge within 1 pass/u);
+  assert.equal(reconciler.kernelRunning, false);
+  assert.equal(effects.live.size, 0);
+});
+
+test("a later wake budget failure stops an already-started reconciler", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  let deployments: readonly PluginDeployment[] = [];
+  const backgroundErrors: unknown[] = [];
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 1,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => [installation()],
+    onBackgroundError: (error) => {
+      backgroundErrors.push(error);
+    },
+  });
+
+  await reconciler.start();
+  assert.equal(reconciler.kernelRunning, true);
+
+  deployments = [deployment()];
+  await assert.rejects(reconciler.wake(), /did not converge within 1 pass/u);
+
+  assert.equal(reconciler.kernelRunning, false);
+  assert.equal(effects.live.size, 0);
+  assert.equal(backgroundErrors.length, 1);
+});
+
+test("the convergence pass budget counts lifecycle work without an extra idle proof pass", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 2,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    effects.performed.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
+test("a recovered final commit conflict does not consume another convergence pass", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  state.failNextObservedCommit = true;
+  state.failNextObservedCommitKind = "start";
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 2,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(
+    effects.performed.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
+test("interruptAfterEffect terminates the whole convergence loop after one external effect", async () => {
+  const secondComponentId = parseComponentId("second-service");
+  const value = installation();
+  const twoComponentManifest: PluginManifest = {
+    ...value.manifest,
+    components: [
+      ...value.manifest.components,
+      {
+        componentId: secondComponentId,
+        kind: "service",
+        entrypoint: "components/second.js",
+        executors: ["process"],
+      },
+    ],
+  };
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async () => ({ ...gate().artifact, manifest: twoComponentManifest }),
+    },
+    clock,
+    effects,
+    interruptAfterEffect: true,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [{ ...value, manifest: twoComponentManifest }],
+  });
+
+  await reconciler.start();
+
+  assert.equal(effects.calls.length, 1);
+  await reconciler.stop();
+});
+
+test("stop prevents a gated reconciliation pass from starting a new external effect", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<ReturnType<typeof gate>["artifact"]>();
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async () => {
+        entered.resolve();
+        return release.promise;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  const starting = reconciler.start();
+  await entered.promise;
+  const stopping = reconciler.stop();
+  release.resolve(gate().artifact);
+  await Promise.all([starting, stopping]);
+
+  assert.deepEqual(effects.calls, []);
+  assert.equal(reconciler.kernelRunning, false);
+});
+
+test("failed lifecycle effects wake automatically when retryAt becomes due", async () => {
+  const clock = new ScheduledClock();
+  const effects = new RecordingEffects();
+  effects.failStart = true;
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "start"],
+  );
+  effects.failStart = false;
+
+  clock.advance(60_000);
+  for (let turn = 0; turn < 20 && effects.calls.length < 3; turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "start", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
+
+test("deferred scheduler failure is observable and fails the reconciler closed", async () => {
+  const clock = new RejectingSleepClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const backgroundErrors: unknown[] = [];
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [],
+    loadInstallations: async () => [],
+    onBackgroundError: (error) => {
+      backgroundErrors.push(error);
+    },
+  });
+
+  await assert.rejects(reconciler.start(), /scheduler unavailable/u);
+
+  assert.equal(reconciler.kernelRunning, false);
+  assert.equal(backgroundErrors.length, 0);
+  assert.equal(
+    reconciler
+      .diagnostics()
+      .some((diagnostic) => diagnostic.code === "LIFECYCLE_RECONCILE_BACKGROUND_FAILED"),
+    true,
+  );
+});
+
+test("an abandoned lifecycle claim is recovered automatically after its lease expires", async () => {
+  const clock = new ScheduledClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const options = {
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  };
+  const abandoned = new Reconciler({
+    ...options,
+    interruptAfterEffect: true,
+    owner: "abandoned-runtime",
+  });
+
+  await abandoned.start();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare"],
+  );
+  await abandoned.stop();
+
+  const recovered = new Reconciler({ ...options, owner: "replacement-runtime" });
+  await recovered.start();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare"],
+  );
+
+  await recovered.wake();
+  clock.advance(30_001);
+  for (let turn = 0; turn < 20 && effects.calls.length < 3; turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "prepare", "start"],
+  );
+  assert.equal(recovered.applicationReady(), true);
+  await recovered.stop();
+});
+
+test("an exhausted lifecycle commit conflict is recovered automatically after its lease expires", async () => {
+  const clock = new ScheduledClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  let deployments: readonly PluginDeployment[] = [];
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  clock.advance(30_001);
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+
+  deployments = [deployment()];
+  state.observedCommitConflicts = 3;
+  await reconciler.wake();
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare"],
+  );
+
+  clock.advance(30_001);
+  for (let turn = 0; turn < 20 && effects.calls.length < 3; turn += 1) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+
+  assert.deepEqual(
+    effects.calls.map((effect) => effect.kind),
+    ["prepare", "prepare", "start"],
+  );
+  assert.equal(reconciler.applicationReady(), true);
   await reconciler.stop();
 });
 
@@ -2056,9 +3248,8 @@ test("failed effect conditional commits reread after a revision conflict", async
     loadInstallations: async () => [installation()],
   });
 
-  await reconciler.start();
   state.failNextFailureCommit = true;
-  await reconciler.wake();
+  await reconciler.start();
 
   assert.equal(reconciler.replanCount, 1);
   assert.equal(

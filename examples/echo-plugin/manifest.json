@@ -11,13 +11,13 @@
       "componentId": "echo",
       "kind": "task",
       "entrypoint": "components/component.js",
-      "executors": ["process", "thread"]
+      "executors": ["process", "thread", "remote"]
     }
   ],
   "permissions": [
     {
       "kind": "executor",
-      "executors": ["process"]
+      "executors": ["process", "thread", "remote"]
     }
   ],
   "capabilities": {

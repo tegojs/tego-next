@@ -405,11 +405,7 @@ function auditImport(
   const next = tokens[index + 1];
   if (next?.value === ".") return index + 1;
   if (next?.value === "(") {
-    validateSpecifier(tokens[index + 2], runtimeImports);
-    if (tokens[index + 3]?.value !== ")") {
-      throw importError("Dynamic imports must contain exactly one literal specifier");
-    }
-    return index + 3;
+    throw importError("Dynamic imports are not supported by phase-one plugin artifacts");
   }
   if (next?.kind === "string") {
     validateSpecifier(next, runtimeImports);

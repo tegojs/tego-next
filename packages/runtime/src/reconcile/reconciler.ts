@@ -1,6 +1,15 @@
 import {
+  type ApplicationId,
+  type ArtifactDigest,
+  type Clock,
   DiagnosticError,
   diagnosticCode,
+  type ExecutorKind,
+  type JsonObject,
+  type OperationId,
+  type OutboxClaim,
+  type PluginDeployment,
+  type PluginInstallation,
   parseApplicationId,
   parseArtifactDigest,
   parseCapabilityName,
@@ -8,60 +17,96 @@ import {
   parseGeneration,
   parseMessageId,
   parseOperationId,
-  parsePluginId,
   parsePluginDeployment,
+  parsePluginId,
   parsePluginInstallation,
-  runtimeDiagnostic,
-  serializeCause,
-  type ArtifactDigest,
-  type ApplicationId,
-  type Clock,
-  type ExecutorKind,
-  type JsonObject,
-  type OperationId,
-  type OutboxClaim,
-  type PluginDeployment,
-  type PluginInstallation,
   type RuntimeAuthority,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type StateKey,
   type StateStore,
+  serializeCause,
 } from "@tegojs/contracts";
 import type {
   ArtifactService,
-  ValidatedPluginArtifact,
   ValidateArtifactRequest,
+  ValidatedPluginArtifact,
 } from "../artifacts/artifact-service.js";
 import {
-  resolveCapabilities,
   type CapabilityResolutionDeployment,
   type PreviousCapabilityBinding,
+  resolveCapabilities,
 } from "../capabilities/resolver.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
+import type { PlacementWorker } from "./placement.js";
+import { placementIsEligible } from "./placement.js";
 import {
-  planReconcile,
-  reconcileEffectIdentities,
   type ArtifactDeploymentGate,
   type ComponentInstance,
+  planReconcile,
   type ReconcileEffect,
   type ReconcileEffectKind,
   type ReconcilePlanStep,
+  reconcileEffectIdentities,
 } from "./plan.js";
-import type { PlacementWorker } from "./placement.js";
-import { planPlacement } from "./placement.js";
 import { deterministicRetryDelay } from "./retry.js";
 
 const namespace = "tego";
 const claimLeaseMs = 30_000;
+const defaultMaxConvergencePasses = 10_000;
 
 export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
   perform(effect: ReconcileEffect): Promise<void>;
+  restore?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  isLive?(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
+  close?(authority?: RuntimeAuthority): Promise<void>;
 }
 
 export interface ReconcileArtifactGate {
   validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact>;
+}
+
+interface ComponentLifecycleExecutor {
+  restore(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  isLive(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
+  close(authority?: RuntimeAuthority): Promise<void>;
+}
+
+function componentLifecycle(
+  effects: ComponentEffectExecutor,
+): ComponentLifecycleExecutor | undefined {
+  const { close, isLive, restore } = effects;
+  if (restore === undefined && isLive === undefined && close === undefined) return undefined;
+  if (restore === undefined || isLive === undefined || close === undefined) {
+    throw new TypeError(
+      "Component lifecycle capability requires restore, isLive, and close methods together",
+    );
+  }
+  return {
+    restore: restore.bind(effects),
+    isLive: isLive.bind(effects),
+    close: close.bind(effects),
+  };
+}
+
+function restorationOperationId(
+  instance: Pick<
+    ComponentInstance,
+    "applicationId" | "componentId" | "deploymentGeneration" | "pluginId"
+  >,
+): OperationId {
+  const prepareOperationId = reconcileEffectIdentities(
+    {
+      applicationId: instance.applicationId,
+      generation: instance.deploymentGeneration,
+      pluginId: instance.pluginId,
+    },
+    instance.componentId,
+    "prepare",
+  ).operationId;
+  return parseOperationId(`${prepareOperationId.slice(0, -"prepare".length)}restore`);
 }
 
 export interface ReconcilerOptions {
@@ -75,6 +120,8 @@ export interface ReconcilerOptions {
   readonly loadDeployments?: () => Promise<readonly PluginDeployment[]>;
   readonly loadInstallations?: () => Promise<readonly PluginInstallation[]>;
   readonly interruptAfterEffect?: boolean;
+  readonly maxConvergencePasses?: number;
+  readonly onBackgroundError?: (error: unknown) => void | Promise<void>;
 }
 
 interface PersistedComponentInstance extends JsonObject {
@@ -184,6 +231,16 @@ function conflictCode(error: unknown): string | undefined {
   );
 }
 
+function observationDiagnosticsFingerprint(diagnostics: readonly JsonObject[]): string {
+  return JSON.stringify(
+    diagnostics.map((diagnostic) => {
+      const { observedAt: _observedAt, ...stable } = diagnostic;
+      void _observedAt;
+      return stable;
+    }),
+  );
+}
+
 function effectDiagnostic(
   effect: ReconcileEffect,
   error: unknown,
@@ -275,18 +332,38 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
 export class Reconciler {
   readonly #options: ReconcilerOptions;
   readonly #owner: string;
+  readonly #componentLifecycle: ComponentLifecycleExecutor | undefined;
+  readonly #maxConvergencePasses: number;
   readonly #diagnosticsByDeployment = new Map<string, readonly RuntimeDiagnostic[]>();
   readonly #readyDeployments = new Set<string>();
   #deployments: readonly PluginDeployment[] = [];
   #running = false;
+  #starting = false;
+  #stopRequested = false;
+  #fatalReported = false;
+  #fatalError: unknown;
   #tail: Promise<void> = Promise.resolve();
   #interrupted = false;
   #lastCommitAuthority: RuntimeAuthority | undefined;
   #replanCount = 0;
+  #nextWakeAt: number | undefined;
+  #fatalDiagnostic: RuntimeDiagnostic | undefined;
+  #deferredWake:
+    | {
+        readonly at: number;
+        readonly controller: AbortController;
+        readonly promise: Promise<void>;
+      }
+    | undefined;
 
   constructor(options: ReconcilerOptions) {
     this.#options = options;
     this.#owner = options.owner ?? "reconciler";
+    this.#componentLifecycle = componentLifecycle(options.effects);
+    this.#maxConvergencePasses = options.maxConvergencePasses ?? defaultMaxConvergencePasses;
+    if (!Number.isSafeInteger(this.#maxConvergencePasses) || this.#maxConvergencePasses < 1) {
+      throw new RangeError("maxConvergencePasses must be a positive safe integer");
+    }
   }
 
   get kernelRunning(): boolean {
@@ -304,25 +381,70 @@ export class Reconciler {
   async start(): Promise<void> {
     if (this.#running) return;
     this.#running = true;
-    await this.wake();
+    this.#starting = true;
+    try {
+      await this.wake();
+      await Promise.resolve();
+      if (!this.#running && !this.#stopRequested) {
+        throw this.#fatalError ?? new Error("Reconciler startup failed");
+      }
+    } catch (error) {
+      const cleanupRequired = this.#running;
+      this.#running = false;
+      this.#cancelDeferredWake();
+      if (cleanupRequired) {
+        try {
+          await this.#componentLifecycle?.close(this.#options.authority);
+        } catch (closeError) {
+          throw new AggregateError([error, closeError], "Reconciler startup cleanup failed");
+        }
+      }
+      throw error;
+    } finally {
+      this.#starting = false;
+    }
   }
 
   wake(): Promise<void> {
     if (!this.#running) return Promise.resolve();
-    const pass = this.#tail.then(() => this.#reconcilePass());
+    const preservedWakeAt = this.#deferredWake?.at;
+    this.#cancelDeferredWake();
+    const pass = this.#tail.then(async () => {
+      if (!this.#running) return;
+      try {
+        await this.#reconcileUntilQuiescent(preservedWakeAt);
+      } catch (error) {
+        this.#running = false;
+        this.#cancelDeferredWake();
+        let failure = error;
+        try {
+          await this.#componentLifecycle?.close(this.#options.authority);
+        } catch (closeError) {
+          failure = new AggregateError([error, closeError], "Reconciler failure cleanup failed");
+        }
+        if (!this.#starting) await this.#reportFatalFailure(failure);
+        throw failure;
+      }
+    });
     this.#tail = pass.catch(() => undefined);
     return pass;
   }
 
   async stop(): Promise<void> {
+    this.#stopRequested = true;
     this.#running = false;
+    this.#cancelDeferredWake();
     await this.#tail;
+    await this.#componentLifecycle?.close(this.#options.authority);
   }
 
   diagnostics(): readonly RuntimeDiagnostic[] {
-    return [...this.#diagnosticsByDeployment.entries()]
+    const diagnostics = [...this.#diagnosticsByDeployment.entries()]
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .flatMap(([, diagnostics]) => diagnostics);
+    return this.#fatalDiagnostic === undefined
+      ? diagnostics
+      : [...diagnostics, this.#fatalDiagnostic];
   }
 
   applicationReady(): boolean {
@@ -338,25 +460,62 @@ export class Reconciler {
     return true;
   }
 
-  async #reconcilePass(): Promise<void> {
+  async #reconcileUntilQuiescent(preservedWakeAt?: number): Promise<void> {
+    this.#diagnosticsByDeployment.clear();
+    this.#nextWakeAt =
+      preservedWakeAt !== undefined && preservedWakeAt > this.#options.clock.now().getTime()
+        ? preservedWakeAt
+        : undefined;
+    for (let pass = 0; pass < this.#maxConvergencePasses; pass += 1) {
+      if (!this.#running) return;
+      const pending = await this.#reconcilePass();
+      if (!this.#running || this.#interrupted) return;
+      if (!pending) {
+        this.#deferUntil(this.#options.clock.now().getTime() + claimLeaseMs);
+        this.#armDeferredWake();
+        return;
+      }
+    }
     if (!this.#running) return;
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "LIFECYCLE_RECONCILE_DID_NOT_CONVERGE",
+        message: `Reconciler did not converge within ${this.#maxConvergencePasses} pass${this.#maxConvergencePasses === 1 ? "" : "es"}`,
+        source: { kind: "runtime", id: this.#owner },
+        details: { maxConvergencePasses: this.#maxConvergencePasses },
+        observedAt: this.#options.clock.now().toISOString(),
+      }),
+    );
+  }
+
+  async #reconcilePass(): Promise<boolean> {
+    if (!this.#running) return false;
+    const replanCount = this.#replanCount;
     let [deployments, installations, loadedInstances] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstallations(),
       this.#loadInstances(),
     ]);
+    if (!this.#running) return false;
+    await this.#restorePersistedComponents(deployments, installations, loadedInstances);
+    if (!this.#running) return false;
+    loadedInstances = await this.#loadInstances();
+    this.#deferRetries(loadedInstances);
     this.#deployments = deployments;
-    this.#diagnosticsByDeployment.clear();
     this.#readyDeployments.clear();
 
     const existingClaim = await this.#claimNext();
+    let performedImmediateWork = existingClaim !== undefined;
     if (existingClaim !== undefined) {
       await this.#executeClaim(existingClaim);
+      if (!this.#running || this.#interrupted) return false;
       [deployments, installations, loadedInstances] = await Promise.all([
         this.#loadDeployments(),
         this.#loadInstallations(),
         this.#loadInstances(),
       ]);
+      if (!this.#running) return false;
+      this.#deferRetries(loadedInstances);
       this.#deployments = deployments;
     }
 
@@ -373,7 +532,14 @@ export class Reconciler {
     const invalidByDeployment = new Map<string, readonly ComponentInstance[]>();
     const gates = new Map<string, ArtifactDeploymentGate | DiagnosticError>();
     const orderRanks = new Map<string, number>();
+    const currentDeploymentKeys = new Set(lexicalDeployments.map(deploymentKey));
+    for (const key of this.#diagnosticsByDeployment.keys()) {
+      if (!key.startsWith("outbox/") && !currentDeploymentKeys.has(key)) {
+        this.#diagnosticsByDeployment.delete(key);
+      }
+    }
     for (const deployment of lexicalDeployments) {
+      this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
       const invalidInstances = loadedInstances
         .filter(
           (record) =>
@@ -392,6 +558,7 @@ export class Reconciler {
         installations,
         canonicalInstances,
       );
+      if (!this.#running) return false;
       gates.set(deploymentKey(deployment), gate);
       if (!(gate instanceof DiagnosticError)) {
         for (const [index, identity] of (gate.capabilityResolution.order ?? []).entries()) {
@@ -483,18 +650,56 @@ export class Reconciler {
         continue;
       }
       for (const step of plan.steps) {
+        if (!this.#running) return false;
         await this.#persistStep(deployment, step);
       }
     }
 
     if (existingClaim === undefined) {
       const claim = await this.#claimNext();
-      if (claim !== undefined) await this.#executeClaim(claim);
+      if (claim !== undefined) {
+        performedImmediateWork = true;
+        await this.#executeClaim(claim);
+      }
     }
+    if (!this.#running || this.#interrupted) return false;
     await this.#refreshReadiness();
+    if (!this.#running) return false;
+    const latestInstances = await this.#loadInstances();
+    this.#deferRetries(latestInstances);
+    const canonicalLatestInstances = latestInstances.filter((record) =>
+      isInstanceContextConsistent(record, this.#deployments),
+    );
+    const needsImmediateReconcile = canonicalLatestInstances.some(
+      (record) =>
+        !this.#isDeploymentPlanningBlocked(record.value) &&
+        this.#needsImmediateReconcile(record.value),
+    );
+    const hasUnsettledDeployment = this.#deployments.some(
+      (deployment) =>
+        deployment.state === "active" &&
+        !this.#readyDeployments.has(deploymentKey(deployment)) &&
+        !this.#diagnosticsByDeployment
+          .get(deploymentKey(deployment))
+          ?.some(
+            (diagnostic) =>
+              diagnostic.code.startsWith("ARTIFACT_") ||
+              diagnostic.code.startsWith("CAPABILITY_") ||
+              diagnostic.code.startsWith("DEPLOYMENT_") ||
+              diagnostic.code.startsWith("PERMISSION_"),
+          ),
+    );
+    const hasDeferredCapabilityResolution = this.diagnostics().some((diagnostic) =>
+      diagnostic.code.startsWith("CAPABILITY_"),
+    );
+    return (
+      (performedImmediateWork || this.#replanCount !== replanCount) &&
+      (needsImmediateReconcile || hasUnsettledDeployment || hasDeferredCapabilityResolution)
+    );
   }
 
   async #claimNext(): Promise<OutboxClaim | undefined> {
+    if (!this.#running) return undefined;
     const claims = await this.#options.state.claimOutbox({
       owner: this.#owner,
       leaseDurationMs: claimLeaseMs,
@@ -502,6 +707,7 @@ export class Reconciler {
       topic: "component.lifecycle",
       ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
     });
+    if (!this.#running) return undefined;
     return claims[0];
   }
 
@@ -545,6 +751,234 @@ export class Reconciler {
       });
     }
     return instances;
+  }
+
+  async #restorePersistedComponents(
+    loadedDeployments?: readonly PluginDeployment[],
+    loadedInstallations?: readonly PluginInstallation[],
+    loadedInstances?: readonly LoadedComponentInstance[],
+  ): Promise<void> {
+    if (this.#componentLifecycle === undefined) return;
+    const [deployments, installations, instances] = await Promise.all([
+      loadedDeployments ?? this.#loadDeployments(),
+      loadedInstallations ?? this.#loadInstallations(),
+      loadedInstances ?? this.#loadInstances(),
+    ]);
+    const now = this.#options.clock.now().toISOString();
+    const restorable = instances
+      .filter((record) => isInstanceContextConsistent(record, deployments))
+      .map((record) => record.value)
+      .filter(
+        (instance) =>
+          (instance.lifecycle === "preparing" || instance.lifecycle === "ready") &&
+          (instance.retryAt === undefined || instance.retryAt <= now) &&
+          (instance.workerId === undefined ||
+            this.#options.workers?.some((worker) => worker.workerId === instance.workerId) ===
+              true) &&
+          instance.artifactDigest !== undefined &&
+          this.#options.effects.supportedExecutors.includes(instance.executor) &&
+          deployments.some(
+            (deployment) =>
+              deployment.state === "active" &&
+              deployment.applicationId === instance.applicationId &&
+              deployment.pluginId === instance.pluginId &&
+              deployment.generation === instance.deploymentGeneration &&
+              deployment.artifactDigest === instance.artifactDigest,
+          ),
+      )
+      .sort((left, right) =>
+        left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
+      );
+    for (const instance of restorable) {
+      if (
+        instance.executor === "remote" &&
+        !(await this.#isPersistedRemotePlacementEligible(instance, deployments, installations))
+      ) {
+        continue;
+      }
+      if (
+        instance.lifecycle === "ready" &&
+        this.#componentLifecycle.isLive(instance, this.#options.authority)
+      ) {
+        await this.#clearRestorationFailure(instance);
+        continue;
+      }
+      try {
+        await this.#componentLifecycle.restore(instance, this.#options.authority);
+        if (
+          instance.lifecycle === "ready" &&
+          !this.#componentLifecycle.isLive(instance, this.#options.authority)
+        ) {
+          throw new Error("Restored component session did not become live");
+        }
+        await this.#clearRestorationFailure(instance);
+      } catch (error) {
+        await this.#recordRestorationFailure(instance, error);
+      }
+    }
+  }
+
+  async #isPersistedRemotePlacementEligible(
+    instance: ComponentInstance,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+  ): Promise<boolean> {
+    if (instance.workerId === undefined || instance.artifactDigest === undefined) return false;
+    const deployment = deployments.find(
+      (candidate) =>
+        candidate.state === "active" &&
+        candidate.applicationId === instance.applicationId &&
+        candidate.pluginId === instance.pluginId &&
+        candidate.generation === instance.deploymentGeneration &&
+        candidate.artifactDigest === instance.artifactDigest,
+    );
+    if (deployment === undefined) return false;
+    const installation = installations.find(
+      (candidate) =>
+        candidate.pluginId === deployment.pluginId &&
+        candidate.version === deployment.version &&
+        candidate.digest === deployment.artifactDigest,
+    );
+    if (installation === undefined) return false;
+    let artifact: ValidatedPluginArtifact;
+    try {
+      artifact = await this.#options.artifactGate.validate({
+        digest: deployment.artifactDigest,
+      });
+    } catch {
+      return false;
+    }
+    const component = artifact.manifest.components.find(
+      (candidate) => candidate.componentId === instance.componentId,
+    );
+    if (component === undefined) return false;
+    const permissionDecision = validatePermissionGrant(
+      artifact.manifest.permissions,
+      deployment.permissionGrants,
+    );
+    if (!permissionDecision.allowed) return false;
+    return placementIsEligible(
+      {
+        artifactDigest: deployment.artifactDigest,
+        component,
+        grantedPermissions: permissionDecision.granted ?? [],
+        supportedExecutors: this.#options.effects.supportedExecutors,
+        ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+      },
+      { executor: "remote", workerId: instance.workerId },
+    );
+  }
+
+  async #recordRestorationFailure(instance: ComponentInstance, error: unknown): Promise<void> {
+    const observedAt = this.#options.clock.now().toISOString();
+    const operationId = restorationOperationId(instance);
+    const diagnostic = runtimeDiagnostic({
+      code: "LIFECYCLE_RESTORE_FAILED",
+      message: "Persisted component session restoration failed",
+      source: { kind: "plugin", id: `${instance.pluginId}/${instance.componentId}` },
+      retryable: true,
+      details: {
+        instanceId: instance.instanceId,
+        deploymentGeneration: instance.deploymentGeneration,
+      },
+      cause: serializeCause(error),
+      observedAt,
+    });
+    const key = instanceKey(instance.instanceId);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.#options.state.read(key);
+      if (current === undefined) return;
+      const nextAttempt = (current.value.attempt ?? 0) + 1;
+      const retryAt = new Date(
+        this.#options.clock.now().getTime() +
+          deterministicRetryDelay({
+            attempt: nextAttempt,
+            baseDelayMs: 1_000,
+            maxDelayMs: 60_000,
+            operationId,
+          }),
+      ).toISOString();
+      try {
+        await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          const { retryEffect: _retryEffect, ...stable } = current.value;
+          void _retryEffect;
+          await transaction.put(
+            key,
+            {
+              ...stable,
+              attempt: nextAttempt,
+              retryAt,
+              diagnostic,
+            },
+            { expectedRevision: current.revision },
+          );
+          await transaction.appendOperation({
+            operationId,
+            kind: "component.lifecycle",
+            status: "failed",
+            state: { diagnostic, retryAt, recovery: "restore" },
+            updatedAt: observedAt,
+          });
+          return null;
+        });
+        this.#lastCommitAuthority = this.#options.authority;
+        return;
+      } catch (commitError) {
+        if (conflictCode(commitError) !== "STATE_REVISION_CONFLICT") throw commitError;
+        this.#replanCount += 1;
+      }
+    }
+  }
+
+  async #clearRestorationFailure(instance: ComponentInstance): Promise<void> {
+    if (instance.diagnostic?.code !== "LIFECYCLE_RESTORE_FAILED") return;
+    const key = instanceKey(instance.instanceId);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.#options.state.read(key);
+      if (current === undefined || current.value.diagnostic?.code !== "LIFECYCLE_RESTORE_FAILED") {
+        return;
+      }
+      const {
+        attempt: _attempt,
+        diagnostic: _diagnostic,
+        retryAt: _retryAt,
+        retryEffect: _retryEffect,
+        ...stable
+      } = current.value;
+      void _attempt;
+      void _diagnostic;
+      void _retryAt;
+      void _retryEffect;
+      try {
+        await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          await transaction.put(key, stable, { expectedRevision: current.revision });
+          await transaction.appendOperation({
+            operationId: restorationOperationId(current.value),
+            kind: "component.lifecycle",
+            status: "completed",
+            state: {
+              instanceId: current.value.instanceId,
+              lifecycle: current.value.lifecycle,
+              recovery: "restore",
+            },
+            updatedAt: this.#options.clock.now().toISOString(),
+          });
+          return null;
+        });
+        this.#lastCommitAuthority = this.#options.authority;
+        return;
+      } catch (error) {
+        if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+        this.#replanCount += 1;
+      }
+    }
+  }
+
+  #isReadyAndLive(instance: ComponentInstance): boolean {
+    return (
+      instance.lifecycle === "ready" &&
+      (this.#componentLifecycle?.isLive(instance, this.#options.authority) ?? false)
+    );
   }
 
   async #gateDeployment(
@@ -678,7 +1112,7 @@ export class Reconciler {
           candidateInstallation.manifest.components.every((component) =>
             candidateInstances.some(
               (instance) =>
-                instance.componentId === component.componentId && instance.lifecycle === "ready",
+                instance.componentId === component.componentId && this.#isReadyAndLive(instance),
             ),
           ),
         provides: candidateInstallation.manifest.capabilities.provides,
@@ -764,6 +1198,16 @@ export class Reconciler {
   ): Promise<void> {
     const key = observationKey(deployment);
     const current = await this.#options.state.read(key);
+    if (
+      current?.value.applicationId === deployment.applicationId &&
+      current.value.pluginId === deployment.pluginId &&
+      current.value.generation === deployment.generation &&
+      current.value.status === status &&
+      observationDiagnosticsFingerprint(current.value.diagnostics) ===
+        observationDiagnosticsFingerprint(diagnostics)
+    ) {
+      return;
+    }
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
       await transaction.put(
         key,
@@ -782,6 +1226,7 @@ export class Reconciler {
   }
 
   async #persistStep(deployment: PluginDeployment, step: ReconcilePlanStep): Promise<void> {
+    if (!this.#running) return;
     const desired = (await this.#loadDeployments()).find(
       (candidate) =>
         candidate.applicationId === deployment.applicationId &&
@@ -838,6 +1283,7 @@ export class Reconciler {
       if (next !== instance.lifecycle) instance = { ...instance, lifecycle: next };
     }
     const now = this.#options.clock.now().toISOString();
+    if (!this.#running) return;
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
         await transaction.put(key, instance, {
@@ -863,7 +1309,7 @@ export class Reconciler {
     } catch (error) {
       const code = conflictCode(error);
       if (code !== "STATE_REVISION_CONFLICT" && code !== "STATE_IDEMPOTENCY_CONFLICT") throw error;
-      this.#replanCount += 1;
+      if (code === "STATE_REVISION_CONFLICT") this.#replanCount += 1;
     }
     void deployment;
   }
@@ -906,6 +1352,7 @@ export class Reconciler {
   }
 
   async #executeClaim(claim: OutboxClaim): Promise<void> {
+    if (!this.#running) return;
     let effect: ReconcileEffect;
     try {
       effect = parseReconcileEffect(claim);
@@ -980,6 +1427,7 @@ export class Reconciler {
     if (desired !== undefined) {
       currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
     }
+    if (!this.#running) return;
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
@@ -1045,18 +1493,20 @@ export class Reconciler {
         return;
       }
       if (component !== undefined) {
-        const placement = planPlacement({
-          component,
-          grantedPermissions: currentGate.permissionDecision.granted ?? [],
-          supportedExecutors: this.#options.effects.supportedExecutors,
-          ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
-        });
-        if (
-          !placement.ok ||
-          placement.placement === undefined ||
-          placement.placement.executor !== effect.executor ||
-          placement.placement.workerId !== effect.workerId
-        ) {
+        const eligible = placementIsEligible(
+          {
+            artifactDigest: effect.artifactDigest,
+            component,
+            grantedPermissions: currentGate.permissionDecision.granted ?? [],
+            supportedExecutors: this.#options.effects.supportedExecutors,
+            ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+          },
+          {
+            executor: effect.executor,
+            ...(effect.workerId === undefined ? {} : { workerId: effect.workerId }),
+          },
+        );
+        if (!eligible) {
           this.#replanCount += 1;
           await this.#retryClaim(claim);
           return;
@@ -1085,6 +1535,7 @@ export class Reconciler {
       retryableFailure && (effect.kind === "start" || effect.kind === "stop")
         ? expectedLifecycle
         : undefined;
+    if (!this.#running) return;
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
         if (retryPreState !== undefined) {
@@ -1121,6 +1572,7 @@ export class Reconciler {
       }
       return;
     }
+    if (!this.#running) return;
     try {
       await this.#options.effects.perform(effect);
     } catch (error) {
@@ -1298,6 +1750,23 @@ export class Reconciler {
       .filter((record) => isInstanceContextConsistent(record, this.#deployments))
       .map((record) => record.value);
     for (const deployment of this.#deployments) {
+      const allDeploymentInstances = instances.filter(
+        (instance) =>
+          instance.applicationId === deployment.applicationId &&
+          instance.pluginId === deployment.pluginId,
+      );
+      const deploymentInstances = allDeploymentInstances.filter(
+        (instance) =>
+          deployment.state === "disabled" ||
+          instance.deploymentGeneration === deployment.generation,
+      );
+      const failedDiagnostics = allDeploymentInstances.flatMap((instance) =>
+        instance.diagnostic === undefined ? [] : [instance.diagnostic],
+      );
+      if (failedDiagnostics.length > 0) {
+        this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
+        await this.#recordObservation(deployment, "failed", failedDiagnostics);
+      }
       if (deployment.state !== "active") continue;
       const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
       if (
@@ -1311,19 +1780,7 @@ export class Reconciler {
       ) {
         continue;
       }
-      const deploymentInstances = instances.filter(
-        (instance) =>
-          instance.applicationId === deployment.applicationId &&
-          instance.pluginId === deployment.pluginId &&
-          instance.deploymentGeneration === deployment.generation,
-      );
-      const failedDiagnostics = deploymentInstances.flatMap((instance) =>
-        instance.diagnostic === undefined ? [] : [instance.diagnostic],
-      );
-      if (failedDiagnostics.length > 0) {
-        this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
-        await this.#recordObservation(deployment, "failed", failedDiagnostics);
-      }
+      if (failedDiagnostics.length > 0) continue;
       const installation = (await this.#loadInstallations()).find(
         (candidate) =>
           candidate.pluginId === deployment.pluginId &&
@@ -1333,7 +1790,7 @@ export class Reconciler {
       const ready = installation.manifest.components.every((component) =>
         deploymentInstances.some(
           (instance) =>
-            instance.componentId === component.componentId && instance.lifecycle === "ready",
+            instance.componentId === component.componentId && this.#isReadyAndLive(instance),
         ),
       );
       if (ready) {
@@ -1348,6 +1805,136 @@ export class Reconciler {
       } else if (failedDiagnostics.length === 0) {
         await this.#recordObservation(deployment, "converging", []);
       }
+    }
+  }
+
+  #needsImmediateReconcile(instance: PersistedComponentInstance): boolean {
+    if (
+      instance.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
+      instance.retryAt !== undefined &&
+      instance.retryAt > this.#options.clock.now().toISOString()
+    ) {
+      return false;
+    }
+    if (
+      instance.lifecycle === "created" ||
+      instance.lifecycle === "preparing" ||
+      instance.lifecycle === "starting" ||
+      instance.lifecycle === "draining" ||
+      instance.lifecycle === "stopping"
+    ) {
+      return true;
+    }
+    return (
+      instance.lifecycle === "failed" &&
+      instance.retryEffect !== undefined &&
+      (instance.retryAt === undefined ||
+        instance.retryAt <= this.#options.clock.now().toISOString())
+    );
+  }
+
+  #isDeploymentPlanningBlocked(instance: PersistedComponentInstance): boolean {
+    return (
+      this.#diagnosticsByDeployment
+        .get(`${instance.applicationId}/${instance.pluginId}`)
+        ?.some(
+          (diagnostic) =>
+            diagnostic.code.startsWith("ARTIFACT_") ||
+            diagnostic.code.startsWith("CAPABILITY_") ||
+            diagnostic.code.startsWith("DEPLOYMENT_") ||
+            diagnostic.code.startsWith("PERMISSION_"),
+        ) ?? false
+    );
+  }
+
+  #deferRetries(instances: readonly LoadedComponentInstance[]): void {
+    const now = this.#options.clock.now().getTime();
+    for (const { value } of instances) {
+      if (
+        value.retryAt === undefined ||
+        (value.diagnostic?.code !== "LIFECYCLE_RESTORE_FAILED" &&
+          (value.lifecycle !== "failed" || value.retryEffect === undefined))
+      ) {
+        continue;
+      }
+      const retryAt = Date.parse(value.retryAt);
+      if (Number.isFinite(retryAt) && retryAt > now) this.#deferUntil(retryAt);
+    }
+  }
+
+  #deferUntil(at: number): void {
+    if (!this.#running || !Number.isFinite(at)) return;
+    this.#nextWakeAt = this.#nextWakeAt === undefined ? at : Math.min(this.#nextWakeAt, at);
+  }
+
+  #armDeferredWake(): void {
+    const at = this.#nextWakeAt;
+    if (!this.#running || at === undefined) return;
+    if (this.#deferredWake !== undefined && this.#deferredWake.at <= at) return;
+    this.#cancelDeferredWake();
+    const controller = new AbortController();
+    const delay = Math.max(0, at - this.#options.clock.now().getTime());
+    const promise = this.#options.clock
+      .sleep(delay, controller.signal)
+      .then(async () => {
+        if (
+          controller.signal.aborted ||
+          !this.#running ||
+          this.#deferredWake?.controller !== controller
+        ) {
+          return;
+        }
+        this.#deferredWake = undefined;
+        if (this.#options.clock.now().getTime() < at) return;
+        await this.wake();
+      })
+      .catch(async (error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (this.#deferredWake?.controller === controller) this.#deferredWake = undefined;
+        let failure = error;
+        if (this.#running) {
+          this.#running = false;
+          this.#cancelDeferredWake();
+          try {
+            await this.#componentLifecycle?.close(this.#options.authority);
+          } catch (closeError) {
+            failure = new AggregateError(
+              [error, closeError],
+              "Reconciler background failure cleanup failed",
+            );
+          }
+        }
+        await this.#reportFatalFailure(failure);
+      });
+    this.#deferredWake = { at, controller, promise };
+  }
+
+  #cancelDeferredWake(): void {
+    const deferred = this.#deferredWake;
+    if (deferred === undefined) return;
+    this.#deferredWake = undefined;
+    deferred.controller.abort("reconciler-deferred-wake-cancelled");
+  }
+
+  async #reportFatalFailure(error: unknown): Promise<void> {
+    if (this.#fatalReported) return;
+    this.#fatalReported = true;
+    this.#fatalError = error;
+    this.#fatalDiagnostic =
+      error instanceof DiagnosticError
+        ? error.diagnostic
+        : runtimeDiagnostic({
+            code: "LIFECYCLE_RECONCILE_BACKGROUND_FAILED",
+            message: "Background reconciliation failed",
+            source: { kind: "runtime", id: this.#owner },
+            cause: serializeCause(error),
+            observedAt: this.#options.clock.now().toISOString(),
+          });
+    if (this.#starting) return;
+    try {
+      await this.#options.onBackgroundError?.(error);
+    } catch {
+      // The reconciler is already failed closed; error reporting must not resurrect it.
     }
   }
 
@@ -1385,13 +1972,15 @@ export class Reconciler {
   }
 
   async #retryClaim(claim: OutboxClaim): Promise<void> {
+    const retryAt = this.#options.clock.now().getTime() + 60_000;
     await this.#options.state.acknowledgeOutbox({
       messageId: claim.message.messageId,
       owner: claim.owner,
       claimEpoch: claim.claimEpoch,
       outcome: "retry",
-      retryAt: new Date(this.#options.clock.now().getTime() + 60_000).toISOString(),
+      retryAt: new Date(retryAt).toISOString(),
       ...(this.#options.authority === undefined ? {} : { fencing: this.#options.authority }),
     });
+    this.#deferUntil(retryAt);
   }
 }

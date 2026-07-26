@@ -1,35 +1,37 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  DiagnosticError,
-  diagnosticCode,
-  compareOperationJournalCursors,
-  parseApplicationId,
-  parseFencingEpoch,
-  parseNodeId,
-  parseOperationId,
-  parseRevision,
-  parseRuntimeId,
-  parseRuntimeEvent,
-  parseRuntimeStatus,
   type ArtifactDigest,
   type ArtifactStore,
   type Clock,
   type CoordinationChange,
   type CoordinationProvider,
   type CoordinationWatchRequest,
+  compareOperationJournalCursors,
+  DiagnosticError,
   type DriverHealth,
+  diagnosticCode,
+  type HostedProcess,
   type JsonValue,
   type Leadership,
+  type LeadershipHandle,
   type OperationJournalQuery,
   type PersistedOperationJournalEntry,
-  type HostedProcess,
   type ProcessHost,
   type ProcessSpawnRequest,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseFencingEpoch,
+  parseNodeId,
+  parseOperationId,
+  parseRevision,
+  parseRuntimeEvent,
+  parseRuntimeId,
+  parseRuntimeStatus,
   type RuntimeConfiguration,
   type RuntimeDrivers,
-  type SecretProvider,
   type ScannedState,
+  type SecretProvider,
   type StateChange,
   type StateKey,
   type StateQuery,
@@ -38,6 +40,7 @@ import {
   type StateTransactionOptions,
   type Versioned,
 } from "@tegojs/contracts";
+import { lifecycleConformance } from "@tegojs/testkit";
 import { createRuntime, isRuntimeReady, transitionRuntimeState } from "../src/index.js";
 
 const now = new Date("2026-07-23T00:00:00.000Z");
@@ -138,6 +141,27 @@ class ControlledStateStore implements StateStore {
     };
   }
 
+  scanOperations(query: OperationJournalQuery = {}): AsyncIterable<PersistedOperationJournalEntry> {
+    const store = this;
+    return {
+      async *[Symbol.asyncIterator]() {
+        const entries = store.recovered
+          .filter(
+            (entry) =>
+              query.after === undefined || compareOperationJournalCursors(entry, query.after) > 0,
+          )
+          .slice(0, query.limit);
+        for (const entry of entries) yield entry;
+      },
+    };
+  }
+
+  scanOperationHistory(
+    query: OperationJournalQuery = {},
+  ): AsyncIterable<PersistedOperationJournalEntry> {
+    return this.scanOperations(query);
+  }
+
   claimOutbox(): ReturnType<StateStore["claimOutbox"]> {
     return Promise.resolve([]);
   }
@@ -168,6 +192,7 @@ class ControlledCoordination implements CoordinationProvider {
   failClose = false;
   campaignResult: unknown;
   healthResult: unknown = healthy();
+  releaseCount = 0;
 
   constructor(log: string[], scope: "distributed" | "local" = "local") {
     this.log = log;
@@ -180,12 +205,19 @@ class ControlledCoordination implements CoordinationProvider {
     if (this.failOpen) throw new Error("coordination open failed");
   }
 
-  async campaign(request: { readonly resource: string }): Promise<Leadership> {
+  async campaign(request: { readonly resource: string }): Promise<LeadershipHandle> {
     this.log.push("coordination.campaign");
-    return (this.campaignResult ?? {
+    const leadership = (this.campaignResult ?? {
       resource: request.resource,
       epoch: parseFencingEpoch("1"),
     }) as Leadership;
+    return {
+      leadership,
+      lost: new Promise(() => undefined),
+      release: async () => {
+        this.releaseCount += 1;
+      },
+    };
   }
 
   async acquireLease(): Promise<never> {
@@ -329,8 +361,10 @@ function controlledDrivers(recovered: readonly PersistedOperationJournalEntry[] 
   };
 }
 
+lifecycleConformance(() => createRuntime(configuration, controlledDrivers().drivers));
+
 test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecycle", async () => {
-  const { drivers, log } = controlledDrivers();
+  const { coordination, drivers, log } = controlledDrivers();
   const runtime = createRuntime(configuration, drivers);
 
   await runtime.start();
@@ -353,7 +387,7 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     tasks: 0,
     workers: 0,
   });
-  assert.deepEqual(log.slice(0, 10), [
+  assert.deepEqual(log.slice(0, 9), [
     "state.open",
     "coordination.open",
     "artifacts.open",
@@ -363,10 +397,19 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     "state.scan:deployments",
     "state.scan:tasks",
     "state.recover:100",
-    "coordination.campaign",
   ]);
+  for (const health of [
+    "state.health",
+    "coordination.health",
+    "artifacts.health",
+    "processHost.health",
+    "secrets.health",
+  ]) {
+    assert.ok(log.indexOf(health) < log.indexOf("coordination.campaign"));
+  }
 
   await runtime.stop();
+  assert.equal(coordination.releaseCount, 1);
   assert.equal((await runtime.status()).lifecycle, "stopped");
   assert.deepEqual(log.slice(-5), [
     "secrets.close",
@@ -375,6 +418,26 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
     "coordination.close",
     "state.close",
   ]);
+});
+
+test("follower rejects mutation before reading artifact bytes", async () => {
+  const { drivers } = controlledDrivers();
+  let artifactReads = 0;
+  drivers.artifacts.read = (_digest) => {
+    artifactReads += 1;
+    return emptyAsyncIterable();
+  };
+  const runtime = createRuntime({ ...configuration, mode: "single-main" }, drivers);
+
+  await assert.rejects(
+    runtime.operations.installPlugin({
+      digest: parseArtifactDigest(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+    }),
+    (error: unknown) => diagnosticCode(error) === "COORDINATION_NOT_LEADER",
+  );
+  assert.equal(artifactReads, 0);
 });
 
 test("driver open failure closes previously opened drivers in reverse order", async () => {
@@ -569,7 +632,7 @@ test("runtime rejects leadership for a different campaign resource before runnin
   const status = await runtime.status();
   assert.equal(status.lifecycle, "failed");
   assert.equal(status.acceptingOperations, false);
-  assert.equal(log.includes("state.health"), false);
+  assert.ok(log.indexOf("state.health") < log.indexOf("coordination.campaign"));
   assert.deepEqual(log.slice(-5), [
     "secrets.close",
     "processHost.close",

@@ -34,6 +34,15 @@ async function nextChange(
   ]);
 }
 
+async function within<T>(promise: Promise<T>, message: string, timeoutMs = 2_000): Promise<T> {
+  return Promise.race([
+    promise,
+    delay(timeoutMs).then(() => {
+      throw new Error(message);
+    }),
+  ]);
+}
+
 export function coordinationConformance(
   factory: CoordinationFactory,
   options: CoordinationConformanceOptions = {},
@@ -100,11 +109,29 @@ export function coordinationConformance(
 
         await leader.close();
         const second = await takeover;
-        assert.equal(second.resource, first.resource);
-        assert.ok(BigInt(second.epoch) > BigInt(first.epoch));
+        assert.equal(second.leadership.resource, first.leadership.resource);
+        assert.ok(BigInt(second.leadership.epoch) > BigInt(first.leadership.epoch));
         assert.equal(await follower.campaign({ resource: "runtime" }), second);
       } finally {
         await Promise.all([leader.close(), follower.close()]);
+      }
+    });
+
+    test("@spec:coordination-provider/fenced-leadership/idempotent-concurrent-release", async () => {
+      const providerA = await openProvider(factory, "leadership-release");
+      const providerB = await openProvider(factory, "leadership-release");
+      try {
+        const resource = "runtime";
+        const first = await providerA.campaign({ resource });
+        const pending = providerB.campaign({ resource });
+        await within(
+          Promise.all([first.release(), first.release()]),
+          "Timed out releasing leadership",
+        );
+        const second = await within(pending, "Timed out waiting for leadership takeover");
+        assert.ok(BigInt(second.leadership.epoch) > BigInt(first.leadership.epoch));
+      } finally {
+        await Promise.all([providerA.close(), providerB.close()]);
       }
     });
 
