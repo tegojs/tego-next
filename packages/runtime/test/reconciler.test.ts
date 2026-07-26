@@ -660,9 +660,7 @@ class TestStateStore implements StateStore {
       }
     | undefined;
   beforeNextProviderLossCommit: (() => Promise<void>) | undefined;
-  afterNextExecutingCommit:
-    | ((effect: ReconcileEffect) => Promise<void>)
-    | undefined;
+  afterNextExecutingCommit: ((effect: ReconcileEffect) => Promise<void>) | undefined;
   capabilityBindingRaceWinner:
     | {
         readonly key: StateKey<JsonValue>;
