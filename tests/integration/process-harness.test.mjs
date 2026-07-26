@@ -243,6 +243,20 @@ test("managed process reports a live child without waiting for exit", async (t) 
   await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_STILL_RUNNING/u);
 });
 
+test("managed process can wait boundedly for an externally killed child to exit", async (t) => {
+  const artifacts = await createRunArtifacts("externally-killed-child");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: ["--eval", "console.log(JSON.stringify({ type: 'ready' })); process.stdin.resume();"],
+    name: "externally-killed-child",
+  });
+  registerCleanup(t, child);
+  await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
+  process.kill(child.pid, "SIGKILL");
+  await child.assertClean({ timeoutMs: 2_000 });
+});
+
 test("managed process gives stdin EOF a bounded graceful stop phase", async (t) => {
   const artifacts = await createRunArtifacts("stdin-eof-stop");
   const child = await spawnManagedProcess({
