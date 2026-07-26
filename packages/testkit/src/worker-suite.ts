@@ -138,7 +138,7 @@ export interface WorkerRegistrationInput {
 
 export interface WorkerSessionMessage {
   readonly messageId: string;
-  readonly correlationId?: string;
+  readonly correlationId: string;
   readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
@@ -451,17 +451,31 @@ export function workerSessionConformance(
           worker,
           "worker-initiated",
         );
-        const received: WorkerSessionMessage[] = [];
-        const unsubscribe = workerSession.onMessage((message) => received.push(message));
+        const workerReceived: WorkerSessionMessage[] = [];
+        const mainReceived: WorkerSessionMessage[] = [];
+        const unsubscribeWorker = workerSession.onMessage((message) => workerReceived.push(message));
+        const unsubscribeMain = mainSession.onMessage((message) => mainReceived.push(message));
         const messageId = await mainSession.send("session.reconcile", { running: [] });
-        await mainSession.send("session.reconcile", { running: [] }, { correlationId: messageId });
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(received.length, 2);
-        assert.equal(received[1]?.correlationId, messageId);
+        assert.equal(workerReceived.length, 1);
+        const request = workerReceived[0];
+        assert.ok(request);
+        assert.equal(request.messageId, messageId);
+        assert.equal(request.correlationId, request.messageId);
+
+        await workerSession.send(
+          "session.reconcile",
+          { running: [] },
+          { correlationId: request.messageId },
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(mainReceived.length, 1);
+        assert.equal(mainReceived[0]?.correlationId, request.messageId);
+
         const original = mainSocket.lastControlFrame();
         workerSocket.inject(original);
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(received.length, 2);
+        assert.equal(workerReceived.length, 1);
 
         const conflict = JSON.parse(original) as Record<string, JsonValue>;
         conflict.messageId = "conformance-conflict";
@@ -469,7 +483,8 @@ export function workerSessionConformance(
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(workerSession.state, "closed");
         assert.equal(workerSession.diagnostic?.code, "PROTOCOL_SEQUENCE_REPLAY");
-        unsubscribe();
+        unsubscribeWorker();
+        unsubscribeMain();
       } finally {
         await Promise.all([main.close(), worker.close()]);
       }
