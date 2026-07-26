@@ -669,6 +669,7 @@ export class Reconciler {
       installations,
       loadedInstances,
       providerLosses,
+      capabilityBindings,
     );
     if (!this.#running) return false;
     loadedInstances = await this.#loadInstances();
@@ -822,15 +823,17 @@ export class Reconciler {
           loss.value.deploymentGeneration === deployment.generation &&
           loss.value.action === "suspend",
       );
-      const recoveryProvidersReady =
+      const recoveryPrerequisitesReady =
         suspension?.value.recoveryActivations !== undefined &&
-        suspension.value.providers
-          .map((provider) =>
-            this.#providerReadiness(provider, deployments, installations, canonicalInstances),
-          )
-          .every(({ ready }) => ready);
+        this.#recoveryPrerequisitesReady(
+          suspension.value,
+          deployments,
+          installations,
+          canonicalInstances,
+          capabilityBindings,
+        );
       const planningInstances =
-        suspension?.value.recoveryActivations !== undefined && !recoveryProvidersReady
+        suspension?.value.recoveryActivations !== undefined && !recoveryPrerequisitesReady
           ? deploymentInstances.filter(
               (instance) =>
                 suspension.value.recoveryActivations?.[instance.componentId] !==
@@ -843,7 +846,7 @@ export class Reconciler {
         instances: planningInstances,
         now: this.#options.clock.now().toISOString(),
         supportedExecutors: this.#options.effects.supportedExecutors,
-        suspended: suspension !== undefined && !recoveryProvidersReady,
+        suspended: suspension !== undefined && !recoveryPrerequisitesReady,
         ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
       });
       if (plan.blocked) {
@@ -895,20 +898,17 @@ export class Reconciler {
           loss.value.action === "suspend" &&
           loss.value.recoveryActivations?.[record.value.componentId] === record.value.activation,
       );
-      const recoveryProvidersReady =
+      const recoveryPrerequisitesReady =
         heldRecovery === undefined ||
-        heldRecovery.value.providers
-          .map((provider) =>
-            this.#providerReadiness(
-              provider,
-              deployments,
-              installations,
-              canonicalLatestInstances.map((candidate) => candidate.value),
-            ),
-          )
-          .every(({ ready }) => ready);
+        this.#recoveryPrerequisitesReady(
+          heldRecovery.value,
+          deployments,
+          installations,
+          canonicalLatestInstances.map((candidate) => candidate.value),
+          capabilityBindings,
+        );
       return (
-        recoveryProvidersReady &&
+        recoveryPrerequisitesReady &&
         !this.#isDeploymentPlanningBlocked(record.value) &&
         this.#needsImmediateReconcile(record.value)
       );
@@ -1137,6 +1137,44 @@ export class Reconciler {
             this.#isReadyAndLive(instance),
         ),
     };
+  }
+
+  #recoveryBindingsAreExact(
+    loss: PersistedProviderLoss,
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+  ): boolean {
+    return loss.capabilities.every((capability) => {
+      const matches = capabilityBindings.filter(
+        (binding) =>
+          binding.value.consumer.applicationId === loss.consumer.applicationId &&
+          binding.value.consumer.pluginId === loss.consumer.pluginId &&
+          binding.value.capability === capability &&
+          binding.value.deploymentGeneration === loss.deploymentGeneration,
+      );
+      return (
+        matches.length === 1 &&
+        loss.providers.some(
+          (provider) =>
+            provider.applicationId === matches[0]?.value.provider.applicationId &&
+            provider.pluginId === matches[0]?.value.provider.pluginId,
+        )
+      );
+    });
+  }
+
+  #recoveryPrerequisitesReady(
+    loss: PersistedProviderLoss,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly ComponentInstance[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+  ): boolean {
+    return (
+      this.#recoveryBindingsAreExact(loss, capabilityBindings) &&
+      loss.providers
+        .map((provider) => this.#providerReadiness(provider, deployments, installations, instances))
+        .every(({ ready }) => ready)
+    );
   }
 
   async #cleanupOrphanProviderLosses(
@@ -1611,6 +1649,7 @@ export class Reconciler {
     loadedInstallations?: readonly PluginInstallation[],
     loadedInstances?: readonly LoadedComponentInstance[],
     loadedProviderLosses?: readonly LoadedProviderLoss[],
+    loadedCapabilityBindings?: readonly LoadedCapabilityBinding[],
   ): Promise<void> {
     if (this.#componentLifecycle === undefined) return;
     const [deployments, installations, instances] = await Promise.all([
@@ -1620,6 +1659,7 @@ export class Reconciler {
     ]);
     const now = this.#options.clock.now().toISOString();
     const providerLosses = loadedProviderLosses ?? (await this.#loadProviderLosses());
+    const capabilityBindings = loadedCapabilityBindings ?? (await this.#loadCapabilityBindings());
     const restorable = instances
       .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value)
@@ -1658,19 +1698,17 @@ export class Reconciler {
       );
       const recoveryInstance =
         suspendedLoss?.value.recoveryActivations?.[instance.componentId] === instance.activation;
-      const recoveryProvidersReady =
-        suspendedLoss?.value.providers
-          .map((provider) =>
-            this.#providerReadiness(
-              provider,
-              deployments,
-              installations,
-              instances.map((record) => record.value),
-            ),
-          )
-          .every(({ ready }) => ready) === true;
+      const recoveryPrerequisitesReady =
+        suspendedLoss !== undefined &&
+        this.#recoveryPrerequisitesReady(
+          suspendedLoss.value,
+          deployments,
+          installations,
+          instances.map((record) => record.value),
+          capabilityBindings,
+        );
       if (suspendedLoss !== undefined && recoveryInstance) {
-        if (!recoveryProvidersReady) continue;
+        if (!recoveryPrerequisitesReady) continue;
       } else if (suspendedLoss !== undefined) {
         if (instance.lifecycle === "preparing") continue;
         if (this.#componentLifecycle.restoreTermination === undefined) continue;
@@ -2512,14 +2550,10 @@ export class Reconciler {
       return;
     }
     const current = await this.#options.state.read(instanceKey(effect.instanceId));
-    if (current === undefined) {
-      this.#replanCount += 1;
-      await this.#acknowledge(claim, "completed");
-      return;
-    }
-    const instance = current.value;
     const legacyActivation =
-      !Object.hasOwn(instance, "activation") && effect[legacyActivationProvenance];
+      current !== undefined &&
+      !Object.hasOwn(current.value, "activation") &&
+      effect[legacyActivationProvenance];
     const canonical = legacyActivation
       ? legacyReconcileEffectIdentities(
           {
@@ -2551,6 +2585,12 @@ export class Reconciler {
       );
       return;
     }
+    if (current === undefined) {
+      this.#replanCount += 1;
+      await this.#acknowledge(claim, "completed");
+      return;
+    }
+    const instance = current.value;
     const instanceActivation = parsePersistedActivation(instance);
     if (
       instance.instanceId !== effect.instanceId ||
@@ -2611,27 +2651,16 @@ export class Reconciler {
     const recoveryActivation = suspendedLoss?.value.recoveryActivations?.[effect.componentId];
     const exactRecoveryEffect =
       recoveryActivation !== undefined && recoveryActivation === effect.activation;
-    const recoveryProvidersReady =
-      suspendedLoss?.value.providers
-        .map((provider) => this.#providerReadiness(provider, deployments, installations, instances))
-        .every(({ ready }) => ready) === true;
-    const recoveryBindingsExact =
-      suspendedLoss?.value.capabilities.every((capability) =>
-        capabilityBindings.some(
-          (binding) =>
-            binding.value.consumer.applicationId === effect.applicationId &&
-            binding.value.consumer.pluginId === effect.pluginId &&
-            binding.value.capability === capability &&
-            binding.value.deploymentGeneration === effect.deploymentGeneration &&
-            suspendedLoss.value.providers.some(
-              (provider) =>
-                provider.applicationId === binding.value.provider.applicationId &&
-                provider.pluginId === binding.value.provider.pluginId,
-            ),
-        ),
-      ) === true;
     const recoveryPermitted =
-      exactRecoveryEffect && recoveryProvidersReady && recoveryBindingsExact;
+      exactRecoveryEffect &&
+      suspendedLoss !== undefined &&
+      this.#recoveryPrerequisitesReady(
+        suspendedLoss.value,
+        deployments,
+        installations,
+        instances,
+        capabilityBindings,
+      );
     const suspended = suspendedLoss !== undefined && !recoveryPermitted;
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (

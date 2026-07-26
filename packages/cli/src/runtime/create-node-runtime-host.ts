@@ -27,8 +27,8 @@ import {
   ComponentRegistry,
   createRuntimeHost,
   type PlacementWorker,
-  parseActivation,
   PreparedArtifactCache,
+  parseActivation,
   Reconciler,
   TaskService,
 } from "@tegojs/runtime";

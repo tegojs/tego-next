@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto";
 import {
-  DiagnosticError,
-  parseExecutorId,
-  parseNodeId,
-  parseTaskExecutionTarget,
-  runtimeDiagnostic,
   type Clock,
+  DiagnosticError,
   type ExecutorKind,
   type JsonValue,
   type PluginManifest,
   type ProcessHost,
+  parseExecutorId,
+  parseNodeId,
+  parseTaskExecutionTarget,
+  runtimeDiagnostic,
   type SecretProvider,
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
@@ -20,14 +20,14 @@ import {
   type ResolvedThreadComponent,
 } from "@tegojs/executor-node";
 import {
-  canonicalJsonBytes,
   type ComponentBinding,
   type ComponentLifecycleHost,
+  canonicalJsonBytes,
   parseActivation,
 } from "@tegojs/runtime";
 import type {
-  LocalComponentSessionRegistry,
   LocalComponentSessionRegistration,
+  LocalComponentSessionRegistry,
 } from "./local-component-session-registry.js";
 
 export interface LocalComponentSessionHostOptions {

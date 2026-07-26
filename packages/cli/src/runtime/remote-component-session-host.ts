@@ -183,24 +183,7 @@ export class RemoteComponentSessionHost implements ComponentLifecycleHost {
 
   async start(binding: ComponentBinding): Promise<void> {
     const target = this.#target(binding);
-    if (target.executor.type !== "remote") {
-      throw new TypeError("Remote component target must use the remote executor");
-    }
-    const workerId = target.executor.workerId;
-    const shared = this.#options.resolveExecutor(workerId);
-    if (
-      shared === undefined ||
-      shared.type !== "remote" ||
-      shared.id !== target.executor.id ||
-      !supportsTargetDrain(shared)
-    ) {
-      throw hostError(
-        "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
-        "The selected remote Worker executor is unavailable or cannot recover and drain an exact target",
-        this.#options.runtimeId,
-        binding,
-      );
-    }
+    const shared = this.#resolveShared(binding, target);
     this.#options.registry.register({
       applicationId: binding.deployment.applicationId,
       pluginId: binding.deployment.pluginId,
@@ -222,9 +205,33 @@ export class RemoteComponentSessionHost implements ComponentLifecycleHost {
   async stop(binding: ComponentBinding): Promise<void> {
     const target = this.#target(binding);
     const registration = this.#options.registry.findExact(target);
-    if (registration === undefined) return;
-    await registration.executor.close();
-    this.#options.registry.remove(target);
+    if (registration !== undefined) {
+      await registration.executor.close();
+      this.#options.registry.remove(target);
+      return;
+    }
+    await this.#resolveShared(binding, target).drainTarget(target, {});
+  }
+
+  #resolveShared(binding: ComponentBinding, target: TaskExecutionTarget): TargetDrainingExecutor {
+    if (target.executor.type !== "remote") {
+      throw new TypeError("Remote component target must use the remote executor");
+    }
+    const shared = this.#options.resolveExecutor(target.executor.workerId);
+    if (
+      shared === undefined ||
+      shared.type !== "remote" ||
+      shared.id !== target.executor.id ||
+      !supportsTargetDrain(shared)
+    ) {
+      throw hostError(
+        "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
+        "The selected remote Worker executor is unavailable or cannot recover and drain an exact target",
+        this.#options.runtimeId,
+        binding,
+      );
+    }
+    return shared;
   }
 
   #target(binding: ComponentBinding): TaskExecutionTarget {
