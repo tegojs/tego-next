@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,6 +11,11 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const expectedNodeVersion = "v26.5.0";
 const expectedNpmVersion = "11.13.0";
 const npmCli = resolveNpmCli();
+const expressionPrefix = "$";
+const runnerTemp = `${expressionPrefix}{{ runner.temp }}`;
+const integrationReporterCommand = `node scripts/run-ci-test.mjs --name integration --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 540000 -- npm run test:integration`;
+const singleMainReporterCommand = `node scripts/run-ci-test.mjs --name single-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:single-main`;
+const multiMainReporterCommand = `node scripts/run-ci-test.mjs --name multi-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:multi-main`;
 
 function npmCommand(name, ...args) {
   return { name, command: process.execPath, args: [npmCli, ...args] };
@@ -52,10 +57,14 @@ function diagnostic(code, message, details = {}) {
 }
 
 export function parseWorkflowJobs(workflow) {
-  const jobsHeader = workflow.match(/^jobs:\s*$/mu);
+  const activeWorkflow = workflow
+    .split("\n")
+    .filter((line) => !/^\s*#/u.test(line))
+    .join("\n");
+  const jobsHeader = activeWorkflow.match(/^jobs:\s*$/mu);
   if (jobsHeader === null || jobsHeader.index === undefined) return new Map();
 
-  const jobsSource = workflow.slice(jobsHeader.index + jobsHeader[0].length);
+  const jobsSource = activeWorkflow.slice(jobsHeader.index + jobsHeader[0].length);
   const headers = [...jobsSource.matchAll(/^ {2}([a-zA-Z0-9_-]+):\s*$/gmu)];
   const jobs = new Map();
   for (const [index, header] of headers.entries()) {
@@ -66,21 +75,62 @@ export function parseWorkflowJobs(workflow) {
   return jobs;
 }
 
+function workflowLines(source) {
+  return source.split("\n").map((line) => line.trim());
+}
+
 function requireMarkers(errors, jobName, job, markers) {
+  const lines = workflowLines(job);
   for (const marker of markers) {
-    if (!job.includes(marker)) errors.push(`${jobName} is missing ${marker}`);
+    if (!lines.some((line) => line.includes(marker))) {
+      errors.push(`${jobName} is missing ${marker}`);
+    }
   }
 }
 
 function requireOrder(errors, jobName, job, markers) {
+  const lines = workflowLines(job).map((line) =>
+    /^- (?:name|run|uses):/u.test(line) ? line.slice(2) : line,
+  );
   let previous = -1;
   for (const marker of markers) {
-    const current = job.indexOf(marker, previous + 1);
+    const current = lines.findIndex((line, index) => index > previous && line === marker);
     if (current === -1 || current <= previous) {
       errors.push(`${jobName} has an invalid step order at ${marker}`);
       return;
     }
     previous = current;
+  }
+}
+
+function parseWorkflowSteps(job) {
+  const lines = job.split("\n");
+  const starts = [];
+  for (const [index, line] of lines.entries()) {
+    const match = line.match(/^ {6}- (name|run|uses):\s*(.*?)\s*$/u);
+    if (match) starts.push({ index, initialKey: match[1], initialValue: match[2] });
+  }
+  return starts.map((start, index) => {
+    const end = starts[index + 1]?.index ?? lines.length;
+    const fields = { [start.initialKey]: start.initialValue };
+    for (const line of lines.slice(start.index + 1, end)) {
+      const match = line.match(/^ {8}(name|if|run|uses|timeout-minutes):\s*(.*?)\s*$/u);
+      if (match) fields[match[1]] = match[2];
+    }
+    return fields;
+  });
+}
+
+function requireNamedStep(errors, jobName, job, name, expected) {
+  const step = parseWorkflowSteps(job).find((candidate) => candidate.name === name);
+  if (!step) {
+    errors.push(`${jobName} is missing step ${name}`);
+    return;
+  }
+  for (const [field, value] of Object.entries(expected)) {
+    if (step[field] !== value) {
+      errors.push(`${jobName} step ${name} must set ${field}: ${value}`);
+    }
   }
 }
 
@@ -135,40 +185,48 @@ export function validateWorkflowContract(workflow) {
       "if-no-files-found: error",
     ]);
   }
-  requireMarkers(errors, "integration", integration, [
-    "- name: Run integration tests",
-    "if: always()",
-    "node scripts/run-ci-test.mjs --name integration",
-    "-- npm run test:integration",
-  ]);
+  requireNamedStep(errors, "integration", integration, "Run integration tests", {
+    if: "always()",
+    "timeout-minutes": "10",
+    run: integrationReporterCommand,
+  });
+  requireNamedStep(errors, "integration", integration, "Upload integration diagnostics", {
+    if: "always()",
+    uses: "actions/upload-artifact@v7",
+  });
   requireOrder(errors, "integration", integration, [
     "run: npm run build",
-    "- name: Run integration tests",
+    "name: Run integration tests",
     "if: always()",
-    "node scripts/run-ci-test.mjs --name integration",
-    "- name: Upload integration diagnostics",
+    `run: ${integrationReporterCommand}`,
+    "name: Upload integration diagnostics",
     "if: always()",
     "uses: actions/upload-artifact@v7",
   ]);
 
-  requireMarkers(errors, "system-e2e", system, [
-    "- name: Run single-Main system smoke",
-    "node scripts/run-ci-test.mjs --name single-main",
-    "-- npm run test:e2e:single-main",
-    "- name: Run multi-Main takeover",
-    "node scripts/run-ci-test.mjs --name multi-main",
-    "-- npm run test:e2e:multi-main",
-    "if: always()",
-  ]);
+  requireNamedStep(errors, "system-e2e", system, "Run single-Main system smoke", {
+    if: "always()",
+    "timeout-minutes": "8",
+    run: singleMainReporterCommand,
+  });
+  requireNamedStep(errors, "system-e2e", system, "Run multi-Main takeover", {
+    if: "always()",
+    "timeout-minutes": "8",
+    run: multiMainReporterCommand,
+  });
+  requireNamedStep(errors, "system-e2e", system, "Upload process diagnostics", {
+    if: "always()",
+    uses: "actions/upload-artifact@v7",
+  });
   requireOrder(errors, "system-e2e", system, [
     "run: npm run build",
-    "- name: Run single-Main system smoke",
+    "name: Run single-Main system smoke",
     "if: always()",
-    "node scripts/run-ci-test.mjs --name single-main",
-    "- name: Run multi-Main takeover",
+    `run: ${singleMainReporterCommand}`,
+    "name: Run multi-Main takeover",
     "if: always()",
-    "node scripts/run-ci-test.mjs --name multi-main",
-    "- name: Upload process diagnostics",
+    `run: ${multiMainReporterCommand}`,
+    "name: Upload process diagnostics",
     "if: always()",
     "uses: actions/upload-artifact@v7",
   ]);

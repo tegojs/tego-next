@@ -90,7 +90,7 @@ jobs:
       - name: Run integration tests
         if: always()
         timeout-minutes: 10
-        run: node scripts/run-ci-test.mjs --name integration --artifacts "${{ runner.temp }}/tego-test-artifacts" -- npm run test:integration
+        run: node scripts/run-ci-test.mjs --name integration --artifacts "${{ runner.temp }}/tego-test-artifacts" --timeout-ms 540000 -- npm run test:integration
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
@@ -141,14 +141,14 @@ jobs:
       - name: Run single-Main system smoke
         if: always()
         timeout-minutes: 8
-        run: node scripts/run-ci-test.mjs --name single-main --artifacts "${{ runner.temp }}/tego-test-artifacts" -- npm run test:e2e:single-main
+        run: node scripts/run-ci-test.mjs --name single-main --artifacts "${{ runner.temp }}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:single-main
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
       - name: Run multi-Main takeover
         if: always()
         timeout-minutes: 8
-        run: node scripts/run-ci-test.mjs --name multi-main --artifacts "${{ runner.temp }}/tego-test-artifacts" -- npm run test:e2e:multi-main
+        run: node scripts/run-ci-test.mjs --name multi-main --artifacts "${{ runner.temp }}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:multi-main
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts

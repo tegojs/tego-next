@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -129,7 +129,8 @@ test("release verification preflight fails closed with structured diagnostics", 
       "      - run: npm run build",
       "      - name: Run integration tests",
       "        if: always()",
-      `        run: node scripts/run-ci-test.mjs --name integration --artifacts ${runnerTemp}/tego-test-artifacts -- npm run test:integration`,
+      "        timeout-minutes: 10",
+      `        run: node scripts/run-ci-test.mjs --name integration --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 540000 -- npm run test:integration`,
       "        env:",
       `          TEGO_POSTGRES_URL: postgresql://localhost:${postgresPort}/tego`,
       `          TEGO_TEST_ARTIFACTS_DIR: ${runnerTemp}/tego-test-artifacts`,
@@ -150,13 +151,15 @@ test("release verification preflight fails closed with structured diagnostics", 
       "      - run: npm run build",
       "      - name: Run single-Main system smoke",
       "        if: always()",
-      `        run: node scripts/run-ci-test.mjs --name single-main --artifacts ${runnerTemp}/tego-test-artifacts -- npm run test:e2e:single-main`,
+      "        timeout-minutes: 8",
+      `        run: node scripts/run-ci-test.mjs --name single-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:single-main`,
       "        env:",
       `          TEGO_POSTGRES_URL: postgresql://localhost:${postgresPort}/tego`,
       `          TEGO_TEST_ARTIFACTS_DIR: ${runnerTemp}/tego-test-artifacts`,
       "      - name: Run multi-Main takeover",
       "        if: always()",
-      `        run: node scripts/run-ci-test.mjs --name multi-main --artifacts ${runnerTemp}/tego-test-artifacts -- npm run test:e2e:multi-main`,
+      "        timeout-minutes: 8",
+      `        run: node scripts/run-ci-test.mjs --name multi-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:multi-main`,
       "        env:",
       `          TEGO_POSTGRES_URL: postgresql://localhost:${postgresPort}/tego`,
       `          TEGO_TEST_ARTIFACTS_DIR: ${runnerTemp}/tego-test-artifacts`,
@@ -212,6 +215,51 @@ test("CI workflow validation rejects evidence and commands placed in the wrong j
   assert.ok(validateWorkflowContract(conditionalUpload).length > 0);
 });
 
+test("CI workflow validation rejects required gates that only appear in comments", async () => {
+  const workflow = await readFile(workflowPath, "utf8");
+  const { validateWorkflowContract } = await import(
+    new URL(`../../scripts/verify-release.mjs?comment-mutations=${Date.now()}`, import.meta.url)
+  );
+  const mutations = [
+    [
+      "commented OpenSpec gate",
+      workflow.replace(
+        "        run: npm run openspec:validate",
+        "        # run: npm run openspec:validate",
+      ),
+    ],
+    [
+      "commented single-Main command",
+      workflow.replace(
+        / {8}run: (node scripts\/run-ci-test\.mjs --name single-main[^\n]+)/u,
+        "        # run: $1",
+      ),
+    ],
+    [
+      "commented multi-Main command",
+      workflow.replace(
+        / {8}run: (node scripts\/run-ci-test\.mjs --name multi-main[^\n]+)/u,
+        "        # run: $1",
+      ),
+    ],
+    [
+      "commented upload condition",
+      workflow.replace(
+        "- name: Upload integration diagnostics\n        if: always()",
+        "- name: Upload integration diagnostics\n        # if: always()",
+      ),
+    ],
+  ];
+
+  for (const [name, mutation] of mutations) {
+    assert.notEqual(mutation, workflow, `${name} mutation must change the workflow`);
+    assert.ok(
+      validateWorkflowContract(mutation).length > 0,
+      `${name} must not satisfy the active workflow contract`,
+    );
+  }
+});
+
 test("CI reporter always writes nonempty JSON metadata and process logs", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-ci-reporter-"));
   const reporter = join(root, "scripts", "run-ci-test.mjs");
@@ -245,9 +293,11 @@ test("CI reporter always writes nonempty JSON metadata and process logs", async 
       const log = await readFile(join(directory, `${probe.name}-process.log`), "utf8");
       assert.equal(metadata.name, probe.name);
       assert.equal(metadata.exitCode, probe.code);
+      assert.equal(metadata.timedOut, false);
       assert.equal(metadata.command, process.execPath);
       assert.ok(metadata.startedAt.length > 0);
       assert.ok(metadata.finishedAt.length > 0);
+      assert.ok(metadata.durationMs >= 0);
       assert.match(log, new RegExp(`stdout-${probe.name}`, "u"));
       assert.match(log, new RegExp(`stderr-${probe.name}`, "u"));
     }
@@ -262,6 +312,61 @@ test("CI reporter always writes nonempty JSON metadata and process logs", async 
     assert.equal(npmMetadata.command, "npm");
     assert.equal(npmMetadata.actualCommand, process.execPath);
     assert.match(npmMetadata.actualArgs[0], /npm-cli\.js$/u);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("CI reporter times out and terminates a child before writing final metadata", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-ci-reporter-timeout-"));
+  const reporter = join(root, "scripts", "run-ci-test.mjs");
+  const startedAt = Date.now();
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        reporter,
+        "--name",
+        "timeout",
+        "--artifacts",
+        directory,
+        "--timeout-ms",
+        "200",
+        "--",
+        process.execPath,
+        "-e",
+        [
+          'console.log("child-pid:" + process.pid);',
+          'process.on("SIGTERM", () => console.log("ignored-sigterm"));',
+          "setInterval(() => {}, 1000);",
+        ].join(""),
+      ],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.notEqual(result.status, 0);
+    assert.equal(result.error, undefined);
+    assert.ok(elapsedMs < 5_000, `reporter exceeded bounded completion: ${elapsedMs}ms`);
+
+    const metadata = JSON.parse(await readFile(join(directory, "timeout-result.json"), "utf8"));
+    const log = await readFile(join(directory, "timeout-process.log"), "utf8");
+    assert.equal(metadata.name, "timeout");
+    assert.equal(metadata.timedOut, true);
+    assert.equal(metadata.timeoutMs, 200);
+    assert.notEqual(metadata.exitCode, 0);
+    assert.ok(Object.hasOwn(metadata, "childExitCode"));
+    assert.ok(Object.hasOwn(metadata, "childSignal"));
+    assert.equal(metadata.command, process.execPath);
+    assert.ok(metadata.startedAt.length > 0);
+    assert.ok(metadata.finishedAt.length > 0);
+    assert.ok(metadata.durationMs >= 200);
+    assert.ok(metadata.terminationSignal);
+    assert.match(log, /child-pid:\d+/u);
+
+    const childPid = Number.parseInt(log.match(/child-pid:(\d+)/u)?.[1] ?? "", 10);
+    assert.ok(Number.isInteger(childPid));
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

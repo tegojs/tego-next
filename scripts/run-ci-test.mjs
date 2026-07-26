@@ -3,6 +3,10 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const defaultTimeoutMs = 10 * 60 * 1000;
+const gracefulTerminationMs = 250;
+const forcedTerminationWaitMs = 1000;
+
 export function resolveNpmCli(env = process.env, execPath = process.execPath) {
   if (env.npm_execpath?.trim()) return env.npm_execpath;
 
@@ -23,19 +27,53 @@ export function parseReporterArguments(args) {
   const command = separator === -1 ? [] : args.slice(separator + 1);
   let name;
   let artifacts;
+  let timeoutMs = defaultTimeoutMs;
   for (let index = 0; index < options.length; index += 2) {
-    if (options[index] === "--name") name = options[index + 1];
-    if (options[index] === "--artifacts") artifacts = options[index + 1];
+    const option = options[index];
+    const value = options[index + 1];
+    if (option === "--name") name = value;
+    else if (option === "--artifacts") artifacts = value;
+    else if (option === "--timeout-ms") timeoutMs = Number(value);
+    else throw new Error(`Unknown reporter option: ${option ?? ""}`);
   }
-  if (!name || !artifacts || command.length === 0) {
+  if (
+    !name ||
+    !artifacts ||
+    command.length === 0 ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0
+  ) {
     throw new Error(
-      "Usage: run-ci-test.mjs --name <name> --artifacts <directory> -- <command> [args...]",
+      "Usage: run-ci-test.mjs --name <name> --artifacts <directory> [--timeout-ms <milliseconds>] -- <command> [args...]",
     );
   }
-  return { name, artifacts, command: command[0], args: command.slice(1) };
+  return { name, artifacts, timeoutMs, command: command[0], args: command.slice(1) };
 }
 
-export async function runReportedCommand({ name, artifacts, command, args }) {
+function signalProcessTree(child, signal) {
+  if (child.pid === undefined) return;
+  if (process.platform === "win32") {
+    if (signal === "SIGKILL") {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      killer.unref();
+    } else {
+      child.kill(signal);
+    }
+    return;
+  }
+  process.kill(-child.pid, signal);
+}
+
+export async function runReportedCommand({
+  name,
+  artifacts,
+  timeoutMs = defaultTimeoutMs,
+  command,
+  args,
+}) {
   mkdirSync(artifacts, { recursive: true });
   const resultPath = join(artifacts, `${name}-result.json`);
   const logPath = join(artifacts, `${name}-process.log`);
@@ -47,13 +85,46 @@ export async function runReportedCommand({ name, artifacts, command, args }) {
   const actualCommand = npmInvocation ? process.execPath : command;
   const actualArgs = npmInvocation ? [resolveNpmCli(), ...args] : args;
   const startedAt = new Date().toISOString();
+  const startedAtMs = Date.now();
 
   const outcome = await new Promise((resolveOutcome) => {
+    let settled = false;
+    let timedOut = false;
+    let terminationSignal;
+    let forceTimer;
+    let finalizationTimer;
     const child = spawn(actualCommand, actualArgs, {
       cwd: process.cwd(),
       env: process.env,
       stdio: ["inherit", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(forceTimer);
+      clearTimeout(finalizationTimer);
+      resolveOutcome({
+        timedOut,
+        timeoutMs,
+        terminationSignal,
+        childPid: child.pid,
+        childExitCode: null,
+        childSignal: null,
+        ...result,
+      });
+    };
+    const terminate = (signal) => {
+      terminationSignal = signal;
+      try {
+        signalProcessTree(child, signal);
+      } catch (error) {
+        if (error?.code !== "ESRCH") {
+          appendFileSync(logPath, `[ci-test] ${signal} failed: ${error.message}\n`);
+        }
+      }
+    };
     child.stdout.on("data", (chunk) => {
       process.stdout.write(chunk);
       appendFileSync(logPath, chunk);
@@ -62,12 +133,39 @@ export async function runReportedCommand({ name, artifacts, command, args }) {
       process.stderr.write(chunk);
       appendFileSync(logPath, chunk);
     });
-    child.once("error", (error) => resolveOutcome({ exitCode: 1, error: error.message }));
-    child.once("close", (exitCode, signal) =>
-      resolveOutcome({ exitCode: exitCode ?? 1, signal: signal ?? undefined }),
+    child.once("error", (error) => finish({ exitCode: 1, error: error.message }));
+    child.once("close", (childExitCode, childSignal) =>
+      finish({
+        exitCode: timedOut ? 124 : (childExitCode ?? 1),
+        childExitCode,
+        childSignal: childSignal ?? null,
+      }),
     );
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      appendFileSync(
+        logPath,
+        `[ci-test] timed out after ${timeoutMs}ms; terminating process tree\n`,
+      );
+      terminate("SIGTERM");
+      forceTimer = setTimeout(() => {
+        terminate("SIGKILL");
+        finalizationTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          child.unref();
+          finish({
+            exitCode: 124,
+            childExitCode: null,
+            childSignal: null,
+            error: "process tree did not report termination after SIGKILL",
+          });
+        }, forcedTerminationWaitMs);
+      }, gracefulTerminationMs);
+    }, timeoutMs);
   });
 
+  const finishedAtMs = Date.now();
   const metadata = {
     name,
     command: requestedCommand,
@@ -75,7 +173,8 @@ export async function runReportedCommand({ name, artifacts, command, args }) {
     actualCommand,
     actualArgs,
     startedAt,
-    finishedAt: new Date().toISOString(),
+    finishedAt: new Date(finishedAtMs).toISOString(),
+    durationMs: finishedAtMs - startedAtMs,
     ...outcome,
   };
   writeFileSync(resultPath, `${JSON.stringify(metadata, null, 2)}\n`);
