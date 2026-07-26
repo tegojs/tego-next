@@ -13,6 +13,10 @@ import {
   resolveCapabilities,
   satisfiesVersionRange,
 } from "../src/index.js";
+import {
+  type ProviderLossDecision,
+  strongestProviderLoss,
+} from "../src/capabilities/resolver.js";
 
 const applicationId = parseApplicationId("application-01");
 
@@ -36,6 +40,43 @@ function deployment(
 
 const echoName = parseCapabilityName("org.example.echo");
 const auditName = parseCapabilityName("org.example.audit");
+
+function permutations<T>(values: readonly T[]): readonly (readonly T[])[] {
+  if (values.length < 2) return [values];
+  return values.flatMap((value, index) =>
+    permutations(values.filter((_, candidate) => candidate !== index)).map((rest) => [
+      value,
+      ...rest,
+    ]),
+  );
+}
+
+function providerLossDecision(action: ProviderLossDecision["action"]): ProviderLossDecision {
+  return {
+    action,
+    capability: echoName,
+    consumer: identity("consumer"),
+    provider: identity(`provider-${action}`),
+  };
+}
+
+test("provider loss precedence is explicit and independent of action order", () => {
+  for (const actions of permutations(["degrade", "suspend", "fail"] as const)) {
+    assert.equal(
+      strongestProviderLoss(actions.map(providerLossDecision)),
+      "fail",
+      actions.join(","),
+    );
+  }
+
+  assert.equal(
+    strongestProviderLoss(
+      (["degrade", "suspend"] as const).toReversed().map(providerLossDecision),
+    ),
+    "suspend",
+  );
+  assert.equal(strongestProviderLoss([]), undefined);
+});
 
 test("@spec:capability-resolution/deterministic-provider-selection/one-compatible-provider", () => {
   const result = resolveCapabilities({
