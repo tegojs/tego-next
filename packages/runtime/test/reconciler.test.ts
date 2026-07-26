@@ -52,6 +52,7 @@ import {
   Reconciler,
   type ReconcileSnapshot,
 } from "../src/index.js";
+import { reconcileEffectIdentities } from "../src/reconcile/plan.js";
 
 const applicationId = parseApplicationId("app");
 const pluginId = parsePluginId("org.example.echo");
@@ -277,6 +278,29 @@ test("planReconcile creates stable one-effect steps and duplicate reconciliation
     revision: parseRevision("1"),
   };
   assert.deepEqual(planReconcile(snapshot(deployment(), [ready])).steps, []);
+});
+
+test("activation identity distinguishes same-generation component incarnations", () => {
+  const identities = reconcileEffectIdentities as (
+    desired: Pick<PluginDeployment, "applicationId" | "generation" | "pluginId">,
+    targetComponentId: ComponentInstance["componentId"],
+    kind: ReconcileEffectKind,
+    activation?: string,
+  ) => {
+    readonly instanceId: string;
+    readonly operationId: string;
+    readonly messageId: string;
+  };
+  const activationOne = identities(deployment("7"), componentId, "prepare", "1");
+  const activationTwo = identities(deployment("7"), componentId, "prepare", "2");
+
+  assert.match(activationOne.instanceId, /\.g7\.a1$/);
+  assert.match(activationOne.operationId, /\.g7\.a1\.prepare$/);
+  assert.match(activationOne.messageId, /\.g7\.a1\.prepare$/);
+  assert.match(activationTwo.instanceId, /\.g7\.a2$/);
+  assert.notEqual(activationTwo.instanceId, activationOne.instanceId);
+  assert.notEqual(activationTwo.operationId, activationOne.operationId);
+  assert.notEqual(activationTwo.messageId, activationOne.messageId);
 });
 
 test("plans enable, disable, upgrade, drain, and rollback without combining external effects", () => {
@@ -951,6 +975,7 @@ class RecordingEffects implements ComponentEffectExecutor {
   readonly performed: ReconcileEffect[] = [];
   readonly uniqueOperations = new Set<string>();
   readonly calls: ReconcileEffect[] = [];
+  readonly restored: ComponentInstance[] = [];
   readonly live = new Set<string>();
   failStart = false;
   failStop = false;
@@ -971,6 +996,7 @@ class RecordingEffects implements ComponentEffectExecutor {
   }
 
   async restore(instance: ComponentInstance): Promise<void> {
+    this.restored.push(instance);
     this.live.add(instance.instanceId);
   }
 
@@ -982,6 +1008,320 @@ class RecordingEffects implements ComponentEffectExecutor {
     this.live.clear();
   }
 }
+
+class GatedRecordingEffects extends RecordingEffects {
+  readonly #gates = new Map<
+    string,
+    {
+      readonly entered: PromiseWithResolvers<void>;
+      readonly release: PromiseWithResolvers<void>;
+    }
+  >();
+
+  gateNext(plugin: string, kind: ReconcileEffectKind) {
+    const gate = {
+      entered: Promise.withResolvers<void>(),
+      release: Promise.withResolvers<void>(),
+    };
+    this.#gates.set(`${plugin}/${kind}`, gate);
+    return gate;
+  }
+
+  override async perform(effect: ReconcileEffect): Promise<void> {
+    const gate = this.#gates.get(`${effect.pluginId}/${effect.kind}`);
+    if (gate !== undefined) {
+      this.#gates.delete(`${effect.pluginId}/${effect.kind}`);
+      gate.entered.resolve();
+      await gate.release.promise;
+    }
+    await super.perform(effect);
+  }
+}
+
+test("legacy activation defaults to one without changing its persisted generation", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const legacyInstanceId = "app.org_dexample_decho.echo-service.g7";
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: legacyInstanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("7"),
+        executor: "process",
+        instanceId: legacyInstanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("7"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects = new RecordingEffects();
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [deployment("7")],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.equal(
+    (effects.restored[0] as (ComponentInstance & { readonly activation?: string }) | undefined)
+      ?.activation,
+    "1",
+  );
+  assert.equal(effects.restored[0]?.deploymentGeneration, parseGeneration("7"));
+  const persisted = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: legacyInstanceId,
+  });
+  const persistedValue = persisted?.value as
+    | { readonly activation?: string; readonly deploymentGeneration?: string }
+    | undefined;
+  assert.equal(persistedValue?.deploymentGeneration, parseGeneration("7"));
+  assert.equal(Object.hasOwn(persistedValue ?? {}, "activation"), false);
+  await reconciler.stop();
+});
+
+test("suspended provider drains activation one, holds, and reactivates activation two", async () => {
+  const providerId = parsePluginId("suspend-provider");
+  const consumerId = parsePluginId("suspend-consumer");
+  const providerComponentId = parseComponentId("provider-service");
+  const consumerComponentId = parseComponentId("consumer-service");
+  const capability = parseCapabilityName("org.example.suspend");
+  const providerDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const component = (target: ComponentInstance["componentId"]) => ({
+    componentId: target,
+    kind: "service" as const,
+    entrypoint: `components/${target}.js`,
+    executors: ["process" as const],
+  });
+  const providerManifest: PluginManifest = {
+    ...manifest("1.0.0", providerDigest),
+    pluginId: providerId,
+    components: [component(providerComponentId)],
+    capabilities: {
+      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      requires: [],
+    },
+  };
+  const consumerManifest: PluginManifest = {
+    ...manifest("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    components: [component(consumerComponentId)],
+    capabilities: {
+      provides: [],
+      requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+    },
+  };
+  const provider = deployment("7", {
+    pluginId: providerId,
+    artifactDigest: providerDigest,
+  });
+  const consumer = deployment("7", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    essential: true,
+  });
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerDigest),
+      pluginId: providerId,
+      manifest: providerManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    for (const desired of [provider, consumer]) {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "deployments",
+          id: `${desired.applicationId}/${desired.pluginId}`,
+        },
+        desired,
+        { expectedRevision: "absent" },
+      );
+    }
+    return null;
+  });
+  const effects = new GatedRecordingEffects();
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate(request) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadInstallations: async () => installations,
+  });
+  await reconciler.start();
+  const providerInstance = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "component-instances" &&
+      (record.value as { readonly pluginId?: string }).pluginId === providerId,
+  );
+  const activationOne = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "component-instances" &&
+      (record.value as { readonly pluginId?: string }).pluginId === consumerId,
+  );
+  assert.ok(providerInstance);
+  assert.ok(activationOne);
+  assert.equal((activationOne.value as { readonly activation?: string }).activation, "1");
+  assert.equal(reconciler.applicationReady(), true);
+
+  await state.transact({}, async (transaction) => {
+    const current = await transaction.get(providerInstance.key);
+    assert.ok(current);
+    await transaction.put(
+      providerInstance.key,
+      { ...(current.value as object), lifecycle: "degraded" },
+      { expectedRevision: current.revision },
+    );
+    return null;
+  });
+  const drainGate = effects.gateNext(consumerId, "drain");
+  const suspendWake = reconciler.wake();
+  assert.equal(
+    await Promise.race([
+      drainGate.entered.promise.then(() => "drain-entered" as const),
+      suspendWake.then(() => "wake-finished" as const),
+    ]),
+    "drain-entered",
+  );
+  assert.equal(
+    effects.calls.some((effect) => effect.pluginId === consumerId && effect.kind === "stop"),
+    false,
+  );
+  drainGate.release.resolve();
+
+  const stopGate = effects.gateNext(consumerId, "stop");
+  assert.equal(
+    await Promise.race([
+      stopGate.entered.promise.then(() => "stop-entered" as const),
+      suspendWake.then(() => "wake-finished" as const),
+    ]),
+    "stop-entered",
+  );
+  stopGate.release.resolve();
+  await suspendWake;
+
+  const stoppedOne = await state.read(activationOne.key);
+  const stoppedOneValue = stoppedOne?.value as
+    | { readonly deploymentGeneration?: string; readonly lifecycle?: string }
+    | undefined;
+  assert.equal(stoppedOneValue?.lifecycle, "stopped");
+  assert.equal(stoppedOneValue?.deploymentGeneration, parseGeneration("7"));
+  assert.equal(reconciler.applicationReady(), false);
+  const suspendedObservation = await state.read({
+    namespace: "tego",
+    collection: "deployment-observations",
+    id: `${applicationId}/${consumerId}`,
+  });
+  assert.equal(
+    (suspendedObservation?.value as { readonly status?: string } | undefined)?.status,
+    "suspended",
+  );
+  const callsAtHold = effects.calls.length;
+  await reconciler.wake();
+  assert.equal(effects.calls.length, callsAtHold);
+
+  await state.transact({}, async (transaction) => {
+    const current = await transaction.get(providerInstance.key);
+    assert.ok(current);
+    await transaction.put(
+      providerInstance.key,
+      { ...(current.value as object), lifecycle: "ready" },
+      { expectedRevision: current.revision },
+    );
+    return null;
+  });
+  const prepareGate = effects.gateNext(consumerId, "prepare");
+  const recoveryWake = reconciler.wake();
+  assert.equal(
+    await Promise.race([
+      prepareGate.entered.promise.then(() => "prepare-entered" as const),
+      recoveryWake.then(() => "wake-finished" as const),
+    ]),
+    "prepare-entered",
+  );
+  const activationTwoPrepare = effects.calls.findLast(
+    (effect) => effect.pluginId === consumerId && effect.kind === "prepare",
+  ) as (ReconcileEffect & { readonly activation?: string }) | undefined;
+  assert.equal(activationTwoPrepare?.activation, "2");
+  assert.notEqual(activationTwoPrepare?.instanceId, activationOne.key.id);
+  prepareGate.release.resolve();
+  await recoveryWake;
+
+  const activationTwo = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: activationTwoPrepare?.instanceId ?? "",
+  });
+  const activationTwoValue = activationTwo?.value as
+    | {
+        readonly activation?: string;
+        readonly deploymentGeneration?: string;
+        readonly lifecycle?: string;
+      }
+    | undefined;
+  assert.equal(activationTwoValue?.lifecycle, "ready");
+  assert.equal(activationTwoValue?.deploymentGeneration, parseGeneration("7"));
+  assert.equal(
+    (activationTwo?.value as { readonly activation?: string } | undefined)?.activation,
+    "2",
+  );
+  assert.equal(
+    ((await state.read(activationOne.key))?.value as { readonly lifecycle?: string } | undefined)
+      ?.lifecycle,
+    "stopped",
+  );
+  assert.equal(
+    effects.calls.filter(
+      (effect) =>
+        effect.pluginId === consumerId &&
+        effect.kind === "start" &&
+        (effect as ReconcileEffect & { readonly activation?: string }).activation === "2",
+    ).length,
+    1,
+  );
+  assert.equal(reconciler.applicationReady(), true);
+  await reconciler.stop();
+});
 
 test("Reconciler gates artifact, capabilities, permissions, placement, and executor before effects", async () => {
   const clock = new ManualClock();

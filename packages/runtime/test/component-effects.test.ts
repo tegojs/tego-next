@@ -429,6 +429,25 @@ test("operation identity replay is idempotent and conflicting payloads are rejec
   );
 });
 
+test("suspend activation effects reject a value that differs from the immutable binding", async () => {
+  const { effects, registry } = harness();
+  const prepare = {
+    ...effect("prepare"),
+    activation: "1",
+  } as ReconcileEffect & { readonly activation: string };
+  await effects.perform(prepare);
+
+  await assert.rejects(
+    effects.perform({
+      ...effect("start"),
+      activation: "2",
+    } as ReconcileEffect & { readonly activation: string }),
+    /activation|identity|binding/iu,
+  );
+  assert.equal(registry.require(instanceId).state, "prepared");
+  await effects.close();
+});
+
 test("stale deployment identity cannot operate a newly registered instance", async () => {
   const { effects, registry } = harness();
   await effects.perform(effect("prepare"));

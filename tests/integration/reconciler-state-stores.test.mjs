@@ -1030,3 +1030,186 @@ test("failed start and stop retries persist a legal pre-state before external ef
     });
   }
 });
+
+test("suspended provider hold survives Memory and SQLite reopen before activation two", async (t) => {
+  await withRealStateStores(t, async (initialState, clock, reopen) => {
+    const providerId = parsePluginId("suspend-provider");
+    const consumerId = parsePluginId("suspend-consumer");
+    const providerComponentId = parseComponentId("provider-service");
+    const consumerComponentId = parseComponentId("consumer-service");
+    const capability = parseCapabilityName("org.example.suspend");
+    const providerDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+    const consumerDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+    const component = (componentId) => ({
+      componentId,
+      kind: "service",
+      entrypoint: `components/${componentId}.js`,
+      executors: ["process"],
+    });
+    const providerManifest = {
+      ...manifest(),
+      pluginId: providerId,
+      components: [component(providerComponentId)],
+      permissions: [{ kind: "executor", executors: ["process"] }],
+      capabilities: {
+        provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        requires: [],
+      },
+    };
+    const consumerManifest = {
+      ...manifest(),
+      pluginId: consumerId,
+      components: [component(consumerComponentId)],
+      permissions: [{ kind: "executor", executors: ["process"] }],
+      capabilities: {
+        provides: [],
+        requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+      },
+    };
+    const providerDeployment = {
+      ...deployment(),
+      pluginId: providerId,
+      artifactDigest: providerDigest,
+      permissionGrants: [{ kind: "executor", executors: ["process"] }],
+    };
+    const consumerDeployment = {
+      ...deployment(),
+      pluginId: consumerId,
+      artifactDigest: consumerDigest,
+      permissionGrants: [{ kind: "executor", executors: ["process"] }],
+    };
+    const installations = [
+      {
+        ...installation(),
+        pluginId: providerId,
+        digest: providerDigest,
+        manifest: providerManifest,
+      },
+      {
+        ...installation(),
+        pluginId: consumerId,
+        digest: consumerDigest,
+        manifest: consumerManifest,
+      },
+    ];
+    const artifacts = new Map(
+      installations.map((installed) => [
+        installed.digest,
+        {
+          digest: installed.digest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: installed.manifest,
+        },
+      ]),
+    );
+    await initialState.transact({}, async (transaction) => {
+      for (const desired of [providerDeployment, consumerDeployment]) {
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "deployments",
+            id: `${desired.applicationId}/${desired.pluginId}`,
+          },
+          desired,
+          { expectedRevision: "absent" },
+        );
+      }
+      return null;
+    });
+    const options = (state, effects) => ({
+      artifactGate: {
+        validate: async (request) => {
+          const artifact = artifacts.get(request.digest);
+          assert.ok(artifact);
+          return artifact;
+        },
+      },
+      clock,
+      effects,
+      state,
+      loadInstallations: async () => installations,
+    });
+    const firstEffects = new RecordingEffects();
+    firstEffects.supportedExecutors = ["process"];
+    const first = new Reconciler(options(initialState, firstEffects));
+    await first.start();
+    const providerStart = firstEffects.calls.find(
+      (effect) => effect.pluginId === providerId && effect.kind === "start",
+    );
+    const activationOneStart = firstEffects.calls.find(
+      (effect) => effect.pluginId === consumerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    assert.ok(activationOneStart);
+    await initialState.transact({}, async (transaction) => {
+      const key = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: providerStart.instanceId,
+      };
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        { ...current.value, lifecycle: "degraded" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+
+    await first.wake();
+
+    assert.equal((await readObservation(initialState, consumerId))?.value.status, "suspended");
+    assert.equal(
+      (await readOnlyInstance(initialState, activationOneStart.instanceId))?.value.lifecycle,
+      "stopped",
+    );
+    await first.stop();
+
+    const state = await reopen();
+    const restartedEffects = new RecordingEffects();
+    restartedEffects.supportedExecutors = ["process"];
+    const restarted = new Reconciler(options(state, restartedEffects));
+    await restarted.start();
+    assert.equal(
+      restartedEffects.calls.some(
+        (effect) => effect.pluginId === consumerId && effect.kind === "prepare",
+      ),
+      false,
+    );
+    assert.equal((await readObservation(state, consumerId))?.value.status, "suspended");
+
+    await state.transact({}, async (transaction) => {
+      const key = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: providerStart.instanceId,
+      };
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        { ...current.value, lifecycle: "ready" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+    await restarted.wake();
+
+    const activationTwoStarts = restartedEffects.calls.filter(
+      (effect) =>
+        effect.pluginId === consumerId && effect.kind === "start" && effect.activation === "2",
+    );
+    assert.equal(activationTwoStarts.length, 1);
+    assert.notEqual(activationTwoStarts[0].instanceId, activationOneStart.instanceId);
+    assert.equal(
+      (await readOnlyInstance(state, activationOneStart.instanceId))?.value.lifecycle,
+      "stopped",
+    );
+    assert.equal(
+      (await readOnlyInstance(state, activationTwoStarts[0].instanceId))?.value.lifecycle,
+      "ready",
+    );
+    await restarted.stop();
+  });
+});
