@@ -29,6 +29,7 @@ import {
   runtimeDiagnostic,
   type StateKey,
   type StateStore,
+  type StateTransaction,
   serializeCause,
   type Versioned,
 } from "@tegojs/contracts";
@@ -96,6 +97,16 @@ interface LoadedProviderLoss {
   readonly key: StateKey<PersistedProviderLoss>;
   readonly value: PersistedProviderLoss;
   readonly revision: Revision;
+}
+
+interface ProviderComponentEvidence {
+  readonly key: StateKey<PersistedComponentInstance>;
+  readonly instance?: ComponentInstance;
+}
+
+interface ProviderReadinessSnapshot {
+  readonly evidence: readonly ProviderComponentEvidence[];
+  readonly ready: boolean;
 }
 
 interface ComponentLifecycleExecutor {
@@ -946,35 +957,144 @@ export class Reconciler {
     }
   }
 
-  #providerIsReady(
+  #providerReadiness(
     provider: PluginDeploymentIdentity,
     deployments: readonly PluginDeployment[],
     installations: readonly PluginInstallation[],
     instances: readonly ComponentInstance[],
-  ): boolean {
+  ): ProviderReadinessSnapshot {
     const deployment = deployments.find(
       (candidate) =>
         candidate.applicationId === provider.applicationId &&
         candidate.pluginId === provider.pluginId,
     );
-    if (deployment?.state !== "active") return false;
+    if (deployment === undefined) return { evidence: [], ready: false };
     const installation = installations.find(
       (candidate) =>
         candidate.pluginId === deployment.pluginId &&
         candidate.version === deployment.version &&
         candidate.digest === deployment.artifactDigest,
     );
-    if (installation === undefined) return false;
-    return installation.manifest.components.every((component) =>
-      instances.some(
-        (instance) =>
-          instance.applicationId === deployment.applicationId &&
-          instance.pluginId === deployment.pluginId &&
-          instance.deploymentGeneration === deployment.generation &&
-          instance.componentId === component.componentId &&
-          this.#isReadyAndLive(instance),
-      ),
+    if (installation === undefined) return { evidence: [], ready: false };
+    const evidence = installation.manifest.components.map((component) => {
+      const expectedInstanceId = reconcileEffectIdentities(
+        {
+          applicationId: deployment.applicationId,
+          generation: deployment.generation,
+          pluginId: deployment.pluginId,
+        },
+        component.componentId,
+        "prepare",
+      ).instanceId;
+      const instance = instances.find(
+        (candidate) =>
+          candidate.instanceId === expectedInstanceId &&
+          candidate.applicationId === deployment.applicationId &&
+          candidate.pluginId === deployment.pluginId &&
+          candidate.deploymentGeneration === deployment.generation &&
+          candidate.observedGeneration === deployment.generation &&
+          candidate.artifactDigest === deployment.artifactDigest &&
+          candidate.componentId === component.componentId,
+      );
+      return {
+        key: instanceKey(expectedInstanceId),
+        ...(instance === undefined ? {} : { instance }),
+      };
+    });
+    return {
+      evidence,
+      ready:
+        deployment.state === "active" &&
+        evidence.every(
+          ({ instance }) =>
+            instance !== undefined &&
+            instance.applicationId === deployment.applicationId &&
+            instance.pluginId === deployment.pluginId &&
+            instance.deploymentGeneration === deployment.generation &&
+            this.#isReadyAndLive(instance),
+        ),
+    };
+  }
+
+  async #cleanupOrphanProviderLosses(
+    deployments: readonly PluginDeployment[],
+    loadedLosses: readonly LoadedProviderLoss[],
+  ): Promise<boolean> {
+    const orphaned = loadedLosses.filter(
+      (record) =>
+        !deployments.some(
+          (deployment) =>
+            deployment.applicationId === record.value.consumer.applicationId &&
+            deployment.pluginId === record.value.consumer.pluginId,
+        ),
     );
+    if (orphaned.length === 0) return false;
+    try {
+      const committed = await this.#options.state.transact(
+        this.#transactionOptions(),
+        async (transaction) => {
+          const deploymentKeys = orphaned.map((record) =>
+            deploymentStateKey(record.value.consumer),
+          );
+          for (const deploymentKey of deploymentKeys) {
+            if ((await transaction.get(deploymentKey)) !== undefined) return false;
+          }
+          for (const record of orphaned) {
+            const deploymentKey = deploymentStateKey(record.value.consumer);
+            await transaction.delete(deploymentKey, { expectedRevision: "absent" });
+            await transaction.delete(record.key, { expectedRevision: record.revision });
+          }
+          return true;
+        },
+      );
+      if (!committed) {
+        this.#replanCount += 1;
+        return true;
+      }
+      this.#lastCommitAuthority = this.#options.authority;
+      return true;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+      return true;
+    }
+  }
+
+  async #fenceProviderComponentEvidence(
+    transaction: StateTransaction,
+    snapshots: readonly ProviderReadinessSnapshot[],
+    mutationKeys: ReadonlySet<string>,
+  ): Promise<boolean> {
+    for (const { evidence } of snapshots) {
+      for (const expected of evidence) {
+        const current = await transaction.get(expected.key);
+        if (expected.instance === undefined) {
+          if (current !== undefined) return false;
+          await transaction.delete(expected.key, { expectedRevision: "absent" });
+          continue;
+        }
+        if (
+          current === undefined ||
+          current.revision !== expected.instance.revision ||
+          current.value.instanceId !== expected.instance.instanceId ||
+          current.value.applicationId !== expected.instance.applicationId ||
+          current.value.pluginId !== expected.instance.pluginId ||
+          current.value.componentId !== expected.instance.componentId ||
+          current.value.deploymentGeneration !== expected.instance.deploymentGeneration ||
+          current.value.observedGeneration !== expected.instance.observedGeneration ||
+          current.value.artifactDigest !== expected.instance.artifactDigest ||
+          current.value.lifecycle !== expected.instance.lifecycle
+        ) {
+          return false;
+        }
+        if (!mutationKeys.has(expected.key.id)) {
+          await transaction.put(expected.key, current.value, {
+            expectedRevision: expected.instance.revision,
+          });
+        }
+      }
+    }
+    return true;
   }
 
   async #reconcileProviderLosses(
@@ -986,6 +1106,7 @@ export class Reconciler {
     gates: ReadonlyMap<string, ArtifactDeploymentGate | DiagnosticError>,
   ): Promise<boolean> {
     if (this.#options.loadDeployments !== undefined) return false;
+    if (await this.#cleanupOrphanProviderLosses(deployments, loadedLosses)) return true;
     const decisionsByConsumer = new Map<string, ProviderLossDecision[]>();
     for (const gate of gates.values()) {
       if (gate instanceof DiagnosticError) continue;
@@ -1051,13 +1172,12 @@ export class Reconciler {
             };
       if (desired === undefined) continue;
 
+      const providerReadiness = desired.providers.map((provider) =>
+        this.#providerReadiness(provider, deployments, installations, instances),
+      );
       const stale = desired.deploymentGeneration !== deployment.generation;
       const recovered =
-        !stale &&
-        decisions.length === 0 &&
-        desired.providers.every((provider) =>
-          this.#providerIsReady(provider, deployments, installations, instances),
-        );
+        !stale && decisions.length === 0 && providerReadiness.every(({ ready }) => ready);
       const deploymentInstances = instances.filter(
         (instance) =>
           instance.applicationId === deployment.applicationId &&
@@ -1162,6 +1282,16 @@ export class Reconciler {
               }
               persistedInstances.push({ ...persistedInstance, key });
             }
+            if (
+              !stale &&
+              !(await this.#fenceProviderComponentEvidence(
+                transaction,
+                providerReadiness,
+                new Set(persistedInstances.map(({ key }) => key.id)),
+              ))
+            ) {
+              return false;
+            }
             if (writeRecord) {
               await transaction.put(providerLossKey(consumer), desired, {
                 expectedRevision: current?.revision ?? "absent",
@@ -1247,7 +1377,7 @@ export class Reconciler {
         continue;
       }
       if (
-        instance.lifecycle === "ready" &&
+        (instance.lifecycle === "ready" || instance.lifecycle === "degraded") &&
         this.#componentLifecycle.isLive(instance, this.#options.authority)
       ) {
         await this.#clearRestorationFailure(instance);
@@ -1256,7 +1386,7 @@ export class Reconciler {
       try {
         await this.#componentLifecycle.restore(instance, this.#options.authority);
         if (
-          instance.lifecycle === "ready" &&
+          (instance.lifecycle === "ready" || instance.lifecycle === "degraded") &&
           !this.#componentLifecycle.isLive(instance, this.#options.authority)
         ) {
           throw new Error("Restored component session did not become live");

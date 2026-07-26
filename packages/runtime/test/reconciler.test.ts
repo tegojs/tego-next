@@ -1792,6 +1792,12 @@ test("degrade persists lexical provider loss evidence and recovers only the same
       (record.value as { readonly pluginId?: string }).pluginId === providerAId,
   );
   assert.ok(providerAInstance);
+  const providerZInstance = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "component-instances" &&
+      (record.value as { readonly pluginId?: string }).pluginId === providerZId,
+  );
+  assert.ok(providerZInstance);
   const readyInstance = [...state.records.values()].find(
     (record) =>
       record.key.collection === "component-instances" &&
@@ -1834,16 +1840,14 @@ test("degrade persists lexical provider loss evidence and recovers only the same
     "ready",
   );
   await state.transact({}, async (transaction) => {
-    for (const desired of [providerZ, providerA]) {
-      const key = deploymentRecordKey(desired);
+    for (const record of [providerZInstance, providerAInstance]) {
+      const key = record.key;
       const current = await transaction.get(key);
       assert.ok(current);
       await transaction.put(
         key,
-        { ...desired, state: "disabled" },
-        {
-          expectedRevision: current.revision,
-        },
+        { ...(current.value as object), lifecycle: "degraded" },
+        { expectedRevision: current.revision },
       );
     }
     await transaction.put(deploymentRecordKey(alternate), alternate, {
@@ -1895,11 +1899,15 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   assert.equal(consumerEffectCount(recoveredEffects), 0);
 
   await state.transact({}, async (transaction) => {
-    for (const desired of [providerZ, providerA]) {
-      const key = deploymentRecordKey(desired);
+    for (const record of [providerZInstance, providerAInstance]) {
+      const key = record.key;
       const current = await transaction.get(key);
       assert.ok(current);
-      await transaction.put(key, desired, { expectedRevision: current.revision });
+      await transaction.put(
+        key,
+        { ...(current.value as object), lifecycle: "ready" },
+        { expectedRevision: current.revision },
+      );
     }
     return null;
   });
