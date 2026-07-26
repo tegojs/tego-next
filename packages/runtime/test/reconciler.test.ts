@@ -584,7 +584,7 @@ class TestStateStore implements StateStore {
   capabilityBindingRaceWinner:
     | {
         readonly key: StateKey<JsonValue>;
-        readonly beforeCommit?: () => void;
+        readonly beforeCommit?: () => Promise<void>;
         readonly value: JsonValue;
       }
     | undefined;
@@ -664,7 +664,7 @@ class TestStateStore implements StateStore {
     ) {
       const winner = this.capabilityBindingRaceWinner;
       this.capabilityBindingRaceWinner = undefined;
-      winner.beforeCommit?.();
+      await winner.beforeCommit?.();
       this.revision += 1n;
       this.records.set(stateIdentifier(winner.key), {
         key: structuredClone(winner.key),
@@ -1169,10 +1169,23 @@ test("automatic capability binding is persisted without revision churn or provid
     artifactDigest: consumerDigest,
     permissionGrants: [],
   });
-  let deployments: readonly PluginDeployment[] = [providerA, consumer];
   const clock = new ManualClock();
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
+  const deploymentStateKey = (desired: PluginDeployment): StateKey<PluginDeployment> => ({
+    namespace: "tego",
+    collection: "deployments",
+    id: `${desired.applicationId}/${desired.pluginId}`,
+  });
+  await state.transact({}, async (transaction) => {
+    await transaction.put(deploymentStateKey(providerA), providerA, {
+      expectedRevision: "absent",
+    });
+    await transaction.put(deploymentStateKey(consumer), consumer, {
+      expectedRevision: "absent",
+    });
+    return null;
+  });
   const reconciler = new Reconciler({
     artifactGate: {
       async validate(request) {
@@ -1184,7 +1197,6 @@ test("automatic capability binding is persisted without revision churn or provid
     clock,
     effects,
     state,
-    loadDeployments: async () => deployments,
     loadInstallations: async () => installations,
   });
   const bindingKey: StateKey<JsonValue> = {
@@ -1215,7 +1227,12 @@ test("automatic capability binding is persisted without revision churn or provid
   await reconciler.wake();
   assert.equal((await state.read(bindingKey))?.revision, created.revision);
 
-  deployments = [providerA, providerB, consumer];
+  await state.transact({}, async (transaction) => {
+    await transaction.put(deploymentStateKey(providerB), providerB, {
+      expectedRevision: "absent",
+    });
+    return null;
+  });
   await reconciler.wake();
 
   const afterProviderB = await state.read(bindingKey);
@@ -1310,10 +1327,23 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
     artifactDigest: consumerDigest,
     permissionGrants: [{ kind: "executor", executors: ["process"] }],
   });
-  let deployments: readonly PluginDeployment[] = [providerA, consumer];
   const clock = new ManualClock();
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
+  const deploymentStateKey = (desired: PluginDeployment): StateKey<PluginDeployment> => ({
+    namespace: "tego",
+    collection: "deployments",
+    id: `${desired.applicationId}/${desired.pluginId}`,
+  });
+  await state.transact({}, async (transaction) => {
+    await transaction.put(deploymentStateKey(providerA), providerA, {
+      expectedRevision: "absent",
+    });
+    await transaction.put(deploymentStateKey(consumer), consumer, {
+      expectedRevision: "absent",
+    });
+    return null;
+  });
   const bindingKey: StateKey<JsonValue> = {
     namespace: "tego",
     collection: "capability-bindings",
@@ -1329,8 +1359,13 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
   } as const;
   state.capabilityBindingRaceWinner = {
     key: bindingKey,
-    beforeCommit: () => {
-      deployments = [providerA, providerB, consumer];
+    beforeCommit: async () => {
+      await state.transact({}, async (transaction) => {
+        await transaction.put(deploymentStateKey(providerB), providerB, {
+          expectedRevision: "absent",
+        });
+        return null;
+      });
     },
     value: winningBinding,
   };
@@ -1345,7 +1380,6 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
     clock,
     effects,
     state,
-    loadDeployments: async () => deployments,
     loadInstallations: async () => installations,
   };
   const loser = new Reconciler({ ...options, maxConvergencePasses: 1 });
@@ -1515,6 +1549,51 @@ test("a generation-2 binding inserted after the deployment read is not deleted o
   await reconciler.start();
 
   assert.deepEqual((await state.read(bindingKey))?.value, winningBinding);
+  await reconciler.stop();
+});
+
+test("a custom deployment loader does not destructively clean up persistent bindings", async () => {
+  const consumerId = parsePluginId("consumer");
+  const providerId = parsePluginId("provider");
+  const capability = parseCapabilityName("org.example.custom-loader");
+  const consumer = deployment("1", { pluginId: consumerId });
+  const bindingKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "capability-bindings",
+    id: `${applicationId}/${consumerId}/${capability}`,
+  };
+  const binding = {
+    consumer: { applicationId, pluginId: consumerId },
+    capability,
+    provider: { applicationId, pluginId: providerId },
+    source: "automatic",
+    deploymentGeneration: parseGeneration("2"),
+    updatedAt: "2026-07-23T00:00:01.000Z",
+  } as const;
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(bindingKey, binding, { expectedRevision: "absent" });
+    return null;
+  });
+  const persisted = await state.read(bindingKey);
+  assert.ok(persisted);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate() {
+        assert.fail("missing installations must fail before artifact validation");
+      },
+    },
+    clock,
+    effects: new RecordingEffects(),
+    state,
+    loadDeployments: async () => [consumer],
+    loadInstallations: async () => [],
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(await state.read(bindingKey), persisted);
   await reconciler.stop();
 });
 

@@ -184,8 +184,16 @@ interface DeploymentObservation extends JsonObject {
   readonly updatedAt: string;
 }
 
-function deploymentKey(deployment: PluginDeployment): string {
-  return `${deployment.applicationId}/${deployment.pluginId}`;
+function deploymentKey(identity: PluginDeploymentIdentity): string {
+  return `${identity.applicationId}/${identity.pluginId}`;
+}
+
+function deploymentStateKey(identity: PluginDeploymentIdentity): StateKey<PluginDeployment> {
+  return {
+    namespace,
+    collection: "deployments",
+    id: deploymentKey(identity),
+  };
 }
 
 function instanceKey(instanceId: string): StateKey<PersistedComponentInstance> {
@@ -829,6 +837,7 @@ export class Reconciler {
     deployments: readonly PluginDeployment[],
     loadedBindings: readonly LoadedCapabilityBinding[],
   ): Promise<boolean> {
+    if (this.#options.loadDeployments !== undefined) return true;
     const staleBindings = loadedBindings.filter(
       (record) => !this.#isCurrentCapabilityBinding(record, deployments),
     );
@@ -836,6 +845,16 @@ export class Reconciler {
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
         for (const record of staleBindings) {
+          const currentDeployment = await transaction.get(
+            deploymentStateKey(record.value.consumer),
+          );
+          if (
+            currentDeployment !== undefined &&
+            parsePluginDeployment(currentDeployment.value).generation ===
+              record.value.deploymentGeneration
+          ) {
+            continue;
+          }
           await transaction.delete(record.key, { expectedRevision: record.revision });
         }
         return null;
@@ -1321,6 +1340,7 @@ export class Reconciler {
     resolvedBindings: readonly ResolvedCapabilityBinding[],
     loadedBindings: readonly LoadedCapabilityBinding[],
   ): Promise<boolean> {
+    if (this.#options.loadDeployments !== undefined) return true;
     const consumer = {
       applicationId: deployment.applicationId,
       pluginId: deployment.pluginId,
@@ -1431,20 +1451,34 @@ export class Reconciler {
       left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
     );
     try {
-      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
-        for (const mutation of mutations) {
-          if (mutation.kind === "delete") {
-            await transaction.delete(mutation.key, {
-              expectedRevision: mutation.expectedRevision,
-            });
-          } else {
-            await transaction.put(mutation.key, mutation.value, {
-              expectedRevision: mutation.expectedRevision,
-            });
+      const committed = await this.#options.state.transact(
+        this.#transactionOptions(),
+        async (transaction) => {
+          const currentDeployment = await transaction.get(deploymentStateKey(deployment));
+          if (
+            currentDeployment === undefined ||
+            parsePluginDeployment(currentDeployment.value).generation !== deployment.generation
+          ) {
+            return false;
           }
-        }
-        return null;
-      });
+          for (const mutation of mutations) {
+            if (mutation.kind === "delete") {
+              await transaction.delete(mutation.key, {
+                expectedRevision: mutation.expectedRevision,
+              });
+            } else {
+              await transaction.put(mutation.key, mutation.value, {
+                expectedRevision: mutation.expectedRevision,
+              });
+            }
+          }
+          return true;
+        },
+      );
+      if (!committed) {
+        this.#replanCount += 1;
+        return false;
+      }
       this.#lastCommitAuthority = this.#options.authority;
       return true;
     } catch (error) {

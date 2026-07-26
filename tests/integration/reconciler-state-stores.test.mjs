@@ -264,7 +264,6 @@ test("automatic capability binding survives reconciler and state-store restart",
       artifactDigest: consumerDigest,
       permissionGrants: [],
     };
-    let deployments = [providerA, consumer];
     const options = (state) => ({
       artifactGate: {
         async validate(request) {
@@ -276,14 +275,27 @@ test("automatic capability binding survives reconciler and state-store restart",
       clock,
       effects: new RecordingEffects(),
       state,
-      loadDeployments: async () => deployments,
       loadInstallations: async () => installations,
+    });
+    const deploymentKey = (desired) => ({
+      namespace: "tego",
+      collection: "deployments",
+      id: `${desired.applicationId}/${desired.pluginId}`,
     });
     const bindingKey = {
       namespace: "tego",
       collection: "capability-bindings",
       id: `${applicationId}/${consumerId}/${capability}`,
     };
+    await initialState.transact({}, async (transaction) => {
+      await transaction.put(deploymentKey(providerA), providerA, {
+        expectedRevision: "absent",
+      });
+      await transaction.put(deploymentKey(consumer), consumer, {
+        expectedRevision: "absent",
+      });
+      return null;
+    });
 
     const first = new Reconciler(options(initialState));
     await first.start();
@@ -292,7 +304,12 @@ test("automatic capability binding survives reconciler and state-store restart",
     assert.equal(persisted.value.provider.pluginId, providerAId);
     await first.stop();
 
-    deployments = [providerA, providerB, consumer];
+    await initialState.transact({}, async (transaction) => {
+      await transaction.put(deploymentKey(providerB), providerB, {
+        expectedRevision: "absent",
+      });
+      return null;
+    });
     const restartedState = await reopen();
     const restarted = new Reconciler(options(restartedState));
     await restarted.start();
@@ -357,6 +374,20 @@ test("capability binding cleanup is canonical before deployment gates", async (t
         generation: parseGeneration("1"),
       },
     ];
+    await state.transact({}, async (transaction) => {
+      for (const desired of deployments) {
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "deployments",
+            id: `${desired.applicationId}/${desired.pluginId}`,
+          },
+          desired,
+          { expectedRevision: "absent" },
+        );
+      }
+      return null;
+    });
     const reconciler = new Reconciler({
       artifactGate: {
         async validate() {
@@ -366,7 +397,6 @@ test("capability binding cleanup is canonical before deployment gates", async (t
       clock,
       effects: new RecordingEffects(),
       state,
-      loadDeployments: async () => deployments,
       loadInstallations: async () => [],
     });
 
