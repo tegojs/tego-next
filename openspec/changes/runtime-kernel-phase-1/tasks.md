@@ -81,8 +81,8 @@
 
 - [x] 10.1 Write SDK type and runtime tests and implement functional component-definition APIs with no base class or decorator requirement
 - [x] 10.2 Write context tests and implement minimal identity, config, logger, event, capability, lifecycle, runtime-info, and disposable access
-- [ ] 10.3 Implement public manifest, lifecycle, executor, Worker, state-store, and coordination-provider conformance test kits
-- [ ] 10.4 Write testkit self-tests proving third-party implementations can use only public exports
+- [x] 10.3 Implement public manifest, lifecycle, executor, Worker, state-store, and coordination-provider conformance test kits
+- [x] 10.4 Write testkit self-tests proving third-party implementations can use only public exports
 - [x] 10.5 Add the TypeScript echo plugin with no executor-specific code and lifecycle/test fixtures
 
 ## 11. CLI and Usable Vertical Slice

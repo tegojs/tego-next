@@ -1,4 +1,20 @@
-import { lifecycleConformance, manifestConformance, workerConformance } from "@tegojs/testkit";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
+  coordinationConformance,
+  executorConformance,
+  lifecycleConformance,
+  manifestConformance,
+  stateStoreConformance,
+  workerConformance,
+  type CoordinationFactory,
+  type ExecutorConformanceFixture,
+  type ExecutorFactory,
+  type LifecycleConformanceFactory,
+  type ManifestConformanceFactory,
+  type StateStoreFactory,
+  type WorkerConformanceFactory,
+} from "@tegojs/testkit";
 import {
   parseApplicationId,
   parseArtifactDigest,
@@ -103,3 +119,27 @@ class PublicWorkerFixture {
 }
 
 workerConformance(() => new PublicWorkerFixture());
+
+const publicSuiteConsumers = {
+  coordination: (factory: CoordinationFactory) => coordinationConformance(factory),
+  executor: (factory: ExecutorFactory, fixture: ExecutorConformanceFixture) =>
+    executorConformance(factory, fixture),
+  lifecycle: (factory: LifecycleConformanceFactory) => lifecycleConformance(factory),
+  manifest: (factory: ManifestConformanceFactory) => manifestConformance(factory),
+  stateStore: (factory: StateStoreFactory) => stateStoreConformance(factory),
+  worker: (factory: WorkerConformanceFactory) => workerConformance(factory),
+};
+
+test("all six conformance suites are consumable from the public package entry", () => {
+  assert.deepEqual(Object.keys(publicSuiteConsumers).sort(), [
+    "coordination",
+    "executor",
+    "lifecycle",
+    "manifest",
+    "stateStore",
+    "worker",
+  ]);
+  for (const consume of Object.values(publicSuiteConsumers)) {
+    assert.equal(typeof consume, "function");
+  }
+});
