@@ -4,6 +4,7 @@ import {
   type ArtifactDigest,
   type Clock,
   compareOperationJournalCursors,
+  DiagnosticError,
   type DriverHealth,
   type ExecutorKind,
   type FencingEpoch,
@@ -579,6 +580,13 @@ class TestStateStore implements StateStore {
   failNextFailureCommit = false;
   failNextExecutionPreStateCommit = false;
   failNextAcknowledgement = false;
+  capabilityBindingRaceWinner:
+    | {
+        readonly key: StateKey<JsonValue>;
+        readonly beforeCommit?: () => void;
+        readonly value: JsonValue;
+      }
+    | undefined;
   readonly #clock: Clock;
   #open = false;
 
@@ -602,6 +610,10 @@ class TestStateStore implements StateStore {
     }> = [];
     const operations: Array<Omit<PersistedOperationJournalEntry, "revision">> = [];
     const messages: OutboxMessage[] = [];
+    const deletes: Array<{
+      key: StateKey<JsonValue>;
+      expectedRevision?: Revision;
+    }> = [];
     const transaction: StateTransaction = {
       get: async <Value extends JsonValue>(key: StateKey<Value>) => {
         const record = this.records.get(stateIdentifier(key));
@@ -626,7 +638,17 @@ class TestStateStore implements StateStore {
             : { expectedRevision: writeOptions.expectedRevision }),
         });
       },
-      delete: async () => {},
+      delete: async <Value extends JsonValue>(
+        key: StateKey<Value>,
+        writeOptions: { readonly expectedRevision?: Revision },
+      ) => {
+        deletes.push({
+          key: key as StateKey<JsonValue>,
+          ...(writeOptions.expectedRevision === undefined
+            ? {}
+            : { expectedRevision: writeOptions.expectedRevision }),
+        });
+      },
       appendOperation: async (entry) => {
         operations.push(structuredClone(entry));
       },
@@ -635,6 +657,20 @@ class TestStateStore implements StateStore {
       },
     };
     const result = await work(transaction);
+    if (
+      this.capabilityBindingRaceWinner !== undefined &&
+      puts.some((put) => put.key.collection === "capability-bindings")
+    ) {
+      const winner = this.capabilityBindingRaceWinner;
+      this.capabilityBindingRaceWinner = undefined;
+      winner.beforeCommit?.();
+      this.revision += 1n;
+      this.records.set(stateIdentifier(winner.key), {
+        key: structuredClone(winner.key),
+        value: structuredClone(winner.value),
+        revision: parseRevision(this.revision.toString()),
+      });
+    }
     if (
       (this.failNextObservedCommit || this.observedCommitConflicts > 0) &&
       puts.some((put) => put.key.collection === "component-instances") &&
@@ -697,7 +733,20 @@ class TestStateStore implements StateStore {
         throw error;
       }
     }
-    if (puts.length > 0 || operations.length > 0 || messages.length > 0) {
+    for (const deleted of deletes) {
+      const current = this.records.get(stateIdentifier(deleted.key));
+      if (
+        deleted.expectedRevision !== undefined &&
+        current?.revision !== deleted.expectedRevision
+      ) {
+        const error = new Error("state revision conflict") as Error & {
+          diagnostic?: { code: string };
+        };
+        error.diagnostic = { code: "STATE_REVISION_CONFLICT" };
+        throw error;
+      }
+    }
+    if (puts.length > 0 || deletes.length > 0 || operations.length > 0 || messages.length > 0) {
       this.revision += 1n;
     }
     const revision = parseRevision(this.revision.toString());
@@ -707,6 +756,9 @@ class TestStateStore implements StateStore {
         value: structuredClone(put.value),
         revision,
       });
+    }
+    for (const deleted of deletes) {
+      this.records.delete(stateIdentifier(deleted.key));
     }
     for (const operation of operations) {
       this.operations.set(operation.operationId, { ...operation, revision });
@@ -1161,6 +1213,159 @@ test("automatic capability binding is persisted without revision churn or provid
   assert.deepEqual(afterProviderB, created);
   assert.deepEqual(reconciler.diagnostics(), []);
   await reconciler.stop();
+});
+
+test("a losing automatic binding CAS aborts lifecycle work and replans from the winning binding", async () => {
+  const providerAId = parsePluginId("provider-a");
+  const providerBId = parsePluginId("provider-b");
+  const consumerId = parsePluginId("consumer");
+  const capability = parseCapabilityName("org.example.race");
+  const providerADigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const providerBDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+  const consumerComponentId = parseComponentId("consumer-service");
+  const capabilityManifest = (
+    targetPluginId: PluginInstallation["pluginId"],
+    provides: PluginManifest["capabilities"]["provides"],
+    requires: PluginManifest["capabilities"]["requires"],
+    components: PluginManifest["components"] = [],
+  ): PluginManifest => ({
+    ...manifest("1.0.0", digestOne),
+    pluginId: targetPluginId,
+    components,
+    permissions:
+      components.length === 0 ? [] : [{ kind: "executor", executors: ["process"] }],
+    capabilities: { provides, requires },
+  });
+  const providerAManifest = capabilityManifest(
+    providerAId,
+    [{ name: capability, protocolVersion: "1.0.0" }],
+    [],
+  );
+  const providerBManifest = capabilityManifest(
+    providerBId,
+    [{ name: capability, protocolVersion: "1.1.0" }],
+    [],
+  );
+  const consumerManifest = capabilityManifest(
+    consumerId,
+    [],
+    [{ name: capability, protocolRange: "^1.0.0" }],
+    [
+      {
+        componentId: consumerComponentId,
+        kind: "service",
+        entrypoint: "components/consumer.js",
+        executors: ["process"],
+      },
+    ],
+  );
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerADigest),
+      pluginId: providerAId,
+      manifest: providerAManifest,
+    },
+    {
+      ...installation("1.0.0", providerBDigest),
+      pluginId: providerBId,
+      manifest: providerBManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const providerA = deployment("1", {
+    pluginId: providerAId,
+    artifactDigest: providerADigest,
+    permissionGrants: [],
+  });
+  const providerB = deployment("1", {
+    pluginId: providerBId,
+    artifactDigest: providerBDigest,
+    permissionGrants: [],
+  });
+  const consumer = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
+  });
+  let deployments: readonly PluginDeployment[] = [providerA, consumer];
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const bindingKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "capability-bindings",
+    id: `${applicationId}/${consumerId}/${capability}`,
+  };
+  const winningBinding = {
+    consumer: { applicationId, pluginId: consumerId },
+    capability,
+    provider: { applicationId, pluginId: providerBId },
+    source: "automatic",
+    deploymentGeneration: parseGeneration("1"),
+    updatedAt: clock.now().toISOString(),
+  } as const;
+  state.capabilityBindingRaceWinner = {
+    key: bindingKey,
+    beforeCommit: () => {
+      deployments = [providerA, providerB, consumer];
+    },
+    value: winningBinding,
+  };
+  const options = {
+    artifactGate: {
+      async validate(request: { readonly digest: ArtifactDigest }) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => installations,
+  };
+  const loser = new Reconciler({ ...options, maxConvergencePasses: 1 });
+
+  await assert.rejects(
+    loser.start(),
+    (error: unknown) =>
+      error instanceof DiagnosticError &&
+      error.diagnostic.code === "LIFECYCLE_RECONCILE_DID_NOT_CONVERGE",
+  );
+
+  assert.equal(state.outbox.size, 0);
+  assert.deepEqual(effects.calls, []);
+  assert.deepEqual((await state.read(bindingKey))?.value, winningBinding);
+  await loser.stop();
+
+  const replanned = new Reconciler(options);
+  await replanned.start();
+
+  assert.deepEqual((await state.read(bindingKey))?.value, winningBinding);
+  assert.equal(
+    effects.performed.some(
+      (effect) => effect.pluginId === consumerId && effect.kind === "start",
+    ),
+    true,
+  );
+  assert.deepEqual(replanned.diagnostics(), []);
+  await replanned.stop();
 });
 
 test("non-canonical provider instances cannot satisfy execution-time capabilities", async () => {

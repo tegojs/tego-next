@@ -304,6 +304,90 @@ test("automatic capability binding survives reconciler and state-store restart",
   });
 });
 
+test("capability binding cleanup is canonical before deployment gates", async (t) => {
+  await withRealStateStores(t, async (state, clock) => {
+    const absentConsumerId = parsePluginId("absent-consumer");
+    const staleConsumerId = parsePluginId("stale-consumer");
+    const currentConsumerId = parsePluginId("current-consumer");
+    const providerId = parsePluginId("provider");
+    const capability = parseCapabilityName("org.example.cleanup");
+    const bindingKey = (consumerId) => ({
+      namespace: "tego",
+      collection: "capability-bindings",
+      id: `${applicationId}/${consumerId}/${capability}`,
+    });
+    const binding = (consumerId, deploymentGeneration) => ({
+      consumer: { applicationId, pluginId: consumerId },
+      capability,
+      provider: { applicationId, pluginId: providerId },
+      source: "automatic",
+      deploymentGeneration,
+      updatedAt: clock.now().toISOString(),
+    });
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        bindingKey(absentConsumerId),
+        binding(absentConsumerId, parseGeneration("1")),
+        { expectedRevision: "absent" },
+      );
+      await transaction.put(
+        bindingKey(staleConsumerId),
+        binding(staleConsumerId, parseGeneration("1")),
+        { expectedRevision: "absent" },
+      );
+      await transaction.put(
+        bindingKey(currentConsumerId),
+        binding(currentConsumerId, parseGeneration("1")),
+        { expectedRevision: "absent" },
+      );
+      return null;
+    });
+    const missingDigest = parseArtifactDigest(`sha256:${"d".repeat(64)}`);
+    const deployments = [
+      {
+        ...deployment(),
+        pluginId: staleConsumerId,
+        artifactDigest: missingDigest,
+        generation: parseGeneration("2"),
+      },
+      {
+        ...deployment(),
+        pluginId: currentConsumerId,
+        artifactDigest: missingDigest,
+        generation: parseGeneration("1"),
+      },
+    ];
+    const reconciler = new Reconciler({
+      artifactGate: {
+        async validate() {
+          assert.fail("missing installations must fail before artifact validation");
+        },
+      },
+      clock,
+      effects: new RecordingEffects(),
+      state,
+      loadDeployments: async () => deployments,
+      loadInstallations: async () => [],
+    });
+
+    await reconciler.start();
+
+    assert.equal(await state.read(bindingKey(absentConsumerId)), undefined);
+    assert.equal(await state.read(bindingKey(staleConsumerId)), undefined);
+    assert.deepEqual(
+      (await state.read(bindingKey(currentConsumerId)))?.value,
+      binding(currentConsumerId, parseGeneration("1")),
+    );
+    assert.equal(
+      reconciler
+        .diagnostics()
+        .filter((diagnostic) => diagnostic.code === "DEPLOYMENT_INSTALLATION_MISSING").length,
+      2,
+    );
+    await reconciler.stop();
+  });
+});
+
 test("stale pending placement is quarantined before its stable identity is replaced", async (t) => {
   await withRealStateStores(t, async (state, clock) => {
     const desired = deployment();
