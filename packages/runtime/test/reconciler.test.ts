@@ -5732,11 +5732,137 @@ async function createProviderLossTestFixture(
     lossKey,
     observationKey,
     options,
+    provider,
     providerId,
     recoverProvider,
     state,
   };
 }
+
+test("sequential provider loss upgrades one durable record after restart", async () => {
+  for (const initialAction of ["degrade", "suspend"] as const) {
+    const fixture = await createProviderLossTestFixture(`sequential-${initialAction}`, ["fail"]);
+    const firstEffects = new RecordingEffects();
+    const first = new Reconciler(fixture.options(firstEffects));
+    await first.start();
+    const providerStart = firstEffects.calls.find(
+      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+    );
+    const consumerStart = firstEffects.calls.find(
+      (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    assert.ok(consumerStart);
+    await first.stop();
+
+    await fixture.state.transact({}, async (transaction) => {
+      const consumerKey = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: consumerStart.instanceId,
+      };
+      const currentConsumer = await transaction.get(consumerKey);
+      assert.ok(currentConsumer);
+      await transaction.put(
+        consumerKey,
+        {
+          ...(currentConsumer.value as Record<string, JsonValue>),
+          lifecycle: initialAction === "degrade" ? "degraded" : "stopped",
+        },
+        { expectedRevision: currentConsumer.revision },
+      );
+      await transaction.put(
+        fixture.lossKey,
+        {
+          consumer: { applicationId, pluginId: fixture.consumerId },
+          deploymentGeneration: fixture.consumer.generation,
+          action: initialAction,
+          capabilities: [
+            parseCapabilityName(`org.example.loss-sequential-${initialAction}-0`),
+          ],
+          providers: [{ applicationId, pluginId: fixture.providerId }],
+          updatedAt: new ManualClock().now().toISOString(),
+        },
+        { expectedRevision: "absent" },
+      );
+      return null;
+    });
+    await fixture.failProvider(providerStart);
+
+    const restartedEffects = new RecordingEffects();
+    const restarted = new Reconciler(fixture.options(restartedEffects));
+    await restarted.start();
+
+    const loss = await fixture.state.read(fixture.lossKey);
+    assert.equal(
+      (loss?.value as { readonly action?: string } | undefined)?.action,
+      "fail",
+    );
+    assert.equal(
+      [...fixture.state.records.values()].filter(
+        (record) =>
+          record.key.collection === "provider-loss" && record.key.id === fixture.lossKey.id,
+      ).length,
+      1,
+    );
+    assert.equal(
+      (
+        (await fixture.state.read(fixture.observationKey))?.value as
+          | { readonly status?: string }
+          | undefined
+      )?.status,
+      "failed",
+    );
+    await restarted.stop();
+  }
+});
+
+test("provider generation upgrade recovers the same logical provider identity", async () => {
+  for (const policy of ["degrade", "suspend"] as const) {
+    const fixture = await createProviderLossTestFixture(`generation-upgrade-${policy}`, [policy]);
+    const effects = new RecordingEffects();
+    const reconciler = new Reconciler(fixture.options(effects));
+    await reconciler.start();
+    const providerStart = effects.calls.find(
+      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    await fixture.failProvider(providerStart);
+    await reconciler.wake();
+    assert.ok(await fixture.state.read(fixture.lossKey));
+
+    await fixture.state.transact({}, async (transaction) => {
+      const key = fixture.deploymentKey(fixture.provider);
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        { ...fixture.provider, generation: parseGeneration("2") },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+    await reconciler.wake();
+
+    assert.equal(await fixture.state.read(fixture.lossKey), undefined);
+    const generationTwoProvider = effects.calls.find(
+      (effect) =>
+        effect.pluginId === fixture.providerId &&
+        effect.kind === "start" &&
+        effect.deploymentGeneration === parseGeneration("2"),
+    );
+    assert.ok(generationTwoProvider);
+    assert.equal(
+      (
+        (await fixture.state.read(fixture.observationKey))?.value as
+          | { readonly status?: string }
+          | undefined
+      )?.status,
+      "ready",
+    );
+    await reconciler.stop();
+  }
+});
 
 test("failed provider loss drains and stops until a new desired generation", async () => {
   const fixture = await createProviderLossTestFixture("generation", ["fail"]);

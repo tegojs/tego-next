@@ -721,3 +721,47 @@ test("a consumer that was not ready does not receive provider loss actions", () 
 
   assert.deepEqual(result.providerLossActions, []);
 });
+
+test("sequential provider loss uses activation history after the consumer is no longer ready", () => {
+  const activatedConsumer = {
+    ...deployment("consumer", {
+      ready: false,
+      requires: [{ name: echoName, protocolRange: "^1.0.0", lossPolicy: "fail" }],
+    }),
+    activated: true,
+  };
+  const neverActivatedConsumer = { ...activatedConsumer, activated: false };
+  const unavailableProvider = deployment("provider", {
+    ready: false,
+    provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+  });
+  const previousBindings = [
+    {
+      consumer: identity("consumer"),
+      capability: echoName,
+      provider: identity("provider"),
+    },
+  ];
+
+  assert.deepEqual(
+    resolveCapabilities({
+      deployments: [activatedConsumer, unavailableProvider],
+      previousBindings,
+    }).providerLossActions,
+    [
+      {
+        action: "fail",
+        capability: echoName,
+        consumer: identity("consumer"),
+        provider: identity("provider"),
+      },
+    ],
+  );
+  assert.deepEqual(
+    resolveCapabilities({
+      deployments: [neverActivatedConsumer, unavailableProvider],
+      previousBindings,
+    }).providerLossActions,
+    [],
+  );
+});
