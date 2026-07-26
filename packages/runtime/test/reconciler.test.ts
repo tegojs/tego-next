@@ -3222,6 +3222,55 @@ test("malformed lifecycle outbox payloads are diagnosed without invoking effects
   await reconciler.stop();
 });
 
+test("missing instances do not grant legacy provenance to lifecycle claims", async () => {
+  const clock = new ManualClock();
+  for (const [index, activation] of (["1", null, "01"] as const).entries()) {
+    const effects = new RecordingEffects();
+    const state = await createHarnessStore(clock);
+    const now = clock.now().toISOString();
+    const desired = deployment(String(index + 7));
+    const legacy = legacyReconcileEffectIdentities(desired, componentId, "prepare");
+    await state.transact({}, async (transaction) => {
+      await transaction.enqueueOutbox({
+        availableAt: now,
+        createdAt: now,
+        messageId: legacy.messageId,
+        operationId: legacy.operationId,
+        payload: {
+          activation,
+          applicationId,
+          artifactDigest: digestOne,
+          componentId,
+          deploymentGeneration: desired.generation,
+          executor: "process",
+          instanceId: legacy.instanceId,
+          kind: "prepare",
+          messageId: legacy.messageId,
+          operationId: legacy.operationId,
+          pluginId,
+        },
+        topic: "component.lifecycle",
+      });
+      return null;
+    });
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [],
+      loadInstallations: async () => [],
+    });
+
+    await reconciler.start();
+
+    assert.deepEqual(effects.calls, []);
+    assert.equal(reconciler.diagnostics()[0]?.code, "PROTOCOL_MESSAGE_INVALID");
+    assert.equal(state.outbox.get(legacy.messageId)?.acknowledgement?.outcome, "retry");
+    await reconciler.stop();
+  }
+});
+
 test("canonical lifecycle identities cannot be retargeted to another persisted instance", async () => {
   const source = (
     lifecycle: ComponentInstance["lifecycle"],

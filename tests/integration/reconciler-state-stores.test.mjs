@@ -1378,3 +1378,214 @@ test("suspension restart terminalizes ready, draining, and stopping checkpoints 
     await reconciler.stop();
   });
 });
+
+test("recovery activation restart requires its exact durable capability binding", async (t) => {
+  for (const bindingCase of ["missing", "mismatched"]) {
+    await t.test(bindingCase, async (t) => {
+      await withRealStateStores(t, async (state, clock, reopen) => {
+        const providerAId = parsePluginId(`restart-provider-a-${bindingCase}`);
+        const providerBId = parsePluginId(`restart-provider-b-${bindingCase}`);
+        const consumerId = parsePluginId(`restart-consumer-${bindingCase}`);
+        const providerAComponentId = parseComponentId(`provider-a-${bindingCase}`);
+        const providerBComponentId = parseComponentId(`provider-b-${bindingCase}`);
+        const consumerComponentId = parseComponentId(`consumer-${bindingCase}`);
+        const capability = parseCapabilityName(`org.example.restart-${bindingCase}`);
+        const providerADigest = parseArtifactDigest(`sha256:${"4".repeat(64)}`);
+        const providerBDigest = parseArtifactDigest(`sha256:${"5".repeat(64)}`);
+        const consumerDigest = parseArtifactDigest(`sha256:${"6".repeat(64)}`);
+        const component = (targetComponentId) => ({
+          componentId: targetComponentId,
+          kind: "service",
+          entrypoint: `components/${targetComponentId}.js`,
+          executors: ["process"],
+        });
+        const providerManifest = (targetPluginId, targetComponentId) => ({
+          ...manifest(),
+          pluginId: targetPluginId,
+          components: [component(targetComponentId)],
+          permissions: [{ kind: "executor", executors: ["process"] }],
+          capabilities: {
+            provides: [{ name: capability, protocolVersion: "1.0.0" }],
+            requires: [],
+          },
+        });
+        const providerAManifest = providerManifest(providerAId, providerAComponentId);
+        const providerBManifest = providerManifest(providerBId, providerBComponentId);
+        const consumerManifest = {
+          ...manifest(),
+          pluginId: consumerId,
+          components: [component(consumerComponentId)],
+          permissions: [{ kind: "executor", executors: ["process"] }],
+          capabilities: {
+            provides: [],
+            requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+          },
+        };
+        const providerA = {
+          ...deployment(),
+          pluginId: providerAId,
+          artifactDigest: providerADigest,
+          permissionGrants: [{ kind: "executor", executors: ["process"] }],
+        };
+        const providerB = {
+          ...deployment(),
+          pluginId: providerBId,
+          artifactDigest: providerBDigest,
+          permissionGrants: [{ kind: "executor", executors: ["process"] }],
+        };
+        const consumer = {
+          ...deployment(),
+          pluginId: consumerId,
+          artifactDigest: consumerDigest,
+          permissionGrants: [{ kind: "executor", executors: ["process"] }],
+        };
+        const installations = [
+          {
+            ...installation(),
+            pluginId: providerAId,
+            digest: providerADigest,
+            manifest: providerAManifest,
+          },
+          {
+            ...installation(),
+            pluginId: providerBId,
+            digest: providerBDigest,
+            manifest: providerBManifest,
+          },
+          {
+            ...installation(),
+            pluginId: consumerId,
+            digest: consumerDigest,
+            manifest: consumerManifest,
+          },
+        ];
+        const artifact = (installed) => ({
+          digest: installed.digest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: installed.manifest,
+        });
+        const artifacts = new Map(
+          installations.map((installed) => [installed.digest, artifact(installed)]),
+        );
+        const planned = (desired, installed, activation = "1") => {
+          const step = planReconcile({
+            deployment: desired,
+            gate: { ...gate(), artifact: artifact(installed) },
+            instances: [],
+            now: clock.now().toISOString(),
+            supportedExecutors: ["process"],
+            activations: {
+              [installed.manifest.components[0].componentId]: activation,
+            },
+          }).steps[0];
+          assert.ok(step);
+          return step.effect;
+        };
+        const providerAInstance = planned(providerA, installations[0]);
+        const providerBInstance = planned(providerB, installations[1]);
+        const recoveryInstance = planned(consumer, installations[2], "2");
+        await state.transact({}, async (transaction) => {
+          for (const effect of [providerAInstance, providerBInstance, recoveryInstance]) {
+            await transaction.put(
+              {
+                namespace: "tego",
+                collection: "component-instances",
+                id: effect.instanceId,
+              },
+              {
+                activation: effect.activation,
+                applicationId: effect.applicationId,
+                artifactDigest: effect.artifactDigest,
+                componentId: effect.componentId,
+                deploymentGeneration: effect.deploymentGeneration,
+                executor: effect.executor,
+                instanceId: effect.instanceId,
+                lifecycle: effect === recoveryInstance ? "preparing" : "ready",
+                observedGeneration: effect.deploymentGeneration,
+                pluginId: effect.pluginId,
+              },
+              { expectedRevision: "absent" },
+            );
+          }
+          await transaction.put(
+            {
+              namespace: "tego",
+              collection: "provider-loss",
+              id: `${applicationId}/${consumerId}`,
+            },
+            {
+              consumer: { applicationId, pluginId: consumerId },
+              deploymentGeneration: consumer.generation,
+              action: "suspend",
+              capabilities: [capability],
+              providers: [{ applicationId, pluginId: providerAId }],
+              recoveryActivations: { [consumerComponentId]: "2" },
+              updatedAt: clock.now().toISOString(),
+            },
+            { expectedRevision: "absent" },
+          );
+          if (bindingCase === "mismatched") {
+            await transaction.put(
+              {
+                namespace: "tego",
+                collection: "capability-bindings",
+                id: `${applicationId}/${consumerId}/${capability}`,
+              },
+              {
+                consumer: { applicationId, pluginId: consumerId },
+                capability,
+                provider: { applicationId, pluginId: providerBId },
+                source: "automatic",
+                deploymentGeneration: consumer.generation,
+                updatedAt: clock.now().toISOString(),
+              },
+              { expectedRevision: "absent" },
+            );
+          }
+          return null;
+        });
+
+        const restartedState = await reopen();
+        const effects = new RecordingEffects();
+        effects.supportedExecutors = ["process"];
+        effects.live.add(providerAInstance.instanceId);
+        effects.live.add(providerBInstance.instanceId);
+        const reconciler = new Reconciler({
+          artifactGate: {
+            validate: async (request) => {
+              const resolved = artifacts.get(request.digest);
+              assert.ok(resolved);
+              return resolved;
+            },
+          },
+          clock,
+          effects,
+          state: restartedState,
+          loadDeployments: async () => [providerA, providerB, consumer],
+          loadInstallations: async () => installations,
+          maxConvergencePasses: 20,
+        });
+
+        await reconciler.start();
+
+        assert.deepEqual(effects.restored, []);
+        assert.equal(
+          effects.calls.some(
+            (effect) =>
+              effect.instanceId === recoveryInstance.instanceId && effect.kind === "start",
+          ),
+          false,
+        );
+        assert.equal(
+          (await readOnlyInstance(restartedState, recoveryInstance.instanceId))?.value.lifecycle,
+          "preparing",
+        );
+        assert.equal(
+          (await readObservation(restartedState, consumerId))?.value.status,
+          "suspended",
+        );
+        await reconciler.stop();
+      });
+    });
+  }
+});

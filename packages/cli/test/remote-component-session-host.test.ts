@@ -93,6 +93,7 @@ class ControlledRemoteExecutor implements Executor {
   readonly targetDrain = Promise.withResolvers<void>();
   submissions = 0;
   closes = 0;
+  drainedTargets: ExecutionRequest["target"][] = [];
   targetDrains = 0;
   submitGate: Promise<void> | undefined;
 
@@ -127,8 +128,9 @@ class ControlledRemoteExecutor implements Executor {
     throw new Error("component drain must not drain the shared Worker executor");
   }
 
-  async drainTarget() {
+  async drainTarget(target: ExecutionRequest["target"]) {
     this.targetDrains += 1;
+    this.drainedTargets.push(target);
     await this.targetDrain.promise;
   }
 
@@ -166,6 +168,55 @@ test("remote component sessions fail closed when the shared executor cannot drai
 
   await assert.rejects(host.start(binding()), /unavailable|drain/iu);
   await registry.close();
+});
+
+test("remote component stop drains the persisted target after a fresh registry restart", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-restart-stop");
+  const shared = new ControlledRemoteExecutor();
+  shared.targetDrain.resolve();
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    runtimeId: "runtime-remote-restart-stop",
+  });
+  const component = binding();
+
+  await host.stop(component);
+
+  assert.equal(shared.targetDrains, 1);
+  assert.deepEqual(shared.drainedTargets, [
+    {
+      instanceId: component.instanceId,
+      deploymentGeneration: component.deployment.generation,
+      artifactDigest: component.artifact.digest,
+      executor: {
+        id: remoteComponentExecutorId(workerId),
+        type: "remote",
+        workerId,
+      },
+    },
+  ]);
+  await registry.close();
+});
+
+test("remote component stop fails closed when the persisted executor cannot be resolved exactly", async () => {
+  for (const resolved of [
+    undefined,
+    Object.assign(new ControlledRemoteExecutor(), {
+      id: remoteComponentExecutorId(parseWorkerId("worker-other")),
+    }),
+  ]) {
+    const registry = new LocalComponentSessionRegistry("runtime-remote-restart-stop-invalid");
+    const host = new RemoteComponentSessionHost({
+      registry,
+      resolveExecutor: () => resolved,
+      runtimeId: "runtime-remote-restart-stop-invalid",
+    });
+
+    await assert.rejects(host.stop(binding()), /unavailable|exact|drain/iu);
+    assert.equal(resolved?.targetDrains ?? 0, 0);
+    await registry.close();
+  }
 });
 
 test("remote component drain waits for a submit admitted before drain to reach the shared executor", async () => {
