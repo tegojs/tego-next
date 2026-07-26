@@ -5831,6 +5831,78 @@ test("sequential provider loss upgrades one durable record after restart", async
   }
 });
 
+test("provider loss ignores current-generation activations that never reached ready", async () => {
+  for (const lifecycle of ["created", "preparing", "starting", "failed"] as const) {
+    const fixture = await createProviderLossTestFixture(`never-started-${lifecycle}`, ["suspend"]);
+    const initialEffects = new RecordingEffects();
+    const initial = new Reconciler(fixture.options(initialEffects));
+    await initial.start();
+    const providerStart = initialEffects.calls.find(
+      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+    );
+    const consumerStart = initialEffects.calls.find(
+      (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    assert.ok(consumerStart);
+    await initial.stop();
+
+    await fixture.state.transact({}, async (transaction) => {
+      const consumerKey = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: consumerStart.instanceId,
+      };
+      const current = await transaction.get(consumerKey);
+      assert.ok(current);
+      const {
+        completedOperationId: _completedOperationId,
+        completedOperationIds: _completedOperationIds,
+        ...neverStarted
+      } = current.value as Record<string, JsonValue>;
+      void _completedOperationId;
+      void _completedOperationIds;
+      await transaction.put(
+        consumerKey,
+        {
+          ...neverStarted,
+          lifecycle,
+          ...(lifecycle === "failed"
+            ? {
+                retryEffect: "start",
+                retryAt: "9999-01-01T00:00:00.000Z",
+              }
+            : {}),
+        },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+    await fixture.failProvider(providerStart);
+
+    const restartedEffects = new RecordingEffects();
+    const restarted = new Reconciler(fixture.options(restartedEffects));
+    await restarted.start();
+
+    assert.equal(await fixture.state.read(fixture.lossKey), undefined, lifecycle);
+    assert.equal(
+      (
+        (await fixture.state.read(fixture.observationKey))?.value as
+          | { readonly status?: string }
+          | undefined
+      )?.status === "failed" ||
+        (
+          (await fixture.state.read(fixture.observationKey))?.value as
+            | { readonly status?: string }
+            | undefined
+        )?.status === "suspended",
+      false,
+      lifecycle,
+    );
+    await restarted.stop();
+  }
+});
+
 test("provider generation upgrade recovers the same logical provider identity", async () => {
   for (const policy of ["degrade", "suspend"] as const) {
     const fixture = await createProviderLossTestFixture(`generation-upgrade-${policy}`, [policy]);
