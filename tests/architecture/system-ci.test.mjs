@@ -26,6 +26,7 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/workflow-gates
     "npm run test:e2e:multi-main",
     "actions/upload-artifact@v7",
     "if: always()",
+    "npx --yes @fission-ai/openspec@1.4.1 validate runtime-kernel-phase-1 --strict --no-interactive",
     "timeout-minutes:",
   ]) {
     assert.match(workflow, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
@@ -87,11 +88,14 @@ test("release verification preflight fails closed with structured diagnostics", 
       "system-e2e:",
       "npm install --global npm@11.13.0",
       "postgres:16.14-alpine",
+      "- 5432/tcp",
+      "job.services.postgres.ports['5432']",
       "npm run test:integration",
       "npm run test:e2e:single-main",
       "npm run test:e2e:multi-main",
       "actions/upload-artifact@v7",
       "if: always()",
+      "npx --yes @fission-ai/openspec@1.4.1 validate runtime-kernel-phase-1 --strict --no-interactive",
     ].join("\n"),
   };
 
@@ -104,7 +108,29 @@ test("release verification preflight fails closed with structured diagnostics", 
     ["workflow", "quality:", "ci_contract_incomplete"],
   ]) {
     const diagnostics = validateReleasePreflight({ ...valid, [field]: value });
-    assert.equal(diagnostics.some((diagnostic) => diagnostic.code === code), true);
-    assert.equal(diagnostics.every((diagnostic) => diagnostic.level === "error"), true);
+    assert.equal(
+      diagnostics.some((diagnostic) => diagnostic.code === code),
+      true,
+    );
+    assert.equal(
+      diagnostics.every((diagnostic) => diagnostic.level === "error"),
+      true,
+    );
   }
+});
+
+test("release verification converts command failures into structured diagnostics", async () => {
+  const { runReleaseCommand } = await import(
+    new URL(`../../scripts/verify-release.mjs?command=${Date.now()}`, import.meta.url)
+  );
+
+  assert.throws(
+    () =>
+      runReleaseCommand({
+        name: "failing probe",
+        command: process.execPath,
+        args: ["-e", "process.exit(7)"],
+      }),
+    (error) => error.code === "command_failed" && error.command === process.execPath,
+  );
 });

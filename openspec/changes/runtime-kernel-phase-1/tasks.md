@@ -99,7 +99,7 @@
 
 - [ ] 12.1 Document architecture boundaries, package graph, state machines, protocol compatibility, threat model, and failure semantics
 - [ ] 12.2 Document contributor setup, strict red-green-refactor workflow, plugin authoring, embedded deployment, and multi-Main deployment
-- [x] 12.3 Add an executable release-verification command and authoritative GitHub Actions gates covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, single-Main smoke, and multi-Main takeover
+- [x] 12.3 Add an executable release-verification command and authoritative GitHub Actions gates covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, single-Main smoke, and multi-Main takeover (evidence: `tests/architecture/system-ci.test.mjs` and `npm run verify:release -- --preflight`)
 - [ ] 12.4 Run mutation or fault-injection checks on lifecycle, fencing, deduplication, and permission gates and close material test gaps
 - [ ] 12.5 Perform API, architecture, security, concurrency, and failure-recovery review and resolve all blocking findings
 - [ ] 12.6 Produce `0.1.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred capabilities

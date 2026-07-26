@@ -29,6 +29,10 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
+      - name: Install pinned npm
+        run: npm install --global npm@11.13.0
+      - name: Verify npm version
+        run: npm --version
       - name: Install dependencies
         run: npm ci
       - name: Validate commit messages
@@ -46,8 +50,10 @@ jobs:
         run: npm run typecheck
       - name: Run unit and architecture tests
         run: npm test
+      - name: Validate OpenSpec
+        run: npx --yes @fission-ai/openspec@1.4.1 validate runtime-kernel-phase-1 --strict --no-interactive
 
-  postgres-integration:
+  integration:
     name: PostgreSQL integration
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -59,7 +65,7 @@ jobs:
           POSTGRES_PASSWORD: tego_test
           POSTGRES_USER: tego_test
         ports:
-          - 5432:5432
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -U tego_test -d tego_next_test"
           --health-interval 1s
@@ -73,17 +79,23 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
+      - name: Install pinned npm
+        run: npm install --global npm@11.13.0
+      - name: Verify npm version
+        run: npm --version
       - name: Install dependencies
         run: npm ci
       - name: Build
         run: npm run build
       - name: Run integration tests
+        timeout-minutes: 10
         run: npm run test:integration
         env:
-          TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:5432/tego_next_test
+          TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
       - name: Upload integration diagnostics
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
           name: postgres-integration-diagnostics
@@ -91,7 +103,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  process-e2e:
+  system-e2e:
     name: Main and Worker process E2E
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -103,7 +115,7 @@ jobs:
           POSTGRES_PASSWORD: tego_test
           POSTGRES_USER: tego_test
         ports:
-          - 5432:5432
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -U tego_test -d tego_next_test"
           --health-interval 1s
@@ -117,17 +129,29 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
+      - name: Install pinned npm
+        run: npm install --global npm@11.13.0
+      - name: Verify npm version
+        run: npm --version
       - name: Install dependencies
         run: npm ci
       - name: Build
         run: npm run build
-      - name: Run real-process system tests
-        run: npm run test:e2e
+      - name: Run single-Main system smoke
+        timeout-minutes: 8
+        run: npm run test:e2e:single-main
         env:
-          TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:5432/tego_next_test
+          TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
+          TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
+      - name: Run multi-Main takeover
+        timeout-minutes: 8
+        run: npm run test:e2e:multi-main
+        env:
+          TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
       - name: Upload process diagnostics
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
           name: process-e2e-diagnostics

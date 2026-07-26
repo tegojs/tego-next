@@ -72,6 +72,27 @@ npm run format:check
 npm run lint
 ```
 
+Run all local-capable checks:
+
+```sh
+npm run verify
+```
+
+Release verification is intentionally stricter. From a clean working tree,
+using exactly Node.js 26.5.0 and npm 11.13.0, provide a PostgreSQL 16 URL:
+
+```sh
+TEGO_POSTGRES_URL=postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test \
+  npm run verify:release
+```
+
+The command performs a clean lockfile install, quality checks, build and
+typechecking, unit and architecture tests, SQLite and PostgreSQL integration
+tests, reproducible echo-plugin packaging, single-Main smoke, multi-Main
+takeover, and strict OpenSpec validation. `npm run verify:release -- --preflight`
+checks the toolchain, clean tree, PostgreSQL URL, and CI contract without
+running the gates.
+
 ## PostgreSQL integration tests
 
 Start the disposable PostgreSQL service:
@@ -92,6 +113,13 @@ Stop and delete the disposable database:
 ```sh
 docker compose down -v
 ```
+
+GitHub Actions is the authoritative phase-one acceptance environment. Its
+`quality`, `integration`, and `system-e2e` gates use PostgreSQL 16.14 and retain
+integration and process diagnostics as workflow artifacts even when a test
+fails. Single-Main uses local drivers; multi-Main requires PostgreSQL
+coordination and persistence. This verification does not claim production
+readiness: production release remains gated on Node.js 26 reaching LTS.
 
 ## Plugin development
 

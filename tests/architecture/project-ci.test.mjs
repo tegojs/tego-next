@@ -106,10 +106,7 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "clean CI must build workspace dependencies before typechecking their consumers",
   );
 
-  const qualityJob = workflow.slice(
-    workflow.indexOf("quality:"),
-    workflow.indexOf("integration:"),
-  );
+  const qualityJob = workflow.slice(workflow.indexOf("quality:"), workflow.indexOf("integration:"));
   const integrationJob = workflow.slice(
     workflow.indexOf("integration:"),
     workflow.indexOf("system-e2e:"),

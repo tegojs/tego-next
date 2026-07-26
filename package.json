@@ -19,10 +19,13 @@
     "test:unit": "npm run test:unit --workspaces --if-present",
     "test:integration": "node --test tests/integration/*.test.mjs && npm run test:integration --workspaces --if-present",
     "test:e2e": "node --test tests/e2e/*.test.mjs",
+    "test:e2e:single-main": "node --test --test-name-pattern=\"real-single-main-process-flow\" tests/e2e/single-main-process.test.mjs",
+    "test:e2e:multi-main": "node --test --test-name-pattern=\"real-two-main-postgres-worker-failover\" tests/e2e/single-main-process.test.mjs",
     "test": "npm run test:unit && node --test tests/architecture/*.test.mjs",
     "format:check": "biome format .",
     "lint": "biome lint .",
-    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run test:integration && npm run build && npm run test:e2e"
+    "verify": "npm run format:check && npm run lint && npm run build && npm run typecheck && npm test && npm run test:integration && npm run test:e2e",
+    "verify:release": "node scripts/verify-release.mjs"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.1",
