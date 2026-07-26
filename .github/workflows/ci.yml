@@ -51,7 +51,7 @@ jobs:
       - name: Run unit and architecture tests
         run: npm test
       - name: Validate OpenSpec
-        run: npx --yes @fission-ai/openspec@1.4.1 validate runtime-kernel-phase-1 --strict --no-interactive
+        run: npm run openspec:validate
 
   integration:
     name: PostgreSQL integration
@@ -88,8 +88,9 @@ jobs:
       - name: Build
         run: npm run build
       - name: Run integration tests
+        if: always()
         timeout-minutes: 10
-        run: npm run test:integration
+        run: node scripts/run-ci-test.mjs --name integration --artifacts "${{ runner.temp }}/tego-test-artifacts" -- npm run test:integration
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
@@ -100,7 +101,7 @@ jobs:
         with:
           name: postgres-integration-diagnostics
           path: ${{ runner.temp }}/tego-test-artifacts
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   system-e2e:
@@ -138,14 +139,16 @@ jobs:
       - name: Build
         run: npm run build
       - name: Run single-Main system smoke
+        if: always()
         timeout-minutes: 8
-        run: npm run test:e2e:single-main
+        run: node scripts/run-ci-test.mjs --name single-main --artifacts "${{ runner.temp }}/tego-test-artifacts" -- npm run test:e2e:single-main
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
       - name: Run multi-Main takeover
+        if: always()
         timeout-minutes: 8
-        run: npm run test:e2e:multi-main
+        run: node scripts/run-ci-test.mjs --name multi-main --artifacts "${{ runner.temp }}/tego-test-artifacts" -- npm run test:e2e:multi-main
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/tego_next_test
           TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
@@ -156,5 +159,5 @@ jobs:
         with:
           name: process-e2e-diagnostics
           path: ${{ runner.temp }}/tego-test-artifacts
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7

@@ -70,6 +70,10 @@ test("TypeScript workspaces reference every internal build dependency", async ()
 test("GitHub CI declares quality, integration, and system E2E gates", async () => {
   assert.equal(existsSync(workflowUrl), true, "CI workflow must exist");
   const workflow = await readFile(workflowUrl, "utf8");
+  const { parseWorkflowJobs } = await import(
+    new URL(`../../scripts/verify-release.mjs?project-ci=${Date.now()}`, import.meta.url)
+  );
+  const jobs = parseWorkflowJobs(workflow);
 
   for (const marker of [
     "pull_request:",
@@ -94,9 +98,10 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "TEGO_POSTGRES_URL:",
     "TEGO_TEST_ARTIFACTS_DIR:",
     "npm run test:integration",
-    "npm run test:e2e",
+    "npm run test:e2e:single-main",
+    "npm run test:e2e:multi-main",
     "if: always()",
-    "if-no-files-found: ignore",
+    "if-no-files-found: error",
   ]) {
     assert.match(workflow, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   }
@@ -106,12 +111,12 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "clean CI must build workspace dependencies before typechecking their consumers",
   );
 
-  const qualityJob = workflow.slice(workflow.indexOf("quality:"), workflow.indexOf("integration:"));
-  const integrationJob = workflow.slice(
-    workflow.indexOf("integration:"),
-    workflow.indexOf("system-e2e:"),
-  );
-  const processE2eJob = workflow.slice(workflow.indexOf("system-e2e:"));
+  const qualityJob = jobs.get("quality");
+  const integrationJob = jobs.get("integration");
+  const processE2eJob = jobs.get("system-e2e");
+  assert.ok(qualityJob);
+  assert.ok(integrationJob);
+  assert.ok(processE2eJob);
   for (const [name, job] of [
     ["quality", qualityJob],
     ["PostgreSQL integration", integrationJob],
@@ -141,11 +146,11 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
   );
   assert.ok(
     processE2eJob.indexOf("TEGO_TEST_ARTIFACTS_DIR:") >
-      processE2eJob.indexOf("- name: Run real-process system tests"),
+      processE2eJob.indexOf("- name: Run single-Main system smoke"),
     "process E2E diagnostic paths must be resolved inside a runner step",
   );
   const integrationBuild = integrationJob.indexOf("run: npm run build");
-  const integrationTests = integrationJob.indexOf("run: npm run test:integration");
+  const integrationTests = integrationJob.indexOf("-- npm run test:integration");
   assert.notEqual(integrationBuild, -1, "PostgreSQL CI must build workspace packages");
   assert.ok(
     integrationBuild < integrationTests,

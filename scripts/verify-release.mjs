@@ -5,50 +5,174 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveNpmCli } from "./run-ci-test.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const expectedNodeVersion = "v26.5.0";
 const expectedNpmVersion = "11.13.0";
-const requiredWorkflowEvidence = [
-  "quality:",
-  "integration:",
-  "system-e2e:",
-  "npm install --global npm@11.13.0",
-  "postgres:16.14-alpine",
-  "- 5432/tcp",
-  "job.services.postgres.ports['5432']",
-  "npm run test:integration",
-  "npm run test:e2e:single-main",
-  "npm run test:e2e:multi-main",
-  "actions/upload-artifact@v7",
-  "if: always()",
-  "npx --yes @fission-ai/openspec@1.4.1 validate runtime-kernel-phase-1 --strict --no-interactive",
-];
+const npmCli = resolveNpmCli();
+
+function npmCommand(name, ...args) {
+  return { name, command: process.execPath, args: [npmCli, ...args] };
+}
+
+export const openspecInvocation = npmCommand(
+  "strict OpenSpec validation",
+  "exec",
+  "--yes",
+  "--package=@fission-ai/openspec@1.4.1",
+  "--",
+  "openspec",
+  "validate",
+  "runtime-kernel-phase-1",
+  "--strict",
+  "--no-interactive",
+);
 
 export const releaseCommands = [
-  { name: "clean lockfile install", command: "npm", args: ["ci"] },
-  { name: "format", command: "npm", args: ["run", "format:check"] },
-  { name: "lint", command: "npm", args: ["run", "lint"] },
-  { name: "build", command: "npm", args: ["run", "build"] },
-  { name: "typecheck", command: "npm", args: ["run", "typecheck"] },
-  { name: "unit and architecture tests", command: "npm", args: ["test"] },
-  { name: "integration tests", command: "npm", args: ["run", "test:integration"] },
+  npmCommand("clean lockfile install", "ci"),
+  npmCommand("format", "run", "format:check"),
+  npmCommand("lint", "run", "lint"),
+  npmCommand("build", "run", "build"),
+  npmCommand("typecheck", "run", "typecheck"),
+  npmCommand("unit and architecture tests", "test"),
+  npmCommand("integration tests", "run", "test:integration"),
   {
     name: "deterministic plugin package",
     command: "internal:deterministic-plugin-package",
     args: [],
   },
-  { name: "single-Main smoke", command: "npm", args: ["run", "test:e2e:single-main"] },
-  { name: "multi-Main takeover", command: "npm", args: ["run", "test:e2e:multi-main"] },
-  {
-    name: "strict OpenSpec validation",
-    command: "openspec",
-    args: ["validate", "runtime-kernel-phase-1", "--strict", "--no-interactive"],
-  },
+  npmCommand("single-Main smoke", "run", "test:e2e:single-main"),
+  npmCommand("multi-Main takeover", "run", "test:e2e:multi-main"),
+  npmCommand("strict OpenSpec validation", "run", "openspec:validate"),
 ];
 
 function diagnostic(code, message, details = {}) {
   return { level: "error", code, message, ...details };
+}
+
+export function parseWorkflowJobs(workflow) {
+  const jobsHeader = workflow.match(/^jobs:\s*$/mu);
+  if (jobsHeader === null || jobsHeader.index === undefined) return new Map();
+
+  const jobsSource = workflow.slice(jobsHeader.index + jobsHeader[0].length);
+  const headers = [...jobsSource.matchAll(/^ {2}([a-zA-Z0-9_-]+):\s*$/gmu)];
+  const jobs = new Map();
+  for (const [index, header] of headers.entries()) {
+    const start = header.index;
+    const end = headers[index + 1]?.index ?? jobsSource.length;
+    jobs.set(header[1], jobsSource.slice(start, end));
+  }
+  return jobs;
+}
+
+function requireMarkers(errors, jobName, job, markers) {
+  for (const marker of markers) {
+    if (!job.includes(marker)) errors.push(`${jobName} is missing ${marker}`);
+  }
+}
+
+function requireOrder(errors, jobName, job, markers) {
+  let previous = -1;
+  for (const marker of markers) {
+    const current = job.indexOf(marker, previous + 1);
+    if (current === -1 || current <= previous) {
+      errors.push(`${jobName} has an invalid step order at ${marker}`);
+      return;
+    }
+    previous = current;
+  }
+}
+
+export function validateWorkflowContract(workflow) {
+  const jobs = parseWorkflowJobs(workflow);
+  const errors = [];
+  const expectedJobs = ["quality", "integration", "system-e2e"];
+  if (
+    jobs.size !== expectedJobs.length ||
+    expectedJobs.some((jobName, index) => [...jobs.keys()][index] !== jobName)
+  ) {
+    errors.push("jobs must be exactly quality, integration, and system-e2e in that order");
+    return errors;
+  }
+
+  const quality = jobs.get("quality");
+  const integration = jobs.get("integration");
+  const system = jobs.get("system-e2e");
+  requireMarkers(errors, "quality", quality, [
+    "timeout-minutes: 15",
+    "run: npm run commitlint:ci",
+    "run: npm run openspec:validate",
+  ]);
+  requireOrder(errors, "quality", quality, [
+    "run: npm install --global npm@11.13.0",
+    "run: npm --version",
+    "run: npm ci",
+    "run: npm run commitlint:ci",
+    "run: npm run format:check",
+    "run: npm run lint",
+    "run: npm run build",
+    "run: npm run typecheck",
+    "run: npm test",
+    "run: npm run openspec:validate",
+  ]);
+  if (quality.includes("npx --yes @fission-ai/openspec")) {
+    errors.push("quality must invoke pinned OpenSpec through the repository npm script");
+  }
+
+  for (const [jobName, job] of [
+    ["integration", integration],
+    ["system-e2e", system],
+  ]) {
+    requireMarkers(errors, jobName, job, [
+      "timeout-minutes: 15",
+      "image: postgres:16.14-alpine",
+      "- 5432/tcp",
+      "job.services.postgres.ports['5432']",
+      "TEGO_POSTGRES_URL:",
+      "TEGO_TEST_ARTIFACTS_DIR:",
+      "uses: actions/upload-artifact@v7",
+      "if-no-files-found: error",
+    ]);
+  }
+  requireMarkers(errors, "integration", integration, [
+    "- name: Run integration tests",
+    "if: always()",
+    "node scripts/run-ci-test.mjs --name integration",
+    "-- npm run test:integration",
+  ]);
+  requireOrder(errors, "integration", integration, [
+    "run: npm run build",
+    "- name: Run integration tests",
+    "if: always()",
+    "node scripts/run-ci-test.mjs --name integration",
+    "- name: Upload integration diagnostics",
+    "if: always()",
+    "uses: actions/upload-artifact@v7",
+  ]);
+
+  requireMarkers(errors, "system-e2e", system, [
+    "- name: Run single-Main system smoke",
+    "node scripts/run-ci-test.mjs --name single-main",
+    "-- npm run test:e2e:single-main",
+    "- name: Run multi-Main takeover",
+    "node scripts/run-ci-test.mjs --name multi-main",
+    "-- npm run test:e2e:multi-main",
+    "if: always()",
+  ]);
+  requireOrder(errors, "system-e2e", system, [
+    "run: npm run build",
+    "- name: Run single-Main system smoke",
+    "if: always()",
+    "node scripts/run-ci-test.mjs --name single-main",
+    "- name: Run multi-Main takeover",
+    "if: always()",
+    "node scripts/run-ci-test.mjs --name multi-main",
+    "- name: Upload process diagnostics",
+    "if: always()",
+    "uses: actions/upload-artifact@v7",
+  ]);
+  return errors;
 }
 
 export function validateReleasePreflight({
@@ -88,10 +212,12 @@ export function validateReleasePreflight({
       ),
     );
   }
-  const missing = requiredWorkflowEvidence.filter((marker) => !workflow.includes(marker));
-  if (missing.length > 0) {
+  const workflowErrors = validateWorkflowContract(workflow);
+  if (workflowErrors.length > 0) {
     diagnostics.push(
-      diagnostic("ci_contract_incomplete", "Required CI release gates are missing.", { missing }),
+      diagnostic("ci_contract_incomplete", "Required CI release gates are missing.", {
+        missing: workflowErrors,
+      }),
     );
   }
   return diagnostics;
@@ -105,7 +231,7 @@ function readPreflightState() {
   return {
     gitStatus: commandOutput("git", ["status", "--porcelain=v1"]),
     nodeVersion: process.version,
-    npmVersion: commandOutput("npm", ["--version"]),
+    npmVersion: commandOutput(process.execPath, [npmCli, "--version"]),
     postgresUrl: process.env.TEGO_POSTGRES_URL,
     workflow: readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8"),
   };
@@ -165,6 +291,22 @@ async function verifyDeterministicPluginPackage() {
 }
 
 async function main() {
+  if (process.argv.length === 3 && process.argv[2] === "--openspec") {
+    try {
+      runReleaseCommand(openspecInvocation);
+    } catch (error) {
+      printDiagnostics([
+        typeof error === "object" && error !== null && "code" in error
+          ? error
+          : diagnostic("openspec_validation_failed", "OpenSpec validation failed.", {
+              cause: error instanceof Error ? error.message : String(error),
+            }),
+      ]);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const unsupported = process.argv.slice(2).filter((argument) => argument !== "--preflight");
   if (unsupported.length > 0) {
     printDiagnostics([
