@@ -809,11 +809,15 @@ test("permission initialization rejects a same-owner 0600 replacement socket", a
   }
   await withEndpoint(async (endpoint) => {
     let replacement: Server | undefined;
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
     const startup = startControlServer({
       endpoint,
       operations: fakeOperations(),
       setEndpointPermissions: async (path) => {
         await chmod(path, 0o600);
+        permissionEntered.resolve();
+        await permissionRelease.promise;
         await unlink(path);
         replacement = createServer();
         await new Promise<void>((resolve, reject) => {
@@ -823,11 +827,17 @@ test("permission initialization rejects a same-owner 0600 replacement socket", a
         await chmod(path, 0o600);
       },
     });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const closed = readUntilClosed(socket);
+    socket.end(runtimeStopFrame("permission-replacement"));
+    permissionRelease.resolve();
 
     const outcome = await startup.then(
       (server) => ({ ok: true as const, server }),
       (error: unknown) => ({ error, ok: false as const }),
     );
+    const response = await closed;
     if (outcome.ok) await outcome.server.close();
     await new Promise<void>((resolve, reject) => {
       if (replacement === undefined || !replacement.listening) {
@@ -842,6 +852,7 @@ test("permission initialization rejects a same-owner 0600 replacement socket", a
       assert.ok(outcome.error instanceof DiagnosticError);
       assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
     }
+    assert.equal(response, "");
   });
 });
 
@@ -994,7 +1005,7 @@ test("permission initialization rejects the wrong owner and closes its queued so
       assert.equal(outcome.ok, false);
       if (!outcome.ok) {
         assert.ok(outcome.error instanceof DiagnosticError);
-        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE");
       }
       assert.equal(response, "");
       await assert.rejects(connect(endpoint));

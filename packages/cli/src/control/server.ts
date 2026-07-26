@@ -59,6 +59,20 @@ export interface EndpointSecurityState {
   readonly mode: 0o600;
 }
 
+interface EndpointIdentity {
+  readonly device: number;
+  readonly inode: number;
+  readonly ownerUid: number;
+  readonly socket: true;
+}
+
+interface EndpointParentIdentity {
+  readonly device: number;
+  readonly inode: number;
+  readonly mode: number;
+  readonly ownerUid: number;
+}
+
 const CONTROL_CLOSE_DRAIN_TIMEOUT_MS = 2_000;
 
 function controlInitializationAbortError(): DOMException {
@@ -206,8 +220,7 @@ async function writeResponse(socket: Socket, response: ControlResponse): Promise
   });
 }
 
-async function assertPrivateEndpointParent(endpoint: string): Promise<void> {
-  if (process.platform === "win32") return;
+async function privateEndpointParentIdentity(endpoint: string): Promise<EndpointParentIdentity> {
   const parent = resolve(dirname(endpoint));
   const metadata = await lstat(parent);
   const userId = process.getuid?.();
@@ -225,15 +238,64 @@ async function assertPrivateEndpointParent(endpoint: string): Promise<void> {
       ),
     );
   }
+  return {
+    device: metadata.dev,
+    inode: metadata.ino,
+    mode: metadata.mode,
+    ownerUid: metadata.uid,
+  };
 }
 
-export async function verifyUnixControlEndpoint(path: string): Promise<EndpointSecurityState> {
+async function assertPrivateEndpointParent(
+  endpoint: string,
+  expected?: EndpointParentIdentity,
+): Promise<void> {
+  if (process.platform === "win32") return;
+  const identity = await privateEndpointParentIdentity(endpoint);
+  if (
+    expected !== undefined &&
+    (identity.device !== expected.device || identity.inode !== expected.inode)
+  ) {
+    throw new DiagnosticError(
+      protocolDiagnostic(
+        "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE",
+        "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE",
+      ),
+    );
+  }
+}
+
+async function controlEndpointIdentity(path: string): Promise<EndpointIdentity> {
+  const metadata = await lstat(path);
+  const userId = process.getuid?.();
+  if (!metadata.isSocket() || userId === undefined || metadata.uid !== userId) {
+    throw new DiagnosticError(
+      protocolDiagnostic(
+        "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+        "Control endpoint is not an owner-owned socket",
+      ),
+    );
+  }
+  return {
+    device: metadata.dev,
+    inode: metadata.ino,
+    ownerUid: metadata.uid,
+    socket: true,
+  };
+}
+
+async function verifyUnixControlEndpointIdentity(
+  path: string,
+  expected?: EndpointIdentity,
+): Promise<EndpointSecurityState> {
   const metadata = await lstat(path);
   const userId = process.getuid?.();
   if (
     !metadata.isSocket() ||
     userId === undefined ||
     metadata.uid !== userId ||
+    (expected !== undefined &&
+      (metadata.dev !== expected.device || metadata.ino !== expected.inode)) ||
     (metadata.mode & 0o7777) !== 0o600
   ) {
     throw new DiagnosticError(
@@ -244,6 +306,10 @@ export async function verifyUnixControlEndpoint(path: string): Promise<EndpointS
     );
   }
   return { mode: 0o600, ownerUid: metadata.uid };
+}
+
+export async function verifyUnixControlEndpoint(path: string): Promise<EndpointSecurityState> {
+  return await verifyUnixControlEndpointIdentity(path);
 }
 
 async function closeListener(
@@ -514,6 +580,14 @@ export async function startControlServer(options: ControlServerOptions): Promise
     });
 
     if (process.platform !== "win32") {
+      const endpointIdentity = await awaitControlInitialization(
+        () => controlEndpointIdentity(options.endpoint),
+        options.signal,
+      );
+      const parentIdentity = await awaitControlInitialization(
+        () => privateEndpointParentIdentity(options.endpoint),
+        options.signal,
+      );
       await awaitControlInitialization(
         () =>
           (options.setEndpointPermissions ?? ((endpoint) => chmod(endpoint, 0o600)))(
@@ -522,7 +596,11 @@ export async function startControlServer(options: ControlServerOptions): Promise
         options.signal,
       );
       await awaitControlInitialization(
-        () => verifyUnixControlEndpoint(options.endpoint),
+        () => assertPrivateEndpointParent(options.endpoint, parentIdentity),
+        options.signal,
+      );
+      await awaitControlInitialization(
+        () => verifyUnixControlEndpointIdentity(options.endpoint, endpointIdentity),
         options.signal,
       );
     }
