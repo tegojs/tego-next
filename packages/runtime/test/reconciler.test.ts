@@ -4443,6 +4443,216 @@ test("restoration skips ready instances whose observed generation is stale", asy
   await reconciler.stop();
 });
 
+test("recovery restoration requires bindings for the consumer manifest's full required set", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const providerAId = parsePluginId("full-set-provider-a");
+  const providerBId = parsePluginId("full-set-provider-b");
+  const consumerId = parsePluginId("full-set-consumer");
+  const providerAComponentId = parseComponentId("full-set-provider-a-service");
+  const providerBComponentId = parseComponentId("full-set-provider-b-service");
+  const consumerComponentId = parseComponentId("full-set-consumer-service");
+  const lostCapability = parseCapabilityName("org.example.full-set-lost");
+  const otherCapability = parseCapabilityName("org.example.full-set-other");
+  const providerADigest = parseArtifactDigest(`sha256:${"3".repeat(64)}`);
+  const providerBDigest = parseArtifactDigest(`sha256:${"4".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"5".repeat(64)}`);
+  const component = (target: ComponentInstance["componentId"]) => ({
+    componentId: target,
+    kind: "service" as const,
+    entrypoint: `components/${target}.js`,
+    executors: ["process" as const],
+  });
+  const providerManifest = (
+    targetPluginId: PluginManifest["pluginId"],
+    targetComponentId: ComponentInstance["componentId"],
+    capability: typeof lostCapability,
+  ): PluginManifest => ({
+    ...manifest("1.0.0", providerADigest),
+    pluginId: targetPluginId,
+    components: [component(targetComponentId)],
+    capabilities: {
+      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      requires: [],
+    },
+  });
+  const providerAManifest = providerManifest(providerAId, providerAComponentId, lostCapability);
+  const providerBManifest = providerManifest(providerBId, providerBComponentId, otherCapability);
+  const consumerManifest: PluginManifest = {
+    ...manifest("1.0.0", consumerDigest),
+    pluginId: consumerId,
+    components: [component(consumerComponentId)],
+    capabilities: {
+      provides: [],
+      requires: [
+        { name: lostCapability, protocolRange: "^1.0.0", lossPolicy: "suspend" },
+        { name: otherCapability, protocolRange: "^1.0.0", lossPolicy: "suspend" },
+      ],
+    },
+  };
+  const providerA = deployment("1", {
+    pluginId: providerAId,
+    artifactDigest: providerADigest,
+  });
+  const providerB = deployment("1", {
+    pluginId: providerBId,
+    artifactDigest: providerBDigest,
+  });
+  const consumer = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    essential: true,
+  });
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerADigest),
+      pluginId: providerAId,
+      manifest: providerAManifest,
+    },
+    {
+      ...installation("1.0.0", providerBDigest),
+      pluginId: providerBId,
+      manifest: providerBManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const planned = (desired: PluginDeployment, installed: PluginInstallation, activation = "1") => {
+    const artifact = artifacts.get(installed.digest);
+    const installedComponent = installed.manifest.components[0];
+    assert.ok(artifact);
+    assert.ok(installedComponent);
+    const step = planReconcile({
+      deployment: desired,
+      gate: { ...gate(installed), artifact },
+      instances: [],
+      now: clock.now().toISOString(),
+      supportedExecutors: ["process"],
+      activations: { [installedComponent.componentId]: activation },
+    }).steps[0];
+    assert.ok(step);
+    return step.effect;
+  };
+  const [providerAInstallation, providerBInstallation, consumerInstallation] = installations;
+  assert.ok(providerAInstallation);
+  assert.ok(providerBInstallation);
+  assert.ok(consumerInstallation);
+  const providerAInstance = planned(providerA, providerAInstallation);
+  const providerBInstance = planned(providerB, providerBInstallation);
+  const recoveryInstance = planned(consumer, consumerInstallation, "2");
+  await state.transact({}, async (transaction) => {
+    for (const effect of [providerAInstance, providerBInstance, recoveryInstance]) {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: effect.instanceId,
+        },
+        {
+          activation: effect.activation,
+          applicationId: effect.applicationId,
+          artifactDigest: effect.artifactDigest,
+          componentId: effect.componentId,
+          deploymentGeneration: effect.deploymentGeneration,
+          executor: effect.executor,
+          instanceId: effect.instanceId,
+          lifecycle: effect === recoveryInstance ? "preparing" : "ready",
+          observedGeneration: effect.deploymentGeneration,
+          pluginId: effect.pluginId,
+        },
+        { expectedRevision: "absent" },
+      );
+    }
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "provider-loss",
+        id: `${applicationId}/${consumerId}`,
+      },
+      {
+        consumer: { applicationId, pluginId: consumerId },
+        deploymentGeneration: consumer.generation,
+        action: "suspend",
+        capabilities: [lostCapability],
+        providers: [{ applicationId, pluginId: providerAId }],
+        recoveryActivations: { [consumerComponentId]: "2" },
+        updatedAt: clock.now().toISOString(),
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "capability-bindings",
+        id: `${applicationId}/${consumerId}/${lostCapability}`,
+      },
+      {
+        consumer: { applicationId, pluginId: consumerId },
+        capability: lostCapability,
+        provider: { applicationId, pluginId: providerAId },
+        source: "automatic",
+        deploymentGeneration: consumer.generation,
+        updatedAt: clock.now().toISOString(),
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects = new RecordingEffects();
+  effects.live.add(providerAInstance.instanceId);
+  effects.live.add(providerBInstance.instanceId);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      validate: async (request) => {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [providerA, providerB, consumer],
+    loadInstallations: async () => installations,
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual(effects.restored, []);
+  assert.equal(
+    effects.calls.some(
+      (effect) => effect.instanceId === recoveryInstance.instanceId && effect.kind === "start",
+    ),
+    false,
+  );
+  assert.equal(
+    (
+      (
+        await state.read({
+          namespace: "tego",
+          collection: "component-instances",
+          id: recoveryInstance.instanceId,
+        })
+      )?.value as { readonly lifecycle?: string } | undefined
+    )?.lifecycle,
+    "preparing",
+  );
+  await reconciler.stop();
+});
+
 test("journaled execution persists before effect, commits with expected revision and authority, and rereads conflicts", async () => {
   const clock = new ManualClock();
   const effects = new RecordingEffects();

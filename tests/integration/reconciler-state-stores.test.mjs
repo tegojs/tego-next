@@ -1380,7 +1380,12 @@ test("suspension restart terminalizes ready, draining, and stopping checkpoints 
 });
 
 test("recovery activation restart requires its exact durable capability binding", async (t) => {
-  for (const bindingCase of ["missing", "mismatched"]) {
+  for (const bindingCase of [
+    "missing",
+    "mismatched",
+    "incomplete-required-set",
+    "wrong-capability-provider",
+  ]) {
     await t.test(bindingCase, async (t) => {
       await withRealStateStores(t, async (state, clock, reopen) => {
         const providerAId = parsePluginId(`restart-provider-a-${bindingCase}`);
@@ -1390,6 +1395,7 @@ test("recovery activation restart requires its exact durable capability binding"
         const providerBComponentId = parseComponentId(`provider-b-${bindingCase}`);
         const consumerComponentId = parseComponentId(`consumer-${bindingCase}`);
         const capability = parseCapabilityName(`org.example.restart-${bindingCase}`);
+        const otherCapability = parseCapabilityName(`org.example.restart-other-${bindingCase}`);
         const providerADigest = parseArtifactDigest(`sha256:${"4".repeat(64)}`);
         const providerBDigest = parseArtifactDigest(`sha256:${"5".repeat(64)}`);
         const consumerDigest = parseArtifactDigest(`sha256:${"6".repeat(64)}`);
@@ -1399,18 +1405,34 @@ test("recovery activation restart requires its exact durable capability binding"
           entrypoint: `components/${targetComponentId}.js`,
           executors: ["process"],
         });
-        const providerManifest = (targetPluginId, targetComponentId) => ({
+        const providerManifest = (targetPluginId, targetComponentId, provides) => ({
           ...manifest(),
           pluginId: targetPluginId,
           components: [component(targetComponentId)],
           permissions: [{ kind: "executor", executors: ["process"] }],
           capabilities: {
-            provides: [{ name: capability, protocolVersion: "1.0.0" }],
+            provides,
             requires: [],
           },
         });
-        const providerAManifest = providerManifest(providerAId, providerAComponentId);
-        const providerBManifest = providerManifest(providerBId, providerBComponentId);
+        const providerAManifest = providerManifest(providerAId, providerAComponentId, [
+          { name: capability, protocolVersion: "1.0.0" },
+          ...(bindingCase === "wrong-capability-provider"
+            ? [{ name: otherCapability, protocolVersion: "1.0.0" }]
+            : []),
+        ]);
+        const providerBManifest = providerManifest(providerBId, providerBComponentId, [
+          {
+            name:
+              bindingCase === "incomplete-required-set" ||
+              bindingCase === "wrong-capability-provider"
+                ? otherCapability
+                : capability,
+            protocolVersion: "1.0.0",
+          },
+        ]);
+        const requiresOther =
+          bindingCase === "incomplete-required-set" || bindingCase === "wrong-capability-provider";
         const consumerManifest = {
           ...manifest(),
           pluginId: consumerId,
@@ -1418,7 +1440,18 @@ test("recovery activation restart requires its exact durable capability binding"
           permissions: [{ kind: "executor", executors: ["process"] }],
           capabilities: {
             provides: [],
-            requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+            requires: [
+              { name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" },
+              ...(requiresOther
+                ? [
+                    {
+                      name: otherCapability,
+                      protocolRange: "^1.0.0",
+                      lossPolicy: "suspend",
+                    },
+                  ]
+                : []),
+            ],
           },
         };
         const providerA = {
@@ -1517,30 +1550,47 @@ test("recovery activation restart requires its exact durable capability binding"
               consumer: { applicationId, pluginId: consumerId },
               deploymentGeneration: consumer.generation,
               action: "suspend",
-              capabilities: [capability],
-              providers: [{ applicationId, pluginId: providerAId }],
+              capabilities:
+                bindingCase === "wrong-capability-provider"
+                  ? [capability, otherCapability]
+                  : [capability],
+              providers:
+                bindingCase === "wrong-capability-provider"
+                  ? [
+                      { applicationId, pluginId: providerAId },
+                      { applicationId, pluginId: providerBId },
+                    ]
+                  : [{ applicationId, pluginId: providerAId }],
               recoveryActivations: { [consumerComponentId]: "2" },
               updatedAt: clock.now().toISOString(),
             },
             { expectedRevision: "absent" },
           );
-          if (bindingCase === "mismatched") {
+          const putBinding = async (boundCapability, providerId) => {
             await transaction.put(
               {
                 namespace: "tego",
                 collection: "capability-bindings",
-                id: `${applicationId}/${consumerId}/${capability}`,
+                id: `${applicationId}/${consumerId}/${boundCapability}`,
               },
               {
                 consumer: { applicationId, pluginId: consumerId },
-                capability,
-                provider: { applicationId, pluginId: providerBId },
+                capability: boundCapability,
+                provider: { applicationId, pluginId: providerId },
                 source: "automatic",
                 deploymentGeneration: consumer.generation,
                 updatedAt: clock.now().toISOString(),
               },
               { expectedRevision: "absent" },
             );
+          };
+          if (bindingCase === "mismatched") {
+            await putBinding(capability, providerBId);
+          } else if (bindingCase === "incomplete-required-set") {
+            await putBinding(capability, providerAId);
+          } else if (bindingCase === "wrong-capability-provider") {
+            await putBinding(capability, providerAId);
+            await putBinding(otherCapability, providerAId);
           }
           return null;
         });
