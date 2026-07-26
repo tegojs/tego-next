@@ -580,6 +580,7 @@ class TestStateStore implements StateStore {
   failNextFailureCommit = false;
   failNextExecutionPreStateCommit = false;
   failNextAcknowledgement = false;
+  beforeNextCapabilityBindingScan: (() => Promise<void>) | undefined;
   capabilityBindingRaceWinner:
     | {
         readonly key: StateKey<JsonValue>;
@@ -784,6 +785,14 @@ class TestStateStore implements StateStore {
   }
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
+    if (
+      query.collection === "capability-bindings" &&
+      this.beforeNextCapabilityBindingScan !== undefined
+    ) {
+      const beforeScan = this.beforeNextCapabilityBindingScan;
+      this.beforeNextCapabilityBindingScan = undefined;
+      await beforeScan();
+    }
     for (const record of [...this.records.values()].sort((left, right) =>
       left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
     )) {
@@ -1363,6 +1372,150 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
   );
   assert.deepEqual(replanned.diagnostics(), []);
   await replanned.stop();
+});
+
+test("a generation-2 binding inserted after the deployment read is not deleted or replaced by generation 1", async () => {
+  const providerAId = parsePluginId("provider-a");
+  const providerBId = parsePluginId("provider-b");
+  const consumerId = parsePluginId("consumer");
+  const capability = parseCapabilityName("org.example.generation-race");
+  const providerADigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const providerBDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+  const capabilityManifest = (
+    targetPluginId: PluginInstallation["pluginId"],
+    provides: PluginManifest["capabilities"]["provides"],
+    requires: PluginManifest["capabilities"]["requires"],
+  ): PluginManifest => ({
+    ...manifest("1.0.0", digestOne),
+    pluginId: targetPluginId,
+    components: [],
+    permissions: [],
+    capabilities: { provides, requires },
+  });
+  const providerAManifest = capabilityManifest(
+    providerAId,
+    [{ name: capability, protocolVersion: "1.0.0" }],
+    [],
+  );
+  const providerBManifest = capabilityManifest(
+    providerBId,
+    [{ name: capability, protocolVersion: "1.1.0" }],
+    [],
+  );
+  const consumerManifest = capabilityManifest(
+    consumerId,
+    [],
+    [{ name: capability, protocolRange: "^1.0.0" }],
+  );
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerADigest),
+      pluginId: providerAId,
+      manifest: providerAManifest,
+    },
+    {
+      ...installation("1.0.0", providerBDigest),
+      pluginId: providerBId,
+      manifest: providerBManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const providerA = deployment("1", {
+    pluginId: providerAId,
+    artifactDigest: providerADigest,
+    permissionGrants: [],
+  });
+  const providerB = deployment("1", {
+    pluginId: providerBId,
+    artifactDigest: providerBDigest,
+    permissionGrants: [],
+  });
+  const consumerGeneration1 = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    permissionGrants: [],
+  });
+  const consumerGeneration2 = deployment("2", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    permissionGrants: [],
+  });
+  const deploymentStateKey = (desired: PluginDeployment): StateKey<PluginDeployment> => ({
+    namespace: "tego",
+    collection: "deployments",
+    id: `${desired.applicationId}/${desired.pluginId}`,
+  });
+  const bindingKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "capability-bindings",
+    id: `${applicationId}/${consumerId}/${capability}`,
+  };
+  const winningBinding = {
+    consumer: { applicationId, pluginId: consumerId },
+    capability,
+    provider: { applicationId, pluginId: providerBId },
+    source: "automatic",
+    deploymentGeneration: parseGeneration("2"),
+    updatedAt: "2026-07-23T00:00:01.000Z",
+  } as const;
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  await state.transact({}, async (transaction) => {
+    await transaction.put(deploymentStateKey(providerA), providerA, {
+      expectedRevision: "absent",
+    });
+    await transaction.put(deploymentStateKey(consumerGeneration1), consumerGeneration1, {
+      expectedRevision: "absent",
+    });
+    return null;
+  });
+  state.beforeNextCapabilityBindingScan = async () => {
+    await state.transact({}, async (transaction) => {
+      const current = await transaction.get(deploymentStateKey(consumerGeneration1));
+      assert.ok(current);
+      await transaction.put(deploymentStateKey(consumerGeneration2), consumerGeneration2, {
+        expectedRevision: current.revision,
+      });
+      await transaction.put(deploymentStateKey(providerB), providerB, {
+        expectedRevision: "absent",
+      });
+      await transaction.put(bindingKey, winningBinding, { expectedRevision: "absent" });
+      return null;
+    });
+  };
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate(request) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects: new RecordingEffects(),
+    state,
+    loadInstallations: async () => installations,
+  });
+
+  await reconciler.start();
+
+  assert.deepEqual((await state.read(bindingKey))?.value, winningBinding);
+  await reconciler.stop();
 });
 
 test("non-canonical provider instances cannot satisfy execution-time capabilities", async () => {
