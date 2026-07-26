@@ -753,7 +753,10 @@ test("permission initialization rejects a no-op hook and closes its queued socke
     const response = await closed;
     if (outcome.ok) await outcome.server.close();
     assert.equal(outcome.ok, false);
-    if (!outcome.ok) assert.match(String(outcome.error), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
     assert.equal(response, "");
     await assert.rejects(connect(endpoint));
   });
@@ -790,7 +793,10 @@ test("permission initialization rejects a non-socket path and closes its queued 
     const response = await closed;
     if (outcome.ok) await outcome.server.close();
     assert.equal(outcome.ok, false);
-    if (!outcome.ok) assert.match(String(outcome.error), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
     assert.equal(response, "");
     await assert.rejects(connect(endpoint));
   });
@@ -826,7 +832,10 @@ test("permission initialization rejects a mode other than 0600 and closes its qu
     const response = await closed;
     if (outcome.ok) await outcome.server.close();
     assert.equal(outcome.ok, false);
-    if (!outcome.ok) assert.match(String(outcome.error), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
     assert.equal(response, "");
     await assert.rejects(connect(endpoint));
   });
@@ -868,7 +877,10 @@ test("permission initialization rejects the wrong owner and closes its queued so
       const response = await closed;
       if (outcome.ok) await outcome.server.close();
       assert.equal(outcome.ok, false);
-      if (!outcome.ok) assert.match(String(outcome.error), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+      if (!outcome.ok) {
+        assert.ok(outcome.error instanceof DiagnosticError);
+        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+      }
       assert.equal(response, "");
       await assert.rejects(connect(endpoint));
     } finally {

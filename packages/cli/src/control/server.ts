@@ -54,6 +54,11 @@ export interface ControlServer {
   close(): Promise<void>;
 }
 
+export interface EndpointSecurityState {
+  readonly ownerUid: number;
+  readonly mode: 0o600;
+}
+
 const CONTROL_CLOSE_DRAIN_TIMEOUT_MS = 2_000;
 
 function controlInitializationAbortError(): DOMException {
@@ -222,6 +227,25 @@ async function assertPrivateEndpointParent(endpoint: string): Promise<void> {
   }
 }
 
+export async function verifyUnixControlEndpoint(path: string): Promise<EndpointSecurityState> {
+  const metadata = await lstat(path);
+  const userId = process.getuid?.();
+  if (
+    !metadata.isSocket() ||
+    userId === undefined ||
+    metadata.uid !== userId ||
+    (metadata.mode & 0o7777) !== 0o600
+  ) {
+    throw new DiagnosticError(
+      protocolDiagnostic(
+        "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+        "Control endpoint is not an owner-only socket",
+      ),
+    );
+  }
+  return { mode: 0o600, ownerUid: metadata.uid };
+}
+
 async function closeListener(
   server: Server,
   sockets: ReadonlySet<Socket>,
@@ -305,13 +329,12 @@ export async function startControlServer(options: ControlServerOptions): Promise
   const sockets = new Set<Socket>();
   const activeDispatchSockets = new Set<Socket>();
   const dispatches = new Set<Promise<void>>();
+  const pendingAdmissionSockets = new Set<Socket>();
   let reservations = 0;
   let closing = false;
+  let endpointReady = process.platform === "win32";
   let terminalError: Error | undefined;
-  const server: Server = createServer((socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    socket.on("error", () => undefined);
+  const beginControlConnection = (socket: Socket) => {
     if (closing || reservations >= maxOutstanding) {
       void writeResponse(
         socket,
@@ -431,7 +454,24 @@ export async function startControlServer(options: ControlServerOptions): Promise
         },
       );
     });
-  });
+  };
+  const server: Server = createServer(
+    { pauseOnConnect: process.platform !== "win32" },
+    (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => {
+        sockets.delete(socket);
+        pendingAdmissionSockets.delete(socket);
+      });
+      socket.on("error", () => undefined);
+      if (!endpointReady) {
+        pendingAdmissionSockets.add(socket);
+        return;
+      }
+      beginControlConnection(socket);
+      socket.resume();
+    },
+  );
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -481,8 +521,19 @@ export async function startControlServer(options: ControlServerOptions): Promise
           ),
         options.signal,
       );
+      await awaitControlInitialization(
+        () => verifyUnixControlEndpoint(options.endpoint),
+        options.signal,
+      );
     }
     assertControlInitializationActive(options.signal);
+    endpointReady = true;
+    for (const socket of pendingAdmissionSockets) {
+      pendingAdmissionSockets.delete(socket);
+      if (socket.destroyed) continue;
+      beginControlConnection(socket);
+      socket.resume();
+    }
   } catch (error) {
     try {
       await closeListener(server, sockets, activeDispatchSockets, dispatches);
