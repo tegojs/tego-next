@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmod,
   cp,
@@ -17,8 +18,11 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { parseRuntimeSnapshotResponse } from "@tegojs/contracts";
+import { requestControl } from "../../packages/cli/dist/src/control/client.js";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
+import { collectSemanticSnapshot, settleWithCleanup } from "../support/single-main-process.mjs";
 
 const executeFile = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -245,17 +249,24 @@ async function startTask({ endpoint, operationId, orphanPolicy = "cancel", value
   ]);
 }
 
-async function runtimeSnapshot(endpoint) {
-  return runCli(["runtime", "snapshot", "--endpoint", endpoint, "--json"]);
+async function runtimeSnapshot(endpoint, input = {}) {
+  const requestId = randomUUID();
+  const response = await requestControl({
+    endpoint,
+    input,
+    operation: "runtime.snapshot",
+    requestId,
+    timeoutMs: processDeadlineMs,
+  });
+  assert.equal(response.requestId, requestId);
+  if (!response.ok) {
+    throw new Error(`RUNTIME_SNAPSHOT_FAILED:${JSON.stringify(response.diagnostic)}`);
+  }
+  return parseRuntimeSnapshotResponse(response.result);
 }
 
-function semanticSnapshotItems(snapshot) {
-  return Object.fromEntries(
-    ["installations", "deployments", "instances", "operations", "tasks"].map((collection) => [
-      collection,
-      snapshot[collection].items,
-    ]),
-  );
+async function semanticSnapshotItems(endpoint) {
+  return collectSemanticSnapshot((input) => runtimeSnapshot(endpoint, input));
 }
 
 async function runtimeStatus(endpoint) {
@@ -294,6 +305,7 @@ async function runSystemFlow(runIndex) {
   let worker;
   let restartedMain;
   let workerUrl;
+  let operationError;
   try {
     await mkdir(dirname(endpoint), { mode: 0o700, recursive: true });
     const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
@@ -503,35 +515,46 @@ async function runSystemFlow(runIndex) {
     });
 
     return { directory, endpoint: restartedEndpoint, workerUrl };
+  } catch (error) {
+    operationError = error;
   } finally {
-    try {
-      await stopProcess(worker);
-      if (restartedMain !== undefined) {
-        await runCli(["runtime", "stop", "--endpoint", restartedEndpoint, "--json"]).catch(
-          () => undefined,
-        );
-        await stopProcess(restartedMain);
-      }
-      if (main !== undefined) {
-        await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
-        await stopProcess(main);
-      }
-      await rm(endpoint, { force: true });
-      assert.equal(await exists(endpoint), false);
-      assert.equal(await exists(restartedEndpoint), false);
-      if (workerUrl !== undefined) await assertPortClosed(workerUrl);
-      for (const name of ["main", "worker", "main-restart"]) {
-        const cleanupPath = artifacts.cleanup(name);
-        if (!(await exists(cleanupPath))) continue;
-        const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
-        assert.deepEqual(cleanup.streamErrors ?? [], []);
-        assert.deepEqual(cleanup.processingErrors ?? [], []);
-      }
-    } finally {
-      await removeTreeWithReadOnlyDirectories(directory);
-      await rm(pluginWorkspace, { force: true, recursive: true });
-      await artifacts.dispose();
-    }
+    await settleWithCleanup(async () => {
+      if (operationError !== undefined) throw operationError;
+    }, [
+      async () => stopProcess(worker),
+      async () => {
+        if (restartedMain !== undefined) {
+          await runCli(["runtime", "stop", "--endpoint", restartedEndpoint, "--json"]);
+        }
+      },
+      async () => stopProcess(restartedMain),
+      async () => {
+        if (main !== undefined) {
+          await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]);
+        }
+      },
+      async () => stopProcess(main),
+      async () => rm(endpoint, { force: true }),
+      async () => {
+        assert.equal(await exists(endpoint), false);
+        assert.equal(await exists(restartedEndpoint), false);
+      },
+      async () => {
+        if (workerUrl !== undefined) await assertPortClosed(workerUrl);
+      },
+      async () => {
+        for (const name of ["main", "worker", "main-restart"]) {
+          const cleanupPath = artifacts.cleanup(name);
+          if (!(await exists(cleanupPath))) continue;
+          const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
+          assert.deepEqual(cleanup.streamErrors ?? [], []);
+          assert.deepEqual(cleanup.processingErrors ?? [], []);
+        }
+      },
+      async () => removeTreeWithReadOnlyDirectories(directory),
+      async () => rm(pluginWorkspace, { force: true, recursive: true }),
+      async () => artifacts.dispose(),
+    ]);
   }
 }
 
@@ -577,6 +600,7 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
   let worker;
   let restartedWorker;
   let killedLeader;
+  let operationError;
   try {
     const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
     await runCli(["plugin", "pack", pluginDirectory, "--output", artifactPath, "--json"]);
@@ -682,10 +706,10 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
     });
 
     const followerSemanticBefore = JSON.stringify(
-      semanticSnapshotItems(await runtimeSnapshot(follower.candidate.configuration.endpoint)),
+      await semanticSnapshotItems(follower.candidate.configuration.endpoint),
     );
     const leaderSemanticBefore = JSON.stringify(
-      semanticSnapshotItems(await runtimeSnapshot(leader.candidate.configuration.endpoint)),
+      await semanticSnapshotItems(leader.candidate.configuration.endpoint),
     );
     assert.equal(followerSemanticBefore, leaderSemanticBefore);
     await assert.rejects(
@@ -703,10 +727,10 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       },
     );
     const followerSemanticAfter = JSON.stringify(
-      semanticSnapshotItems(await runtimeSnapshot(follower.candidate.configuration.endpoint)),
+      await semanticSnapshotItems(follower.candidate.configuration.endpoint),
     );
     const leaderSemanticAfter = JSON.stringify(
-      semanticSnapshotItems(await runtimeSnapshot(leader.candidate.configuration.endpoint)),
+      await semanticSnapshotItems(leader.candidate.configuration.endpoint),
     );
     assert.equal(followerSemanticAfter, followerSemanticBefore);
     assert.equal(leaderSemanticAfter, leaderSemanticBefore);
@@ -773,21 +797,29 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       assert.equal(task.state, "terminal");
       assert.equal(task.result.status, "succeeded");
     }
+  } catch (error) {
+    operationError = error;
   } finally {
-    await stopProcess(restartedWorker).catch(() => undefined);
-    await stopProcess(worker).catch(() => undefined);
-    for (const main of mains) {
-      if (main.handle === killedLeader) continue;
-      await runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]).catch(
-        () => undefined,
-      );
-      await stopProcess(main.handle).catch(() => undefined);
-    }
-    for (const configuration of mainConfigurations) {
-      await rm(configuration.endpoint, { force: true });
-    }
-    await removeTreeWithReadOnlyDirectories(directory);
-    await rm(pluginWorkspace, { force: true, recursive: true });
-    await artifacts.dispose();
+    await settleWithCleanup(async () => {
+      if (operationError !== undefined) throw operationError;
+    }, [
+      async () => stopProcess(restartedWorker),
+      async () => stopProcess(worker),
+      ...mains.flatMap((main) =>
+        main.handle === killedLeader
+          ? []
+          : [
+              async () =>
+                runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]),
+              async () => stopProcess(main.handle),
+            ],
+      ),
+      ...mainConfigurations.map(
+        (configuration) => async () => rm(configuration.endpoint, { force: true }),
+      ),
+      async () => removeTreeWithReadOnlyDirectories(directory),
+      async () => rm(pluginWorkspace, { force: true, recursive: true }),
+      async () => artifacts.dispose(),
+    ]);
   }
 });

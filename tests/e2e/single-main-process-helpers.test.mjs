@@ -23,7 +23,11 @@ function record(collection, index, suffix = "") {
   };
 }
 
-function paginatedSnapshotFetcher({ repeatCursorFor, duplicateBoundaryFor } = {}) {
+function paginatedSnapshotFetcher({
+  repeatCursorFor,
+  duplicateBoundaryFor,
+  lastSuffix = "-different",
+} = {}) {
   const calls = [];
   const fetchSnapshot = async ({ cursors = {} }) => {
     calls.push(cursors);
@@ -47,7 +51,7 @@ function paginatedSnapshotFetcher({ repeatCursorFor, duplicateBoundaryFor } = {}
               record(
                 collection,
                 duplicateBoundaryFor === collection ? 25 : 26,
-                duplicateBoundaryFor === collection ? "" : "-different",
+                duplicateBoundaryFor === collection ? "" : lastSuffix,
               ),
             ],
             ...(repeatCursorFor === collection ? { nextCursor: cursor } : {}),
@@ -59,21 +63,29 @@ function paginatedSnapshotFetcher({ repeatCursorFor, duplicateBoundaryFor } = {}
   return { calls, fetchSnapshot };
 }
 
-test("collectSemanticSnapshot includes records beyond the first 25 for every collection", async () => {
-  const { calls, fetchSnapshot } = paginatedSnapshotFetcher();
+test("collectSemanticSnapshot detects a difference at record 26 in every collection", async () => {
+  const follower = paginatedSnapshotFetcher({ lastSuffix: "-follower" });
+  const leader = paginatedSnapshotFetcher({ lastSuffix: "-leader" });
 
-  const snapshot = await collectSemanticSnapshot(fetchSnapshot);
+  const followerSnapshot = await collectSemanticSnapshot(follower.fetchSnapshot);
+  const leaderSnapshot = await collectSemanticSnapshot(leader.fetchSnapshot);
 
+  assert.notDeepEqual(followerSnapshot, leaderSnapshot);
   for (const collection of semanticSnapshotCollections) {
-    assert.equal(snapshot[collection].length, 26);
+    assert.equal(followerSnapshot[collection].length, 26);
+    assert.equal(leaderSnapshot[collection].length, 26);
     assert.match(
       collection === "operations"
-        ? snapshot[collection][25].operationId
-        : snapshot[collection][25].id,
-      /-different$/,
+        ? followerSnapshot[collection][25].operationId
+        : followerSnapshot[collection][25].id,
+      /-follower$/,
     );
     assert.equal(
-      calls.some((cursors) => cursors[collection] === `${collection}-page-2`),
+      follower.calls.some((cursors) => cursors[collection] === `${collection}-page-2`),
+      true,
+    );
+    assert.equal(
+      leader.calls.some((cursors) => cursors[collection] === `${collection}-page-2`),
       true,
     );
   }
@@ -133,16 +145,13 @@ test("settleWithCleanup preserves the operation error alongside cleanup errors",
   const cleanupError = new Error("process stop failed");
 
   await assert.rejects(
-    settleWithCleanup(
+    settleWithCleanup(async () => {
+      throw operationError;
+    }, [
       async () => {
-        throw operationError;
+        throw cleanupError;
       },
-      [
-        async () => {
-          throw cleanupError;
-        },
-      ],
-    ),
+    ]),
     (error) => {
       assert.equal(error instanceof AggregateError, true);
       assert.deepEqual(error.errors, [operationError, cleanupError]);
