@@ -127,6 +127,86 @@ test("explicit bindings take precedence and never fall back", async (context) =>
   }
 });
 
+test("persisted automatic binding remains authoritative across provider availability changes", async (context) => {
+  const consumer = deployment("consumer", {
+    requires: [
+      {
+        name: echoName,
+        protocolRange: "^1.0.0",
+        lossPolicy: "suspend",
+      },
+    ],
+  });
+  const providerA = deployment("provider-a", {
+    provides: [{ name: echoName, protocolVersion: "1.1.0" }],
+  });
+  const providerB = deployment("provider-b", {
+    provides: [{ name: echoName, protocolVersion: "1.2.0" }],
+  });
+  const previousBindings = [
+    {
+      consumer: identity("consumer"),
+      capability: echoName,
+      provider: identity("provider-a"),
+    },
+  ];
+
+  await context.test("keeps the observed provider when another provider becomes ready", () => {
+    const result = resolveCapabilities({
+      deployments: [consumer, providerA, providerB],
+      previousBindings,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.diagnostics, []);
+    assert.deepEqual(result.bindings?.[0]?.provider?.deployment, identity("provider-a"));
+  });
+
+  await context.test("reports loss against the observed provider without substitution", () => {
+    const result = resolveCapabilities({
+      deployments: [consumer, { ...providerA, ready: false }, providerB],
+      previousBindings,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.diagnostics, []);
+    assert.deepEqual(result.bindings, [
+      {
+        consumer: identity("consumer"),
+        requirement: {
+          name: echoName,
+          protocolRange: "^1.0.0",
+          lossPolicy: "suspend",
+          optional: false,
+        },
+        provider: null,
+      },
+    ]);
+    assert.deepEqual(result.providerLossActions, [
+      {
+        action: "suspend",
+        capability: echoName,
+        consumer: identity("consumer"),
+        provider: identity("provider-a"),
+      },
+    ]);
+  });
+
+  await context.test("still gives an explicit desired binding precedence", () => {
+    const result = resolveCapabilities({
+      deployments: [
+        { ...consumer, bindings: { [echoName]: identity("provider-b") } },
+        providerA,
+        providerB,
+      ],
+      previousBindings,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.bindings?.[0]?.provider?.deployment, identity("provider-b"));
+  });
+});
+
 test("binding lookup ignores prototypes and rejects unsafe own properties without invoking getters", () => {
   for (const name of ["constructor", "toString"]) {
     const capability = parseCapabilityName(name);

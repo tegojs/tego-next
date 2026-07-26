@@ -1032,6 +1032,138 @@ test("an unready capability consumer does not block its provider from bootstrapp
   await reconciler.stop();
 });
 
+test("automatic capability binding is persisted without revision churn or provider substitution", async () => {
+  const providerAId = parsePluginId("provider-a");
+  const providerBId = parsePluginId("provider-b");
+  const consumerId = parsePluginId("consumer");
+  const capability = parseCapabilityName("org.example.durable");
+  const providerADigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+  const providerBDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+  const consumerDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+  const capabilityManifest = (
+    targetPluginId: PluginInstallation["pluginId"],
+    provides: PluginManifest["capabilities"]["provides"],
+    requires: PluginManifest["capabilities"]["requires"],
+  ): PluginManifest => ({
+    ...manifest("1.0.0", digestOne),
+    pluginId: targetPluginId,
+    components: [],
+    permissions: [],
+    capabilities: { provides, requires },
+  });
+  const providerAManifest = capabilityManifest(
+    providerAId,
+    [{ name: capability, protocolVersion: "1.0.0" }],
+    [],
+  );
+  const providerBManifest = capabilityManifest(
+    providerBId,
+    [{ name: capability, protocolVersion: "1.1.0" }],
+    [],
+  );
+  const consumerManifest = capabilityManifest(
+    consumerId,
+    [],
+    [{ name: capability, protocolRange: "^1.0.0" }],
+  );
+  const installations: PluginInstallation[] = [
+    {
+      ...installation("1.0.0", providerADigest),
+      pluginId: providerAId,
+      manifest: providerAManifest,
+    },
+    {
+      ...installation("1.0.0", providerBDigest),
+      pluginId: providerBId,
+      manifest: providerBManifest,
+    },
+    {
+      ...installation("1.0.0", consumerDigest),
+      pluginId: consumerId,
+      manifest: consumerManifest,
+    },
+  ];
+  const artifacts = new Map(
+    installations.map((installed) => [
+      installed.digest,
+      {
+        digest: installed.digest,
+        files: { schemaVersion: "1.0" as const, files: [] },
+        manifest: installed.manifest,
+      },
+    ]),
+  );
+  const providerA = deployment("1", {
+    pluginId: providerAId,
+    artifactDigest: providerADigest,
+    permissionGrants: [],
+  });
+  const providerB = deployment("1", {
+    pluginId: providerBId,
+    artifactDigest: providerBDigest,
+    permissionGrants: [],
+  });
+  const consumer = deployment("1", {
+    pluginId: consumerId,
+    artifactDigest: consumerDigest,
+    permissionGrants: [],
+  });
+  let deployments: readonly PluginDeployment[] = [providerA, consumer];
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const reconciler = new Reconciler({
+    artifactGate: {
+      async validate(request) {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => installations,
+  });
+  const bindingKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "capability-bindings",
+    id: `${applicationId}/${consumerId}/${capability}`,
+  };
+
+  await reconciler.start();
+
+  const created = await state.read(bindingKey);
+  assert.ok(created);
+  assert.deepEqual(created.value, {
+    consumer: { applicationId, pluginId: consumerId },
+    capability,
+    provider: { applicationId, pluginId: providerAId },
+    source: "automatic",
+    deploymentGeneration: parseGeneration("1"),
+    updatedAt: clock.now().toISOString(),
+  });
+  assert.equal(
+    [...state.records.values()].filter(
+      (record) => record.key.collection === "capability-bindings",
+    ).length,
+    1,
+  );
+  assert.deepEqual(consumer.capabilityBindings, {});
+
+  await reconciler.wake();
+  assert.equal((await state.read(bindingKey))?.revision, created.revision);
+
+  deployments = [providerA, providerB, consumer];
+  await reconciler.wake();
+
+  const afterProviderB = await state.read(bindingKey);
+  assert.deepEqual(afterProviderB, created);
+  assert.deepEqual(reconciler.diagnostics(), []);
+  await reconciler.stop();
+});
+
 test("non-canonical provider instances cannot satisfy execution-time capabilities", async () => {
   const providerId = parsePluginId("z-provider");
   const consumerId = parsePluginId("a-consumer");

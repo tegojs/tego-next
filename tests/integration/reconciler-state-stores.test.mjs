@@ -144,7 +144,7 @@ async function withRealStateStores(t, run) {
     const store = new MemoryStateStore({ clock });
     await store.open();
     try {
-      await run(store, clock);
+      await run(store, clock, async () => store);
     } finally {
       await store.close();
     }
@@ -152,13 +152,16 @@ async function withRealStateStores(t, run) {
   await t.test("SqliteStateStore", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tego-reconciler-store-"));
     const clock = new ManualClock();
-    const store = new SqliteStateStore({
-      databasePath: join(directory, "state.sqlite"),
-      clock,
-    });
+    const databasePath = join(directory, "state.sqlite");
+    let store = new SqliteStateStore({ databasePath, clock });
     await store.open();
     try {
-      await run(store, clock);
+      await run(store, clock, async () => {
+        await store.close();
+        store = new SqliteStateStore({ databasePath, clock });
+        await store.open();
+        return store;
+      });
     } finally {
       await store.close();
       await rm(directory, { recursive: true, force: true });
@@ -181,6 +184,125 @@ async function readObservation(store, targetPluginId = pluginId) {
     id: `${applicationId}/${targetPluginId}`,
   });
 }
+
+test("automatic capability binding survives reconciler and state-store restart", async (t) => {
+  await withRealStateStores(t, async (initialState, clock, reopen) => {
+    const providerAId = parsePluginId("provider-a");
+    const providerBId = parsePluginId("provider-b");
+    const consumerId = parsePluginId("consumer");
+    const capability = parseCapabilityName("org.example.durable");
+    const providerADigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
+    const providerBDigest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
+    const consumerDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+    const capabilityManifest = (targetPluginId, provides, requires) => ({
+      ...manifest(),
+      pluginId: targetPluginId,
+      components: [],
+      permissions: [],
+      capabilities: { provides, requires },
+    });
+    const providerAManifest = capabilityManifest(
+      providerAId,
+      [{ name: capability, protocolVersion: "1.0.0" }],
+      [],
+    );
+    const providerBManifest = capabilityManifest(
+      providerBId,
+      [{ name: capability, protocolVersion: "1.1.0" }],
+      [],
+    );
+    const consumerManifest = capabilityManifest(
+      consumerId,
+      [],
+      [{ name: capability, protocolRange: "^1.0.0" }],
+    );
+    const installations = [
+      {
+        ...installation(),
+        pluginId: providerAId,
+        digest: providerADigest,
+        manifest: providerAManifest,
+      },
+      {
+        ...installation(),
+        pluginId: providerBId,
+        digest: providerBDigest,
+        manifest: providerBManifest,
+      },
+      {
+        ...installation(),
+        pluginId: consumerId,
+        digest: consumerDigest,
+        manifest: consumerManifest,
+      },
+    ];
+    const artifacts = new Map(
+      installations.map((installed) => [
+        installed.digest,
+        {
+          digest: installed.digest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: installed.manifest,
+        },
+      ]),
+    );
+    const providerA = {
+      ...deployment(),
+      pluginId: providerAId,
+      artifactDigest: providerADigest,
+      permissionGrants: [],
+    };
+    const providerB = {
+      ...deployment(),
+      pluginId: providerBId,
+      artifactDigest: providerBDigest,
+      permissionGrants: [],
+    };
+    const consumer = {
+      ...deployment(),
+      pluginId: consumerId,
+      artifactDigest: consumerDigest,
+      permissionGrants: [],
+    };
+    let deployments = [providerA, consumer];
+    const options = (state) => ({
+      artifactGate: {
+        async validate(request) {
+          const artifact = artifacts.get(request.digest);
+          assert.ok(artifact);
+          return artifact;
+        },
+      },
+      clock,
+      effects: new RecordingEffects(),
+      state,
+      loadDeployments: async () => deployments,
+      loadInstallations: async () => installations,
+    });
+    const bindingKey = {
+      namespace: "tego",
+      collection: "capability-bindings",
+      id: `${applicationId}/${consumerId}/${capability}`,
+    };
+
+    const first = new Reconciler(options(initialState));
+    await first.start();
+    const persisted = await initialState.read(bindingKey);
+    assert.ok(persisted);
+    assert.equal(persisted.value.provider.pluginId, providerAId);
+    await first.stop();
+
+    deployments = [providerA, providerB, consumer];
+    const restartedState = await reopen();
+    const restarted = new Reconciler(options(restartedState));
+    await restarted.start();
+
+    const afterRestart = await restartedState.read(bindingKey);
+    assert.deepEqual(afterRestart, persisted);
+    assert.deepEqual(restarted.diagnostics(), []);
+    await restarted.stop();
+  });
+});
 
 test("stale pending placement is quarantined before its stable identity is replaced", async (t) => {
   await withRealStateStores(t, async (state, clock) => {
