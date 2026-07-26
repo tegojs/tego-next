@@ -243,7 +243,7 @@ test("managed process reports a live child without waiting for exit", async (t) 
   await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_STILL_RUNNING/u);
 });
 
-test("managed process gives stdin EOF a bounded graceful stop phase", async () => {
+test("managed process gives stdin EOF a bounded graceful stop phase", async (t) => {
   const artifacts = await createRunArtifacts("stdin-eof-stop");
   const child = await spawnManagedProcess({
     artifacts,
@@ -258,6 +258,7 @@ test("managed process gives stdin EOF a bounded graceful stop phase", async () =
     ],
     name: "stdin-child",
   });
+  registerCleanup(t, child);
   await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
   await child.stop({ timeoutMs: 2_000 });
   await child.assertClean();
