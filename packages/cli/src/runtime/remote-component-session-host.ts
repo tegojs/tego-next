@@ -17,7 +17,11 @@ import {
   type TaskId,
   type WorkerId,
 } from "@tegojs/contracts";
-import type { ComponentBinding, ComponentLifecycleHost } from "@tegojs/runtime";
+import {
+  type ComponentBinding,
+  type ComponentLifecycleHost,
+  parseActivation,
+} from "@tegojs/runtime";
 import type { LocalComponentSessionRegistry } from "./local-component-session-registry.js";
 
 export interface RemoteComponentSessionHostOptions {
@@ -224,6 +228,7 @@ export class RemoteComponentSessionHost implements ComponentLifecycleHost {
   }
 
   #target(binding: ComponentBinding): TaskExecutionTarget {
+    parseActivation(binding.activation);
     if (binding.executor !== "remote" || binding.workerId === undefined) {
       throw hostError(
         "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",

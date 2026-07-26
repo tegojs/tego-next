@@ -74,6 +74,7 @@ export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
   perform(effect: ReconcileEffect): Promise<void>;
   restore?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   isLive?(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
   close?(authority?: RuntimeAuthority): Promise<void>;
 }
@@ -115,6 +116,7 @@ interface ProviderReadinessSnapshot {
 
 interface ComponentLifecycleExecutor {
   restore(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   isLive(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
   close(authority?: RuntimeAuthority): Promise<void>;
 }
@@ -122,7 +124,7 @@ interface ComponentLifecycleExecutor {
 function componentLifecycle(
   effects: ComponentEffectExecutor,
 ): ComponentLifecycleExecutor | undefined {
-  const { close, isLive, restore } = effects;
+  const { close, isLive, restore, restoreTermination } = effects;
   if (restore === undefined && isLive === undefined && close === undefined) return undefined;
   if (restore === undefined || isLive === undefined || close === undefined) {
     throw new TypeError(
@@ -131,6 +133,9 @@ function componentLifecycle(
   }
   return {
     restore: restore.bind(effects),
+    ...(restoreTermination === undefined
+      ? {}
+      : { restoreTermination: restoreTermination.bind(effects) }),
     isLive: isLive.bind(effects),
     close: close.bind(effects),
   };
@@ -139,10 +144,17 @@ function componentLifecycle(
 function restorationOperationId(
   instance: Pick<
     ComponentInstance,
-    "activation" | "applicationId" | "componentId" | "deploymentGeneration" | "pluginId"
+    | "activation"
+    | "applicationId"
+    | "componentId"
+    | "deploymentGeneration"
+    | "legacyActivation"
+    | "pluginId"
   >,
 ): OperationId {
-  const prepareOperationId = reconcileEffectIdentities(
+  const prepareOperationId = (
+    instance.legacyActivation === true ? legacyReconcileEffectIdentities : reconcileEffectIdentities
+  )(
     {
       applicationId: instance.applicationId,
       generation: instance.deploymentGeneration,
@@ -150,7 +162,7 @@ function restorationOperationId(
     },
     instance.componentId,
     "prepare",
-    instance.activation,
+    ...(instance.legacyActivation === true ? [] : [instance.activation]),
   ).operationId;
   return parseOperationId(`${prepareOperationId.slice(0, -"prepare".length)}restore`);
 }
@@ -188,6 +200,10 @@ interface PersistedComponentInstance extends JsonObject {
   readonly diagnostic?: RuntimeDiagnostic;
   readonly completedOperationId?: OperationId;
   readonly completedOperationIds?: readonly OperationId[];
+}
+
+function parsePersistedActivation(instance: PersistedComponentInstance): Activation {
+  return parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1");
 }
 
 interface LoadedComponentInstance {
@@ -338,6 +354,16 @@ function parsePersistedProviderLoss(value: PersistedProviderLoss): PersistedProv
       applicationId: parseApplicationId(provider?.applicationId),
       pluginId: parsePluginId(provider?.pluginId),
     })),
+    ...(value.recoveryActivations === undefined
+      ? {}
+      : {
+          recoveryActivations: Object.fromEntries(
+            Object.entries(value.recoveryActivations).map(([componentId, activation]) => [
+              parseComponentId(componentId),
+              parseActivation(activation),
+            ]),
+          ),
+        }),
     updatedAt: value.updatedAt,
   };
 }
@@ -410,7 +436,12 @@ function invalidMessageDiagnostic(claim: OutboxClaim, error: unknown, observedAt
   });
 }
 
-function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
+const legacyActivationProvenance = Symbol("legacy-activation-provenance");
+type ParsedReconcileEffect = ReconcileEffect & {
+  readonly [legacyActivationProvenance]: boolean;
+};
+
+function parseReconcileEffect(claim: OutboxClaim): ParsedReconcileEffect {
   const payload = claim.message.payload;
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
     throw new TypeError("Lifecycle payload must be an object");
@@ -433,9 +464,11 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
   if (value.workerId !== undefined && typeof value.workerId !== "string") {
     throw new TypeError("Lifecycle worker identity is invalid");
   }
-  const effect: ReconcileEffect = {
+  const legacyActivation = !Object.hasOwn(value, "activation");
+  const effect: ParsedReconcileEffect = {
     kind: value.kind,
-    activation: parseActivation(value.activation ?? "1"),
+    activation: parseActivation(legacyActivation ? "1" : value.activation),
+    [legacyActivationProvenance]: legacyActivation,
     applicationId: parseApplicationId(value.applicationId),
     artifactDigest: parseArtifactDigest(value.artifactDigest),
     componentId: parseComponentId(value.componentId),
@@ -631,7 +664,12 @@ export class Reconciler {
     capabilityBindings = capabilityBindings.filter((record) =>
       this.#isCurrentCapabilityBinding(record, deployments),
     );
-    await this.#restorePersistedComponents(deployments, installations, loadedInstances);
+    await this.#restorePersistedComponents(
+      deployments,
+      installations,
+      loadedInstances,
+      providerLosses,
+    );
     if (!this.#running) return false;
     loadedInstances = await this.#loadInstances();
     this.#deferRetries(loadedInstances);
@@ -777,19 +815,35 @@ export class Reconciler {
         await this.#recordBlocked(deployment, [gate.diagnostic]);
         continue;
       }
+      const suspension = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === deployment.applicationId &&
+          loss.value.consumer.pluginId === deployment.pluginId &&
+          loss.value.deploymentGeneration === deployment.generation &&
+          loss.value.action === "suspend",
+      );
+      const recoveryProvidersReady =
+        suspension?.value.recoveryActivations !== undefined &&
+        suspension.value.providers
+          .map((provider) =>
+            this.#providerReadiness(provider, deployments, installations, canonicalInstances),
+          )
+          .every(({ ready }) => ready);
+      const planningInstances =
+        suspension?.value.recoveryActivations !== undefined && !recoveryProvidersReady
+          ? deploymentInstances.filter(
+              (instance) =>
+                suspension.value.recoveryActivations?.[instance.componentId] !==
+                instance.activation,
+            )
+          : deploymentInstances;
       const plan = planReconcile({
         deployment,
         gate,
-        instances: deploymentInstances,
+        instances: planningInstances,
         now: this.#options.clock.now().toISOString(),
         supportedExecutors: this.#options.effects.supportedExecutors,
-        suspended: providerLosses.some(
-          (loss) =>
-            loss.value.consumer.applicationId === deployment.applicationId &&
-            loss.value.consumer.pluginId === deployment.pluginId &&
-            loss.value.deploymentGeneration === deployment.generation &&
-            loss.value.action === "suspend",
-        ),
+        suspended: suspension !== undefined && !recoveryProvidersReady,
         ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
       });
       if (plan.blocked) {
@@ -832,11 +886,33 @@ export class Reconciler {
     const canonicalLatestInstances = latestInstances.filter((record) =>
       isInstanceContextConsistent(record, this.#deployments),
     );
-    const needsImmediateReconcile = canonicalLatestInstances.some(
-      (record) =>
+    const needsImmediateReconcile = canonicalLatestInstances.some((record) => {
+      const heldRecovery = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === record.value.applicationId &&
+          loss.value.consumer.pluginId === record.value.pluginId &&
+          loss.value.deploymentGeneration === record.value.deploymentGeneration &&
+          loss.value.action === "suspend" &&
+          loss.value.recoveryActivations?.[record.value.componentId] === record.value.activation,
+      );
+      const recoveryProvidersReady =
+        heldRecovery === undefined ||
+        heldRecovery.value.providers
+          .map((provider) =>
+            this.#providerReadiness(
+              provider,
+              deployments,
+              installations,
+              canonicalLatestInstances.map((candidate) => candidate.value),
+            ),
+          )
+          .every(({ ready }) => ready);
+      return (
+        recoveryProvidersReady &&
         !this.#isDeploymentPlanningBlocked(record.value) &&
-        this.#needsImmediateReconcile(record.value),
-    );
+        this.#needsImmediateReconcile(record.value)
+      );
+    });
     const hasUnsettledDeployment = this.#deployments.some(
       (deployment) =>
         deployment.state === "active" &&
@@ -1124,7 +1200,7 @@ export class Reconciler {
           current === undefined ||
           current.revision !== expected.instance.revision ||
           current.value.instanceId !== expected.instance.instanceId ||
-          (current.value.activation ?? "1") !== expected.instance.activation ||
+          parsePersistedActivation(current.value) !== expected.instance.activation ||
           current.value.applicationId !== expected.instance.applicationId ||
           current.value.pluginId !== expected.instance.pluginId ||
           current.value.componentId !== expected.instance.componentId ||
@@ -1244,18 +1320,41 @@ export class Reconciler {
             );
       const suspendStopped =
         desired.action !== "suspend" ||
-        (latestByComponent.length > 0 &&
-          latestByComponent.every((instance) => instance?.lifecycle === "stopped"));
-      const recoveryActivations =
-        desired.action === "suspend" && recovered && suspendStopped
-          ? Object.fromEntries(
-              latestByComponent.map((instance) => [
-                instance?.componentId ?? "",
-                nextActivation(instance?.activation ?? "0"),
-              ]),
-            )
-          : undefined;
+        latestByComponent.every((instance) => instance?.lifecycle === "stopped");
+      let recoveryActivations = desired.recoveryActivations;
+      const beginRecovery =
+        desired.action === "suspend" &&
+        recovered &&
+        suspendStopped &&
+        latestByComponent.length > 0 &&
+        recoveryActivations === undefined;
+      if (beginRecovery) {
+        try {
+          recoveryActivations = Object.fromEntries(
+            latestByComponent.map((instance) => [
+              instance?.componentId ?? "",
+              nextActivation(instance?.activation ?? "0"),
+            ]),
+          );
+        } catch (error) {
+          const diagnostic = runtimeDiagnostic({
+            code: "DEPLOYMENT_ACTIVATION_EXHAUSTED",
+            message: "Component activation identity space is exhausted",
+            source: { kind: "deployment", id: deploymentKey(deployment) },
+            retryable: false,
+            details: {
+              deploymentGeneration: deployment.generation,
+              cause: serializeCause(error),
+            },
+            observedAt: this.#options.clock.now().toISOString(),
+          });
+          this.#diagnosticsByDeployment.set(deploymentKey(deployment), [diagnostic]);
+          await this.#recordBlocked(deployment, [diagnostic]);
+          continue;
+        }
+      }
       const recoveryPlan =
+        !beginRecovery ||
         recoveryActivations === undefined ||
         deploymentGate === undefined ||
         deploymentGate instanceof DiagnosticError
@@ -1269,13 +1368,29 @@ export class Reconciler {
               activations: recoveryActivations,
               ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
             });
+      const recoveryReady =
+        desired.action === "suspend" &&
+        recoveryActivations !== undefined &&
+        (deploymentGate === undefined || deploymentGate instanceof DiagnosticError
+          ? false
+          : deploymentGate.artifact.manifest.components.every((component) => {
+              const activation = recoveryActivations?.[component.componentId];
+              const recovery = deploymentInstances.find(
+                (instance) =>
+                  instance.componentId === component.componentId &&
+                  instance.activation === activation,
+              );
+              return recovery !== undefined && this.#isReadyAndLive(recovery);
+            }));
+      const recoveryPlanValid =
+        recoveryPlan !== undefined &&
+        !recoveryPlan.blocked &&
+        recoveryPlan.steps.length === latestByComponent.length;
       const canRecover =
-        recovered &&
-        suspendStopped &&
-        (desired.action !== "suspend" ||
-          (recoveryPlan !== undefined &&
-            !recoveryPlan.blocked &&
-            recoveryPlan.steps.length === latestByComponent.length));
+        desired.action === "suspend"
+          ? recovered &&
+            (recoveryReady || (recoveryActivations === undefined && latestByComponent.length === 0))
+          : recovered && suspendStopped;
       const nextLifecycle =
         canRecover && desired.action !== "suspend"
           ? "ready"
@@ -1296,9 +1411,15 @@ export class Reconciler {
         current.value.action === desired.action &&
         JSON.stringify(current.value.capabilities) === JSON.stringify(desired.capabilities) &&
         JSON.stringify(current.value.providers) === JSON.stringify(desired.providers);
-      const recoverySteps =
-        canRecover && desired.action === "suspend" ? (recoveryPlan?.steps ?? []) : [];
-      const writeRecord = !canRecover && !stale && !sameRecord;
+      const recoverySteps = beginRecovery && recoveryPlanValid ? (recoveryPlan?.steps ?? []) : [];
+      const recoveryRecord =
+        beginRecovery && recoveryPlanValid && recoveryActivations !== undefined
+          ? { ...desired, recoveryActivations }
+          : desired;
+      const writeRecord =
+        !stale &&
+        ((beginRecovery && recoveryPlanValid) ||
+          (!canRecover && !sameRecord && desired.recoveryActivations === undefined));
       const deleteRecord = current !== undefined && (canRecover || stale);
       if (
         !writeRecord &&
@@ -1391,7 +1512,7 @@ export class Reconciler {
               if (
                 persistedInstance === undefined ||
                 persistedInstance.revision !== instance.revision ||
-                (persistedInstance.value.activation ?? "1") !== instance.activation ||
+                parsePersistedActivation(persistedInstance.value) !== instance.activation ||
                 persistedInstance.value.lifecycle !== "stopped" ||
                 persistedInstance.value.deploymentGeneration !== deployment.generation
               ) {
@@ -1412,7 +1533,7 @@ export class Reconciler {
               return false;
             }
             if (writeRecord) {
-              await transaction.put(providerLossKey(consumer), desired, {
+              await transaction.put(providerLossKey(consumer), recoveryRecord, {
                 expectedRevision: current?.revision ?? "absent",
               });
             } else if (deleteRecord && current !== undefined) {
@@ -1489,6 +1610,7 @@ export class Reconciler {
     loadedDeployments?: readonly PluginDeployment[],
     loadedInstallations?: readonly PluginInstallation[],
     loadedInstances?: readonly LoadedComponentInstance[],
+    loadedProviderLosses?: readonly LoadedProviderLoss[],
   ): Promise<void> {
     if (this.#componentLifecycle === undefined) return;
     const [deployments, installations, instances] = await Promise.all([
@@ -1497,6 +1619,7 @@ export class Reconciler {
       loadedInstances ?? this.#loadInstances(),
     ]);
     const now = this.#options.clock.now().toISOString();
+    const providerLosses = loadedProviderLosses ?? (await this.#loadProviderLosses());
     const restorable = instances
       .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value)
@@ -1526,6 +1649,40 @@ export class Reconciler {
         left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
       );
     for (const instance of restorable) {
+      const suspendedLoss = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === instance.applicationId &&
+          loss.value.consumer.pluginId === instance.pluginId &&
+          loss.value.deploymentGeneration === instance.deploymentGeneration &&
+          loss.value.action === "suspend",
+      );
+      const recoveryInstance =
+        suspendedLoss?.value.recoveryActivations?.[instance.componentId] === instance.activation;
+      const recoveryProvidersReady =
+        suspendedLoss?.value.providers
+          .map((provider) =>
+            this.#providerReadiness(
+              provider,
+              deployments,
+              installations,
+              instances.map((record) => record.value),
+            ),
+          )
+          .every(({ ready }) => ready) === true;
+      if (suspendedLoss !== undefined && recoveryInstance) {
+        if (!recoveryProvidersReady) continue;
+      } else if (suspendedLoss !== undefined) {
+        if (instance.lifecycle === "preparing") continue;
+        if (this.#componentLifecycle.restoreTermination === undefined) continue;
+        try {
+          await this.#componentLifecycle.restoreTermination(instance, this.#options.authority);
+          await this.#markTerminationRestored(instance);
+          await this.#clearRestorationFailure(instance);
+        } catch (error) {
+          await this.#recordRestorationFailure(instance, error);
+        }
+        continue;
+      }
       if (
         instance.executor === "remote" &&
         !(await this.#isPersistedRemotePlacementEligible(instance, deployments, installations))
@@ -1550,6 +1707,49 @@ export class Reconciler {
         await this.#clearRestorationFailure(instance);
       } catch (error) {
         await this.#recordRestorationFailure(instance, error);
+      }
+    }
+  }
+
+  async #markTerminationRestored(instance: ComponentInstance): Promise<void> {
+    if (instance.lifecycle === "stopping") return;
+    const key = instanceKey(instance.instanceId);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.#options.state.read(key);
+      if (current === undefined || current.value.lifecycle === "stopping") return;
+      try {
+        await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          const draining =
+            current.value.lifecycle === "ready" || current.value.lifecycle === "degraded"
+              ? transitionComponentLifecycle({
+                  pluginId: current.value.pluginId,
+                  componentId: current.value.componentId,
+                  current: current.value.lifecycle,
+                  next: "draining",
+                  observedAt: this.#options.clock.now().toISOString(),
+                })
+              : current.value.lifecycle;
+          await transaction.put(
+            key,
+            {
+              ...current.value,
+              lifecycle: transitionComponentLifecycle({
+                pluginId: current.value.pluginId,
+                componentId: current.value.componentId,
+                current: draining,
+                next: "stopping",
+                observedAt: this.#options.clock.now().toISOString(),
+              }),
+            },
+            { expectedRevision: current.revision },
+          );
+          return null;
+        });
+        this.#lastCommitAuthority = this.#options.authority;
+        return;
+      } catch (error) {
+        if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+        this.#replanCount += 1;
       }
     }
   }
@@ -1691,7 +1891,8 @@ export class Reconciler {
           await transaction.appendOperation({
             operationId: restorationOperationId({
               ...current.value,
-              activation: parseActivation(current.value.activation ?? "1"),
+              activation: parsePersistedActivation(current.value),
+              ...(!Object.hasOwn(current.value, "activation") ? { legacyActivation: true } : {}),
             }),
             kind: "component.lifecycle",
             status: "completed",
@@ -2196,7 +2397,7 @@ export class Reconciler {
     if (current === undefined) {
       instance = {
         instanceId: step.instanceId,
-        activation: step.effect.activation,
+        ...(step.legacyActivation === true ? {} : { activation: step.effect.activation }),
         applicationId: step.effect.applicationId,
         pluginId: step.effect.pluginId,
         componentId: step.effect.componentId,
@@ -2218,7 +2419,7 @@ export class Reconciler {
         instance = {
           ...stable,
           artifactDigest: step.effect.artifactDigest,
-          activation: step.effect.activation,
+          ...(step.legacyActivation === true ? {} : { activation: step.effect.activation }),
           executor: step.effect.executor,
           ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
         };
@@ -2240,11 +2441,17 @@ export class Reconciler {
           state: step.effect,
           updatedAt: now,
         });
+        const payload =
+          step.legacyActivation === true
+            ? Object.fromEntries(
+                Object.entries(step.effect).filter(([field]) => field !== "activation"),
+              )
+            : step.effect;
         await transaction.enqueueOutbox({
           messageId: step.messageId,
           operationId: step.operationId,
           topic: "component.lifecycle",
-          payload: step.effect,
+          payload,
           createdAt: now,
           availableAt: now,
         });
@@ -2297,7 +2504,7 @@ export class Reconciler {
 
   async #executeClaim(claim: OutboxClaim): Promise<undefined | typeof capabilityBindingConflict> {
     if (!this.#running) return;
-    let effect: ReconcileEffect;
+    let effect: ParsedReconcileEffect;
     try {
       effect = parseReconcileEffect(claim);
     } catch (error) {
@@ -2311,7 +2518,8 @@ export class Reconciler {
       return;
     }
     const instance = current.value;
-    const legacyActivation = !Object.hasOwn(instance, "activation");
+    const legacyActivation =
+      !Object.hasOwn(instance, "activation") && effect[legacyActivationProvenance];
     const canonical = legacyActivation
       ? legacyReconcileEffectIdentities(
           {
@@ -2343,7 +2551,7 @@ export class Reconciler {
       );
       return;
     }
-    const instanceActivation = parseActivation(instance.activation ?? "1");
+    const instanceActivation = parsePersistedActivation(instance);
     if (
       instance.instanceId !== effect.instanceId ||
       instanceActivation !== effect.activation ||
@@ -2374,10 +2582,11 @@ export class Reconciler {
       (candidate) =>
         candidate.applicationId === effect.applicationId && candidate.pluginId === effect.pluginId,
     );
-    const [installations, loadedInstances, providerLosses] = await Promise.all([
+    const [installations, loadedInstances, providerLosses, capabilityBindings] = await Promise.all([
       this.#loadInstallations(),
       this.#loadInstances(),
       this.#loadProviderLosses(),
+      this.#loadCapabilityBindings(),
     ]);
     const instances = loadedInstances
       .filter((record) => isInstanceContextConsistent(record, deployments))
@@ -2392,13 +2601,38 @@ export class Reconciler {
     }
     if (!this.#running) return;
     if (currentGate === capabilityBindingConflict) return capabilityBindingConflict;
-    const suspended = providerLosses.some(
+    const suspendedLoss = providerLosses.find(
       (loss) =>
         loss.value.consumer.applicationId === effect.applicationId &&
         loss.value.consumer.pluginId === effect.pluginId &&
         loss.value.deploymentGeneration === effect.deploymentGeneration &&
         loss.value.action === "suspend",
     );
+    const recoveryActivation = suspendedLoss?.value.recoveryActivations?.[effect.componentId];
+    const exactRecoveryEffect =
+      recoveryActivation !== undefined && recoveryActivation === effect.activation;
+    const recoveryProvidersReady =
+      suspendedLoss?.value.providers
+        .map((provider) => this.#providerReadiness(provider, deployments, installations, instances))
+        .every(({ ready }) => ready) === true;
+    const recoveryBindingsExact =
+      suspendedLoss?.value.capabilities.every((capability) =>
+        capabilityBindings.some(
+          (binding) =>
+            binding.value.consumer.applicationId === effect.applicationId &&
+            binding.value.consumer.pluginId === effect.pluginId &&
+            binding.value.capability === capability &&
+            binding.value.deploymentGeneration === effect.deploymentGeneration &&
+            suspendedLoss.value.providers.some(
+              (provider) =>
+                provider.applicationId === binding.value.provider.applicationId &&
+                provider.pluginId === binding.value.provider.pluginId,
+            ),
+        ),
+      ) === true;
+    const recoveryPermitted =
+      exactRecoveryEffect && recoveryProvidersReady && recoveryBindingsExact;
+    const suspended = suspendedLoss !== undefined && !recoveryPermitted;
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
@@ -2408,6 +2642,10 @@ export class Reconciler {
         suspended
       ) {
         this.#replanCount += 1;
+        if (exactRecoveryEffect && suspendedLoss !== undefined) {
+          await this.#retryClaim(claim);
+          return;
+        }
         await this.#acknowledge(claim, "completed");
         return;
       }
@@ -2569,7 +2807,7 @@ export class Reconciler {
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
       if (
-        parseActivation(current.value.activation ?? "1") !== effect.activation ||
+        parsePersistedActivation(current.value) !== effect.activation ||
         current.value.deploymentGeneration !== effect.deploymentGeneration ||
         current.value.componentId !== effect.componentId
       ) {
@@ -2668,7 +2906,7 @@ export class Reconciler {
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
       if (
-        parseActivation(current.value.activation ?? "1") !== effect.activation ||
+        parsePersistedActivation(current.value) !== effect.activation ||
         current.value.deploymentGeneration !== effect.deploymentGeneration ||
         current.value.componentId !== effect.componentId
       ) {
@@ -2761,20 +2999,28 @@ export class Reconciler {
         await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
       if (deployment.state !== "active") continue;
-      const suspended = providerLosses.some(
+      const suspendedLoss = providerLosses.find(
         (loss) =>
           loss.value.consumer.applicationId === deployment.applicationId &&
           loss.value.consumer.pluginId === deployment.pluginId &&
           loss.value.deploymentGeneration === deployment.generation &&
           loss.value.action === "suspend",
       );
-      if (suspended) {
+      if (suspendedLoss !== undefined) {
+        const blockedDiagnostics = this.#diagnosticsByDeployment
+          .get(deploymentKey(deployment))
+          ?.filter((diagnostic) => diagnostic.code === "DEPLOYMENT_ACTIVATION_EXHAUSTED");
+        if (blockedDiagnostics !== undefined && blockedDiagnostics.length > 0) {
+          await this.#recordObservation(deployment, "blocked", blockedDiagnostics);
+          continue;
+        }
         const installation = (await this.#loadInstallations()).find(
           (candidate) =>
             candidate.pluginId === deployment.pluginId &&
             candidate.digest === deployment.artifactDigest,
         );
         const allStopped =
+          suspendedLoss.value.recoveryActivations !== undefined ||
           installation?.manifest.components.every((component) => {
             const latest = deploymentInstances
               .filter((instance) => instance.componentId === component.componentId)

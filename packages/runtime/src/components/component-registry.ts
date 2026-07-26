@@ -9,11 +9,11 @@ import {
   type WorkerId,
 } from "@tegojs/contracts";
 import type { PreparedArtifact } from "../artifacts/prepared-artifact-cache.js";
-import type { Activation, ReconcileEffect } from "../reconcile/plan.js";
+import { type Activation, parseActivation, type ReconcileEffect } from "../reconcile/plan.js";
 
 export interface ComponentBinding {
   readonly instanceId: string;
-  readonly activation?: Activation;
+  readonly activation: Activation;
   readonly executor: ExecutorKind;
   readonly workerId?: WorkerId;
   readonly artifact: PreparedArtifact;
@@ -99,6 +99,8 @@ export class ComponentRegistry {
     binding: ComponentBinding,
     authority?: RuntimeAuthority,
   ): RegisteredComponent {
+    parseActivation(effect.activation);
+    parseActivation(binding.activation);
     this.#assertBinding(effect, binding, authority);
     const existing = this.#entries.get(effect.instanceId);
     if (existing !== undefined) {
@@ -118,7 +120,7 @@ export class ComponentRegistry {
     }
     const stableBinding = deepFreeze({
       instanceId: binding.instanceId,
-      activation: binding.activation ?? "1",
+      activation: binding.activation,
       executor: binding.executor,
       ...(binding.workerId === undefined ? {} : { workerId: binding.workerId }),
       artifact: binding.artifact,
@@ -272,9 +274,11 @@ export class ComponentRegistry {
 
   #matchesIdentity(effect: ReconcileEffect, entry: RegisteredComponent): boolean {
     const { binding } = entry;
+    const effectActivation = parseActivation(effect.activation);
+    const bindingActivation = parseActivation(binding.activation);
     return (
       binding.instanceId === effect.instanceId &&
-      (binding.activation ?? "1") === effect.activation &&
+      bindingActivation === effectActivation &&
       binding.artifact.digest === effect.artifactDigest &&
       binding.deployment.applicationId === effect.applicationId &&
       binding.deployment.pluginId === effect.pluginId &&
@@ -295,7 +299,7 @@ export class ComponentRegistry {
     );
     if (
       binding.instanceId !== effect.instanceId ||
-      (binding.activation ?? "1") !== effect.activation ||
+      binding.activation !== effect.activation ||
       binding.executor !== effect.executor ||
       binding.workerId !== effect.workerId ||
       binding.artifact.digest !== effect.artifactDigest ||

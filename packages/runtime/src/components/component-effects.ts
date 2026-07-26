@@ -13,7 +13,11 @@ import {
 } from "@tegojs/contracts";
 import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { PreparedArtifactCache } from "../artifacts/prepared-artifact-cache.js";
-import type { ComponentInstance, ReconcileEffect } from "../reconcile/plan.js";
+import {
+  type ComponentInstance,
+  parseActivation,
+  type ReconcileEffect,
+} from "../reconcile/plan.js";
 import type { ComponentEffectExecutor } from "../reconcile/reconciler.js";
 import type {
   ComponentBinding,
@@ -143,6 +147,11 @@ export class ComponentEffects implements ComponentEffectExecutor {
   }
 
   perform(effect: ReconcileEffect): Promise<void> {
+    try {
+      parseActivation(effect.activation);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const authority = this.#authority();
     if (this.#closingAuthorities.has(this.#restorationAuthorityPrefix(authority))) {
       return Promise.reject(
@@ -216,6 +225,11 @@ export class ComponentEffects implements ComponentEffectExecutor {
     instance: ComponentInstance,
     authority: RuntimeAuthority | undefined = this.#authority(),
   ): Promise<void> {
+    try {
+      parseActivation(instance.activation);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     let effect: ReconcileEffect;
     try {
       effect = this.#restorationEffect(
@@ -268,6 +282,20 @@ export class ComponentEffects implements ComponentEffectExecutor {
       },
     );
     return result;
+  }
+
+  restoreTermination(
+    instance: ComponentInstance,
+    authority: RuntimeAuthority | undefined = this.#authority(),
+  ): Promise<void> {
+    try {
+      parseActivation(instance.activation);
+      const effect = this.#restorationEffect(instance, "stop");
+      this.#assertCurrentAuthority(effect, authority);
+      return this.#prepare(effect, authority);
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   async #restore(
@@ -342,7 +370,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
     for (const entry of this.#registry.entries()) {
       if (!sameAuthority(entry.binding.authority, authority)) continue;
       const instance: ComponentInstance = {
-        activation: entry.binding.activation ?? "1",
+        activation: entry.binding.activation,
         applicationId: entry.binding.deployment.applicationId,
         artifactDigest: entry.binding.artifact.digest,
         componentId: entry.binding.component.componentId,
@@ -666,7 +694,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
         ? instance.lifecycle !== "preparing" && instance.lifecycle !== "stopping"
         : instance.lifecycle !== "ready" &&
           instance.lifecycle !== "degraded" &&
-          instance.lifecycle !== "draining")
+          instance.lifecycle !== "draining" &&
+          instance.lifecycle !== "stopping")
     ) {
       throw new TypeError("Only exact persisted restorable component instances can be restored");
     }

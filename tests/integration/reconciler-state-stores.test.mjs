@@ -45,6 +45,8 @@ class RecordingEffects {
   supportedExecutors = ["thread"];
   calls = [];
   live = new Set();
+  restored = [];
+  terminationRestored = [];
 
   async perform(effect) {
     this.calls.push(effect);
@@ -53,7 +55,12 @@ class RecordingEffects {
   }
 
   async restore(instance) {
+    this.restored.push(instance);
     this.live.add(instance.instanceId);
+  }
+
+  async restoreTermination(instance) {
+    this.terminationRestored.push(instance);
   }
 
   isLive(instance) {
@@ -1217,5 +1224,157 @@ test("suspended provider hold survives Memory and SQLite reopen before activatio
       "ready",
     );
     await restarted.stop();
+  });
+});
+
+test("suspension restart terminalizes ready, draining, and stopping checkpoints without start", async (t) => {
+  await withRealStateStores(t, async (initialState, clock, reopen) => {
+    const missingProviderId = parsePluginId("missing-suspend-provider");
+    const checkpoints = ["ready", "draining", "stopping"];
+    const installations = [];
+    const artifacts = new Map();
+    const expected = [];
+    await initialState.transact({}, async (transaction) => {
+      for (const [index, lifecycle] of checkpoints.entries()) {
+        const consumerId = parsePluginId(`suspend-restart-${lifecycle}`);
+        const targetComponentId = parseComponentId(`consumer-${lifecycle}`);
+        const targetDigest = parseArtifactDigest(`sha256:${String(index + 3).repeat(64)}`);
+        const targetManifest = {
+          ...manifest(),
+          pluginId: consumerId,
+          components: [
+            {
+              componentId: targetComponentId,
+              kind: "service",
+              entrypoint: `components/${targetComponentId}.js`,
+              executors: ["process"],
+            },
+          ],
+          permissions: [{ kind: "executor", executors: ["process"] }],
+        };
+        const desired = {
+          ...deployment(),
+          pluginId: consumerId,
+          artifactDigest: targetDigest,
+          permissionGrants: [{ kind: "executor", executors: ["process"] }],
+        };
+        const installed = {
+          ...installation(),
+          pluginId: consumerId,
+          digest: targetDigest,
+          manifest: targetManifest,
+        };
+        installations.push(installed);
+        artifacts.set(targetDigest, {
+          digest: targetDigest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: targetManifest,
+        });
+        const planned = planReconcile({
+          deployment: desired,
+          gate: {
+            ...gate(),
+            artifact: artifacts.get(targetDigest),
+          },
+          instances: [],
+          now: clock.now().toISOString(),
+          supportedExecutors: ["process"],
+        }).steps[0];
+        assert.ok(planned);
+        expected.push({ consumerId, instanceId: planned.instanceId, lifecycle });
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "deployments",
+            id: `${applicationId}/${consumerId}`,
+          },
+          desired,
+          { expectedRevision: "absent" },
+        );
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "provider-loss",
+            id: `${applicationId}/${consumerId}`,
+          },
+          {
+            consumer: { applicationId, pluginId: consumerId },
+            deploymentGeneration: desired.generation,
+            action: "suspend",
+            capabilities: [],
+            providers: [{ applicationId, pluginId: missingProviderId }],
+            updatedAt: clock.now().toISOString(),
+          },
+          { expectedRevision: "absent" },
+        );
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "component-instances",
+            id: planned.instanceId,
+          },
+          {
+            activation: "1",
+            applicationId,
+            artifactDigest: targetDigest,
+            componentId: targetComponentId,
+            deploymentGeneration: desired.generation,
+            executor: "process",
+            instanceId: planned.instanceId,
+            lifecycle,
+            observedGeneration: desired.generation,
+            pluginId: consumerId,
+          },
+          { expectedRevision: "absent" },
+        );
+      }
+      return null;
+    });
+
+    const state = await reopen();
+    const effects = new RecordingEffects();
+    effects.supportedExecutors = ["process"];
+    const reconciler = new Reconciler({
+      artifactGate: {
+        validate: async (request) => {
+          const artifact = artifacts.get(request.digest);
+          assert.ok(artifact);
+          return artifact;
+        },
+      },
+      clock,
+      effects,
+      state,
+      loadInstallations: async () => installations,
+    });
+
+    await reconciler.start();
+
+    assert.deepEqual(
+      [...new Set(effects.terminationRestored.map((instance) => instance.instanceId))].sort(),
+      expected.map((checkpoint) => checkpoint.instanceId).sort(),
+    );
+    for (const lifecycle of checkpoints) {
+      assert.equal(
+        effects.terminationRestored.some((instance) => instance.lifecycle === lifecycle),
+        true,
+      );
+    }
+    assert.deepEqual(effects.restored, []);
+    assert.equal(
+      effects.calls.some((effect) => effect.kind === "prepare" || effect.kind === "start"),
+      false,
+    );
+    for (const checkpoint of expected) {
+      assert.equal(
+        (await readOnlyInstance(state, checkpoint.instanceId))?.value.lifecycle,
+        "stopped",
+      );
+      assert.equal(
+        (await readObservation(state, checkpoint.consumerId))?.value.status,
+        "suspended",
+      );
+    }
+    await reconciler.stop();
   });
 });

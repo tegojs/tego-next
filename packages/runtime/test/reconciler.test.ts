@@ -652,6 +652,12 @@ class TestStateStore implements StateStore {
   failNextAcknowledgement = false;
   failNextProviderLossScan = false;
   beforeNextCapabilityBindingScan: (() => Promise<void>) | undefined;
+  beforeProviderLossScan:
+    | {
+        remaining: number;
+        readonly run: () => Promise<void>;
+      }
+    | undefined;
   beforeNextProviderLossCommit: (() => Promise<void>) | undefined;
   capabilityBindingRaceWinner:
     | {
@@ -870,6 +876,15 @@ class TestStateStore implements StateStore {
     if (query.collection === "provider-loss" && this.failNextProviderLossScan) {
       this.failNextProviderLossScan = false;
       throw new Error("provider loss scan unavailable");
+    }
+    if (
+      query.collection === "provider-loss" &&
+      this.beforeProviderLossScan !== undefined &&
+      --this.beforeProviderLossScan.remaining === 0
+    ) {
+      const hook = this.beforeProviderLossScan;
+      this.beforeProviderLossScan = undefined;
+      await hook.run();
     }
     if (
       query.collection === "capability-bindings" &&
@@ -1289,7 +1304,7 @@ test("explicit, null, and invalid activation payloads cannot claim a legacy inst
       clock,
       effects,
       state,
-      loadDeployments: async () => [deployment("7")],
+      loadDeployments: async () => [],
       loadInstallations: async () => [installation()],
     });
     await reconciler.start();
@@ -1487,10 +1502,7 @@ test("activation exhaustion blocks only its deployment and preserves suspension 
       }
     | undefined;
   assert.equal(observationValue?.status, "blocked");
-  assert.equal(
-    observationValue?.diagnostics?.[0]?.code,
-    "DEPLOYMENT_ACTIVATION_EXHAUSTED",
-  );
+  assert.equal(observationValue?.diagnostics?.[0]?.code, "DEPLOYMENT_ACTIVATION_EXHAUSTED");
   await reconciler.stop();
 });
 
@@ -1669,6 +1681,61 @@ test("suspended provider drains activation one, holds, and reactivates activatio
     );
     return null;
   });
+  state.beforeProviderLossScan = {
+    remaining: 2,
+    run: async () => {
+      await state.transact({}, async (transaction) => {
+        const current = await transaction.get(providerInstance.key);
+        assert.ok(current);
+        await transaction.put(
+          providerInstance.key,
+          { ...(current.value as object), lifecycle: "degraded" },
+          { expectedRevision: current.revision },
+        );
+        return null;
+      });
+    },
+  };
+  const callsBeforeRecoveryRace = effects.calls.length;
+  await reconciler.wake();
+  assert.equal(effects.calls.length, callsBeforeRecoveryRace);
+  const retainedRecovery = await state.read({
+    namespace: "tego",
+    collection: "provider-loss",
+    id: `${applicationId}/${consumerId}`,
+  });
+  assert.equal(
+    (
+      retainedRecovery?.value as
+        | { readonly recoveryActivations?: Readonly<Record<string, string>> }
+        | undefined
+    )?.recoveryActivations?.[consumerComponentId],
+    "2",
+  );
+  assert.equal(
+    (
+      (
+        await state.read({
+          namespace: "tego",
+          collection: "deployment-observations",
+          id: `${applicationId}/${consumerId}`,
+        })
+      )?.value as { readonly status?: string } | undefined
+    )?.status,
+    "suspended",
+  );
+
+  await state.transact({}, async (transaction) => {
+    const current = await transaction.get(providerInstance.key);
+    assert.ok(current);
+    await transaction.put(
+      providerInstance.key,
+      { ...(current.value as object), lifecycle: "ready" },
+      { expectedRevision: current.revision },
+    );
+    return null;
+  });
+  clock.advance(60_000);
   const prepareGate = effects.gateNext(consumerId, "prepare");
   const recoveryWake = reconciler.wake();
   assert.equal(

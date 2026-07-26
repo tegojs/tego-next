@@ -23,6 +23,7 @@ import {
   canonicalJsonBytes,
   type ComponentBinding,
   type ComponentLifecycleHost,
+  parseActivation,
 } from "@tegojs/runtime";
 import type {
   LocalComponentSessionRegistry,
@@ -82,6 +83,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
   }
 
   async start(binding: ComponentBinding): Promise<void> {
+    parseActivation(binding.activation);
     assertLocalComponentManifestSupported(binding.artifact.manifest);
     if (binding.executor !== "process" && binding.executor !== "thread") {
       throw new TypeError("Local component sessions support only process and thread executors");
@@ -165,6 +167,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
   }
 
   #target(binding: ComponentBinding): TaskExecutionTarget {
+    parseActivation(binding.activation);
     if (binding.executor !== "process" && binding.executor !== "thread") {
       throw new TypeError("Local component sessions support only process and thread executors");
     }

@@ -95,6 +95,7 @@ export interface ReconcilePlanStep extends JsonObject {
   readonly effect: ReconcileEffect;
   readonly expectedRevision: Revision | "absent";
   readonly currentLifecycle: ComponentLifecycleState;
+  readonly legacyActivation?: boolean;
 }
 
 export interface ReconcileSnapshot {
@@ -228,6 +229,7 @@ function step(
     effect,
     expectedRevision,
     currentLifecycle,
+    ...(legacyActivation ? { legacyActivation: true } : {}),
   };
 }
 
@@ -349,6 +351,7 @@ function currentInstanceStep(
       instance.revision,
       instance.lifecycle,
       activation,
+      instance.legacyActivation,
     );
   }
   if (instance.lifecycle === "preparing" || instance.lifecycle === "starting") {
@@ -360,6 +363,7 @@ function currentInstanceStep(
       instance.revision,
       instance.lifecycle,
       activation,
+      instance.legacyActivation,
     );
   }
   if (instance.lifecycle === "draining" || instance.lifecycle === "stopping") {
@@ -371,6 +375,7 @@ function currentInstanceStep(
       instance.revision,
       instance.lifecycle,
       activation,
+      instance.legacyActivation,
     );
   }
   if (
@@ -386,6 +391,7 @@ function currentInstanceStep(
       instance.revision,
       instance.lifecycle,
       activation,
+      instance.legacyActivation,
     );
   }
   return undefined;

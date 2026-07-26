@@ -6,6 +6,7 @@ import type {
   PluginCapabilityRequirement,
   PluginDeploymentIdentity,
 } from "@tegojs/contracts";
+import type { Activation } from "../reconcile/plan.js";
 import { stronglyConnectedComponents, topologicalOrder } from "./graph.js";
 import { isValidVersion, isValidVersionRange, satisfiesVersionRange } from "./version.js";
 
@@ -87,6 +88,7 @@ export interface PersistedProviderLoss extends JsonObject {
   readonly action: ProviderLossAction;
   readonly capabilities: readonly CapabilityName[];
   readonly providers: readonly PluginDeploymentIdentity[];
+  readonly recoveryActivations?: Readonly<Record<string, Activation>>;
   readonly updatedAt: string;
 }
 

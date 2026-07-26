@@ -469,10 +469,7 @@ test("suspend activation effects reject a value that differs from the immutable 
 
 test("component effects reject non-canonical activation at the public boundary", async () => {
   const { effects } = harness();
-  await assert.rejects(
-    effects.perform({ ...effect("prepare"), activation: "01" }),
-    /activation/iu,
-  );
+  await assert.rejects(effects.perform({ ...effect("prepare"), activation: "01" }), /activation/iu);
 });
 
 test("stale deployment identity cannot operate a newly registered instance", async () => {

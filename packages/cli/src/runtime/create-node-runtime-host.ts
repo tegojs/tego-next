@@ -27,6 +27,7 @@ import {
   ComponentRegistry,
   createRuntimeHost,
   type PlacementWorker,
+  parseActivation,
   PreparedArtifactCache,
   Reconciler,
   TaskService,
@@ -526,7 +527,8 @@ export async function createNodeRuntimeHost(
             if (
               instance === undefined ||
               instance.instanceId !== effect.instanceId ||
-              (instance.activation ?? "1") !== effect.activation ||
+              parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1") !==
+                effect.activation ||
               instance.deploymentGeneration !== effect.deploymentGeneration
             ) {
               return undefined;
