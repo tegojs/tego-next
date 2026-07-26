@@ -1,18 +1,19 @@
 import {
   DiagnosticError,
-  runtimeDiagnostic,
   type ExecutorKind,
   type JsonValue,
   type PluginComponent,
   type PluginDeployment,
   type RuntimeAuthority,
+  runtimeDiagnostic,
   type WorkerId,
 } from "@tegojs/contracts";
 import type { PreparedArtifact } from "../artifacts/prepared-artifact-cache.js";
-import type { ReconcileEffect } from "../reconcile/plan.js";
+import type { Activation, ReconcileEffect } from "../reconcile/plan.js";
 
 export interface ComponentBinding {
   readonly instanceId: string;
+  readonly activation?: Activation;
   readonly executor: ExecutorKind;
   readonly workerId?: WorkerId;
   readonly artifact: PreparedArtifact;
@@ -39,6 +40,7 @@ function lifecycleError(code: `LIFECYCLE_${string}`, message: string, effect: Re
       source: { kind: "plugin", id: `${effect.pluginId}/${effect.componentId}` },
       details: {
         artifactDigest: effect.artifactDigest,
+        activation: effect.activation,
         deploymentGeneration: effect.deploymentGeneration,
         instanceId: effect.instanceId,
         operationId: effect.operationId,
@@ -116,6 +118,7 @@ export class ComponentRegistry {
     }
     const stableBinding = deepFreeze({
       instanceId: binding.instanceId,
+      activation: binding.activation ?? "1",
       executor: binding.executor,
       ...(binding.workerId === undefined ? {} : { workerId: binding.workerId }),
       artifact: binding.artifact,
@@ -271,6 +274,7 @@ export class ComponentRegistry {
     const { binding } = entry;
     return (
       binding.instanceId === effect.instanceId &&
+      (binding.activation ?? "1") === effect.activation &&
       binding.artifact.digest === effect.artifactDigest &&
       binding.deployment.applicationId === effect.applicationId &&
       binding.deployment.pluginId === effect.pluginId &&
@@ -291,6 +295,7 @@ export class ComponentRegistry {
     );
     if (
       binding.instanceId !== effect.instanceId ||
+      (binding.activation ?? "1") !== effect.activation ||
       binding.executor !== effect.executor ||
       binding.workerId !== effect.workerId ||
       binding.artifact.digest !== effect.artifactDigest ||

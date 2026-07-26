@@ -120,7 +120,10 @@ export {
   type ComponentTransitionInput,
 } from "./reconcile/component-lifecycle.js";
 export {
+  parseActivation,
   planReconcile,
+  reconcileEffectIdentities,
+  type Activation,
   type ArtifactDeploymentGate,
   type ComponentInstance,
   type ReconcileEffect,

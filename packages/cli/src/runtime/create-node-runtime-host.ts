@@ -512,6 +512,25 @@ export async function createNodeRuntimeHost(
             ) {
               return undefined;
             }
+            const durableInstance = await drivers.state.read({
+              namespace: "tego",
+              collection: "component-instances",
+              id: effect.instanceId,
+            });
+            const instance: Record<string, unknown> | undefined =
+              durableInstance?.value !== null &&
+              typeof durableInstance?.value === "object" &&
+              !Array.isArray(durableInstance.value)
+                ? (durableInstance.value as Record<string, unknown>)
+                : undefined;
+            if (
+              instance === undefined ||
+              instance.instanceId !== effect.instanceId ||
+              (instance.activation ?? "1") !== effect.activation ||
+              instance.deploymentGeneration !== effect.deploymentGeneration
+            ) {
+              return undefined;
+            }
             const durableInstallation = await drivers.state.read({
               namespace: "tego",
               collection: "installations",

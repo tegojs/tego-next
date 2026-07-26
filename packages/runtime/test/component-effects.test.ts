@@ -74,6 +74,7 @@ const deployment: PluginDeployment = {
 function effect(kind: ReconcileEffectKind): ReconcileEffect {
   return {
     kind,
+    activation: "1",
     operationId: parseOperationId(`${kind}-operation`),
     messageId: parseMessageId(`${kind}-message`),
     instanceId,
@@ -88,6 +89,7 @@ function effect(kind: ReconcileEffectKind): ReconcileEffect {
 
 function readyInstance(overrides: Partial<ComponentInstance> = {}): ComponentInstance {
   return {
+    activation: "1",
     applicationId,
     artifactDigest,
     componentId,

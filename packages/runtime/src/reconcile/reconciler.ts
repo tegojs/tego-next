@@ -52,8 +52,12 @@ import { transitionComponentLifecycle } from "./component-lifecycle.js";
 import type { PlacementWorker } from "./placement.js";
 import { placementIsEligible } from "./placement.js";
 import {
+  type Activation,
   type ArtifactDeploymentGate,
   type ComponentInstance,
+  legacyReconcileEffectIdentities,
+  legacyReconcileInstanceId,
+  parseActivation,
   planReconcile,
   type ReconcileEffect,
   type ReconcileEffectKind,
@@ -135,7 +139,7 @@ function componentLifecycle(
 function restorationOperationId(
   instance: Pick<
     ComponentInstance,
-    "applicationId" | "componentId" | "deploymentGeneration" | "pluginId"
+    "activation" | "applicationId" | "componentId" | "deploymentGeneration" | "pluginId"
   >,
 ): OperationId {
   const prepareOperationId = reconcileEffectIdentities(
@@ -146,6 +150,7 @@ function restorationOperationId(
     },
     instance.componentId,
     "prepare",
+    instance.activation,
   ).operationId;
   return parseOperationId(`${prepareOperationId.slice(0, -"prepare".length)}restore`);
 }
@@ -167,6 +172,7 @@ export interface ReconcilerOptions {
 
 interface PersistedComponentInstance extends JsonObject {
   readonly instanceId: string;
+  readonly activation?: Activation;
   readonly applicationId: ApplicationId;
   readonly pluginId: ComponentInstance["pluginId"];
   readonly componentId: ComponentInstance["componentId"];
@@ -187,6 +193,7 @@ interface PersistedComponentInstance extends JsonObject {
 interface LoadedComponentInstance {
   readonly storageId: string;
   readonly value: ComponentInstance;
+  readonly legacyActivation: boolean;
 }
 
 interface DeploymentObservation extends JsonObject {
@@ -200,6 +207,7 @@ interface DeploymentObservation extends JsonObject {
     | "failed"
     | "inconsistent"
     | "ready"
+    | "suspended"
     | "unavailable";
   readonly diagnostics: readonly JsonObject[];
   readonly updatedAt: string;
@@ -207,6 +215,16 @@ interface DeploymentObservation extends JsonObject {
 
 function deploymentKey(identity: PluginDeploymentIdentity): string {
   return `${identity.applicationId}/${identity.pluginId}`;
+}
+
+function compareActivations(left: Activation, right: Activation): number {
+  const leftValue = BigInt(left);
+  const rightValue = BigInt(right);
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+function nextActivation(current: Activation): Activation {
+  return parseActivation((BigInt(parseActivation(current)) + 1n).toString());
 }
 
 function deploymentStateKey(identity: PluginDeploymentIdentity): StateKey<PluginDeployment> {
@@ -229,15 +247,25 @@ function isCanonicalInstance(record: LoadedComponentInstance): boolean {
   const instance = record.value;
   return (
     record.storageId === instance.instanceId &&
-    reconcileEffectIdentities(
-      {
-        applicationId: instance.applicationId,
-        generation: instance.deploymentGeneration,
-        pluginId: instance.pluginId,
-      },
-      instance.componentId,
-      "prepare",
-    ).instanceId === instance.instanceId
+    (record.legacyActivation
+      ? legacyReconcileInstanceId(
+          {
+            applicationId: instance.applicationId,
+            generation: instance.deploymentGeneration,
+            pluginId: instance.pluginId,
+          },
+          instance.componentId,
+        )
+      : reconcileEffectIdentities(
+          {
+            applicationId: instance.applicationId,
+            generation: instance.deploymentGeneration,
+            pluginId: instance.pluginId,
+          },
+          instance.componentId,
+          "prepare",
+          instance.activation,
+        ).instanceId) === instance.instanceId
   );
 }
 
@@ -355,6 +383,7 @@ function effectDiagnostic(
     },
     retryable: true,
     details: {
+      activation: effect.activation,
       componentId: effect.componentId,
       deploymentGeneration: effect.deploymentGeneration,
       instanceId: effect.instanceId,
@@ -406,6 +435,7 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
   }
   const effect: ReconcileEffect = {
     kind: value.kind,
+    activation: parseActivation(value.activation ?? "1"),
     applicationId: parseApplicationId(value.applicationId),
     artifactDigest: parseArtifactDigest(value.artifactDigest),
     componentId: parseComponentId(value.componentId),
@@ -753,6 +783,13 @@ export class Reconciler {
         instances: deploymentInstances,
         now: this.#options.clock.now().toISOString(),
         supportedExecutors: this.#options.effects.supportedExecutors,
+        suspended: providerLosses.some(
+          (loss) =>
+            loss.value.consumer.applicationId === deployment.applicationId &&
+            loss.value.consumer.pluginId === deployment.pluginId &&
+            loss.value.deploymentGeneration === deployment.generation &&
+            loss.value.action === "suspend",
+        ),
         ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
       });
       if (plan.blocked) {
@@ -870,9 +907,16 @@ export class Reconciler {
       namespace,
       collection: "component-instances",
     })) {
+      const legacyActivation = !Object.hasOwn(record.value, "activation");
       instances.push({
         storageId: record.key.id,
-        value: { ...record.value, revision: record.revision },
+        value: {
+          ...record.value,
+          activation: parseActivation(legacyActivation ? "1" : record.value.activation),
+          ...(legacyActivation ? { legacyActivation: true } : {}),
+          revision: record.revision,
+        },
+        legacyActivation,
       });
     }
     return instances;
@@ -977,25 +1021,28 @@ export class Reconciler {
     );
     if (installation === undefined) return { evidence: [], ready: false };
     const evidence = installation.manifest.components.map((component) => {
-      const expectedInstanceId = reconcileEffectIdentities(
-        {
-          applicationId: deployment.applicationId,
-          generation: deployment.generation,
-          pluginId: deployment.pluginId,
-        },
-        component.componentId,
-        "prepare",
-      ).instanceId;
-      const instance = instances.find(
-        (candidate) =>
-          candidate.instanceId === expectedInstanceId &&
-          candidate.applicationId === deployment.applicationId &&
-          candidate.pluginId === deployment.pluginId &&
-          candidate.deploymentGeneration === deployment.generation &&
-          candidate.observedGeneration === deployment.generation &&
-          candidate.artifactDigest === deployment.artifactDigest &&
-          candidate.componentId === component.componentId,
-      );
+      const instance = instances
+        .filter(
+          (candidate) =>
+            candidate.applicationId === deployment.applicationId &&
+            candidate.pluginId === deployment.pluginId &&
+            candidate.deploymentGeneration === deployment.generation &&
+            candidate.observedGeneration === deployment.generation &&
+            candidate.artifactDigest === deployment.artifactDigest &&
+            candidate.componentId === component.componentId,
+        )
+        .sort((left, right) => compareActivations(right.activation, left.activation))[0];
+      const expectedInstanceId =
+        instance?.instanceId ??
+        reconcileEffectIdentities(
+          {
+            applicationId: deployment.applicationId,
+            generation: deployment.generation,
+            pluginId: deployment.pluginId,
+          },
+          component.componentId,
+          "prepare",
+        ).instanceId;
       return {
         key: instanceKey(expectedInstanceId),
         ...(instance === undefined ? {} : { instance }),
@@ -1077,6 +1124,7 @@ export class Reconciler {
           current === undefined ||
           current.revision !== expected.instance.revision ||
           current.value.instanceId !== expected.instance.instanceId ||
+          (current.value.activation ?? "1") !== expected.instance.activation ||
           current.value.applicationId !== expected.instance.applicationId ||
           current.value.pluginId !== expected.instance.pluginId ||
           current.value.componentId !== expected.instance.componentId ||
@@ -1184,11 +1232,56 @@ export class Reconciler {
           instance.pluginId === deployment.pluginId &&
           instance.deploymentGeneration === deployment.generation,
       );
-      const nextLifecycle = recovered
-        ? "ready"
-        : !stale && desired.action === "degrade"
-          ? "degraded"
+      const deploymentGate = gates.get(deploymentKey(deployment));
+      const latestByComponent =
+        deploymentGate === undefined || deploymentGate instanceof DiagnosticError
+          ? []
+          : deploymentGate.artifact.manifest.components.map(
+              (component) =>
+                deploymentInstances
+                  .filter((instance) => instance.componentId === component.componentId)
+                  .sort((left, right) => compareActivations(right.activation, left.activation))[0],
+            );
+      const suspendStopped =
+        desired.action !== "suspend" ||
+        (latestByComponent.length > 0 &&
+          latestByComponent.every((instance) => instance?.lifecycle === "stopped"));
+      const recoveryActivations =
+        desired.action === "suspend" && recovered && suspendStopped
+          ? Object.fromEntries(
+              latestByComponent.map((instance) => [
+                instance?.componentId ?? "",
+                nextActivation(instance?.activation ?? "0"),
+              ]),
+            )
           : undefined;
+      const recoveryPlan =
+        recoveryActivations === undefined ||
+        deploymentGate === undefined ||
+        deploymentGate instanceof DiagnosticError
+          ? undefined
+          : planReconcile({
+              deployment,
+              gate: deploymentGate,
+              instances: deploymentInstances,
+              now: this.#options.clock.now().toISOString(),
+              supportedExecutors: this.#options.effects.supportedExecutors,
+              activations: recoveryActivations,
+              ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+            });
+      const canRecover =
+        recovered &&
+        suspendStopped &&
+        (desired.action !== "suspend" ||
+          (recoveryPlan !== undefined &&
+            !recoveryPlan.blocked &&
+            recoveryPlan.steps.length === latestByComponent.length));
+      const nextLifecycle =
+        canRecover && desired.action !== "suspend"
+          ? "ready"
+          : !stale && desired.action === "degrade"
+            ? "degraded"
+            : undefined;
       const transitioningInstances =
         nextLifecycle === undefined
           ? []
@@ -1203,9 +1296,18 @@ export class Reconciler {
         current.value.action === desired.action &&
         JSON.stringify(current.value.capabilities) === JSON.stringify(desired.capabilities) &&
         JSON.stringify(current.value.providers) === JSON.stringify(desired.providers);
-      const writeRecord = !recovered && !stale && !sameRecord;
-      const deleteRecord = current !== undefined && (recovered || stale);
-      if (!writeRecord && !deleteRecord && transitioningInstances.length === 0) continue;
+      const recoverySteps =
+        canRecover && desired.action === "suspend" ? (recoveryPlan?.steps ?? []) : [];
+      const writeRecord = !canRecover && !stale && !sameRecord;
+      const deleteRecord = current !== undefined && (canRecover || stale);
+      if (
+        !writeRecord &&
+        !deleteRecord &&
+        transitioningInstances.length === 0 &&
+        recoverySteps.length === 0
+      ) {
+        continue;
+      }
 
       try {
         const committed = await this.#options.state.transact(
@@ -1282,6 +1384,23 @@ export class Reconciler {
               }
               persistedInstances.push({ ...persistedInstance, key });
             }
+            for (const instance of latestByComponent) {
+              if (recoverySteps.length === 0 || instance === undefined) continue;
+              const key = instanceKey(instance.instanceId);
+              const persistedInstance = await transaction.get(key);
+              if (
+                persistedInstance === undefined ||
+                persistedInstance.revision !== instance.revision ||
+                (persistedInstance.value.activation ?? "1") !== instance.activation ||
+                persistedInstance.value.lifecycle !== "stopped" ||
+                persistedInstance.value.deploymentGeneration !== deployment.generation
+              ) {
+                return false;
+              }
+              await transaction.put(key, persistedInstance.value, {
+                expectedRevision: instance.revision,
+              });
+            }
             if (
               !stale &&
               !(await this.#fenceProviderComponentEvidence(
@@ -1312,6 +1431,41 @@ export class Reconciler {
                 { ...persistedInstance.value, lifecycle },
                 { expectedRevision: persistedInstance.revision },
               );
+            }
+            for (const step of recoverySteps) {
+              const key = instanceKey(step.instanceId);
+              await transaction.put(
+                key,
+                {
+                  instanceId: step.instanceId,
+                  activation: step.effect.activation,
+                  applicationId: step.effect.applicationId,
+                  pluginId: step.effect.pluginId,
+                  componentId: step.effect.componentId,
+                  deploymentGeneration: step.effect.deploymentGeneration,
+                  observedGeneration: step.effect.deploymentGeneration,
+                  lifecycle: "created",
+                  executor: step.effect.executor,
+                  artifactDigest: step.effect.artifactDigest,
+                  ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
+                },
+                { expectedRevision: "absent" },
+              );
+              await transaction.appendOperation({
+                operationId: step.operationId,
+                kind: "component.lifecycle",
+                status: "planned",
+                state: step.effect,
+                updatedAt: this.#options.clock.now().toISOString(),
+              });
+              await transaction.enqueueOutbox({
+                messageId: step.messageId,
+                operationId: step.operationId,
+                topic: "component.lifecycle",
+                payload: step.effect,
+                createdAt: this.#options.clock.now().toISOString(),
+                availableAt: this.#options.clock.now().toISOString(),
+              });
             }
             return true;
           },
@@ -1350,7 +1504,9 @@ export class Reconciler {
         (instance) =>
           (instance.lifecycle === "preparing" ||
             instance.lifecycle === "ready" ||
-            instance.lifecycle === "degraded") &&
+            instance.lifecycle === "degraded" ||
+            instance.lifecycle === "draining" ||
+            instance.lifecycle === "stopping") &&
           (instance.retryAt === undefined || instance.retryAt <= now) &&
           (instance.workerId === undefined ||
             this.#options.workers?.some((worker) => worker.workerId === instance.workerId) ===
@@ -1533,7 +1689,10 @@ export class Reconciler {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
           await transaction.put(key, stable, { expectedRevision: current.revision });
           await transaction.appendOperation({
-            operationId: restorationOperationId(current.value),
+            operationId: restorationOperationId({
+              ...current.value,
+              activation: parseActivation(current.value.activation ?? "1"),
+            }),
             kind: "component.lifecycle",
             status: "completed",
             state: {
@@ -2037,6 +2196,7 @@ export class Reconciler {
     if (current === undefined) {
       instance = {
         instanceId: step.instanceId,
+        activation: step.effect.activation,
         applicationId: step.effect.applicationId,
         pluginId: step.effect.pluginId,
         componentId: step.effect.componentId,
@@ -2058,6 +2218,7 @@ export class Reconciler {
         instance = {
           ...stable,
           artifactDigest: step.effect.artifactDigest,
+          activation: step.effect.activation,
           executor: step.effect.executor,
           ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
         };
@@ -2143,15 +2304,34 @@ export class Reconciler {
       await this.#rejectInvalidClaim(claim, error);
       return;
     }
-    const canonical = reconcileEffectIdentities(
-      {
-        applicationId: effect.applicationId,
-        generation: effect.deploymentGeneration,
-        pluginId: effect.pluginId,
-      },
-      effect.componentId,
-      effect.kind,
-    );
+    const current = await this.#options.state.read(instanceKey(effect.instanceId));
+    if (current === undefined) {
+      this.#replanCount += 1;
+      await this.#acknowledge(claim, "completed");
+      return;
+    }
+    const instance = current.value;
+    const legacyActivation = !Object.hasOwn(instance, "activation");
+    const canonical = legacyActivation
+      ? legacyReconcileEffectIdentities(
+          {
+            applicationId: effect.applicationId,
+            generation: effect.deploymentGeneration,
+            pluginId: effect.pluginId,
+          },
+          effect.componentId,
+          effect.kind,
+        )
+      : reconcileEffectIdentities(
+          {
+            applicationId: effect.applicationId,
+            generation: effect.deploymentGeneration,
+            pluginId: effect.pluginId,
+          },
+          effect.componentId,
+          effect.kind,
+          effect.activation,
+        );
     if (
       effect.instanceId !== canonical.instanceId ||
       effect.operationId !== canonical.operationId ||
@@ -2163,15 +2343,10 @@ export class Reconciler {
       );
       return;
     }
-    const current = await this.#options.state.read(instanceKey(effect.instanceId));
-    if (current === undefined) {
-      this.#replanCount += 1;
-      await this.#acknowledge(claim, "completed");
-      return;
-    }
-    const instance = current.value;
+    const instanceActivation = parseActivation(instance.activation ?? "1");
     if (
       instance.instanceId !== effect.instanceId ||
+      instanceActivation !== effect.activation ||
       instance.applicationId !== effect.applicationId ||
       instance.pluginId !== effect.pluginId ||
       instance.componentId !== effect.componentId ||
@@ -2199,9 +2374,10 @@ export class Reconciler {
       (candidate) =>
         candidate.applicationId === effect.applicationId && candidate.pluginId === effect.pluginId,
     );
-    const [installations, loadedInstances] = await Promise.all([
+    const [installations, loadedInstances, providerLosses] = await Promise.all([
       this.#loadInstallations(),
       this.#loadInstances(),
+      this.#loadProviderLosses(),
     ]);
     const instances = loadedInstances
       .filter((record) => isInstanceContextConsistent(record, deployments))
@@ -2216,12 +2392,20 @@ export class Reconciler {
     }
     if (!this.#running) return;
     if (currentGate === capabilityBindingConflict) return capabilityBindingConflict;
+    const suspended = providerLosses.some(
+      (loss) =>
+        loss.value.consumer.applicationId === effect.applicationId &&
+        loss.value.consumer.pluginId === effect.pluginId &&
+        loss.value.deploymentGeneration === effect.deploymentGeneration &&
+        loss.value.action === "suspend",
+    );
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
         desired.state !== "active" ||
         desired.generation !== effect.deploymentGeneration ||
-        desired.artifactDigest !== effect.artifactDigest
+        desired.artifactDigest !== effect.artifactDigest ||
+        suspended
       ) {
         this.#replanCount += 1;
         await this.#acknowledge(claim, "completed");
@@ -2258,6 +2442,7 @@ export class Reconciler {
         return;
       }
     } else if (
+      !suspended &&
       desired !== undefined &&
       desired.state === "active" &&
       desired.generation === effect.deploymentGeneration &&
@@ -2383,6 +2568,14 @@ export class Reconciler {
       const key = instanceKey(effect.instanceId);
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
+      if (
+        parseActivation(current.value.activation ?? "1") !== effect.activation ||
+        current.value.deploymentGeneration !== effect.deploymentGeneration ||
+        current.value.componentId !== effect.componentId
+      ) {
+        this.#replanCount += 1;
+        return;
+      }
       const lifecycle = this.#successfulLifecycle(effect.kind, current.value);
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -2474,6 +2667,14 @@ export class Reconciler {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
+      if (
+        parseActivation(current.value.activation ?? "1") !== effect.activation ||
+        current.value.deploymentGeneration !== effect.deploymentGeneration ||
+        current.value.componentId !== effect.componentId
+      ) {
+        this.#replanCount += 1;
+        return;
+      }
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
           const lifecycle =
@@ -2534,7 +2735,11 @@ export class Reconciler {
   }
 
   async #refreshReadiness(): Promise<void> {
-    const instances = (await this.#loadInstances())
+    const [loadedInstances, providerLosses] = await Promise.all([
+      this.#loadInstances(),
+      this.#loadProviderLosses(),
+    ]);
+    const instances = loadedInstances
       .filter((record) => isInstanceContextConsistent(record, this.#deployments))
       .map((record) => record.value);
     for (const deployment of this.#deployments) {
@@ -2556,6 +2761,29 @@ export class Reconciler {
         await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
       if (deployment.state !== "active") continue;
+      const suspended = providerLosses.some(
+        (loss) =>
+          loss.value.consumer.applicationId === deployment.applicationId &&
+          loss.value.consumer.pluginId === deployment.pluginId &&
+          loss.value.deploymentGeneration === deployment.generation &&
+          loss.value.action === "suspend",
+      );
+      if (suspended) {
+        const installation = (await this.#loadInstallations()).find(
+          (candidate) =>
+            candidate.pluginId === deployment.pluginId &&
+            candidate.digest === deployment.artifactDigest,
+        );
+        const allStopped =
+          installation?.manifest.components.every((component) => {
+            const latest = deploymentInstances
+              .filter((instance) => instance.componentId === component.componentId)
+              .sort((left, right) => compareActivations(right.activation, left.activation))[0];
+            return latest?.lifecycle === "stopped";
+          }) === true;
+        await this.#recordObservation(deployment, allStopped ? "suspended" : "converging", []);
+        continue;
+      }
       const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
       if (
         existingDiagnostics?.some(
@@ -2575,12 +2803,12 @@ export class Reconciler {
           candidate.digest === deployment.artifactDigest,
       );
       if (installation === undefined) continue;
-      const ready = installation.manifest.components.every((component) =>
-        deploymentInstances.some(
-          (instance) =>
-            instance.componentId === component.componentId && this.#isReadyAndLive(instance),
-        ),
-      );
+      const ready = installation.manifest.components.every((component) => {
+        const latest = deploymentInstances
+          .filter((instance) => instance.componentId === component.componentId)
+          .sort((left, right) => compareActivations(right.activation, left.activation))[0];
+        return latest !== undefined && this.#isReadyAndLive(latest);
+      });
       if (ready) {
         this.#readyDeployments.add(deploymentKey(deployment));
         this.#diagnosticsByDeployment.delete(deploymentKey(deployment));

@@ -73,6 +73,7 @@ function effectFingerprint(effect: ReconcileEffect): string {
     effect.pluginId,
     effect.componentId,
     effect.deploymentGeneration,
+    effect.activation,
     effect.artifactDigest,
     effect.executor,
     effect.workerId ?? null,
@@ -108,6 +109,7 @@ function effectError(
       source: { kind: "plugin", id: `${effect.pluginId}/${effect.componentId}` },
       details: {
         deploymentGeneration: effect.deploymentGeneration,
+        activation: effect.activation,
         instanceId: effect.instanceId,
         operationId: effect.operationId,
         ...details,
@@ -218,7 +220,9 @@ export class ComponentEffects implements ComponentEffectExecutor {
     try {
       effect = this.#restorationEffect(
         instance,
-        instance.lifecycle === "preparing" ? "prepare" : "start",
+        instance.lifecycle === "preparing" || instance.lifecycle === "stopping"
+          ? "prepare"
+          : "start",
       );
     } catch (error) {
       return Promise.reject(error);
@@ -280,6 +284,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
     if (entry !== undefined) {
       this.#registry.assertMatches(effect, entry, authority);
       if (entry.state === "active") return;
+      if (instance.lifecycle === "draining" && entry.state === "draining") return;
       if (entry.state !== "prepared") {
         throw effectError(
           "LIFECYCLE_TRANSITION_INVALID",
@@ -337,6 +342,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
     for (const entry of this.#registry.entries()) {
       if (!sameAuthority(entry.binding.authority, authority)) continue;
       const instance: ComponentInstance = {
+        activation: entry.binding.activation ?? "1",
         applicationId: entry.binding.deployment.applicationId,
         artifactDigest: entry.binding.artifact.digest,
         componentId: entry.binding.component.componentId,
@@ -520,6 +526,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
       }
       const binding: ComponentBinding = {
         instanceId: effect.instanceId,
+        activation: effect.activation,
         executor: effect.executor,
         ...(effect.workerId === undefined ? {} : { workerId: parseWorkerId(effect.workerId) }),
         artifact,
@@ -655,11 +662,13 @@ export class ComponentEffects implements ComponentEffectExecutor {
   ): ReconcileEffect {
     if (
       instance.artifactDigest === undefined ||
-      (kind === "prepare" ? instance.lifecycle !== "preparing" : instance.lifecycle !== "ready")
+      (kind === "prepare"
+        ? instance.lifecycle !== "preparing" && instance.lifecycle !== "stopping"
+        : instance.lifecycle !== "ready" &&
+          instance.lifecycle !== "degraded" &&
+          instance.lifecycle !== "draining")
     ) {
-      throw new TypeError(
-        "Only exact persisted preparing or ready component instances can be restored",
-      );
+      throw new TypeError("Only exact persisted restorable component instances can be restored");
     }
     const digest = createHash("sha256").update(instance.instanceId).digest("hex");
     const identity = `restore.${kind}.${digest}`;
@@ -672,6 +681,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
       pluginId: instance.pluginId,
       componentId: instance.componentId,
       deploymentGeneration: instance.deploymentGeneration,
+      activation: instance.activation,
       artifactDigest: instance.artifactDigest,
       executor: instance.executor,
       ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),

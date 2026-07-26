@@ -27,9 +27,27 @@ import {
 } from "./placement.js";
 
 export type ReconcileEffectKind = "drain" | "prepare" | "start" | "stop";
+export type Activation = string;
+
+const DECIMAL_PATTERN = /^(?:0|[1-9]\d*)$/u;
+const UINT64_MAX = "18446744073709551615";
+
+export function parseActivation(value: unknown): Activation {
+  if (
+    typeof value !== "string" ||
+    !DECIMAL_PATTERN.test(value) ||
+    value.length > UINT64_MAX.length ||
+    (value.length === UINT64_MAX.length && value > UINT64_MAX)
+  ) {
+    throw new TypeError("Activation must be a canonical unsigned decimal string");
+  }
+  return value;
+}
 
 export interface ComponentInstance extends JsonObject {
   readonly instanceId: string;
+  readonly activation: Activation;
+  readonly legacyActivation?: boolean;
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
   readonly componentId: ComponentId;
@@ -56,6 +74,7 @@ export interface ArtifactDeploymentGate {
 
 export interface ReconcileEffect extends JsonObject {
   readonly kind: ReconcileEffectKind;
+  readonly activation: Activation;
   readonly operationId: OperationId;
   readonly messageId: MessageId;
   readonly instanceId: string;
@@ -85,6 +104,8 @@ export interface ReconcileSnapshot {
   readonly now: string;
   readonly supportedExecutors: readonly ExecutorKind[];
   readonly workers?: readonly PlacementWorker[];
+  readonly suspended?: boolean;
+  readonly activations?: Readonly<Record<string, Activation>>;
 }
 
 export interface ReconcilePlan extends JsonObject {
@@ -105,17 +126,58 @@ export function reconcileEffectIdentities(
   deployment: Pick<PluginDeployment, "applicationId" | "generation" | "pluginId">,
   componentId: ComponentId,
   kind: ReconcileEffectKind,
+  activation: Activation = "1",
 ): {
   readonly instanceId: string;
   readonly operationId: OperationId;
   readonly messageId: MessageId;
 } {
+  const canonicalActivation = parseActivation(activation);
   const instanceId = portableStableId([
     deployment.applicationId,
     deployment.pluginId,
     componentId,
     `g${deployment.generation}`,
+    `a${canonicalActivation}`,
   ]);
+  const effectId = portableStableId([
+    "reconcile",
+    deployment.applicationId,
+    deployment.pluginId,
+    componentId,
+    `g${deployment.generation}`,
+    `a${canonicalActivation}`,
+    kind,
+  ]);
+  return {
+    instanceId,
+    operationId: parseOperationId(effectId),
+    messageId: parseMessageId(effectId),
+  };
+}
+
+export function legacyReconcileInstanceId(
+  deployment: Pick<PluginDeployment, "applicationId" | "generation" | "pluginId">,
+  componentId: ComponentId,
+): string {
+  return portableStableId([
+    deployment.applicationId,
+    deployment.pluginId,
+    componentId,
+    `g${deployment.generation}`,
+  ]);
+}
+
+export function legacyReconcileEffectIdentities(
+  deployment: Pick<PluginDeployment, "applicationId" | "generation" | "pluginId">,
+  componentId: ComponentId,
+  kind: ReconcileEffectKind,
+): {
+  readonly instanceId: string;
+  readonly operationId: OperationId;
+  readonly messageId: MessageId;
+} {
+  const instanceId = legacyReconcileInstanceId(deployment, componentId);
   const effectId = portableStableId([
     "reconcile",
     deployment.applicationId,
@@ -138,10 +200,15 @@ function step(
   placement: ComponentPlacement,
   expectedRevision: Revision | "absent",
   currentLifecycle: ComponentLifecycleState,
+  activation: Activation,
+  legacyActivation = false,
 ): ReconcilePlanStep {
-  const identity = reconcileEffectIdentities(deployment, componentId, kind);
+  const identity = legacyActivation
+    ? legacyReconcileEffectIdentities(deployment, componentId, kind)
+    : reconcileEffectIdentities(deployment, componentId, kind, activation);
   const effect: ReconcileEffect = {
     kind,
+    activation,
     operationId: identity.operationId,
     messageId: identity.messageId,
     instanceId: identity.instanceId,
@@ -192,13 +259,20 @@ function oldInstanceStep(
       placement,
       instance.revision,
       instance.lifecycle,
+      instance.activation,
+      instance.legacyActivation,
     );
   }
   if (instance.lifecycle === "draining") {
-    const drainOperationId = reconcileEffectIdentities(
-      oldDeployment,
-      instance.componentId,
-      "drain",
+    const drainOperationId = (
+      instance.legacyActivation
+        ? legacyReconcileEffectIdentities(oldDeployment, instance.componentId, "drain")
+        : reconcileEffectIdentities(
+            oldDeployment,
+            instance.componentId,
+            "drain",
+            instance.activation,
+          )
     ).operationId;
     if (
       instance.completedOperationId !== drainOperationId &&
@@ -211,6 +285,8 @@ function oldInstanceStep(
         placement,
         instance.revision,
         instance.lifecycle,
+        instance.activation,
+        instance.legacyActivation,
       );
     }
   }
@@ -222,6 +298,8 @@ function oldInstanceStep(
       placement,
       instance.revision,
       instance.lifecycle,
+      instance.activation,
+      instance.legacyActivation,
     );
   }
   if (instance.lifecycle === "stopped") return undefined;
@@ -232,6 +310,8 @@ function oldInstanceStep(
     placement,
     instance.revision,
     instance.lifecycle,
+    instance.activation,
+    instance.legacyActivation,
   );
 }
 
@@ -240,6 +320,7 @@ function currentInstanceStep(
   instance: ComponentInstance | undefined,
   componentId: ComponentId,
   placement: ComponentPlacement,
+  activation: Activation,
 ): ReconcilePlanStep | undefined {
   if (
     instance?.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
@@ -249,7 +330,15 @@ function currentInstanceStep(
     return undefined;
   }
   if (instance === undefined || instance.lifecycle === "stopped") {
-    return step(snapshot.deployment, componentId, "prepare", placement, "absent", "created");
+    return step(
+      snapshot.deployment,
+      componentId,
+      "prepare",
+      placement,
+      "absent",
+      "created",
+      activation,
+    );
   }
   if (instance.lifecycle === "created") {
     return step(
@@ -259,6 +348,7 @@ function currentInstanceStep(
       placement,
       instance.revision,
       instance.lifecycle,
+      activation,
     );
   }
   if (instance.lifecycle === "preparing" || instance.lifecycle === "starting") {
@@ -269,6 +359,7 @@ function currentInstanceStep(
       placement,
       instance.revision,
       instance.lifecycle,
+      activation,
     );
   }
   if (instance.lifecycle === "draining" || instance.lifecycle === "stopping") {
@@ -279,6 +370,7 @@ function currentInstanceStep(
       placement,
       instance.revision,
       instance.lifecycle,
+      activation,
     );
   }
   if (
@@ -293,6 +385,7 @@ function currentInstanceStep(
       placement,
       instance.revision,
       instance.lifecycle,
+      activation,
     );
   }
   return undefined;
@@ -350,14 +443,15 @@ export function planReconcile(snapshot: ReconcileSnapshot): ReconcilePlan {
   for (const instance of instances) {
     if (
       snapshot.deployment.state === "disabled" ||
-      instance.deploymentGeneration !== snapshot.deployment.generation
+      instance.deploymentGeneration !== snapshot.deployment.generation ||
+      snapshot.suspended === true
     ) {
       const obsolete = oldInstanceStep(snapshot.deployment, instance, snapshot.now);
       if (obsolete !== undefined) steps.push(obsolete);
     }
   }
 
-  if (snapshot.deployment.state === "active") {
+  if (snapshot.deployment.state === "active" && snapshot.suspended !== true) {
     for (const component of [...snapshot.gate.artifact.manifest.components].sort((left, right) =>
       left.componentId < right.componentId ? -1 : left.componentId > right.componentId ? 1 : 0,
     )) {
@@ -372,16 +466,28 @@ export function planReconcile(snapshot: ReconcileSnapshot): ReconcilePlan {
         placementDiagnostics.push(...placement.diagnostics);
         continue;
       }
-      const current = instances.find(
+      const currentInstances = instances.filter(
         (instance) =>
           instance.componentId === component.componentId &&
           instance.deploymentGeneration === snapshot.deployment.generation,
       );
+      const activation =
+        snapshot.activations?.[component.componentId] ??
+        currentInstances.reduce<Activation | undefined>(
+          (highest, instance) =>
+            highest === undefined || BigInt(instance.activation) > BigInt(highest)
+              ? instance.activation
+              : highest,
+          undefined,
+        ) ??
+        "1";
+      const current = currentInstances.find((instance) => instance.activation === activation);
       const next = currentInstanceStep(
         snapshot,
         current,
         component.componentId,
         placement.placement,
+        activation,
       );
       if (next !== undefined) steps.push(next);
     }

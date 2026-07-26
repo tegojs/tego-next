@@ -255,9 +255,9 @@ test("planReconcile creates stable one-effect steps and duplicate reconciliation
       {
         effect: "prepare",
         generation: "1",
-        instanceId: "app.org_dexample_decho.echo-service.g1",
-        messageId: "reconcile.app.org_dexample_decho.echo-service.g1.prepare",
-        operationId: "reconcile.app.org_dexample_decho.echo-service.g1.prepare",
+        instanceId: "app.org_dexample_decho.echo-service.g1.a1",
+        messageId: "reconcile.app.org_dexample_decho.echo-service.g1.a1.prepare",
+        operationId: "reconcile.app.org_dexample_decho.echo-service.g1.a1.prepare",
       },
     ],
   );
@@ -267,6 +267,7 @@ test("planReconcile creates stable one-effect steps and duplicate reconciliation
   );
 
   const ready: ComponentInstance = {
+    activation: "1",
     applicationId,
     componentId,
     deploymentGeneration: parseGeneration("1"),
@@ -301,10 +302,16 @@ test("activation identity distinguishes same-generation component incarnations",
   assert.notEqual(activationTwo.instanceId, activationOne.instanceId);
   assert.notEqual(activationTwo.operationId, activationOne.operationId);
   assert.notEqual(activationTwo.messageId, activationOne.messageId);
+  assert.throws(() => identities(deployment("7"), componentId, "prepare", "01"), /activation/iu);
+  assert.throws(
+    () => identities(deployment("7"), componentId, "prepare", "18446744073709551616"),
+    /activation/iu,
+  );
 });
 
 test("plans enable, disable, upgrade, drain, and rollback without combining external effects", () => {
   const oldReady: ComponentInstance = {
+    activation: "1",
     applicationId,
     componentId,
     deploymentGeneration: parseGeneration("1"),
@@ -357,6 +364,7 @@ test("plans enable, disable, upgrade, drain, and rollback without combining exte
 
 test("duplicate live instances for one component generation are inconsistent and never execute", () => {
   const first: ComponentInstance = {
+    activation: "1",
     applicationId,
     componentId,
     deploymentGeneration: parseGeneration("1"),
@@ -385,6 +393,7 @@ test("duplicate live instances for one component generation are inconsistent and
 
 test("instances belonging to another application never satisfy or drain this deployment", () => {
   const foreign: ComponentInstance = {
+    activation: "1",
     applicationId: parseApplicationId("other-app"),
     componentId,
     deploymentGeneration: parseGeneration("1"),
@@ -1013,14 +1022,14 @@ class GatedRecordingEffects extends RecordingEffects {
   readonly #gates = new Map<
     string,
     {
-      readonly entered: PromiseWithResolvers<void>;
+      readonly entered: PromiseWithResolvers<ReconcileEffect>;
       readonly release: PromiseWithResolvers<void>;
     }
   >();
 
   gateNext(plugin: string, kind: ReconcileEffectKind) {
     const gate = {
-      entered: Promise.withResolvers<void>(),
+      entered: Promise.withResolvers<ReconcileEffect>(),
       release: Promise.withResolvers<void>(),
     };
     this.#gates.set(`${plugin}/${kind}`, gate);
@@ -1031,7 +1040,7 @@ class GatedRecordingEffects extends RecordingEffects {
     const gate = this.#gates.get(`${effect.pluginId}/${effect.kind}`);
     if (gate !== undefined) {
       this.#gates.delete(`${effect.pluginId}/${effect.kind}`);
-      gate.entered.resolve();
+      gate.entered.resolve(effect);
       await gate.release.promise;
     }
     await super.perform(effect);
@@ -1065,12 +1074,13 @@ test("legacy activation defaults to one without changing its persisted generatio
     return null;
   });
   const effects = new RecordingEffects();
+  let desired = deployment("7");
   const reconciler = new Reconciler({
     artifactGate: { validate: async () => gate().artifact },
     clock,
     effects,
     state,
-    loadDeployments: async () => [deployment("7")],
+    loadDeployments: async () => [desired],
     loadInstallations: async () => [installation()],
   });
 
@@ -1092,6 +1102,83 @@ test("legacy activation defaults to one without changing its persisted generatio
     | undefined;
   assert.equal(persistedValue?.deploymentGeneration, parseGeneration("7"));
   assert.equal(Object.hasOwn(persistedValue ?? {}, "activation"), false);
+  desired = { ...desired, state: "disabled" };
+  await reconciler.wake();
+  const legacyLifecycleEffects = effects.calls.filter(
+    (effect) => effect.instanceId === legacyInstanceId,
+  );
+  assert.deepEqual(
+    legacyLifecycleEffects.map((effect) => effect.kind),
+    ["drain", "stop"],
+  );
+  const stopped = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: legacyInstanceId,
+  });
+  assert.equal(
+    (stopped?.value as { readonly lifecycle?: string } | undefined)?.lifecycle,
+    "stopped",
+  );
+  assert.equal(
+    Object.hasOwn(
+      (stopped?.value as { readonly activation?: string } | undefined) ?? {},
+      "activation",
+    ),
+    false,
+  );
+  assert.equal(
+    await state.read({
+      namespace: "tego",
+      collection: "component-instances",
+      id: reconcileEffectIdentities(deployment("7"), componentId, "prepare", "1").instanceId,
+    }),
+    undefined,
+  );
+  await reconciler.stop();
+});
+
+test("non-canonical activation state is rejected without destructive writes", async () => {
+  const clock = new ManualClock();
+  const state = await createHarnessStore(clock);
+  const identity = reconcileEffectIdentities(deployment("7"), componentId, "prepare", "1");
+  const key = {
+    namespace: "tego",
+    collection: "component-instances",
+    id: identity.instanceId,
+  } as const;
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      key,
+      {
+        activation: "01",
+        applicationId,
+        artifactDigest: digestOne,
+        componentId,
+        deploymentGeneration: parseGeneration("7"),
+        executor: "process",
+        instanceId: identity.instanceId,
+        lifecycle: "ready",
+        observedGeneration: parseGeneration("7"),
+        pluginId,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const before = await state.read(key);
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects: new RecordingEffects(),
+    state,
+    loadDeployments: async () => [deployment("7")],
+    loadInstallations: async () => [installation()],
+  });
+
+  await assert.rejects(reconciler.start(), /activation/iu);
+
+  assert.deepEqual(await state.read(key), before);
   await reconciler.stop();
 });
 
@@ -1279,9 +1366,9 @@ test("suspended provider drains activation one, holds, and reactivates activatio
     ]),
     "prepare-entered",
   );
-  const activationTwoPrepare = effects.calls.findLast(
-    (effect) => effect.pluginId === consumerId && effect.kind === "prepare",
-  ) as (ReconcileEffect & { readonly activation?: string }) | undefined;
+  const activationTwoPrepare = (await prepareGate.entered.promise) as ReconcileEffect & {
+    readonly activation?: string;
+  };
   assert.equal(activationTwoPrepare?.activation, "2");
   assert.notEqual(activationTwoPrepare?.instanceId, activationOne.key.id);
   prepareGate.release.resolve();
@@ -2576,6 +2663,7 @@ test("non-canonical provider instances cannot satisfy execution-time capabilitie
         deploymentGeneration: parseGeneration("1"),
         executor: effect.executor,
         instanceId: effect.instanceId,
+        activation: effect.activation,
         lifecycle: "created",
         observedGeneration: parseGeneration("1"),
         pluginId: consumerId,
@@ -2760,6 +2848,7 @@ test("canonical lifecycle identities cannot be retargeted to another persisted i
     lifecycle: ComponentInstance["lifecycle"],
     generation = "1",
   ): ComponentInstance => ({
+    activation: "1",
     applicationId,
     componentId,
     deploymentGeneration: parseGeneration(generation),
@@ -2820,6 +2909,7 @@ test("canonical lifecycle identities cannot be retargeted to another persisted i
           deploymentGeneration: effect.deploymentGeneration,
           executor: effect.executor,
           instanceId: retargeted.instanceId,
+          activation: retargeted.activation,
           lifecycle: item.lifecycle,
           observedGeneration: effect.deploymentGeneration,
           pluginId,
@@ -2893,6 +2983,7 @@ test("claimed effects revalidate current placement before journaling or performi
         deploymentGeneration: effect.deploymentGeneration,
         executor: effect.executor,
         instanceId: effect.instanceId,
+        activation: effect.activation,
         lifecycle: "created",
         observedGeneration: effect.deploymentGeneration,
         pluginId,
@@ -3006,6 +3097,7 @@ test("claimed remote effects require the current worker placement to match exact
         deploymentGeneration: planned.deploymentGeneration,
         executor: planned.executor,
         instanceId: planned.instanceId,
+        activation: planned.activation,
         lifecycle: "created",
         observedGeneration: planned.deploymentGeneration,
         pluginId,
@@ -3070,6 +3162,7 @@ test("canonical effects with stale pre-lifecycle state never invoke the executor
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
   const preparing: ComponentInstance = {
+    activation: "1",
     applicationId,
     componentId,
     deploymentGeneration: parseGeneration("1"),
@@ -3098,6 +3191,7 @@ test("canonical effects with stale pre-lifecycle state never invoke the executor
         deploymentGeneration: effect.deploymentGeneration,
         executor: effect.executor,
         instanceId: effect.instanceId,
+        activation: effect.activation,
         lifecycle: "ready",
         observedGeneration: effect.deploymentGeneration,
         pluginId,
@@ -3204,6 +3298,7 @@ test("canonical instance values stored under non-canonical keys remain inconsist
         deploymentGeneration: parseGeneration("1"),
         executor: effect.executor,
         instanceId: effect.instanceId,
+        activation: effect.activation,
         lifecycle: "ready",
         observedGeneration: parseGeneration("1"),
         pluginId,
@@ -3249,6 +3344,7 @@ test("restores persisted ready local sessions before reconciliation and requires
         deploymentGeneration: parseGeneration("1"),
         executor: planned.executor,
         instanceId: planned.instanceId,
+        activation: planned.activation,
         lifecycle: "ready",
         observedGeneration: parseGeneration("1"),
         pluginId,
@@ -3325,6 +3421,7 @@ test("degraded persisted sessions restore only when needed and require post-rest
           deploymentGeneration: parseGeneration("1"),
           executor: planned.executor,
           instanceId: planned.instanceId,
+          activation: planned.activation,
           lifecycle: "degraded",
           observedGeneration: parseGeneration("1"),
           pluginId,
@@ -3520,6 +3617,7 @@ test("remote restoration requires the persisted Worker to remain placement-eligi
           deploymentGeneration: parseGeneration("1"),
           executor: "remote",
           instanceId: planned.instanceId,
+          activation: planned.activation,
           lifecycle: "ready",
           observedGeneration: parseGeneration("1"),
           pluginId,
@@ -3573,6 +3671,7 @@ test("persisted local restoration failures are isolated and durably retryable", 
           deploymentGeneration: parseGeneration("1"),
           executor: planned.executor,
           instanceId: planned.instanceId,
+          activation: planned.activation,
           lifecycle: "ready",
           observedGeneration: parseGeneration("1"),
           pluginId,
@@ -3637,6 +3736,7 @@ test("persisted preparing local sessions are restored before their start effect 
         deploymentGeneration: parseGeneration("1"),
         executor: planned.executor,
         instanceId: planned.instanceId,
+        activation: planned.activation,
         lifecycle: "preparing",
         observedGeneration: parseGeneration("1"),
         pluginId,
@@ -3697,6 +3797,7 @@ test("persisted local restoration retries automatically without reopening comple
         deploymentGeneration: parseGeneration("1"),
         executor: planned.executor,
         instanceId: planned.instanceId,
+        activation: planned.activation,
         lifecycle: "ready",
         observedGeneration: parseGeneration("1"),
         pluginId,
@@ -3808,6 +3909,7 @@ test("persisted ready state is not live when the executor has no lifecycle capab
         deploymentGeneration: parseGeneration("1"),
         executor: planned.executor,
         instanceId: planned.instanceId,
+        activation: planned.activation,
         lifecycle: "ready",
         observedGeneration: parseGeneration("1"),
         pluginId,
@@ -3883,6 +3985,7 @@ test("restoration skips ready instances whose observed generation is stale", asy
         deploymentGeneration: parseGeneration("1"),
         executor: planned.executor,
         instanceId: planned.instanceId,
+        activation: planned.activation,
         lifecycle: "ready",
         observedGeneration: parseGeneration("2"),
         pluginId,
@@ -3956,12 +4059,13 @@ test("retry pre-state revision conflicts replan before external execution", asyn
   const effects = new RecordingEffects();
   const state = await createHarnessStore(clock);
   const instance: ComponentInstance = {
+    activation: "1",
     applicationId,
     artifactDigest: digestOne,
     componentId,
     deploymentGeneration: parseGeneration("1"),
     executor: "process",
-    instanceId: "app.org_dexample_decho.echo-service.g1",
+    instanceId: "app.org_dexample_decho.echo-service.g1.a1",
     lifecycle: "failed",
     observedGeneration: parseGeneration("1"),
     pluginId,
@@ -4061,7 +4165,7 @@ test("restart before acknowledgement reuses stable identity and leaves one live 
     effects.performed.every(
       (effect) =>
         effect.messageId ===
-        parseMessageId(`reconcile.app.org_dexample_decho.echo-service.g1.${effect.kind}`),
+        parseMessageId(`reconcile.app.org_dexample_decho.echo-service.g1.a1.${effect.kind}`),
     ),
     true,
   );
