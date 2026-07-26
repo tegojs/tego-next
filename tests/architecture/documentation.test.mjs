@@ -21,8 +21,6 @@ const documentedContracts = [
       "correlation ID is mandatory",
       "one-way messages and requests self-correlate",
       "responses correlate to the triggering request's message ID",
-      "A Worker Thread has its own JavaScript thread and event loop",
-      "shares the Main operating-system process, address space, privileges, and process-wide resources",
     ],
     forbidden: ["unknown -> expired", "optional correlation"],
   },
@@ -34,13 +32,34 @@ const documentedContracts = [
       "owner-private parent directory",
       "mode 0600",
       "Windows named-pipe ACL hardening is not implemented",
-      "The endpoint is trusted",
-      "authorized local client",
     ],
   },
+];
+
+const followerIngressRequiredClauses = [
+  /\blocal (?:control )?endpoint is trusted\b/iu,
+  /\bfollower\b[^.]{0,120}\b(?:may\s+)?(?:admit|store)s?\b[^.]{0,120}\bcontent-addressed immutable(?: artifact)? bytes\b[^.]{0,120}\bbefore\b[^.]{0,120}\bsemantic installation\b[^.]{0,120}\bfence\b/iu,
+  /\b(?:returns?|responds with)\s+`?COORDINATION_NOT_LEADER`?\b/iu,
+  /\bleaving installations and deployments semantic state unchanged\b/iu,
+  /\bauthorized local client\b[^.]{0,120}\bcan\b[^.]{0,40}\bconsume\b[^.]{0,80}\bartifact (?:storage|capacity)\b/iu,
+  /\bstorage denial of service\b/iu,
+];
+
+const forbiddenFollowerIngressClaims = [
   {
-    document: "operations",
-    required: ["immutable artifact bytes", "COORDINATION_NOT_LEADER", "storage denial of service"],
+    claim:
+      /\bfollower\b[^.]{0,80}\b(?:rejects?|blocks?|refuses?)\b[^.]{0,100}\bimmutable(?: artifact)? bytes\b[^.]{0,80}\bbefore ingress\b/iu,
+    description: "pre-ingress rejection",
+  },
+  {
+    claim:
+      /\bCOORDINATION_NOT_LEADER\b[^.]{0,100}\b(?:prevents?|blocks?|stops?)\b[^.]{0,100}\b(?:artifact storage|storage (?:consumption|denial of service))\b/iu,
+    description: "not-leader storage prevention",
+  },
+  {
+    claim:
+      /\bauthorized local client\b[^.]{0,80}\b(?:cannot|may not|does not)\b[^.]{0,40}\bconsume\b[^.]{0,80}\bartifact (?:storage|capacity)\b/iu,
+    description: "authorized-client storage prevention",
   },
 ];
 
@@ -74,6 +93,45 @@ function assertRequiredContractMarkers(source, required, document) {
   for (const marker of required) {
     assert.ok(source.includes(marker), `${document} must state: ${marker}`);
   }
+}
+
+function assertOrderedClauses(source, clauses, document) {
+  let offset = 0;
+  for (const clause of clauses) {
+    const match = clause.exec(source.slice(offset));
+    assert.ok(match, `${document} must state ordered affirmative clause: ${clause}`);
+    offset += match.index + match[0].length;
+  }
+}
+
+function assertFollowerIngressContract(source, document) {
+  const normalized = normalizeWhitespace(source);
+  for (const forbidden of forbiddenFollowerIngressClaims) {
+    assert.ok(
+      !forbidden.claim.test(normalized),
+      `${document} must not claim ${forbidden.description}`,
+    );
+  }
+  assertOrderedClauses(normalized, followerIngressRequiredClauses, document);
+}
+
+function assertWorkerThreadContract(source, document) {
+  const normalized = normalizeWhitespace(source);
+  assert.match(
+    normalized,
+    /\bWorker Thread\b[^.]{0,100}\bhas its own JavaScript thread and event loop\b/iu,
+    `${document} must state that a Worker Thread has its own JavaScript event loop`,
+  );
+  assert.match(
+    normalized,
+    /\bshares the Main operating-system process, address space, privileges, and process-wide resources\b/iu,
+    `${document} must state the resources shared with Main`,
+  );
+  assert.doesNotMatch(
+    normalized,
+    /(?:^|[.;]\s+|,\s+|\b(?:and|but)\s+)(?:(?:a|the) Worker Thread\s+|it\s+)?(?:runs?|executes?) on the Main JavaScript event loop\b/iu,
+    `${document} must not state affirmative execution on the Main JavaScript event loop`,
+  );
 }
 
 function section(source, heading) {
@@ -159,11 +217,7 @@ test("@spec:runtime-operations/documented-contracts/exact-operator-claims", asyn
     const source = normalizeWhitespace(await read(documents[contract.document]));
     for (const required of contract.required) {
       await t.test(`${contract.document}: ${required}`, () => {
-        assertRequiredContractMarkers(
-          source,
-          [required],
-          documents[contract.document],
-        );
+        assertRequiredContractMarkers(source, [required], documents[contract.document]);
       });
     }
     for (const forbidden of contract.forbidden ?? []) {
@@ -177,41 +231,80 @@ test("@spec:runtime-operations/documented-contracts/exact-operator-claims", asyn
   }
 });
 
-test("follower ingress contract rejects inverse pre-ingress and storage claims", () => {
-  const inverseFollowerIngressClaim = normalizeWhitespace(`
-    The trusted local endpoint rejects immutable artifact bytes before ingress.
-    It returns COORDINATION_NOT_LEADER, which prevents installations,
-    deployments, semantic state changes, and storage denial of service.
-    An authorized local client cannot consume artifact storage.
-  `);
+for (const document of ["operations", "security"]) {
+  test(`${document} documents ordered affirmative follower ingress semantics`, async () => {
+    assertFollowerIngressContract(await read(documents[document]), documents[document]);
+  });
+}
 
-  assert.throws(() =>
-    assertRequiredContractMarkers(
-      inverseFollowerIngressClaim,
-      ["immutable artifact bytes", "COORDINATION_NOT_LEADER", "storage denial of service"],
-      documents.operations,
+const validFollowerIngressFixture = normalizeWhitespace(`
+  The local control endpoint is trusted.
+  A follower may admit content-addressed immutable artifact bytes before the
+  semantic installation fence. The operation returns COORDINATION_NOT_LEADER,
+  leaving installations and deployments semantic state unchanged.
+  An authorized local client can consume artifact storage, creating a storage
+  denial of service risk.
+`);
+
+for (const mutation of [
+  {
+    name: "pre-ingress byte rejection",
+    source: validFollowerIngressFixture.replace(
+      /A follower may admit[^.]+\./u,
+      "A follower rejects immutable artifact bytes before ingress.",
     ),
+    rejection: /must not claim pre-ingress rejection/u,
+  },
+  {
+    name: "not-leader storage prevention",
+    source: validFollowerIngressFixture.replace(
+      "returns COORDINATION_NOT_LEADER,",
+      "returns COORDINATION_NOT_LEADER and prevents artifact storage,",
+    ),
+    rejection: /must not claim not-leader storage prevention/u,
+  },
+  {
+    name: "authorized-client storage prevention",
+    source: validFollowerIngressFixture.replace(
+      "An authorized local client can consume artifact storage",
+      "An authorized local client cannot consume artifact storage",
+    ),
+    rejection: /must not claim authorized-client storage prevention/u,
+  },
+]) {
+  test(`follower ingress contract rejects ${mutation.name}`, () => {
+    assert.throws(
+      () => assertFollowerIngressContract(mutation.source, "mutation fixture"),
+      mutation.rejection,
+    );
+  });
+}
+
+test("architecture documents Worker Thread event-loop isolation", async () => {
+  assertWorkerThreadContract(await read(documents.architecture), documents.architecture);
+});
+
+const validWorkerThreadFixture = normalizeWhitespace(`
+  A Worker Thread has its own JavaScript thread and event loop. It shares the
+  Main operating-system process, address space, privileges, and process-wide
+  resources; it does not run on the Main JavaScript event loop.
+`);
+
+test("Worker Thread contract accepts negative Main event-loop wording", () => {
+  assert.doesNotThrow(() =>
+    assertWorkerThreadContract(validWorkerThreadFixture, "mutation fixture"),
   );
 });
 
-test("Worker Thread contract rejects affirmative Main event-loop execution", () => {
-  const incorrectWorkerThreadClaim = normalizeWhitespace(`
-    A Worker Thread has its own JavaScript thread and event loop and executes on
-    the Main JavaScript event loop. It shares the Main operating-system process,
-    address space, privileges, and process-wide resources.
-  `);
-
-  assert.throws(() =>
-    assertRequiredContractMarkers(
-      incorrectWorkerThreadClaim,
-      [
-        "A Worker Thread has its own JavaScript thread and event loop",
-        "shares the Main operating-system process, address space, privileges, and process-wide resources",
-      ],
-      documents.architecture,
-    ),
-  );
-});
+for (const verb of ["runs", "executes"]) {
+  test(`Worker Thread contract rejects affirmative '${verb} on Main' wording`, () => {
+    const mutation = validWorkerThreadFixture.replace("does not run", verb);
+    assert.throws(
+      () => assertWorkerThreadContract(mutation, "mutation fixture"),
+      /must not state affirmative execution/u,
+    );
+  });
+}
 
 test("@spec:runtime-operations/plugin-development-operations/exact-cli-inventory", async () => {
   const contributor = await read(documents.contributor);

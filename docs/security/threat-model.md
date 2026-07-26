@@ -101,11 +101,12 @@ named-pipe ACL hardening is not implemented in the built-in path; operators must
 provide an operating-system deployment boundary. Each connection carries one
 bounded request.
 
-The endpoint is trusted. A follower may admit content-addressed immutable bytes
-before semantic installation is rejected, so an authorized local client can
-consume artifact storage even though it cannot mutate installations or
-deployments. This is an authorized local storage denial of service risk, not a
-fencing bypass.
+The local control endpoint is trusted. A follower may admit content-addressed
+immutable artifact bytes before the semantic installation crosses the
+leadership fence. The operation returns `COORDINATION_NOT_LEADER`, leaving
+installations and deployments semantic state unchanged. An authorized local
+client can consume artifact storage this way. This is an authorized local
+storage denial of service risk, not a fencing bypass.
 
 Worker transport accepts `ws:` and `wss:` for outbound connections. The
 built-in Main listener uses a WebSocket upgrade on `node:http`, so deployments
