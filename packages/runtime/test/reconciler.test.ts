@@ -615,7 +615,7 @@ class TestStateStore implements StateStore {
     const messages: OutboxMessage[] = [];
     const deletes: Array<{
       key: StateKey<JsonValue>;
-      expectedRevision?: Revision;
+      expectedRevision?: Revision | "absent";
     }> = [];
     const transaction: StateTransaction = {
       get: async <Value extends JsonValue>(key: StateKey<Value>) => {
@@ -643,7 +643,7 @@ class TestStateStore implements StateStore {
       },
       delete: async <Value extends JsonValue>(
         key: StateKey<Value>,
-        writeOptions: { readonly expectedRevision?: Revision },
+        writeOptions: { readonly expectedRevision?: Revision | "absent" },
       ) => {
         deletes.push({
           key: key as StateKey<JsonValue>,
@@ -747,8 +747,10 @@ class TestStateStore implements StateStore {
     for (const deleted of deletes) {
       const current = this.records.get(stateIdentifier(deleted.key));
       if (
-        deleted.expectedRevision !== undefined &&
-        current?.revision !== deleted.expectedRevision
+        (deleted.expectedRevision === "absent" && current !== undefined) ||
+        (deleted.expectedRevision !== undefined &&
+          deleted.expectedRevision !== "absent" &&
+          current?.revision !== deleted.expectedRevision)
       ) {
         const error = new Error("state revision conflict") as Error & {
           diagnostic?: { code: string };
@@ -1639,11 +1641,27 @@ test("degrade persists lexical provider loss evidence and recovers only the same
     providerZId,
     [{ name: capabilityZ, protocolVersion: "1.0.0" }],
     [],
+    [
+      {
+        componentId: parseComponentId("z-provider-service"),
+        kind: "service",
+        entrypoint: "components/provider.js",
+        executors: ["process"],
+      },
+    ],
   );
   const providerAManifest = capabilityManifest(
     providerAId,
     [{ name: capabilityA, protocolVersion: "1.0.0" }],
     [],
+    [
+      {
+        componentId: parseComponentId("a-provider-service"),
+        kind: "service",
+        entrypoint: "components/provider.js",
+        executors: ["process"],
+      },
+    ],
   );
   const alternateManifest = capabilityManifest(
     alternateId,
@@ -1712,12 +1730,12 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   const providerZ = deployment("1", {
     pluginId: providerZId,
     artifactDigest: providerZDigest,
-    permissionGrants: [],
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
   });
   const providerA = deployment("1", {
     pluginId: providerAId,
     artifactDigest: providerADigest,
-    permissionGrants: [],
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
   });
   const alternate = deployment("1", {
     pluginId: alternateId,
@@ -1768,13 +1786,53 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   await first.start();
 
   assert.equal(first.applicationReady(), true);
+  const providerAInstance = [...state.records.values()].find(
+    (record) =>
+      record.key.collection === "component-instances" &&
+      (record.value as { readonly pluginId?: string }).pluginId === providerAId,
+  );
+  assert.ok(providerAInstance);
   const readyInstance = [...state.records.values()].find(
     (record) =>
       record.key.collection === "component-instances" &&
       (record.value as { readonly pluginId?: string }).pluginId === consumerId,
   );
   assert.ok(readyInstance);
-  const initialEffectCount = firstEffects.calls.length;
+  const consumerEffectCount = (effects: RecordingEffects) =>
+    effects.calls.filter((effect) => effect.pluginId === consumerId).length;
+  const initialConsumerEffectCount = consumerEffectCount(firstEffects);
+  await state.transact({}, async (transaction) => {
+    const current = await transaction.get(providerAInstance.key);
+    assert.ok(current);
+    await transaction.put(
+      providerAInstance.key,
+      { ...(current.value as object), lifecycle: "degraded" },
+      { expectedRevision: current.revision },
+    );
+    return null;
+  });
+  state.beforeNextProviderLossCommit = async () => {
+    await state.transact({}, async (transaction) => {
+      const current = await transaction.get(providerAInstance.key);
+      assert.ok(current);
+      await transaction.put(
+        providerAInstance.key,
+        { ...(current.value as object), lifecycle: "ready" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+  };
+
+  await first.wake();
+
+  assert.equal(await state.read(lossKey), undefined);
+  const stillReadyAfterProviderRace = await state.read(readyInstance.key);
+  assert.ok(stillReadyAfterProviderRace);
+  assert.equal(
+    (stillReadyAfterProviderRace.value as { readonly lifecycle?: string }).lifecycle,
+    "ready",
+  );
   await state.transact({}, async (transaction) => {
     for (const desired of [providerZ, providerA]) {
       const key = deploymentRecordKey(desired);
@@ -1800,7 +1858,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   assert.ok(degraded);
   assert.equal((degraded.value as { readonly lifecycle?: string }).lifecycle, "degraded");
   assert.equal(first.applicationReady(), false);
-  assert.equal(firstEffects.calls.length, initialEffectCount);
+  assert.equal(consumerEffectCount(firstEffects), initialConsumerEffectCount);
   const persistedLoss = await state.read(lossKey);
   assert.deepEqual(persistedLoss?.value, {
     consumer: { applicationId, pluginId: consumerId },
@@ -1826,7 +1884,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   await first.wake();
 
   assert.deepEqual(await state.read(lossKey), persistedLoss);
-  assert.equal(firstEffects.calls.length, initialEffectCount);
+  assert.equal(consumerEffectCount(firstEffects), initialConsumerEffectCount);
   await first.stop();
 
   const recoveredEffects = new RecordingEffects();
@@ -1834,7 +1892,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   await recovered.start();
   assert.deepEqual(await state.read(lossKey), persistedLoss);
   assert.equal(recovered.applicationReady(), false);
-  assert.equal(recoveredEffects.calls.length, 0);
+  assert.equal(consumerEffectCount(recoveredEffects), 0);
 
   await state.transact({}, async (transaction) => {
     for (const desired of [providerZ, providerA]) {
@@ -1847,21 +1905,13 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   });
   state.beforeNextProviderLossCommit = async () => {
     await state.transact({}, async (transaction) => {
-      const providerKey = deploymentRecordKey(providerA);
-      const currentProvider = await transaction.get(providerKey);
-      const currentLoss = await transaction.get(lossKey);
-      assert.ok(currentProvider);
-      assert.ok(currentLoss);
+      const currentProviderInstance = await transaction.get(providerAInstance.key);
+      assert.ok(currentProviderInstance);
       await transaction.put(
-        providerKey,
-        { ...providerA, state: "disabled" },
-        {
-          expectedRevision: currentProvider.revision,
-        },
+        providerAInstance.key,
+        { ...(currentProviderInstance.value as object), lifecycle: "degraded" },
+        { expectedRevision: currentProviderInstance.revision },
       );
-      await transaction.put(lossKey, currentLoss.value, {
-        expectedRevision: currentLoss.revision,
-      });
       return null;
     });
   };
@@ -1872,12 +1922,15 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   assert.ok(stillDegraded);
   assert.equal((stillDegraded.value as { readonly lifecycle?: string }).lifecycle, "degraded");
   assert.equal(recovered.applicationReady(), false);
-  assert.equal(recoveredEffects.calls.length, 0);
+  assert.equal(consumerEffectCount(recoveredEffects), 0);
   await state.transact({}, async (transaction) => {
-    const key = deploymentRecordKey(providerA);
-    const current = await transaction.get(key);
+    const current = await transaction.get(providerAInstance.key);
     assert.ok(current);
-    await transaction.put(key, providerA, { expectedRevision: current.revision });
+    await transaction.put(
+      providerAInstance.key,
+      { ...(current.value as object), lifecycle: "ready" },
+      { expectedRevision: current.revision },
+    );
     return null;
   });
   await recovered.wake();
@@ -1891,7 +1944,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   assert.equal((readyAgain.value as { readonly lifecycle?: string }).lifecycle, "ready");
   assert.equal(await state.read(lossKey), undefined);
   assert.equal(recovered.applicationReady(), true);
-  assert.equal(recoveredEffects.calls.length, 0);
+  assert.equal(consumerEffectCount(recoveredEffects), 0);
   const recoveredObservation = [...state.records.values()].find(
     (record) =>
       record.key.collection === "deployment-observations" &&
@@ -1961,6 +2014,95 @@ test("provider loss load and parse failures preserve durable evidence", async (c
     const reconciler = new Reconciler(options(state, clock));
 
     await assert.rejects(reconciler.start(), /Persisted provider loss is invalid/);
+
+    assert.deepEqual(await state.read(lossKey), persisted);
+    await reconciler.stop();
+  });
+});
+
+test("orphan provider loss cleanup is fenced and disabled for custom deployment loaders", async (context) => {
+  const consumerId = parsePluginId("orphan-consumer");
+  const providerId = parsePluginId("orphan-provider");
+  const capability = parseCapabilityName("org.example.orphan");
+  const consumer = deployment("1", { pluginId: consumerId });
+  const lossKey: StateKey<JsonValue> = {
+    namespace: "tego",
+    collection: "provider-loss",
+    id: `${applicationId}/${consumerId}`,
+  };
+  const deploymentKey: StateKey<PluginDeployment> = {
+    namespace: "tego",
+    collection: "deployments",
+    id: `${applicationId}/${consumerId}`,
+  };
+  const persistedLoss = (clock: Clock) =>
+    ({
+      consumer: { applicationId, pluginId: consumerId },
+      deploymentGeneration: consumer.generation,
+      action: "degrade",
+      capabilities: [capability],
+      providers: [{ applicationId, pluginId: providerId }],
+      updatedAt: clock.now().toISOString(),
+    }) as const;
+  const seed = async (state: TestStateStore, clock: Clock) => {
+    await state.transact({}, async (transaction) => {
+      await transaction.put(lossKey, persistedLoss(clock), { expectedRevision: "absent" });
+      return null;
+    });
+  };
+  const options = (state: TestStateStore, clock: Clock) => ({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects: new RecordingEffects(),
+    state,
+    loadInstallations: async () => [],
+  });
+
+  await context.test("removes a loss whose consumer remains absent", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    await seed(state, clock);
+    const reconciler = new Reconciler(options(state, clock));
+
+    await reconciler.start();
+
+    assert.equal(await state.read(lossKey), undefined);
+    await reconciler.stop();
+  });
+
+  await context.test(
+    "preserves loss when the same generation is concurrently recreated",
+    async () => {
+      const clock = new ManualClock();
+      const state = await createHarnessStore(clock);
+      await seed(state, clock);
+      state.beforeNextProviderLossCommit = async () => {
+        await state.transact({}, async (transaction) => {
+          await transaction.put(deploymentKey, consumer, { expectedRevision: "absent" });
+          return null;
+        });
+      };
+      const reconciler = new Reconciler(options(state, clock));
+
+      await reconciler.start();
+
+      assert.deepEqual((await state.read(deploymentKey))?.value, consumer);
+      assert.deepEqual((await state.read(lossKey))?.value, persistedLoss(clock));
+      await reconciler.stop();
+    },
+  );
+
+  await context.test("custom deployment loaders remain non-destructive", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    await seed(state, clock);
+    const persisted = await state.read(lossKey);
+    const reconciler = new Reconciler({
+      ...options(state, clock),
+      loadDeployments: async () => [],
+    });
+
+    await reconciler.start();
 
     assert.deepEqual(await state.read(lossKey), persisted);
     await reconciler.stop();
@@ -2814,6 +2956,131 @@ test("restores persisted ready local sessions before reconciliation and requires
     "LIFECYCLE_RESTORE_FAILED",
   );
   await reconciler.stop();
+});
+
+test("degraded persisted sessions restore only when needed and require post-restore liveness", async (context) => {
+  const seedDegraded = async (state: TestStateStore) => {
+    const desired = deployment("1", { essential: true });
+    const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+    assert.ok(planned);
+    await state.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: planned.instanceId,
+        },
+        {
+          applicationId,
+          artifactDigest: digestOne,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: planned.executor,
+          instanceId: planned.instanceId,
+          lifecycle: "degraded",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+        },
+        { expectedRevision: "absent" },
+      );
+      return null;
+    });
+    return { desired, planned };
+  };
+
+  await context.test("a live degraded session is not restored on repeated wakes", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    const { desired, planned } = await seedDegraded(state);
+    const effects = new RecordingEffects();
+    effects.live.add(planned.instanceId);
+    let restores = 0;
+    effects.restore = async () => {
+      restores += 1;
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+    await reconciler.wake();
+    await reconciler.wake();
+
+    assert.equal(restores, 0);
+    await reconciler.stop();
+  });
+
+  await context.test("a restarted degraded session is restored exactly once", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    const { desired } = await seedDegraded(state);
+    const effects = new RecordingEffects();
+    let restores = 0;
+    const restore = effects.restore.bind(effects);
+    effects.restore = async (instance) => {
+      restores += 1;
+      await restore(instance);
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+    await reconciler.wake();
+    await reconciler.wake();
+
+    assert.equal(restores, 1);
+    await reconciler.stop();
+  });
+
+  await context.test("a degraded restore that stays non-live is recorded safely", async () => {
+    const clock = new ManualClock();
+    const state = await createHarnessStore(clock);
+    const { desired, planned } = await seedDegraded(state);
+    const effects = new RecordingEffects();
+    let restores = 0;
+    effects.restore = async () => {
+      restores += 1;
+    };
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+
+    await reconciler.start();
+
+    const failed = await state.read({
+      namespace: "tego",
+      collection: "component-instances",
+      id: planned.instanceId,
+    });
+    const value = failed?.value as
+      | {
+          readonly diagnostic?: { readonly code?: string };
+          readonly lifecycle?: string;
+          readonly retryAt?: string;
+        }
+      | undefined;
+    assert.equal(restores, 1);
+    assert.equal(value?.lifecycle, "degraded");
+    assert.equal(typeof value?.retryAt, "string");
+    assert.equal(value?.diagnostic?.code, "LIFECYCLE_RESTORE_FAILED");
+    await reconciler.stop();
+  });
 });
 
 test("remote restoration requires the persisted Worker to remain placement-eligible", async () => {
