@@ -5726,6 +5726,17 @@ async function createProviderLossTestFixture(
     for (const desired of [provider, consumer]) {
       await transaction.put(deploymentKey(desired), desired, { expectedRevision: "absent" });
     }
+    for (const installed of installations) {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "installations",
+          id: `${installed.pluginId}@${installed.version}@${installed.digest}`,
+        },
+        installed,
+        { expectedRevision: "absent" },
+      );
+    }
     return null;
   });
   const options = (effects: RecordingEffects) => ({
@@ -5884,9 +5895,19 @@ test("sequential provider loss upgrades one durable record after restart", async
   }
 });
 
-test("provider loss ignores current-generation activations that never reached ready", async () => {
-  for (const lifecycle of ["created", "preparing", "starting", "failed"] as const) {
-    const fixture = await createProviderLossTestFixture(`never-started-${lifecycle}`, ["suspend"]);
+test("legacy provider loss infers started only from unambiguous ready lifecycles", async () => {
+  for (const lifecycle of [
+    "created",
+    "preparing",
+    "starting",
+    "ready",
+    "degraded",
+    "draining",
+    "stopping",
+    "stopped",
+    "failed",
+  ] as const) {
+    const fixture = await createProviderLossTestFixture(`legacy-started-${lifecycle}`, ["suspend"]);
     const initialEffects = new RecordingEffects();
     const initial = new Reconciler(fixture.options(initialEffects));
     await initial.start();
@@ -5911,15 +5932,16 @@ test("provider loss ignores current-generation activations that never reached re
       const {
         completedOperationId: _completedOperationId,
         completedOperationIds: _completedOperationIds,
+        hasStarted: _hasStarted,
         ...neverStarted
       } = current.value as Record<string, JsonValue>;
       void _completedOperationId;
       void _completedOperationIds;
+      void _hasStarted;
       await transaction.put(
         consumerKey,
         {
           ...neverStarted,
-          hasStarted: false,
           lifecycle,
           ...(lifecycle === "failed"
             ? {
@@ -5938,7 +5960,12 @@ test("provider loss ignores current-generation activations that never reached re
     const restarted = new Reconciler(fixture.options(restartedEffects));
     await restarted.start();
 
-    assert.equal(await fixture.state.read(fixture.lossKey), undefined, lifecycle);
+    const expectedStarted = lifecycle === "ready" || lifecycle === "degraded";
+    assert.equal(
+      (await fixture.state.read(fixture.lossKey)) !== undefined,
+      expectedStarted,
+      lifecycle,
+    );
     assert.equal(
       (
         (await fixture.state.read(fixture.observationKey))?.value as
@@ -5948,11 +5975,74 @@ test("provider loss ignores current-generation activations that never reached re
         (
           (await fixture.state.read(fixture.observationKey))?.value as
             | { readonly status?: string }
-            | undefined
+          | undefined
         )?.status === "suspended",
-      false,
+      expectedStarted,
       lifecycle,
     );
+    await restarted.stop();
+  }
+});
+
+test("explicit hasStarted survives every lifecycle checkpoint", async () => {
+  for (const lifecycle of [
+    "created",
+    "preparing",
+    "starting",
+    "ready",
+    "degraded",
+    "draining",
+    "stopping",
+    "stopped",
+    "failed",
+  ] as const) {
+    const fixture = await createProviderLossTestFixture(`explicit-started-${lifecycle}`, [
+      "suspend",
+    ]);
+    const initialEffects = new RecordingEffects();
+    const initial = new Reconciler(fixture.options(initialEffects));
+    await initial.start();
+    const providerStart = initialEffects.calls.find(
+      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+    );
+    const consumerStart = initialEffects.calls.find(
+      (effect) => effect.pluginId === fixture.consumerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+    assert.ok(consumerStart);
+    await initial.stop();
+
+    await fixture.state.transact({}, async (transaction) => {
+      const consumerKey = {
+        namespace: "tego",
+        collection: "component-instances",
+        id: consumerStart.instanceId,
+      };
+      const current = await transaction.get(consumerKey);
+      assert.ok(current);
+      await transaction.put(
+        consumerKey,
+        {
+          ...(current.value as Record<string, JsonValue>),
+          hasStarted: true,
+          lifecycle,
+          ...(lifecycle === "failed"
+            ? {
+                retryEffect: "start",
+                retryAt: "9999-01-01T00:00:00.000Z",
+              }
+            : {}),
+        },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+    await fixture.failProvider(providerStart);
+
+    const restarted = new Reconciler(fixture.options(new RecordingEffects()));
+    await restarted.start();
+
+    assert.ok(await fixture.state.read(fixture.lossKey), lifecycle);
     await restarted.stop();
   }
 });
@@ -6037,6 +6127,66 @@ test("recovery effect is fenced by the current consumer instance revision", asyn
     [],
   );
   await reconciler.stop();
+});
+
+test("recovery execution fails closed when durable authorization records disappear", async () => {
+  for (const deletedCollection of [
+    "deployments",
+    "installations",
+    "capability-bindings",
+    "component-instances",
+    "provider-loss",
+  ] as const) {
+    const fixture = await createProviderLossTestFixture(
+      `recovery-delete-${deletedCollection}`,
+      ["suspend"],
+    );
+    const effects = new RecordingEffects();
+    const reconciler = new Reconciler(fixture.options(effects));
+    await reconciler.start();
+    const providerStart = effects.calls.find(
+      (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+    );
+    assert.ok(providerStart);
+
+    await fixture.failProvider(providerStart);
+    await reconciler.wake();
+    await fixture.recoverProvider(providerStart);
+    fixture.state.afterNextExecutingCommit = async (effect) => {
+      assert.equal(effect.pluginId, fixture.consumerId);
+      assert.equal(effect.kind, "prepare");
+      await fixture.state.transact({}, async (transaction) => {
+        const records = [];
+        for await (const record of transaction.scan({
+          namespace: "tego",
+          collection: deletedCollection,
+        })) {
+          records.push(record);
+        }
+        const targets =
+          deletedCollection === "component-instances"
+            ? records.filter((record) => record.key.id === providerStart.instanceId)
+            : records;
+        for (const record of targets) {
+          await transaction.delete(record.key, { expectedRevision: record.revision });
+        }
+        return null;
+      });
+    };
+    await reconciler.wake();
+
+    assert.deepEqual(
+      effects.calls.filter(
+        (effect) =>
+          effect.pluginId === fixture.consumerId &&
+          effect.activation === "2" &&
+          effect.kind === "prepare",
+      ),
+      [],
+      deletedCollection,
+    );
+    await reconciler.stop();
+  }
 });
 
 test("provider generation upgrade recovers the same logical provider identity", async () => {
