@@ -70,6 +70,12 @@ function normalizeWhitespace(source) {
   return source.replace(/\s+/gu, " ").trim();
 }
 
+function assertRequiredContractMarkers(source, required, document) {
+  for (const marker of required) {
+    assert.ok(source.includes(marker), `${document} must state: ${marker}`);
+  }
+}
+
 function section(source, heading) {
   const start = source.indexOf(`${heading}\n`);
   assert.notEqual(start, -1, `${heading} must exist`);
@@ -153,9 +159,10 @@ test("@spec:runtime-operations/documented-contracts/exact-operator-claims", asyn
     const source = normalizeWhitespace(await read(documents[contract.document]));
     for (const required of contract.required) {
       await t.test(`${contract.document}: ${required}`, () => {
-        assert.ok(
-          source.includes(required),
-          `${documents[contract.document]} must state: ${required}`,
+        assertRequiredContractMarkers(
+          source,
+          [required],
+          documents[contract.document],
         );
       });
     }
@@ -168,6 +175,42 @@ test("@spec:runtime-operations/documented-contracts/exact-operator-claims", asyn
       });
     }
   }
+});
+
+test("follower ingress contract rejects inverse pre-ingress and storage claims", () => {
+  const inverseFollowerIngressClaim = normalizeWhitespace(`
+    The trusted local endpoint rejects immutable artifact bytes before ingress.
+    It returns COORDINATION_NOT_LEADER, which prevents installations,
+    deployments, semantic state changes, and storage denial of service.
+    An authorized local client cannot consume artifact storage.
+  `);
+
+  assert.throws(() =>
+    assertRequiredContractMarkers(
+      inverseFollowerIngressClaim,
+      ["immutable artifact bytes", "COORDINATION_NOT_LEADER", "storage denial of service"],
+      documents.operations,
+    ),
+  );
+});
+
+test("Worker Thread contract rejects affirmative Main event-loop execution", () => {
+  const incorrectWorkerThreadClaim = normalizeWhitespace(`
+    A Worker Thread has its own JavaScript thread and event loop and executes on
+    the Main JavaScript event loop. It shares the Main operating-system process,
+    address space, privileges, and process-wide resources.
+  `);
+
+  assert.throws(() =>
+    assertRequiredContractMarkers(
+      incorrectWorkerThreadClaim,
+      [
+        "A Worker Thread has its own JavaScript thread and event loop",
+        "shares the Main operating-system process, address space, privileges, and process-wide resources",
+      ],
+      documents.architecture,
+    ),
+  );
 });
 
 test("@spec:runtime-operations/plugin-development-operations/exact-cli-inventory", async () => {
