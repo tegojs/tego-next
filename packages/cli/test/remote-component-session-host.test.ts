@@ -77,6 +77,7 @@ function binding(): ComponentBinding {
   assert.ok(component);
   return {
     instanceId: "application-default.org_dexample_dremote.echo.g1",
+    activation: "1",
     executor: "remote",
     workerId,
     artifact,

@@ -266,6 +266,23 @@ test("restores persisted preparing sessions without starting them twice", async 
   await effects.close();
 });
 
+test("termination restoration prepares held sessions without externally starting them", async () => {
+  for (const lifecycle of ["ready", "draining", "stopping"] as const) {
+    const { calls, effects, registry } = harness();
+    const termination = effects as ComponentEffects & {
+      restoreTermination(instance: ComponentInstance): Promise<void>;
+    };
+    const instance = readyInstance({ lifecycle });
+
+    await termination.restoreTermination(instance);
+
+    assert.equal(registry.require(instanceId).state, "prepared");
+    assert.deepEqual(calls, []);
+    await effects.perform(effect("stop"));
+    assert.deepEqual(calls, [`stop:${instanceId}`]);
+  }
+});
+
 test("close fences concurrent restoration and concurrent close calls share cleanup", async () => {
   const stopGate = deferred();
   const { calls, effects, registry, setStopGate } = harness();
@@ -448,6 +465,14 @@ test("suspend activation effects reject a value that differs from the immutable 
   );
   assert.equal(registry.require(instanceId).state, "prepared");
   await effects.close();
+});
+
+test("component effects reject non-canonical activation at the public boundary", async () => {
+  const { effects } = harness();
+  await assert.rejects(
+    effects.perform({ ...effect("prepare"), activation: "01" }),
+    /activation/iu,
+  );
 });
 
 test("stale deployment identity cannot operate a newly registered instance", async () => {
