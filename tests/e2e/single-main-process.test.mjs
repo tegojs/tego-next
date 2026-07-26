@@ -672,6 +672,37 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       },
     });
 
+    const followerSemanticBefore = JSON.stringify(
+      semanticSnapshotItems(await runtimeSnapshot(follower.candidate.configuration.endpoint)),
+    );
+    const leaderSemanticBefore = JSON.stringify(
+      semanticSnapshotItems(await runtimeSnapshot(leader.candidate.configuration.endpoint)),
+    );
+    assert.equal(followerSemanticBefore, leaderSemanticBefore);
+    await assert.rejects(
+      runCli([
+        "plugin",
+        "install",
+        artifactPath,
+        "--endpoint",
+        follower.candidate.configuration.endpoint,
+        "--json",
+      ]),
+      (error) => {
+        assert.equal(JSON.parse(error.stderr).diagnostic.code, "COORDINATION_NOT_LEADER");
+        return true;
+      },
+    );
+    const followerSemanticAfter = JSON.stringify(
+      semanticSnapshotItems(await runtimeSnapshot(follower.candidate.configuration.endpoint)),
+    );
+    const leaderSemanticAfter = JSON.stringify(
+      semanticSnapshotItems(await runtimeSnapshot(leader.candidate.configuration.endpoint)),
+    );
+    assert.equal(followerSemanticAfter, followerSemanticBefore);
+    assert.equal(leaderSemanticAfter, leaderSemanticBefore);
+    assert.equal(followerSemanticAfter, leaderSemanticAfter);
+
     killedLeader = leader.candidate.handle;
     process.kill(killedLeader.pid, "SIGKILL");
     await killedLeader.assertClean({ timeoutMs: processDeadlineMs });
