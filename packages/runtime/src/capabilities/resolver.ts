@@ -364,6 +364,10 @@ function providerLossDecisions(
       (candidate) => candidate.name === previous.capability,
     );
     if (consumer?.ready !== true || requirementSource === undefined) continue;
+    const explicit = ownBinding(consumer.bindings, previous.capability);
+    if (explicit !== undefined && identityKey(explicit) !== identityKey(previous.provider)) {
+      continue;
+    }
     const requirement = normalizeRequirement(requirementSource);
     const provider = byIdentity.get(identityKey(previous.provider));
     const available =
@@ -419,6 +423,12 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
   const byIdentity = new Map(
     deployments.map((deployment) => [identityKey(deployment.identity), deployment]),
   );
+  const previousByRequirement = new Map(
+    previousBindings.map((binding) => [
+      `${identityKey(binding.consumer)}/${binding.capability}`,
+      binding,
+    ]),
+  );
   const bindings: ResolvedCapabilityBinding[] = [];
   const requiredOutgoing = new Map<string, Set<string>>(
     deployments.map((deployment) => [identityKey(deployment.identity), new Set<string>()]),
@@ -431,11 +441,15 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
       compareText(left.name, right.name),
     )) {
       const requirement = normalizeRequirement(sourceRequirement);
+      const persisted = previousByRequirement.get(
+        `${identityKey(consumer.identity)}/${requirement.name}`,
+      );
       const explicit = ownBinding(consumer.bindings, requirement.name);
+      const selectedIdentity = explicit ?? persisted?.provider;
       let provider: CapabilityResolutionDeployment | undefined;
 
-      if (explicit !== undefined) {
-        provider = byIdentity.get(identityKey(explicit));
+      if (selectedIdentity !== undefined) {
+        provider = byIdentity.get(identityKey(selectedIdentity));
         if (
           provider === undefined ||
           provider.identity.applicationId !== consumer.identity.applicationId
@@ -446,7 +460,7 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
               "Explicit capability provider does not exist in the consumer application",
               consumer.identity,
               requirement.name,
-              [explicit],
+              [selectedIdentity],
             ),
           );
           continue;
@@ -477,6 +491,15 @@ export function resolveCapabilities(input: CapabilityResolutionInput): Resolutio
           continue;
         }
         if (!provider.ready) {
+          if (explicit === undefined && persisted !== undefined) {
+            bindings.push({ consumer: consumer.identity, requirement, provider: null });
+            if (!requirement.optional) {
+              requiredOutgoing
+                .get(identityKey(provider.identity))
+                ?.add(identityKey(consumer.identity));
+            }
+            continue;
+          }
           diagnostics.push(
             diagnostic(
               "CAPABILITY_EXPLICIT_PROVIDER_UNREADY",

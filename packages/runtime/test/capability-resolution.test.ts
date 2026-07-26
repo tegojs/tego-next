@@ -1,17 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type PluginDeploymentIdentity,
   parseApplicationId,
   parseCapabilityName,
   parsePluginId,
-  type PluginDeploymentIdentity,
 } from "@tegojs/contracts";
 import {
+  type CapabilityResolutionDeployment,
   isValidVersion,
   isValidVersionRange,
   resolveCapabilities,
   satisfiesVersionRange,
-  type CapabilityResolutionDeployment,
 } from "../src/index.js";
 
 const applicationId = parseApplicationId("application-01");

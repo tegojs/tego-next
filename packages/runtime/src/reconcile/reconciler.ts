@@ -1,14 +1,17 @@
 import {
   type ApplicationId,
   type ArtifactDigest,
+  type CapabilityName,
   type Clock,
   DiagnosticError,
   diagnosticCode,
   type ExecutorKind,
+  type Generation,
   type JsonObject,
   type OperationId,
   type OutboxClaim,
   type PluginDeployment,
+  type PluginDeploymentIdentity,
   type PluginInstallation,
   parseApplicationId,
   parseArtifactDigest,
@@ -20,6 +23,7 @@ import {
   parsePluginDeployment,
   parsePluginId,
   parsePluginInstallation,
+  type Revision,
   type RuntimeAuthority,
   type RuntimeDiagnostic,
   runtimeDiagnostic,
@@ -35,6 +39,7 @@ import type {
 import {
   type CapabilityResolutionDeployment,
   type PreviousCapabilityBinding,
+  type ResolvedCapabilityBinding,
   resolveCapabilities,
 } from "../capabilities/resolver.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
@@ -66,6 +71,21 @@ export interface ComponentEffectExecutor {
 
 export interface ReconcileArtifactGate {
   validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact>;
+}
+
+export interface PersistedCapabilityBinding extends JsonObject {
+  readonly consumer: PluginDeploymentIdentity;
+  readonly capability: CapabilityName;
+  readonly provider: PluginDeploymentIdentity;
+  readonly source: "automatic" | "explicit";
+  readonly deploymentGeneration: Generation;
+  readonly updatedAt: string;
+}
+
+interface LoadedCapabilityBinding {
+  readonly key: StateKey<PersistedCapabilityBinding>;
+  readonly value: PersistedCapabilityBinding;
+  readonly revision: Revision;
 }
 
 interface ComponentLifecycleExecutor {
@@ -216,6 +236,17 @@ function observationKey(deployment: PluginDeployment): StateKey<DeploymentObserv
     namespace,
     collection: "deployment-observations",
     id: deploymentKey(deployment),
+  };
+}
+
+export function capabilityBindingKey(
+  consumer: PluginDeploymentIdentity,
+  capability: CapabilityName,
+): StateKey<PersistedCapabilityBinding> {
+  return {
+    namespace,
+    collection: "capability-bindings",
+    id: `${consumer.applicationId}/${consumer.pluginId}/${capability}`,
   };
 }
 
@@ -491,10 +522,11 @@ export class Reconciler {
   async #reconcilePass(): Promise<boolean> {
     if (!this.#running) return false;
     const replanCount = this.#replanCount;
-    let [deployments, installations, loadedInstances] = await Promise.all([
+    let [deployments, installations, loadedInstances, capabilityBindings] = await Promise.all([
       this.#loadDeployments(),
       this.#loadInstallations(),
       this.#loadInstances(),
+      this.#loadCapabilityBindings(),
     ]);
     if (!this.#running) return false;
     await this.#restorePersistedComponents(deployments, installations, loadedInstances);
@@ -509,10 +541,11 @@ export class Reconciler {
     if (existingClaim !== undefined) {
       await this.#executeClaim(existingClaim);
       if (!this.#running || this.#interrupted) return false;
-      [deployments, installations, loadedInstances] = await Promise.all([
+      [deployments, installations, loadedInstances, capabilityBindings] = await Promise.all([
         this.#loadDeployments(),
         this.#loadInstallations(),
         this.#loadInstances(),
+        this.#loadCapabilityBindings(),
       ]);
       if (!this.#running) return false;
       this.#deferRetries(loadedInstances);
@@ -557,6 +590,7 @@ export class Reconciler {
         deployments,
         installations,
         canonicalInstances,
+        capabilityBindings,
       );
       if (!this.#running) return false;
       gates.set(deploymentKey(deployment), gate);
@@ -751,6 +785,21 @@ export class Reconciler {
       });
     }
     return instances;
+  }
+
+  async #loadCapabilityBindings(): Promise<readonly LoadedCapabilityBinding[]> {
+    const bindings: LoadedCapabilityBinding[] = [];
+    for await (const record of this.#options.state.scan<PersistedCapabilityBinding>({
+      namespace,
+      collection: "capability-bindings",
+    })) {
+      bindings.push({ key: record.key, value: record.value, revision: record.revision });
+    }
+    return bindings.sort((left, right) => {
+      const leftKey = left.key.id;
+      const rightKey = right.key.id;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
   }
 
   async #restorePersistedComponents(
@@ -986,7 +1035,10 @@ export class Reconciler {
     deployments: readonly PluginDeployment[],
     installations: readonly PluginInstallation[],
     instances: readonly ComponentInstance[],
+    loadedCapabilityBindings?: readonly LoadedCapabilityBinding[],
   ): Promise<ArtifactDeploymentGate | DiagnosticError> {
+    const persistedCapabilityBindings =
+      loadedCapabilityBindings ?? (await this.#loadCapabilityBindings());
     const installation = installations.find(
       (candidate) =>
         candidate.pluginId === deployment.pluginId &&
@@ -1066,6 +1118,12 @@ export class Reconciler {
         manifest: installation.manifest,
         ...(installation.signature === undefined ? {} : { signature: installation.signature }),
       };
+      await this.#persistResolvedBindings(
+        deployment,
+        installation.manifest.capabilities.requires,
+        [],
+        persistedCapabilityBindings,
+      );
       return {
         artifact,
         capabilityResolution: {
@@ -1120,16 +1178,42 @@ export class Reconciler {
         bindings: candidate.capabilityBindings,
       });
     }
-    const previousBindings: PreviousCapabilityBinding[] = deployments.flatMap((candidate) =>
-      Object.entries(candidate.capabilityBindings).map(([capability, provider]) => ({
-        consumer: {
+    const previousByRequirement = new Map<string, PreviousCapabilityBinding>();
+    for (const record of persistedCapabilityBindings) {
+      const candidate = deployments.find(
+        (desired) =>
+          desired.applicationId === record.value.consumer.applicationId &&
+          desired.pluginId === record.value.consumer.pluginId,
+      );
+      if (candidate?.generation !== record.value.deploymentGeneration) continue;
+      previousByRequirement.set(
+        `${record.value.consumer.applicationId}/${record.value.consumer.pluginId}/${record.value.capability}`,
+        {
+          consumer: record.value.consumer,
+          capability: record.value.capability,
+          provider: record.value.provider,
+        },
+      );
+    }
+    for (const candidate of deployments) {
+      for (const [capability, provider] of Object.entries(candidate.capabilityBindings)) {
+        const consumer = {
           applicationId: candidate.applicationId,
           pluginId: candidate.pluginId,
-        },
-        capability: parseCapabilityName(capability),
-        provider,
-      })),
-    );
+        };
+        const name = parseCapabilityName(capability);
+        previousByRequirement.set(`${candidate.applicationId}/${candidate.pluginId}/${name}`, {
+          consumer,
+          capability: name,
+          provider,
+        });
+      }
+    }
+    const previousBindings = [...previousByRequirement.values()].sort((left, right) => {
+      const leftKey = capabilityBindingKey(left.consumer, left.capability).id;
+      const rightKey = capabilityBindingKey(right.consumer, right.capability).id;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
     const globalCapabilityResolution = resolveCapabilities({
       deployments: capabilityDeployments,
       previousBindings,
@@ -1163,11 +1247,154 @@ export class Reconciler {
         ? {}
         : { order: globalCapabilityResolution.order }),
     };
+    await this.#persistResolvedBindings(
+      deployment,
+      artifact.manifest.capabilities.requires,
+      capabilityResolution.bindings ?? [],
+      persistedCapabilityBindings,
+    );
     const permissionDecision = validatePermissionGrant(
       artifact.manifest.permissions,
       deployment.permissionGrants,
     );
     return { artifact, capabilityResolution, permissionDecision };
+  }
+
+  async #persistResolvedBindings(
+    deployment: PluginDeployment,
+    requirements: readonly { readonly name: string }[],
+    resolvedBindings: readonly ResolvedCapabilityBinding[],
+    loadedBindings: readonly LoadedCapabilityBinding[],
+  ): Promise<void> {
+    const consumer = {
+      applicationId: deployment.applicationId,
+      pluginId: deployment.pluginId,
+    };
+    const requirementNames = new Set(requirements.map((requirement) => requirement.name));
+    const resolvedByCapability = new Map<
+      CapabilityName,
+      ResolvedCapabilityBinding & {
+        readonly provider: NonNullable<ResolvedCapabilityBinding["provider"]>;
+      }
+    >();
+    for (const binding of resolvedBindings) {
+      if (binding.provider !== null) {
+        resolvedByCapability.set(binding.requirement.name, {
+          ...binding,
+          provider: binding.provider,
+        });
+      }
+    }
+    const currentByCapability = new Map(
+      loadedBindings
+        .filter(
+          (record) =>
+            record.value.consumer.applicationId === consumer.applicationId &&
+            record.value.consumer.pluginId === consumer.pluginId,
+        )
+        .map((record) => [record.value.capability, record] as const),
+    );
+    const mutations: Array<
+      | {
+          readonly kind: "delete";
+          readonly key: StateKey<PersistedCapabilityBinding>;
+          readonly expectedRevision: Revision;
+        }
+      | {
+          readonly kind: "put";
+          readonly key: StateKey<PersistedCapabilityBinding>;
+          readonly value: PersistedCapabilityBinding;
+          readonly expectedRevision: Revision | "absent";
+        }
+    > = [];
+    const updatedAt = this.#options.clock.now().toISOString();
+
+    for (const [capability, current] of currentByCapability) {
+      const resolved = resolvedByCapability.get(capability);
+      const stale =
+        current.value.deploymentGeneration !== deployment.generation ||
+        !requirementNames.has(capability);
+      if (resolved === undefined) {
+        if (stale) {
+          mutations.push({
+            kind: "delete",
+            key: current.key,
+            expectedRevision: current.revision,
+          });
+        }
+        continue;
+      }
+      const source = Object.hasOwn(deployment.capabilityBindings, capability)
+        ? "explicit"
+        : "automatic";
+      const value: PersistedCapabilityBinding = {
+        consumer,
+        capability: resolved.requirement.name,
+        provider: resolved.provider.deployment,
+        source,
+        deploymentGeneration: deployment.generation,
+        updatedAt,
+      };
+      if (
+        !stale &&
+        current.value.provider.applicationId === value.provider.applicationId &&
+        current.value.provider.pluginId === value.provider.pluginId &&
+        current.value.source === value.source
+      ) {
+        resolvedByCapability.delete(capability);
+        continue;
+      }
+      mutations.push({
+        kind: "put",
+        key: capabilityBindingKey(consumer, resolved.requirement.name),
+        value,
+        expectedRevision: current.revision,
+      });
+      resolvedByCapability.delete(capability);
+    }
+
+    for (const [capability, resolved] of resolvedByCapability) {
+      const source = Object.hasOwn(deployment.capabilityBindings, capability)
+        ? "explicit"
+        : "automatic";
+      mutations.push({
+        kind: "put",
+        key: capabilityBindingKey(consumer, resolved.requirement.name),
+        value: {
+          consumer,
+          capability: resolved.requirement.name,
+          provider: resolved.provider.deployment,
+          source,
+          deploymentGeneration: deployment.generation,
+          updatedAt,
+        },
+        expectedRevision: "absent",
+      });
+    }
+    if (mutations.length === 0) return;
+    mutations.sort((left, right) =>
+      left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
+    );
+    try {
+      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+        for (const mutation of mutations) {
+          if (mutation.kind === "delete") {
+            await transaction.delete(mutation.key, {
+              expectedRevision: mutation.expectedRevision,
+            });
+          } else {
+            await transaction.put(mutation.key, mutation.value, {
+              expectedRevision: mutation.expectedRevision,
+            });
+          }
+        }
+        return null;
+      });
+      this.#lastCommitAuthority = this.#options.authority;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+    }
   }
 
   async #recordBlocked(

@@ -1145,9 +1145,8 @@ test("automatic capability binding is persisted without revision churn or provid
     updatedAt: clock.now().toISOString(),
   });
   assert.equal(
-    [...state.records.values()].filter(
-      (record) => record.key.collection === "capability-bindings",
-    ).length,
+    [...state.records.values()].filter((record) => record.key.collection === "capability-bindings")
+      .length,
     1,
   );
   assert.deepEqual(consumer.capabilityBindings, {});
