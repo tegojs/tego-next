@@ -5991,6 +5991,51 @@ test("recovery start is reauthorized after its executing journal commit", async 
   await reconciler.stop();
 });
 
+test("recovery effect is fenced by the current consumer instance revision", async () => {
+  const fixture = await createProviderLossTestFixture("recovery-instance-fence", ["suspend"]);
+  const effects = new RecordingEffects();
+  const reconciler = new Reconciler(fixture.options(effects));
+  await reconciler.start();
+  const providerStart = effects.calls.find(
+    (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+  );
+  assert.ok(providerStart);
+
+  await fixture.failProvider(providerStart);
+  await reconciler.wake();
+  await fixture.recoverProvider(providerStart);
+  fixture.state.afterNextExecutingCommit = async (effect) => {
+    assert.equal(effect.pluginId, fixture.consumerId);
+    const key = {
+      namespace: "tego",
+      collection: "component-instances",
+      id: effect.instanceId,
+    };
+    await fixture.state.transact({}, async (transaction) => {
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        { ...(current.value as Record<string, JsonValue>), lifecycle: "stopped" },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+  };
+  await reconciler.wake();
+
+  assert.equal(
+    effects.calls.some(
+      (effect) =>
+        effect.pluginId === fixture.consumerId &&
+        effect.activation === "2" &&
+        effect.kind === "prepare",
+    ),
+    false,
+  );
+  await reconciler.stop();
+});
+
 test("provider generation upgrade recovers the same logical provider identity", async () => {
   for (const policy of ["degrade", "suspend"] as const) {
     const fixture = await createProviderLossTestFixture(`generation-upgrade-${policy}`, [policy]);
