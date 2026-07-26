@@ -48,6 +48,7 @@ export interface ComponentInstance extends JsonObject {
   readonly instanceId: string;
   readonly activation: Activation;
   readonly legacyActivation?: boolean;
+  readonly hasStarted?: boolean;
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
   readonly componentId: ComponentId;

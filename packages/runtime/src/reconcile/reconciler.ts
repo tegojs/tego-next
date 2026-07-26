@@ -187,6 +187,7 @@ export interface ReconcilerOptions {
 interface PersistedComponentInstance extends JsonObject {
   readonly instanceId: string;
   readonly activation?: Activation;
+  readonly hasStarted?: boolean;
   readonly applicationId: ApplicationId;
   readonly pluginId: ComponentInstance["pluginId"];
   readonly componentId: ComponentInstance["componentId"];
@@ -206,6 +207,17 @@ interface PersistedComponentInstance extends JsonObject {
 
 function parsePersistedActivation(instance: PersistedComponentInstance): Activation {
   return parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1");
+}
+
+function hasStarted(instance: PersistedComponentInstance): boolean {
+  if (instance.hasStarted !== undefined) return instance.hasStarted;
+  return (
+    instance.lifecycle === "ready" ||
+    instance.lifecycle === "degraded" ||
+    instance.lifecycle === "draining" ||
+    instance.lifecycle === "stopping" ||
+    instance.lifecycle === "stopped"
+  );
 }
 
 interface LoadedComponentInstance {
@@ -2292,7 +2304,11 @@ export class Reconciler {
           pluginId: candidate.pluginId,
         },
         activated: candidateInstallation.manifest.components.every((component) =>
-          candidateInstances.some((instance) => instance.componentId === component.componentId),
+          candidateInstances.some(
+            (instance) =>
+              instance.componentId === component.componentId &&
+              hasStarted(instance as PersistedComponentInstance),
+          ),
         ),
         ready:
           candidate.state === "active" &&
@@ -2632,6 +2648,7 @@ export class Reconciler {
       instance = {
         instanceId: step.instanceId,
         ...(step.legacyActivation === true ? {} : { activation: step.effect.activation }),
+        hasStarted: false,
         applicationId: step.effect.applicationId,
         pluginId: step.effect.pluginId,
         componentId: step.effect.componentId,
@@ -3066,6 +3083,7 @@ export class Reconciler {
             {
               ...stable,
               lifecycle,
+              ...(effect.kind === "start" ? { hasStarted: true } : {}),
               observedGeneration: effect.deploymentGeneration,
               completedOperationId: effect.operationId,
               completedOperationIds,

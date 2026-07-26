@@ -5866,6 +5866,7 @@ test("provider loss ignores current-generation activations that never reached re
         consumerKey,
         {
           ...neverStarted,
+          hasStarted: false,
           lifecycle,
           ...(lifecycle === "failed"
             ? {
