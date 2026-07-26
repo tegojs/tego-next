@@ -137,6 +137,16 @@ test("GitHub CI declares quality, PostgreSQL integration, and process E2E gates"
       `${name} CI must retain process diagnostics for upload`,
     );
   }
+  assert.ok(
+    integrationJob.indexOf("TEGO_TEST_ARTIFACTS_DIR:") >
+      integrationJob.indexOf("- name: Run integration tests"),
+    "PostgreSQL diagnostic paths must be resolved inside a runner step",
+  );
+  assert.ok(
+    processE2eJob.indexOf("TEGO_TEST_ARTIFACTS_DIR:") >
+      processE2eJob.indexOf("- name: Run real-process system tests"),
+    "process E2E diagnostic paths must be resolved inside a runner step",
+  );
   const integrationBuild = integrationJob.indexOf("run: npm run build");
   const integrationTests = integrationJob.indexOf("run: npm run test:integration");
   assert.notEqual(integrationBuild, -1, "PostgreSQL CI must build workspace packages");

@@ -51,8 +51,6 @@ jobs:
     name: PostgreSQL integration
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
     services:
       postgres:
         image: postgres:16.14-alpine
@@ -83,12 +81,13 @@ jobs:
         run: npm run test:integration
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:5432/tego_next_test
+          TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
       - name: Upload integration diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: postgres-integration-diagnostics
-          path: ${{ env.TEGO_TEST_ARTIFACTS_DIR }}
+          path: ${{ runner.temp }}/tego-test-artifacts
           if-no-files-found: ignore
           retention-days: 7
 
@@ -96,8 +95,6 @@ jobs:
     name: Main and Worker process E2E
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
     services:
       postgres:
         image: postgres:16.14-alpine
@@ -128,11 +125,12 @@ jobs:
         run: npm run test:e2e
         env:
           TEGO_POSTGRES_URL: postgresql://tego_test:tego_test@127.0.0.1:5432/tego_next_test
+          TEGO_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/tego-test-artifacts
       - name: Upload process diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: process-e2e-diagnostics
-          path: ${{ env.TEGO_TEST_ARTIFACTS_DIR }}
+          path: ${{ runner.temp }}/tego-test-artifacts
           if-no-files-found: ignore
           retention-days: 7
