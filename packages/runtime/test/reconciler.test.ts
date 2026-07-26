@@ -1233,8 +1233,7 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
     ...manifest("1.0.0", digestOne),
     pluginId: targetPluginId,
     components,
-    permissions:
-      components.length === 0 ? [] : [{ kind: "executor", executors: ["process"] }],
+    permissions: components.length === 0 ? [] : [{ kind: "executor", executors: ["process"] }],
     capabilities: { provides, requires },
   });
   const providerAManifest = capabilityManifest(
@@ -1359,9 +1358,7 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
 
   assert.deepEqual((await state.read(bindingKey))?.value, winningBinding);
   assert.equal(
-    effects.performed.some(
-      (effect) => effect.pluginId === consumerId && effect.kind === "start",
-    ),
+    effects.performed.some((effect) => effect.pluginId === consumerId && effect.kind === "start"),
     true,
   );
   assert.deepEqual(replanned.diagnostics(), []);

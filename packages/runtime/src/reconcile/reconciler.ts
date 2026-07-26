@@ -73,7 +73,7 @@ export interface ReconcileArtifactGate {
   validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact>;
 }
 
-export interface PersistedCapabilityBinding extends JsonObject {
+interface PersistedCapabilityBinding extends JsonObject {
   readonly consumer: PluginDeploymentIdentity;
   readonly capability: CapabilityName;
   readonly provider: PluginDeploymentIdentity;
@@ -239,7 +239,7 @@ function observationKey(deployment: PluginDeployment): StateKey<DeploymentObserv
   };
 }
 
-export function capabilityBindingKey(
+function capabilityBindingKey(
   consumer: PluginDeploymentIdentity,
   capability: CapabilityName,
 ): StateKey<PersistedCapabilityBinding> {
@@ -249,6 +249,8 @@ export function capabilityBindingKey(
     id: `${consumer.applicationId}/${consumer.pluginId}/${capability}`,
   };
 }
+
+const capabilityBindingConflict = Symbol("capability-binding-conflict");
 
 function conflictCode(error: unknown): string | undefined {
   return (
@@ -529,6 +531,10 @@ export class Reconciler {
       this.#loadCapabilityBindings(),
     ]);
     if (!this.#running) return false;
+    if (!(await this.#cleanupCapabilityBindings(deployments, capabilityBindings))) return true;
+    capabilityBindings = capabilityBindings.filter((record) =>
+      this.#isCurrentCapabilityBinding(record, deployments),
+    );
     await this.#restorePersistedComponents(deployments, installations, loadedInstances);
     if (!this.#running) return false;
     loadedInstances = await this.#loadInstances();
@@ -539,7 +545,7 @@ export class Reconciler {
     const existingClaim = await this.#claimNext();
     let performedImmediateWork = existingClaim !== undefined;
     if (existingClaim !== undefined) {
-      await this.#executeClaim(existingClaim);
+      if ((await this.#executeClaim(existingClaim)) === capabilityBindingConflict) return true;
       if (!this.#running || this.#interrupted) return false;
       [deployments, installations, loadedInstances, capabilityBindings] = await Promise.all([
         this.#loadDeployments(),
@@ -548,6 +554,10 @@ export class Reconciler {
         this.#loadCapabilityBindings(),
       ]);
       if (!this.#running) return false;
+      if (!(await this.#cleanupCapabilityBindings(deployments, capabilityBindings))) return true;
+      capabilityBindings = capabilityBindings.filter((record) =>
+        this.#isCurrentCapabilityBinding(record, deployments),
+      );
       this.#deferRetries(loadedInstances);
       this.#deployments = deployments;
     }
@@ -593,6 +603,7 @@ export class Reconciler {
         capabilityBindings,
       );
       if (!this.#running) return false;
+      if (gate === capabilityBindingConflict) return true;
       gates.set(deploymentKey(deployment), gate);
       if (!(gate instanceof DiagnosticError)) {
         for (const [index, identity] of (gate.capabilityResolution.order ?? []).entries()) {
@@ -693,7 +704,7 @@ export class Reconciler {
       const claim = await this.#claimNext();
       if (claim !== undefined) {
         performedImmediateWork = true;
-        await this.#executeClaim(claim);
+        if ((await this.#executeClaim(claim)) === capabilityBindingConflict) return true;
       }
     }
     if (!this.#running || this.#interrupted) return false;
@@ -800,6 +811,42 @@ export class Reconciler {
       const rightKey = right.key.id;
       return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
     });
+  }
+
+  #isCurrentCapabilityBinding(
+    record: LoadedCapabilityBinding,
+    deployments: readonly PluginDeployment[],
+  ): boolean {
+    return deployments.some(
+      (deployment) =>
+        deployment.applicationId === record.value.consumer.applicationId &&
+        deployment.pluginId === record.value.consumer.pluginId &&
+        deployment.generation === record.value.deploymentGeneration,
+    );
+  }
+
+  async #cleanupCapabilityBindings(
+    deployments: readonly PluginDeployment[],
+    loadedBindings: readonly LoadedCapabilityBinding[],
+  ): Promise<boolean> {
+    const staleBindings = loadedBindings.filter(
+      (record) => !this.#isCurrentCapabilityBinding(record, deployments),
+    );
+    if (staleBindings.length === 0) return true;
+    try {
+      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+        for (const record of staleBindings) {
+          await transaction.delete(record.key, { expectedRevision: record.revision });
+        }
+        return null;
+      });
+      this.#lastCommitAuthority = this.#options.authority;
+      return true;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+      return false;
+    }
   }
 
   async #restorePersistedComponents(
@@ -1036,7 +1083,7 @@ export class Reconciler {
     installations: readonly PluginInstallation[],
     instances: readonly ComponentInstance[],
     loadedCapabilityBindings?: readonly LoadedCapabilityBinding[],
-  ): Promise<ArtifactDeploymentGate | DiagnosticError> {
+  ): Promise<ArtifactDeploymentGate | DiagnosticError | typeof capabilityBindingConflict> {
     const persistedCapabilityBindings =
       loadedCapabilityBindings ?? (await this.#loadCapabilityBindings());
     const installation = installations.find(
@@ -1118,12 +1165,16 @@ export class Reconciler {
         manifest: installation.manifest,
         ...(installation.signature === undefined ? {} : { signature: installation.signature }),
       };
-      await this.#persistResolvedBindings(
-        deployment,
-        installation.manifest.capabilities.requires,
-        [],
-        persistedCapabilityBindings,
-      );
+      if (
+        !(await this.#persistResolvedBindings(
+          deployment,
+          installation.manifest.capabilities.requires,
+          [],
+          persistedCapabilityBindings,
+        ))
+      ) {
+        return capabilityBindingConflict;
+      }
       return {
         artifact,
         capabilityResolution: {
@@ -1247,12 +1298,16 @@ export class Reconciler {
         ? {}
         : { order: globalCapabilityResolution.order }),
     };
-    await this.#persistResolvedBindings(
-      deployment,
-      artifact.manifest.capabilities.requires,
-      capabilityResolution.bindings ?? [],
-      persistedCapabilityBindings,
-    );
+    if (
+      !(await this.#persistResolvedBindings(
+        deployment,
+        artifact.manifest.capabilities.requires,
+        capabilityResolution.bindings ?? [],
+        persistedCapabilityBindings,
+      ))
+    ) {
+      return capabilityBindingConflict;
+    }
     const permissionDecision = validatePermissionGrant(
       artifact.manifest.permissions,
       deployment.permissionGrants,
@@ -1265,7 +1320,7 @@ export class Reconciler {
     requirements: readonly { readonly name: string }[],
     resolvedBindings: readonly ResolvedCapabilityBinding[],
     loadedBindings: readonly LoadedCapabilityBinding[],
-  ): Promise<void> {
+  ): Promise<boolean> {
     const consumer = {
       applicationId: deployment.applicationId,
       pluginId: deployment.pluginId,
@@ -1371,7 +1426,7 @@ export class Reconciler {
         expectedRevision: "absent",
       });
     }
-    if (mutations.length === 0) return;
+    if (mutations.length === 0) return true;
     mutations.sort((left, right) =>
       left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
     );
@@ -1391,9 +1446,11 @@ export class Reconciler {
         return null;
       });
       this.#lastCommitAuthority = this.#options.authority;
+      return true;
     } catch (error) {
       if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
       this.#replanCount += 1;
+      return false;
     }
   }
 
@@ -1578,7 +1635,7 @@ export class Reconciler {
     return instance.lifecycle;
   }
 
-  async #executeClaim(claim: OutboxClaim): Promise<void> {
+  async #executeClaim(claim: OutboxClaim): Promise<undefined | typeof capabilityBindingConflict> {
     if (!this.#running) return;
     let effect: ReconcileEffect;
     try {
@@ -1650,11 +1707,16 @@ export class Reconciler {
     const instances = loadedInstances
       .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value);
-    let currentGate: ArtifactDeploymentGate | DiagnosticError | undefined;
+    let currentGate:
+      | ArtifactDeploymentGate
+      | DiagnosticError
+      | typeof capabilityBindingConflict
+      | undefined;
     if (desired !== undefined) {
       currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
     }
     if (!this.#running) return;
+    if (currentGate === capabilityBindingConflict) return capabilityBindingConflict;
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
