@@ -1,11 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: Uniform executor contract
-Thread, process, and remote executors SHALL implement the same probe, submit, observe, cancel, drain, and health behavior for one execution request and result contract.
+Thread, process, and remote executors SHALL implement the same probe, submit, observe, cancel, drain, and health behavior for one execution request and result contract. At task admission, the runtime SHALL construct, canonicalize, fingerprint, and persist one immutable execution binding containing the target configuration, effective permission grants, capability definitions, and durable capability bindings. Restart dispatch SHALL reuse that binding, every executor boundary SHALL validate it against the target generation and artifact digest, and Workers SHALL consume it verbatim without synthesizing topology-specific configuration or grants.
 
 #### Scenario: Run one component on every executor
 - **WHEN** the same echo component and input are submitted to thread, process, and remote executors
 - **THEN** each returns the same successful logical output with executor-specific metadata only
+
+#### Scenario: Thread, process, and remote receive one identical immutable execution binding
+- **WHEN** one component is admitted with the same target and deployment evidence for execution through thread, process, and remote executors
+- **THEN** every executor receives the identical persisted configuration, grants, capability definitions, capability bindings, and fingerprint, and rejects a binding that does not match the target generation or artifact digest
 
 ### Requirement: Stable task and attempt identity
 Every execution SHALL use a stable task ID and a unique attempt ID, and duplicate submission of the same pair SHALL NOT execute component logic twice.

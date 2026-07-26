@@ -12,7 +12,7 @@ The transport SHALL establish the same authenticated logical Worker session whet
 - **THEN** the peer closes the session before accepting registration or task messages
 
 ### Requirement: Versioned reliable message envelope
-Every protocol message SHALL include protocol version, message ID, session ID, sequence, type, and correlation identity, and the receiver SHALL reject unsupported protocol versions or a missing correlation identity. A one-way or request envelope SHALL self-correlate, and a response SHALL correlate to its request.
+Every protocol message SHALL include protocol version, message ID, session ID, sequence, type, and correlation identity, and the receiver SHALL reject unsupported protocol versions or a missing correlation identity. A one-way or request envelope SHALL self-correlate, and a response SHALL correlate to its request. Replay retention SHALL associate each accepted message ID with a canonical content fingerprint: an identical replay MAY be ignored or return the existing outcome, while reuse of that message ID with different canonical envelope content SHALL close the session with a structured protocol violation.
 
 #### Scenario: Unsupported protocol version
 - **WHEN** a peer sends an envelope with an unsupported major protocol version
@@ -29,6 +29,10 @@ Every protocol message SHALL include protocol version, message ID, session ID, s
 #### Scenario: Missing correlation identity
 - **WHEN** a peer sends a protocol-1.0 envelope without `correlationId`
 - **THEN** the receiver rejects the envelope as an invalid protocol message
+
+#### Scenario: Same-message-ID replay with different content is rejected
+- **WHEN** a peer reuses an accepted message ID in the same session with different canonical envelope content
+- **THEN** the receiver rejects the equivocation and closes the session with a structured protocol violation while an identical replay remains deduplicated
 
 ### Requirement: Worker liveness and capabilities
 The Worker SHALL register labels, resources, executors, and prepared artifacts and SHALL renew liveness through heartbeat messages.
