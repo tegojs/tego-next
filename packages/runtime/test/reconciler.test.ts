@@ -660,6 +660,9 @@ class TestStateStore implements StateStore {
       }
     | undefined;
   beforeNextProviderLossCommit: (() => Promise<void>) | undefined;
+  afterNextExecutingCommit:
+    | ((effect: ReconcileEffect) => Promise<void>)
+    | undefined;
   capabilityBindingRaceWinner:
     | {
         readonly key: StateKey<JsonValue>;
@@ -862,6 +865,14 @@ class TestStateStore implements StateStore {
       if (existing === undefined || existing.acknowledgement?.outcome === "retry") {
         this.outbox.set(message.messageId, { attempt: 0, message });
       }
+    }
+    const executing = operations.find((operation) => operation.status === "executing")?.state as
+      | ReconcileEffect
+      | undefined;
+    if (executing !== undefined && this.afterNextExecutingCommit !== undefined) {
+      const afterCommit = this.afterNextExecutingCommit;
+      this.afterNextExecutingCommit = undefined;
+      await afterCommit(executing);
     }
     void options;
     return structuredClone(result);
@@ -5902,6 +5913,40 @@ test("provider loss ignores current-generation activations that never reached re
     );
     await restarted.stop();
   }
+});
+
+test("recovery start is reauthorized after its executing journal commit", async () => {
+  const fixture = await createProviderLossTestFixture("recovery-execution-fence", ["suspend"]);
+  const effects = new RecordingEffects();
+  const reconciler = new Reconciler(fixture.options(effects));
+  await reconciler.start();
+  const providerStart = effects.calls.find(
+    (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+  );
+  assert.ok(providerStart);
+
+  await fixture.failProvider(providerStart);
+  await reconciler.wake();
+  await fixture.recoverProvider(providerStart);
+  fixture.state.afterNextExecutingCommit = async (effect) => {
+    assert.equal(effect.pluginId, fixture.consumerId);
+    assert.equal(effect.kind, "prepare");
+    await fixture.failProvider(providerStart);
+  };
+  await reconciler.wake();
+
+  assert.equal(
+    effects.calls.some(
+      (effect) =>
+        effect.pluginId === fixture.consumerId &&
+        effect.activation === "2" &&
+        effect.kind === "prepare",
+    ),
+    false,
+  );
+  const loss = await fixture.state.read(fixture.lossKey);
+  assert.equal((loss?.value as { readonly action?: string } | undefined)?.action, "suspend");
+  await reconciler.stop();
 });
 
 test("provider generation upgrade recovers the same logical provider identity", async () => {
