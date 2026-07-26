@@ -1,11 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: Separate desired and observed plugin state
-The runtime SHALL persist mutable `PluginDeployment` desired state separately from immutable manifests and installations, and SHALL track an observed generation for every component instance.
+The runtime SHALL persist mutable `PluginDeployment` desired state separately from immutable manifests and installations, and SHALL track an observed generation and activation for every component instance. An activation SHALL be a persisted unsigned decimal string scoped within `(applicationId, pluginId, componentId, generation)`, SHALL participate in stable instance, operation, and message identities, and MAY have a `suspended` observation.
 
 #### Scenario: Deployment generation changes
 - **WHEN** an administrator changes a deployment
 - **THEN** its generation increments and old instances remain out of date until they report the new observed generation
+
+#### Scenario: Activation identity is persisted
+- **WHEN** the reconciler creates a component activation for a desired deployment generation
+- **THEN** its unsigned decimal activation string is persisted within `(applicationId, pluginId, componentId, generation)` and is used by stable instance, operation, and message identities
+
+#### Scenario: Suspended activation is observed
+- **WHEN** a running activation is suspended for provider loss
+- **THEN** its observed component state records `suspended` without changing the desired generation
 
 ### Requirement: Pre-execution deployment gate
 The reconciler SHALL validate artifact availability, runtime compatibility, capability bindings, permission grants, dependency cycles, placement, and executor support before loading plugin code.

@@ -12,11 +12,23 @@ The transport SHALL establish the same authenticated logical Worker session whet
 - **THEN** the peer closes the session before accepting registration or task messages
 
 ### Requirement: Versioned reliable message envelope
-Every protocol message SHALL include protocol version, message ID, session ID, sequence, type, and correlation identity, and the receiver SHALL reject unsupported protocol versions.
+Every protocol message SHALL include protocol version, message ID, session ID, sequence, type, and correlation identity, and the receiver SHALL reject unsupported protocol versions or a missing correlation identity. A one-way or request envelope SHALL self-correlate, and a response SHALL correlate to its request.
 
 #### Scenario: Unsupported protocol version
 - **WHEN** a peer sends an envelope with an unsupported major protocol version
 - **THEN** the session closes with a structured incompatibility reason
+
+#### Scenario: One-way message self-correlates
+- **WHEN** either peer sends a one-way or request envelope
+- **THEN** `correlationId` equals that envelope's `messageId`
+
+#### Scenario: Response correlates to request
+- **WHEN** a peer sends a response to a received request
+- **THEN** the response `correlationId` equals the request `messageId`
+
+#### Scenario: Missing correlation identity
+- **WHEN** a peer sends a protocol-1.0 envelope without `correlationId`
+- **THEN** the receiver rejects the envelope as an invalid protocol message
 
 ### Requirement: Worker liveness and capabilities
 The Worker SHALL register labels, resources, executors, and prepared artifacts and SHALL renew liveness through heartbeat messages.

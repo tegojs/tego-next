@@ -8,11 +8,15 @@ The CLI SHALL start, inspect, and stop a local runtime and SHALL return machine-
 - **THEN** the CLI returns runtime identity, mode, liveness, readiness, driver health, deployment counts, Worker counts, and task counts
 
 ### Requirement: Plugin development operations
-The CLI SHALL validate, pack, inspect, install, deploy, and report status for a plugin using the same contracts as the kernel.
+The CLI SHALL validate, pack, inspect, install, deploy, and report status for a plugin using the same contracts as the kernel. In multi-Main mode, a follower MAY admit immutable content-addressed artifact bytes from a trusted local `plugin install` request, but it SHALL NOT create or change installation, deployment, operation, or task state without fenced leader authority.
 
 #### Scenario: Validate before pack
 - **WHEN** an invalid plugin project is passed to `tego plugin pack`
 - **THEN** the command fails with manifest and build diagnostics and creates no artifact
+
+#### Scenario: Follower receives immutable artifact ingress
+- **WHEN** a trusted local client sends `plugin install <path>` to a multi-Main follower
+- **THEN** content-addressed artifact bytes may be ingested, installation and deployment records do not change, and the operation returns a not-leader diagnostic
 
 ### Requirement: Task operations
 The CLI SHALL run, inspect, wait for, and cancel tasks while preserving structured outputs and terminal error details.
