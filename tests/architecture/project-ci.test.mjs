@@ -67,7 +67,7 @@ test("TypeScript workspaces reference every internal build dependency", async ()
   }
 });
 
-test("GitHub CI declares quality, PostgreSQL integration, and process E2E gates", async () => {
+test("GitHub CI declares quality, integration, and system E2E gates", async () => {
   assert.equal(existsSync(workflowUrl), true, "CI workflow must exist");
   const workflow = await readFile(workflowUrl, "utf8");
 
@@ -77,8 +77,8 @@ test("GitHub CI declares quality, PostgreSQL integration, and process E2E gates"
     "workflow_dispatch:",
     "contents: read",
     "quality:",
-    "postgres-integration:",
-    "process-e2e:",
+    "integration:",
+    "system-e2e:",
     "timeout-minutes:",
     "actions/checkout@v6",
     "actions/setup-node@v6",
@@ -108,13 +108,13 @@ test("GitHub CI declares quality, PostgreSQL integration, and process E2E gates"
 
   const qualityJob = workflow.slice(
     workflow.indexOf("quality:"),
-    workflow.indexOf("postgres-integration:"),
+    workflow.indexOf("integration:"),
   );
   const integrationJob = workflow.slice(
-    workflow.indexOf("postgres-integration:"),
-    workflow.indexOf("process-e2e:"),
+    workflow.indexOf("integration:"),
+    workflow.indexOf("system-e2e:"),
   );
-  const processE2eJob = workflow.slice(workflow.indexOf("process-e2e:"));
+  const processE2eJob = workflow.slice(workflow.indexOf("system-e2e:"));
   for (const [name, job] of [
     ["quality", qualityJob],
     ["PostgreSQL integration", integrationJob],
