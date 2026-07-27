@@ -491,6 +491,76 @@ test("CI reporter reaps a background process after its successful parent exits",
   }
 });
 
+test("managed runner proves Windows normal-close tree cleanup before success", async () => {
+  const { runManagedProcessTree } = await import(
+    new URL(`../../scripts/run-ci-test.mjs?windows-tree=${Date.now()}`, import.meta.url)
+  );
+  const events = [];
+  let descendantAlive = true;
+  const metadata = await runManagedProcessTree({
+    name: "windows-proven-tree",
+    command: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    timeoutMs: 1_000,
+    platform: "win32",
+    windowsTreeStrategy: {
+      async probe(processId) {
+        events.push(`probe:${processId}:${descendantAlive}`);
+        return !descendantAlive;
+      },
+      async terminate(processId, signal) {
+        events.push(`terminate:${processId}:${signal}`);
+        descendantAlive = false;
+        return true;
+      },
+    },
+  });
+
+  assert.equal(metadata.timedOut, false);
+  assert.equal(metadata.childExitCode, 0);
+  assert.equal(metadata.exitCode, 0);
+  assert.equal(metadata.processTreeTerminated, true);
+  assert.equal(metadata.terminationSignal, "SIGTERM");
+  assert.deepEqual(
+    events.map((event) => event.replace(/:\d+:/u, ":pid:")),
+    ["probe:pid:true", "terminate:pid:SIGTERM", "probe:pid:false"],
+  );
+});
+
+test("managed runner fails closed when Windows tree termination cannot be proven", async () => {
+  const { runManagedProcessTree } = await import(
+    new URL(`../../scripts/run-ci-test.mjs?windows-tree-failure=${Date.now()}`, import.meta.url)
+  );
+  const events = [];
+  const metadata = await runManagedProcessTree({
+    name: "windows-unproven-tree",
+    command: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    timeoutMs: 1_000,
+    platform: "win32",
+    windowsTreeStrategy: {
+      async probe(processId) {
+        events.push(`probe:${processId}`);
+        return false;
+      },
+      async terminate(processId, signal) {
+        events.push(`terminate:${processId}:${signal}`);
+        return false;
+      },
+    },
+  });
+
+  assert.equal(metadata.timedOut, false);
+  assert.equal(metadata.childExitCode, 0);
+  assert.equal(metadata.exitCode, 125);
+  assert.equal(metadata.processTreeTerminated, false);
+  assert.match(metadata.error, /process tree did not terminate/iu);
+  assert.deepEqual(
+    events.map((event) => event.replace(/:\d+/u, ":pid")),
+    ["probe:pid", "terminate:pid:SIGTERM", "probe:pid"],
+  );
+});
+
 test("release verification bounds stages and reports deterministic process metadata", async () => {
   const { runReleaseCommand } = await import(
     new URL(`../../scripts/verify-release.mjs?command=${Date.now()}`, import.meta.url)
