@@ -5514,7 +5514,7 @@ test("retry deadlines follow authoritative cluster time across a skewed authorit
 
   const untilRetry = Date.parse(retryAt as string) - Date.parse(await clusterTime.now());
   stateClock.advance(untilRetry);
-  clusterTime.advance(untilRetry);
+  clusterTime.advance(untilRetry - 1);
   const replacementEffects = new RecordingEffects();
   const replacement = new Reconciler({
     artifactGate: { validate: async () => gate().artifact },
