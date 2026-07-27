@@ -4487,7 +4487,7 @@ test("restoration skips ready instances whose observed generation is stale", asy
   await reconciler.stop();
 });
 
-test("recovery restoration reauthorizes the full required provider set after its snapshot", async () => {
+test("recovery restoration invalidates its activation when durable providers change", async () => {
   const clock = new ManualClock();
   const state = await createHarnessStore(clock);
   const providerAId = parsePluginId("full-set-provider-a");
@@ -4743,7 +4743,19 @@ test("recovery restoration reauthorizes the full required provider set after its
         })
       )?.value as { readonly lifecycle?: string } | undefined
     )?.lifecycle,
-    "preparing",
+    "stopped",
+  );
+  assert.equal(
+    (
+      (
+        await state.read({
+          namespace: "tego",
+          collection: "provider-loss",
+          id: `${applicationId}/${consumerId}`,
+        })
+      )?.value as { readonly recoveryActivations?: Readonly<Record<string, string>> } | undefined
+    )?.recoveryActivations,
+    undefined,
   );
   await reconciler.stop();
 });
@@ -6018,6 +6030,65 @@ test("recovery effect is fenced by the current consumer instance revision", asyn
         effect.kind === "prepare",
     ),
     [],
+  );
+  await reconciler.stop();
+});
+
+test("recovery claim replans when its exact instance receives a legal revision", async () => {
+  const fixture = await createProviderLossTestFixture("recovery-instance-retry", ["suspend"]);
+  const effects = new RecordingEffects();
+  const reconciler = new Reconciler(fixture.options(effects));
+  await reconciler.start();
+  const providerStart = effects.calls.find(
+    (effect) => effect.pluginId === fixture.providerId && effect.kind === "start",
+  );
+  assert.ok(providerStart);
+
+  await fixture.failProvider(providerStart);
+  await reconciler.wake();
+  await fixture.recoverProvider(providerStart);
+  fixture.state.afterNextExecutingCommit = async (effect) => {
+    assert.equal(effect.pluginId, fixture.consumerId);
+    assert.equal(effect.kind, "prepare");
+    const key = {
+      namespace: "tego",
+      collection: "component-instances",
+      id: effect.instanceId,
+    };
+    await fixture.state.transact({}, async (transaction) => {
+      const current = await transaction.get(key);
+      assert.ok(current);
+      await transaction.put(
+        key,
+        {
+          ...(current.value as Record<string, JsonValue>),
+          hasStarted: false,
+        },
+        { expectedRevision: current.revision },
+      );
+      return null;
+    });
+  };
+  await reconciler.wake();
+
+  assert.equal(
+    effects.calls.filter(
+      (effect) =>
+        effect.pluginId === fixture.consumerId &&
+        effect.activation === "2" &&
+        effect.kind === "prepare",
+    ).length,
+    1,
+  );
+  await reconciler.wake();
+  assert.equal(
+    effects.calls.filter(
+      (effect) =>
+        effect.pluginId === fixture.consumerId &&
+        effect.activation === "2" &&
+        effect.kind === "prepare",
+    ).length,
+    1,
   );
   await reconciler.stop();
 });

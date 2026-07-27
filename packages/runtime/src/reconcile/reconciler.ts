@@ -116,6 +116,8 @@ interface ProviderReadinessSnapshot {
   readonly ready: boolean;
 }
 
+type RecoveryEffectAuthorization = "abandoned" | "authorized" | "retry" | "superseded";
+
 interface ComponentLifecycleExecutor {
   restore(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
@@ -1048,55 +1050,18 @@ export class Reconciler {
     });
   }
 
-  async #authorizeRecoveryEffect(
-    transaction: StateTransaction,
-    effect: Pick<
-      ComponentInstance,
-      | "activation"
-      | "applicationId"
-      | "artifactDigest"
-      | "componentId"
-      | "deploymentGeneration"
-      | "instanceId"
-      | "pluginId"
-    >,
-    expectedLifecycle: PersistedComponentInstance["lifecycle"],
-    expectedRevision: Revision,
-  ): Promise<boolean> {
-    const currentLoss = await transaction.get(
-      providerLossKey({
-        applicationId: effect.applicationId,
-        pluginId: effect.pluginId,
-      }),
-    );
-    if (currentLoss === undefined) return false;
-    const loss = parsePersistedProviderLoss(currentLoss.value as PersistedProviderLoss);
-    if (
-      loss.action !== "suspend" ||
-      loss.deploymentGeneration !== effect.deploymentGeneration ||
-      loss.recoveryActivations?.[effect.componentId] !== effect.activation
-    ) {
-      return false;
-    }
+  async #loadRecoveryEvidence(transaction: StateTransaction): Promise<{
+    readonly bindings: readonly LoadedCapabilityBinding[];
+    readonly deployments: readonly PluginDeployment[];
+    readonly installations: readonly PluginInstallation[];
+    readonly instances: readonly ComponentInstance[];
+  }> {
     const persistedDeployments: PluginDeployment[] = [];
     for await (const record of transaction.scan<PluginDeployment>({
       namespace,
       collection: "deployments",
     })) {
       persistedDeployments.push(parsePluginDeployment(record.value));
-    }
-    const consumer = persistedDeployments.find(
-      (deployment) =>
-        deployment.applicationId === effect.applicationId &&
-        deployment.pluginId === effect.pluginId,
-    );
-    if (
-      consumer === undefined ||
-      consumer.state !== "active" ||
-      consumer.generation !== effect.deploymentGeneration ||
-      consumer.artifactDigest !== effect.artifactDigest
-    ) {
-      return false;
     }
     const persistedInstallations: PluginInstallation[] = [];
     for await (const record of transaction.scan<PluginInstallation>({
@@ -1118,7 +1083,63 @@ export class Reconciler {
         revision: record.revision,
       });
     }
-    const consumerInstance = instances.find(
+    const bindings: LoadedCapabilityBinding[] = [];
+    for await (const record of transaction.scan<PersistedCapabilityBinding>({
+      namespace,
+      collection: "capability-bindings",
+    })) {
+      bindings.push({ key: record.key, value: record.value, revision: record.revision });
+    }
+    return {
+      bindings,
+      deployments: persistedDeployments,
+      installations: persistedInstallations,
+      instances,
+    };
+  }
+
+  async #authorizeRecoveryEffect(
+    transaction: StateTransaction,
+    effect: Pick<
+      ComponentInstance,
+      | "activation"
+      | "applicationId"
+      | "artifactDigest"
+      | "componentId"
+      | "deploymentGeneration"
+      | "instanceId"
+      | "pluginId"
+    >,
+    expectedLifecycle: PersistedComponentInstance["lifecycle"],
+    expectedRevision: Revision,
+  ): Promise<RecoveryEffectAuthorization> {
+    const currentLoss = await transaction.get(
+      providerLossKey({
+        applicationId: effect.applicationId,
+        pluginId: effect.pluginId,
+      }),
+    );
+    if (currentLoss === undefined) return "superseded";
+    const loss = parsePersistedProviderLoss(currentLoss.value as PersistedProviderLoss);
+    if (
+      loss.action !== "suspend" ||
+      loss.deploymentGeneration !== effect.deploymentGeneration ||
+      loss.recoveryActivations?.[effect.componentId] !== effect.activation
+    ) {
+      return "superseded";
+    }
+    const evidence = await this.#loadRecoveryEvidence(transaction);
+    const consumer = evidence.deployments.find(
+      (deployment) =>
+        deployment.applicationId === effect.applicationId &&
+        deployment.pluginId === effect.pluginId,
+    );
+    const consumerMatchesEffect =
+      consumer !== undefined &&
+      consumer.state === "active" &&
+      consumer.generation === effect.deploymentGeneration &&
+      consumer.artifactDigest === effect.artifactDigest;
+    const consumerInstance = evidence.instances.find(
       (instance) =>
         instance.instanceId === effect.instanceId &&
         instance.activation === effect.activation &&
@@ -1129,26 +1150,54 @@ export class Reconciler {
         instance.observedGeneration === effect.deploymentGeneration &&
         instance.artifactDigest === effect.artifactDigest,
     );
+    if (consumerInstance?.lifecycle !== expectedLifecycle) {
+      return "superseded";
+    }
+    if (consumerInstance.revision !== expectedRevision) {
+      return "retry";
+    }
     if (
-      consumerInstance?.lifecycle !== expectedLifecycle ||
-      consumerInstance.revision !== expectedRevision
+      consumerMatchesEffect &&
+      this.#recoveryPrerequisitesReady(
+        loss,
+        evidence.deployments,
+        evidence.installations,
+        evidence.instances,
+        evidence.bindings,
+      )
     ) {
-      return false;
+      return "authorized";
     }
-    const bindings: LoadedCapabilityBinding[] = [];
-    for await (const record of transaction.scan<PersistedCapabilityBinding>({
-      namespace,
-      collection: "capability-bindings",
-    })) {
-      bindings.push({ key: record.key, value: record.value, revision: record.revision });
-    }
-    return this.#recoveryPrerequisitesReady(
-      loss,
-      persistedDeployments,
-      persistedInstallations,
-      instances,
-      bindings,
+    const { recoveryActivations: _recoveryActivations, ...invalidatedLoss } = loss;
+    const {
+      attempt: _attempt,
+      diagnostic: _diagnostic,
+      retryAt: _retryAt,
+      retryEffect: _retryEffect,
+      ...stableInstance
+    } = consumerInstance;
+    void _recoveryActivations;
+    void _attempt;
+    void _diagnostic;
+    void _retryAt;
+    void _retryEffect;
+    await transaction.put(
+      providerLossKey(loss.consumer),
+      {
+        ...invalidatedLoss,
+        updatedAt: this.#options.clock.now().toISOString(),
+      },
+      { expectedRevision: currentLoss.revision },
     );
+    await transaction.put(
+      instanceKey(effect.instanceId),
+      {
+        ...stableInstance,
+        lifecycle: "stopped",
+      },
+      { expectedRevision },
+    );
+    return "abandoned";
   }
 
   async #loadProviderLosses(): Promise<readonly LoadedProviderLoss[]> {
@@ -1788,6 +1837,20 @@ export class Reconciler {
             ) {
               return false;
             }
+            if (beginRecovery) {
+              const recoveryEvidence = await this.#loadRecoveryEvidence(transaction);
+              if (
+                !this.#recoveryPrerequisitesReady(
+                  desired,
+                  recoveryEvidence.deployments,
+                  recoveryEvidence.installations,
+                  recoveryEvidence.instances,
+                  recoveryEvidence.bindings,
+                )
+              ) {
+                return "recovery-not-ready";
+              }
+            }
             if (!stale) {
               for (const provider of providersToFence) {
                 const loadedProvider = deployments.find(
@@ -1932,6 +1995,9 @@ export class Reconciler {
             return true;
           },
         );
+        if (committed === "recovery-not-ready") {
+          continue;
+        }
         if (!committed) {
           this.#replanCount += 1;
           return true;
@@ -2039,19 +2105,24 @@ export class Reconciler {
         await this.#clearRestorationFailure(instance);
         continue;
       }
-      if (
-        recoveryInstance &&
-        !(await this.#options.state.transact(this.#transactionOptions(), (transaction) =>
-          this.#authorizeRecoveryEffect(
-            transaction,
-            instance,
-            instance.lifecycle,
-            instance.revision,
-          ),
-        ))
-      ) {
-        this.#replanCount += 1;
-        continue;
+      if (recoveryInstance) {
+        const authorization = await this.#options.state.transact(
+          this.#transactionOptions(),
+          (transaction) =>
+            this.#authorizeRecoveryEffect(
+              transaction,
+              instance,
+              instance.lifecycle,
+              instance.revision,
+            ),
+        );
+        if (authorization !== "authorized") {
+          this.#replanCount += 1;
+          if (authorization === "abandoned") {
+            this.#lastCommitAuthority = this.#options.authority;
+          }
+          continue;
+        }
       }
       try {
         await this.#componentLifecycle.restore(instance, this.#options.authority);
@@ -3107,19 +3178,19 @@ export class Reconciler {
         : undefined;
     if (!this.#running) return;
     try {
-      const authorized = await this.#options.state.transact(
+      const authorization = await this.#options.state.transact(
         this.#transactionOptions(),
         async (transaction) => {
-          if (
-            exactRecoveryEffect &&
-            !(await this.#authorizeRecoveryEffect(
+          if (exactRecoveryEffect) {
+            const recoveryAuthorization = await this.#authorizeRecoveryEffect(
               transaction,
               effect,
               instance.lifecycle,
               current.revision,
-            ))
-          ) {
-            return false;
+            );
+            if (recoveryAuthorization !== "authorized") {
+              return recoveryAuthorization;
+            }
           }
           if (retryPreState !== undefined) {
             await transaction.put(
@@ -3138,12 +3209,19 @@ export class Reconciler {
             state: effect,
             updatedAt: this.#options.clock.now().toISOString(),
           });
-          return true;
+          return "authorized";
         },
       );
-      if (!authorized) {
+      if (authorization !== "authorized") {
         this.#replanCount += 1;
-        await this.#acknowledge(claim, "completed");
+        if (authorization === "abandoned") {
+          this.#lastCommitAuthority = this.#options.authority;
+        }
+        if (authorization === "retry") {
+          await this.#retryClaim(claim);
+        } else {
+          await this.#acknowledge(claim, "completed");
+        }
         return;
       }
       if (retryPreState !== undefined) this.#lastCommitAuthority = this.#options.authority;
@@ -3162,20 +3240,29 @@ export class Reconciler {
       return;
     }
     if (!this.#running) return;
-    if (
-      exactRecoveryEffect &&
-      !(await this.#options.state.transact(this.#transactionOptions(), (transaction) =>
-        this.#authorizeRecoveryEffect(
-          transaction,
-          effect,
-          retryPreState ?? instance.lifecycle,
-          current.revision,
-        ),
-      ))
-    ) {
-      this.#replanCount += 1;
-      await this.#acknowledge(claim, "completed");
-      return;
+    if (exactRecoveryEffect) {
+      const authorization = await this.#options.state.transact(
+        this.#transactionOptions(),
+        (transaction) =>
+          this.#authorizeRecoveryEffect(
+            transaction,
+            effect,
+            retryPreState ?? instance.lifecycle,
+            current.revision,
+          ),
+      );
+      if (authorization !== "authorized") {
+        this.#replanCount += 1;
+        if (authorization === "abandoned") {
+          this.#lastCommitAuthority = this.#options.authority;
+        }
+        if (authorization === "retry") {
+          await this.#retryClaim(claim);
+        } else {
+          await this.#acknowledge(claim, "completed");
+        }
+        return;
+      }
     }
     try {
       await this.#options.effects.perform(effect);
