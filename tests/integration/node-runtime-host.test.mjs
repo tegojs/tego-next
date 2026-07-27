@@ -153,6 +153,11 @@ test("@spec:runtime-operations/local-node-runtime-host/thread-process-convergenc
     const processTask = await runEcho(host.runtime, "process", "integration-process");
 
     await host.runtime.stop();
+    const stoppedStatus = await host.runtime.status();
+    assert.equal(stoppedStatus.lifecycle, "stopped");
+    assert.equal(stoppedStatus.readiness, false);
+    assert.equal(stoppedStatus.counts.deployments, 1);
+    assert.equal(stoppedStatus.counts.installations, 1);
     host = undefined;
 
     restarted = await createHost(dataDirectory);
