@@ -3058,6 +3058,16 @@ export class Reconciler {
       await this.#acknowledge(claim, "completed");
       return;
     }
+    if (
+      effect.kind === "start" &&
+      instance.lifecycle === "starting" &&
+      instance.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
+      instance.retryAt !== undefined &&
+      instance.retryAt > this.#options.clock.now().toISOString()
+    ) {
+      await this.#retryClaim(claim, instance.retryAt);
+      return;
+    }
     const deployments = await this.#loadDeployments();
     const desired = deployments.find(
       (candidate) =>
@@ -3782,8 +3792,10 @@ export class Reconciler {
     await this.#retryClaim(claim);
   }
 
-  async #retryClaim(claim: OutboxClaim): Promise<void> {
-    const retryAt = this.#options.clock.now().getTime() + 60_000;
+  async #retryClaim(claim: OutboxClaim, requestedRetryAt?: string): Promise<void> {
+    const now = this.#options.clock.now().getTime();
+    const requested = requestedRetryAt === undefined ? Number.NaN : Date.parse(requestedRetryAt);
+    const retryAt = Number.isFinite(requested) && requested > now ? requested : now + 60_000;
     await this.#options.state.acknowledgeOutbox({
       messageId: claim.message.messageId,
       owner: claim.owner,
