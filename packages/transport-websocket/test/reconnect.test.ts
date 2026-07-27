@@ -860,7 +860,7 @@ test("persisted attempt epochs fence stale sessions after Main restart", async (
   await store.save({
     workerId,
     request,
-    fingerprint: "persisted-fingerprint",
+    fingerprint: requestFingerprint(request),
     revision: "0",
     state: "assigned",
     epoch: "7",

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import {
+  createExecutionBinding,
+  DiagnosticError,
   type ExecutionRequest,
   type JsonValue,
   parseComponentInstanceId,
@@ -18,9 +20,11 @@ import {
   REMOTE_ASSIGN,
   REMOTE_CANCEL,
   REMOTE_RESULT_ACK,
+  type RemoteAttemptRecord,
   type RemoteAttemptStore,
   RemoteExecutor,
   type RemoteExecutorOptions,
+  requestFingerprint,
   WorkerRuntime,
 } from "../src/index.js";
 import {
@@ -284,6 +288,149 @@ test("RemoteExecutor rejects mismatched immutable targets before attempt-store a
         /target|executor|worker/iu,
       );
       assert.equal(storeCalls, 0);
+    });
+  }
+});
+
+test("target-scoped recovery rejects a foreign executor before attempt lookup", async () => {
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const request = executionRequest(null, "foreign-recovery-target");
+  const foreignTarget: ExecutionRequest["target"] = {
+    ...request.target,
+    executor: {
+      id: "different-remote",
+      type: "remote",
+      workerId,
+    },
+  };
+
+  await assert.rejects(
+    remote.resumeTarget(foreignTarget, request.taskId, request.attemptId),
+    (error: unknown) =>
+      error instanceof DiagnosticError &&
+      error.diagnostic.code === "PROTOCOL_EXECUTION_TARGET_INVALID",
+  );
+});
+
+test("hydration rejects foreign persisted attempts before target-scoped access", async (t) => {
+  const expectedRequest = executionRequest(null, "foreign-persisted-attempt");
+  const foreignWorkerId = parseWorkerId("different-worker");
+  const cases: readonly {
+    readonly name: string;
+    readonly workerId: RemoteAttemptRecord["workerId"];
+    readonly target: ExecutionRequest["target"];
+  }[] = [
+    {
+      name: "record Worker",
+      workerId: foreignWorkerId,
+      target: expectedRequest.target,
+    },
+    {
+      name: "executor id",
+      workerId,
+      target: {
+        ...expectedRequest.target,
+        executor: { id: "different-remote", type: "remote", workerId },
+      },
+    },
+    {
+      name: "executor Worker",
+      workerId,
+      target: {
+        ...expectedRequest.target,
+        executor: { id: "remote", type: "remote", workerId: foreignWorkerId },
+      },
+    },
+    {
+      name: "executor type",
+      workerId,
+      target: {
+        ...expectedRequest.target,
+        executor: { id: "remote", type: "process" },
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      const identity = {
+        applicationId: expectedRequest.applicationId,
+        pluginId: expectedRequest.pluginId,
+        componentId: expectedRequest.componentId,
+        target: testCase.target,
+      };
+      const request = {
+        ...expectedRequest,
+        target: testCase.target,
+        binding: createExecutionBinding(identity, expectedRequest.binding),
+      };
+      const record: RemoteAttemptRecord = {
+        workerId: testCase.workerId,
+        request,
+        fingerprint: requestFingerprint(request),
+        state: "assigned",
+        epoch: "1",
+        updatedAt: clock.now().toISOString(),
+        revision: "1",
+      };
+      const store: RemoteAttemptStore = {
+        save: async () => undefined,
+        commit: async () => undefined,
+        delete: async () => undefined,
+        load: async () => undefined,
+        list: async () => [record],
+      };
+      const [mainSession, workerSession] = memorySessionPair("1");
+      const runtime = new WorkerRuntime({
+        workerId,
+        clock,
+        attemptStore: new MemoryRemoteAttemptStore(),
+        selectExecutor: () => new TestLocalExecutor(),
+      });
+      await runtime.attach(workerSession);
+      const remote = new RemoteExecutor({
+        id: "remote",
+        workerId,
+        clock,
+        attemptStore: store,
+      });
+
+      try {
+        await assert.rejects(
+          remote.attach(mainSession),
+          (error: unknown) =>
+            error instanceof DiagnosticError &&
+            error.diagnostic.code === "PROTOCOL_EXECUTION_TARGET_INVALID",
+        );
+        assert.equal(
+          await remote.observeTarget(
+            expectedRequest.target,
+            expectedRequest.taskId,
+            expectedRequest.attemptId,
+          ),
+          undefined,
+        );
+        assert.equal(
+          await remote.resumeTarget(
+            expectedRequest.target,
+            expectedRequest.taskId,
+            expectedRequest.attemptId,
+          ),
+          undefined,
+        );
+        await remote.cancelTarget(
+          expectedRequest.target,
+          expectedRequest.taskId,
+          expectedRequest.attemptId,
+        );
+      } finally {
+        await Promise.all([remote.close(), runtime.close()]);
+      }
     });
   }
 });

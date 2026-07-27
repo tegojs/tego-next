@@ -985,6 +985,7 @@ export class RemoteExecutor implements Executor {
     attemptId: AttemptId,
   ): Promise<ExecutionHandle | undefined> {
     const target = parseTaskExecutionTarget(targetValue);
+    this.#assertExactTarget(target, "attempt recovery");
     const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
     if (attempt === undefined) return undefined;
     this.#assertAttemptTarget(attempt, target, "recovery");
@@ -1233,8 +1234,34 @@ export class RemoteExecutor implements Executor {
     if (this.#hydrated) return;
     this.#assertPersistenceAvailable();
     const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
-    for (const record of records) parseAttemptRevision(record.revision);
-    const activeRecords = records.filter((record) => record.state !== "expired");
+    const validatedRecords = records.map((record) => {
+      parseAttemptRevision(record.revision);
+      const request = parseRemoteRequest(record.request);
+      const executor = request.target.executor;
+      if (
+        record.workerId !== this.#workerId ||
+        executor.type !== this.type ||
+        executor.id !== this.id ||
+        executor.workerId !== this.#workerId
+      ) {
+        throw remoteError(
+          "PROTOCOL_EXECUTION_TARGET_INVALID",
+          "Persisted remote attempt does not belong to this executor and Worker",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      }
+      if (requestFingerprint(request) !== record.fingerprint) {
+        throw remoteError(
+          "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
+          "Persisted remote attempt fingerprint does not match its request",
+          this.id,
+          this.#clock.now().toISOString(),
+        );
+      }
+      return { record, request };
+    });
+    const activeRecords = validatedRecords.filter(({ record }) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
       throw remoteError(
         "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
@@ -1243,18 +1270,18 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    for (const record of records) {
+    for (const { record, request } of validatedRecords) {
       const persistedEpoch = BigInt(record.epoch);
       if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
       if (record.state === "expired") continue;
       const result = Promise.withResolvers<ExecutionResult>();
       const handle = Object.freeze({
-        taskId: record.request.taskId,
-        attemptId: record.request.attemptId,
+        taskId: request.taskId,
+        attemptId: request.attemptId,
         result: result.promise,
       });
       const attempt: RemoteAttempt = {
-        request: record.request,
+        request,
         fingerprint: record.fingerprint,
         handle,
         result,
@@ -1270,7 +1297,7 @@ export class RemoteExecutor implements Executor {
           ? {}
           : { terminalAt: Date.parse(record.result.completedAt) }),
       };
-      this.#attempts.set(attemptKey(record.request.taskId, record.request.attemptId), attempt);
+      this.#attempts.set(attemptKey(request.taskId, request.attemptId), attempt);
       if (record.result !== undefined) {
         attempt.deadline.abort();
         result.resolve(record.result);
