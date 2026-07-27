@@ -124,7 +124,7 @@ globals[marker] = (typeof globals[marker] === "number" ? globals[marker] : 0) + 
 
 export default defineComponent({
   kind: "task",
-  async run(_context, input) {
+  async run(context, input) {
     const requestedDelay =
       typeof input === "object" && input !== null && "delayMs" in input
         ? Reflect.get(input, "delayMs")
@@ -132,6 +132,16 @@ export default defineComponent({
     if (typeof requestedDelay === "number" && Number.isFinite(requestedDelay)) {
       const delayMs = Math.max(0, Math.min(requestedDelay, 10_000));
       await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      Reflect.get(input, "inspectExecutionBinding") === true
+    ) {
+      return {
+        configuration: context.config.get(),
+        input,
+      };
     }
     return input;
   },
@@ -179,6 +189,8 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
     input.digest,
     "--permissions",
     JSON.stringify(permissions),
+    "--configuration",
+    JSON.stringify(input.configuration),
     "--endpoint",
     endpoint,
     "--json",
@@ -189,10 +201,11 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
     endpoint,
     operationId: `system-${executor}`,
     value: input.value,
+    expectedOutput: input.expectedOutput,
   });
 }
 
-async function runTask({ endpoint, operationId, value }) {
+async function runTask({ endpoint, expectedOutput = value, operationId, value }) {
   const accepted = await startTask({ endpoint, operationId, value });
   let completed;
   try {
@@ -226,7 +239,7 @@ async function runTask({ endpoint, operationId, value }) {
     "--json",
   ]);
   assert.equal(completed.result.status, "succeeded");
-  assert.deepEqual(completed.result.output, value);
+  assert.deepEqual(completed.result.output, expectedOutput);
   assert.deepEqual(status, completed);
   return completed;
 }
@@ -369,18 +382,41 @@ async function runSystemFlow(runIndex) {
       "--json",
     ]);
     const tasks = [];
+    const executionBindingConfiguration = {
+      nested: {
+        retries: 3,
+        values: ["one", { enabled: true }],
+      },
+    };
     for (const [index, executor] of ["thread", "process", "remote"].entries()) {
+      const value = {
+        executor,
+        inspectExecutionBinding: true,
+        runIndex,
+        value: index + 1,
+      };
       tasks.push(
         await deployAndRun({
           endpoint,
           executor,
           generation: String(index + 1),
           input: {
+            configuration: executionBindingConfiguration,
             digest: installation.digest,
-            value: { executor, runIndex, value: index + 1 },
+            expectedOutput: {
+              configuration: executionBindingConfiguration,
+              input: value,
+            },
+            value,
           },
         }),
       );
+    }
+    for (const task of tasks) {
+      assert.deepEqual(task.binding.configuration, executionBindingConfiguration);
+      assert.equal(task.binding.permissionGrants.length > 0, true);
+      assert.deepEqual(task.binding.capabilityDefinitions, []);
+      assert.deepEqual(task.binding.capabilityBindings, []);
     }
     const beforeRestart = await runtimeSnapshot(endpoint);
     const beforeInstallation = onlySnapshotValue(beforeRestart.installations, "installations");
@@ -558,7 +594,7 @@ async function runSystemFlow(runIndex) {
   }
 }
 
-test("@spec:runtime-operations/ci-authoritative-system-acceptance/real-single-main-process-flow", async () => {
+test("@spec:runtime-operations/ci-authoritative-system-acceptance/real-single-main-process-flow execution binding parity", async () => {
   const first = await runSystemFlow(1);
   const second = await runSystemFlow(2);
   assert.notEqual(first.directory, second.directory);
