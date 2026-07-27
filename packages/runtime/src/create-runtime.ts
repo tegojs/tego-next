@@ -249,6 +249,7 @@ class TegoRuntime implements Runtime {
   #stopPromise: Promise<void> | undefined;
   #stopRequested = false;
   #servicesClosed = false;
+  #terminalObservedStatus: RuntimeObservedStatus | undefined;
 
   constructor(
     configuration: RuntimeConfiguration,
@@ -382,6 +383,11 @@ class TegoRuntime implements Runtime {
     } catch (error) {
       errors.push(error);
     }
+    try {
+      this.#terminalObservedStatus = await this.#observedStatus.read();
+    } catch (error) {
+      errors.push(error);
+    }
     errors.push(...(await this.#closeServices()), ...(await this.#supervisor.close()));
     this.#setLifecycle(errors.length === 0 ? "stopped" : "failed");
     this.#eventStream.close();
@@ -404,7 +410,7 @@ class TegoRuntime implements Runtime {
     if (this.#lifecycle === "running") {
       this.#driverHealth = await this.#supervisor.health(this.#drivers.clock.now().toISOString());
     }
-    const observed = await this.#observedStatus.read();
+    const observed = this.#terminalObservedStatus ?? (await this.#observedStatus.read());
     const driverHealth = this.#driverHealth.map(({ health }) => health);
     const status = {
       identity: {
