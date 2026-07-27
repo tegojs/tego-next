@@ -356,6 +356,7 @@ test("execution binding parity forwards nested configuration, grants, and capabi
       capabilityDefinitions: [
         {
           identity: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
+          methods: ["query"],
           requestSchema: { type: "object" },
           responseSchema: { type: "object" },
         },
