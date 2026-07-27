@@ -134,6 +134,7 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/workflow-gates
 
 test("release verification is strict, complete, and non-recursive", async () => {
   const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  assert.equal(packageJson.devDependencies["js-yaml"], "4.3.0");
   assert.equal(packageJson.scripts["verify:release"], "node scripts/verify-release.mjs");
   assert.equal(
     packageJson.scripts.verify,
@@ -332,6 +333,33 @@ test("CI workflow validation rejects extra or duplicate PostgreSQL health flags"
       true,
     );
   }
+});
+
+test("CI workflow validation binds action review comments to their required steps", async () => {
+  const workflow = await readFile(workflowPath, "utf8");
+  const { validateReleasePreflight } = await import(
+    new URL(`../../scripts/verify-release.mjs?action-comment-mutations=${Date.now()}`, import.meta.url)
+  );
+  const checkout =
+    "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0";
+  const mutation = workflow
+    .replace(`        uses: ${checkout}`, `        uses: ${checkout.split(" # ")[0]}`)
+    .replace(
+      "permissions:\n  contents: read",
+      `permissions:\n  contents: read\n\nenv:\n  ACTION_REVIEW_SPOOF: |\n    uses: ${checkout}`,
+    );
+  const diagnostics = validateReleasePreflight({
+    gitStatus: "",
+    nodeVersion: "v26.5.0",
+    npmVersion: "11.13.0",
+    postgresUrl: "postgresql://localhost/tego",
+    workflow: mutation,
+  });
+
+  assert.equal(
+    diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+    true,
+  );
 });
 
 test("deterministic package gate compares independent artifacts and manifests without residue", async () => {
