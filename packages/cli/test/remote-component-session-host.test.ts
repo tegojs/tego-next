@@ -10,13 +10,19 @@ import {
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
+  parseCapabilityName,
   parseComponentId,
   parseGeneration,
+  parseOperationId,
   parsePluginId,
   parseTaskId,
   parseWorkerId,
 } from "@tegojs/contracts";
 import type { ComponentBinding, PreparedArtifact } from "@tegojs/runtime";
+import type {
+  RemoteCapabilityInvocation,
+  RemoteComponentActivation,
+} from "@tegojs/transport-websocket";
 import { LocalComponentSessionRegistry } from "../src/runtime/local-component-session-registry.js";
 import {
   RemoteComponentSessionHost,
@@ -115,6 +121,9 @@ class ControlledRemoteExecutor implements Executor {
   closes = 0;
   drainedTargets: ExecutionRequest["target"][] = [];
   targetDrains = 0;
+  activations: RemoteComponentActivation[] = [];
+  capabilityInvocations: RemoteCapabilityInvocation[] = [];
+  lifecycle: string[] = [];
   submitGate: Promise<void> | undefined;
 
   async probe() {
@@ -154,6 +163,24 @@ class ControlledRemoteExecutor implements Executor {
     await this.targetDrain.promise;
   }
 
+  async activateComponent(activation: RemoteComponentActivation) {
+    this.lifecycle.push("activate");
+    this.activations.push(activation);
+  }
+
+  async drainComponent() {
+    this.lifecycle.push("drain");
+  }
+
+  async stopComponent() {
+    this.lifecycle.push("stop");
+  }
+
+  async invokeCapability(request: RemoteCapabilityInvocation) {
+    this.capabilityInvocations.push(request);
+    return { invoked: request.invocation.method };
+  }
+
   async resumeTarget() {
     return undefined;
   }
@@ -183,10 +210,78 @@ test("remote component sessions fail closed when the shared executor cannot drai
   const host = new RemoteComponentSessionHost({
     registry,
     resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
     runtimeId: "runtime-remote-capability",
   });
 
   await assert.rejects(host.start(binding()), /unavailable|drain/iu);
+  await registry.close();
+});
+
+test("remote component activation binds lifecycle and capability invocation to one immutable target", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-activation");
+  const shared = new ControlledRemoteExecutor();
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    runtimeId: "runtime-remote-activation",
+  });
+  const component = binding();
+
+  await host.start(component);
+  const registration = registry.resolveFresh({
+    applicationId,
+    pluginId,
+    componentId,
+    input: null,
+    deadline: new Date(Date.now() + 60_000).toISOString(),
+    orphanPolicy: "finish-and-persist",
+  });
+  const immutableBinding = executionBinding(registration.target);
+  assert.deepEqual(shared.activations, [
+    {
+      identity: { applicationId, pluginId, componentId },
+      target: registration.target,
+      configuration: immutableBinding.configuration,
+      permissionGrants: immutableBinding.permissionGrants,
+      capabilityDefinitions: immutableBinding.capabilityDefinitions,
+      capabilityBindings: immutableBinding.capabilityBindings,
+      bindingFingerprint: immutableBinding.fingerprint,
+    },
+  ]);
+
+  const provider = registration.executor as Executor & {
+    invokeCapability(request: {
+      readonly invocationId: ReturnType<typeof parseOperationId>;
+      readonly identity: {
+        readonly name: ReturnType<typeof parseCapabilityName>;
+        readonly protocolVersion: string;
+      };
+      readonly method: string;
+      readonly input: null;
+    }): Promise<unknown>;
+  };
+  const invocation = {
+    invocationId: parseOperationId("remote-capability-1"),
+    identity: {
+      name: parseCapabilityName("org.example.echo"),
+      protocolVersion: "1.0.0",
+    },
+    method: "echo",
+    input: null,
+  };
+  assert.deepEqual(await provider.invokeCapability(invocation), { invoked: "echo" });
+  assert.deepEqual(shared.capabilityInvocations, [
+    {
+      invocationId: invocation.invocationId,
+      bindingFingerprint: immutableBinding.fingerprint,
+      target: registration.target,
+      invocation,
+    },
+  ]);
+  await host.stop(component);
+  assert.deepEqual(shared.lifecycle, ["activate", "stop"]);
   await registry.close();
 });
 
@@ -197,6 +292,7 @@ test("remote component stop drains the persisted target after a fresh registry r
   const host = new RemoteComponentSessionHost({
     registry,
     resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
     runtimeId: "runtime-remote-restart-stop",
   });
   const component = binding();
@@ -230,6 +326,7 @@ test("remote component stop fails closed when the persisted executor cannot be r
     const host = new RemoteComponentSessionHost({
       registry,
       resolveExecutor: () => resolved,
+      resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
       runtimeId: "runtime-remote-restart-stop-invalid",
     });
 
@@ -247,6 +344,7 @@ test("remote component drain waits for a submit admitted before drain to reach t
   const host = new RemoteComponentSessionHost({
     registry,
     resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
     runtimeId: "runtime-remote-race",
   });
   const component = binding();
@@ -309,6 +407,7 @@ test("remote component sessions scope admission and drain without closing the sh
   const host = new RemoteComponentSessionHost({
     registry,
     resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
     runtimeId: "runtime-remote",
   });
   const component = binding();
