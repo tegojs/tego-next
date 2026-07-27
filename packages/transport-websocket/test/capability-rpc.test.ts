@@ -200,13 +200,19 @@ test("disconnect before the authoritative response is indeterminate and never re
   let calls = 0;
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  const { remote, mainSession } = await connected(async () => {
-    calls += 1;
-    started.resolve();
-    await release.promise;
-    return "too-late";
-  });
+  const { remote, runtime, mainSession } = await connected(
+    async (received) => {
+      calls += 1;
+      if (calls === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return received.invocation.input;
+    },
+    { maxCapabilityInvocations: 1 },
+  );
   const expected = request("invocation-disconnect");
+  await remote.activateComponent(activationFor(expected));
   const pending = remote.invokeCapability(expected);
   await started.promise;
   mainSession.close();
@@ -229,7 +235,77 @@ test("disconnect before the authoritative response is indeterminate and never re
     message: /indeterminate/iu,
   });
   assert.equal(calls, 1);
+
   release.resolve();
+  const [mainReplacement, workerReplacement] = memorySessionPair("2");
+  await runtime.attach(workerReplacement);
+  await remote.attach(mainReplacement);
+  assert.deepEqual(await remote.invokeCapability(request("invocation-after-disconnect")), {
+    value: "hello",
+  });
+  await assert.rejects(remote.invokeCapability(expected), /indeterminate/iu);
+  assert.equal(calls, 2);
+
+  await remote.stopComponent(expected.target);
+  await remote.activateComponent(activationFor(expected));
+  assert.deepEqual(await remote.invokeCapability(expected), { value: "hello" });
+  assert.equal(calls, 3);
+});
+
+test("authoritative remote capability failure releases active admission capacity", async () => {
+  let calls = 0;
+  const { remote } = await connected(
+    (received) => {
+      calls += 1;
+      if (calls === 1) throw new Error("authoritative provider failure");
+      return received.invocation.input;
+    },
+    { maxCapabilityInvocations: 1 },
+  );
+
+  await assert.rejects(remote.invokeCapability(request("authoritative-failure-1")));
+  assert.deepEqual(await remote.invokeCapability(request("authoritative-failure-2")), {
+    value: "hello",
+  });
+  assert.equal(calls, 2);
+});
+
+test("authoritative Main capability failure releases Worker admission capacity", async () => {
+  let calls = 0;
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    validateActivation: () => undefined,
+    maxCapabilityInvocations: 1,
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxCapabilityInvocations: 1,
+    routeCapability: (received) => {
+      calls += 1;
+      if (calls === 1) throw new Error("authoritative Main failure");
+      return received.invocation.input;
+    },
+  });
+  await remote.attach(mainSession);
+  cleanups.push(async () => {
+    await Promise.all([remote.close(), runtime.close()]);
+  });
+  const first = request("main-authoritative-failure-1");
+  await remote.activateComponent(activationFor(first));
+
+  await assert.rejects(runtime.invokeMainCapability(first));
+  assert.deepEqual(await runtime.invokeMainCapability(request("main-authoritative-failure-2")), {
+    value: "hello",
+  });
+  assert.equal(calls, 2);
 });
 
 test("capability invocation admission is bounded", async () => {
@@ -351,6 +427,7 @@ test("remote consumer to Main disconnect is indeterminate and is not auto-retrie
     attemptStore: new MemoryRemoteAttemptStore(),
     selectExecutor: () => new TestLocalExecutor(),
     validateActivation: () => undefined,
+    maxCapabilityInvocations: 1,
   });
   await runtime.attach(workerSession);
   const remote = new RemoteExecutor({
@@ -360,10 +437,13 @@ test("remote consumer to Main disconnect is indeterminate and is not auto-retrie
     attemptStore: new MemoryRemoteAttemptStore(),
     routeCapability: async () => {
       calls += 1;
-      started.resolve();
-      await release.promise;
+      if (calls === 1) {
+        started.resolve();
+        await release.promise;
+      }
       return null;
     },
+    maxCapabilityInvocations: 1,
   });
   await remote.attach(mainSession);
   cleanups.push(async () => {
@@ -385,4 +465,17 @@ test("remote consumer to Main disconnect is indeterminate and is not auto-retrie
   });
   await assert.rejects(runtime.invokeMainCapability(expected), /indeterminate/iu);
   assert.equal(calls, 1);
+
+  release.resolve();
+  const [mainReplacement, workerReplacement] = memorySessionPair("2");
+  await runtime.attach(workerReplacement);
+  await remote.attach(mainReplacement);
+  assert.equal(await runtime.invokeMainCapability(request("consumer-after-disconnect")), null);
+  await assert.rejects(runtime.invokeMainCapability(expected), /indeterminate/iu);
+  assert.equal(calls, 2);
+
+  await remote.stopComponent(expected.target);
+  await remote.activateComponent(activationFor(expected));
+  assert.equal(await runtime.invokeMainCapability(expected), null);
+  assert.equal(calls, 3);
 });
