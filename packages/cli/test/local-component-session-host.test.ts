@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   diagnosticCode,
+  parseCapabilityName,
+  parseComponentId,
+  type PluginManifest,
   parseExecutorId,
   parsePluginManifest,
-  type PluginManifest,
 } from "@tegojs/contracts";
 import {
   assertLocalComponentManifestSupported,
@@ -15,7 +17,7 @@ import {
 function manifest(
   input: {
     readonly kind?: "service" | "task";
-    readonly provides?: readonly { readonly name: string; readonly protocolVersion: string }[];
+    readonly provides?: PluginManifest["capabilities"]["provides"];
     readonly requires?: readonly {
       readonly name: string;
       readonly protocolRange: string;
@@ -61,15 +63,23 @@ test("local task manifests without capabilities remain supported", () => {
   assert.doesNotThrow(() => assertLocalComponentManifestSupported(manifest()));
 });
 
-test("local capability-bearing manifests fail closed without real schema definitions", () => {
+test("local task capability manifests pass the production host gate with complete definitions", () => {
   for (const candidate of [
-    manifest({ provides: [{ name: "example.echo", protocolVersion: "1.0.0" }] }),
+    manifest({
+      provides: [
+        {
+          name: parseCapabilityName("example.echo"),
+          protocolVersion: "1.0.0",
+          componentId: parseComponentId("component"),
+          methods: ["echo"],
+          requestSchema: true,
+          responseSchema: true,
+        },
+      ],
+    }),
     manifest({ requires: [{ name: "example.echo", protocolRange: "^1.0.0" }] }),
   ]) {
-    assert.throws(
-      () => assertLocalComponentManifestSupported(candidate),
-      (error: unknown) => diagnosticCode(error) === "CAPABILITY_DEFINITION_UNAVAILABLE",
-    );
+    assert.doesNotThrow(() => assertLocalComponentManifestSupported(candidate));
   }
 });
 
