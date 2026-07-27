@@ -57,6 +57,7 @@ export interface TaskServiceOptions {
     target?: TaskExecutionTarget,
     signal?: AbortSignal,
     binding?: ExecutionBinding,
+    identity?: TaskIdentity,
   ) => TaskExecutorSelection | Promise<TaskExecutorSelection>;
   readonly createIdentity?: (request: RunTaskRequest) => TaskIdentity;
 }
@@ -246,6 +247,8 @@ export class TaskService implements RuntimeTaskLifecycle {
       authority,
       proposed.taskId,
       undefined,
+      undefined,
+      proposed.attemptId,
     );
     this.#validateSelection(selected, proposed.taskId);
     this.#assertAuthority(authority);
@@ -787,6 +790,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       record.taskId,
       target,
       record.binding,
+      record.attemptId,
     );
     this.#validateSelection(resolved, record.taskId);
     const mismatchedFields = targetMismatchedFields(target, resolved.target);
@@ -805,11 +809,20 @@ export class TaskService implements RuntimeTaskLifecycle {
     taskId: TaskId,
     target: TaskExecutionTarget | undefined,
     binding?: ExecutionBinding,
+    attemptId?: AttemptId,
   ): Promise<TaskExecutorSelection> {
     const controller = new AbortController();
     this.#observationControllers.add(controller);
     const selection = Promise.resolve()
-      .then(() => this.#selectExecutor(request, target, controller.signal, binding))
+      .then(() =>
+        this.#selectExecutor(
+          request,
+          target,
+          controller.signal,
+          binding,
+          attemptId === undefined ? undefined : { taskId, attemptId },
+        ),
+      )
       .then(
         (value) => ({ kind: "selected" as const, value }),
         (error: unknown) => ({ kind: "failed" as const, error }),

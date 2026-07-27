@@ -5,6 +5,7 @@ import {
   type ComponentId,
   DiagnosticError,
   type ExecutorKind,
+  type ExecutionBinding,
   type Generation,
   type JsonObject,
   type MessageId,
@@ -71,6 +72,7 @@ export interface ComponentInstance extends JsonObject {
   readonly executor: ExecutorKind;
   readonly workerId?: string;
   readonly artifactDigest?: ArtifactDigest;
+  readonly executionBinding?: ExecutionBinding;
   readonly attempt?: number;
   readonly retryAt?: string;
   readonly retryEffect?: ReconcileEffectKind;
@@ -99,6 +101,7 @@ export interface ReconcileEffect extends JsonObject {
   readonly artifactDigest: ArtifactDigest;
   readonly executor: ExecutorKind;
   readonly workerId?: string;
+  readonly executionBinding?: ExecutionBinding;
 }
 
 export interface ReconcilePlanStep extends JsonObject {
@@ -217,6 +220,7 @@ function step(
   currentLifecycle: ComponentLifecycleState,
   activation: Activation,
   legacyActivation = false,
+  executionBinding?: ExecutionBinding,
 ): ReconcilePlanStep {
   const identity = legacyActivation
     ? legacyReconcileEffectIdentities(deployment, componentId, kind)
@@ -234,6 +238,7 @@ function step(
     artifactDigest: deployment.artifactDigest,
     executor: placement.executor,
     ...(placement.workerId === undefined ? {} : { workerId: placement.workerId }),
+    ...(executionBinding === undefined ? {} : { executionBinding }),
   };
   return {
     operationId: identity.operationId,
@@ -277,6 +282,7 @@ function oldInstanceStep(
       instance.lifecycle,
       instance.activation,
       instance.legacyActivation,
+      instance.executionBinding,
     );
   }
   if (instance.lifecycle === "draining") {
@@ -303,6 +309,7 @@ function oldInstanceStep(
         instance.lifecycle,
         instance.activation,
         instance.legacyActivation,
+        instance.executionBinding,
       );
     }
   }
@@ -316,6 +323,7 @@ function oldInstanceStep(
       instance.lifecycle,
       instance.activation,
       instance.legacyActivation,
+      instance.executionBinding,
     );
   }
   if (instance.lifecycle === "stopped") return undefined;
@@ -328,6 +336,7 @@ function oldInstanceStep(
     instance.lifecycle,
     instance.activation,
     instance.legacyActivation,
+    instance.executionBinding,
   );
 }
 
@@ -366,6 +375,7 @@ function currentInstanceStep(
       instance.lifecycle,
       activation,
       instance.legacyActivation,
+      instance.executionBinding,
     );
   }
   if (instance.lifecycle === "preparing" || instance.lifecycle === "starting") {
@@ -378,6 +388,7 @@ function currentInstanceStep(
       instance.lifecycle,
       activation,
       instance.legacyActivation,
+      instance.executionBinding,
     );
   }
   if (instance.lifecycle === "draining" || instance.lifecycle === "stopping") {
@@ -390,6 +401,7 @@ function currentInstanceStep(
       instance.lifecycle,
       activation,
       instance.legacyActivation,
+      instance.executionBinding,
     );
   }
   if (
@@ -406,6 +418,7 @@ function currentInstanceStep(
       instance.lifecycle,
       activation,
       instance.legacyActivation,
+      instance.executionBinding,
     );
   }
   return undefined;

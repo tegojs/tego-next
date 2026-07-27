@@ -15,6 +15,7 @@ import {
   parseGeneration,
   parseOperationId,
   parsePluginId,
+  parseTaskExecutionTarget,
   parseTaskId,
   parseWorkerId,
 } from "@tegojs/contracts";
@@ -101,14 +102,29 @@ const artifact: PreparedArtifact = {
 function binding(): ComponentBinding {
   const component = artifact.manifest.components[0];
   assert.ok(component);
-  return {
+  const prepared = {
     instanceId: "application-default.org_dexample_dremote.echo.g1",
     activation: "1",
-    executor: "remote",
+    executor: "remote" as const,
     workerId,
     artifact,
     deployment,
     component,
+  };
+  return {
+    ...prepared,
+    executionBinding: executionBinding(
+      parseTaskExecutionTarget({
+        instanceId: prepared.instanceId,
+        deploymentGeneration: generation,
+        artifactDigest,
+        executor: {
+          id: remoteComponentExecutorId(workerId),
+          type: "remote",
+          workerId,
+        },
+      }),
+    ),
   };
 }
 
@@ -122,6 +138,9 @@ class ControlledRemoteExecutor implements Executor {
   drainedTargets: ExecutionRequest["target"][] = [];
   targetDrains = 0;
   activations: RemoteComponentActivation[] = [];
+  terminationRestorations: RemoteComponentActivation[] = [];
+  drainFingerprints: (string | undefined)[] = [];
+  drainFailures = 0;
   stopFingerprints: (string | undefined)[] = [];
   capabilityInvocations: RemoteCapabilityInvocation[] = [];
   lifecycle: string[] = [];
@@ -155,6 +174,12 @@ class ControlledRemoteExecutor implements Executor {
 
   async cancel() {}
 
+  async observeTarget() {
+    return undefined;
+  }
+
+  async cancelTarget() {}
+
   async drain() {
     throw new Error("component drain must not drain the shared Worker executor");
   }
@@ -170,8 +195,18 @@ class ControlledRemoteExecutor implements Executor {
     this.activations.push(activation);
   }
 
-  async drainComponent() {
+  async drainComponent(_target: ExecutionRequest["target"], bindingFingerprint?: string) {
     this.lifecycle.push("drain");
+    this.drainFingerprints.push(bindingFingerprint);
+    if (this.drainFailures > 0) {
+      this.drainFailures -= 1;
+      throw new Error("transient component drain failure");
+    }
+  }
+
+  async restoreComponentForTermination(activation: RemoteComponentActivation) {
+    this.lifecycle.push("restore-termination");
+    this.terminationRestorations.push(activation);
   }
 
   async stopComponent(_target: ExecutionRequest["target"], bindingFingerprint?: string) {
@@ -287,6 +322,7 @@ test("remote component activation binds lifecycle and capability invocation to o
   shared.targetDrain.resolve();
   await host.stop(component);
   assert.deepEqual(shared.lifecycle, ["activate", "drain", "stop"]);
+  assert.deepEqual(shared.drainFingerprints, [component.executionBinding.fingerprint]);
   await registry.close();
 });
 
@@ -294,15 +330,10 @@ test("remote component stop drains the persisted target after a fresh registry r
   const registry = new LocalComponentSessionRegistry("runtime-remote-restart-stop");
   const shared = new ControlledRemoteExecutor();
   shared.targetDrain.resolve();
-  let resolvedFingerprint: string | undefined;
   const host = new RemoteComponentSessionHost({
     registry,
     resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
-    resolveExecutionBinding: (_binding, target) => {
-      const resolved = executionBinding(target);
-      resolvedFingerprint = resolved.fingerprint;
-      return Promise.resolve(resolved);
-    },
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
     runtimeId: "runtime-remote-restart-stop",
   });
   const component = binding();
@@ -310,7 +341,149 @@ test("remote component stop drains the persisted target after a fresh registry r
   await host.stop(component);
 
   assert.deepEqual(shared.lifecycle, ["stop"]);
-  assert.deepEqual(shared.stopFingerprints, [resolvedFingerprint]);
+  assert.deepEqual(shared.stopFingerprints, [component.executionBinding.fingerprint]);
+  await registry.close();
+});
+
+test("remote component drain can retry after a transient exact-target failure", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-drain-retry");
+  const shared = new ControlledRemoteExecutor();
+  shared.targetDrain.resolve();
+  shared.drainFailures = 1;
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    runtimeId: "runtime-remote-drain-retry",
+  });
+  const component = binding();
+  await host.start(component);
+
+  await assert.rejects(host.drain(component), /transient component drain failure/iu);
+  await host.drain(component);
+  await host.stop(component);
+
+  assert.deepEqual(shared.lifecycle, ["activate", "drain", "drain", "stop"]);
+  await registry.close();
+});
+
+test("remote component termination restoration adopts the persisted binding before exact drain", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-restore-termination");
+  const shared = new ControlledRemoteExecutor();
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    runtimeId: "runtime-remote-restore-termination",
+  });
+  const component = binding();
+  const target = parseTaskExecutionTarget({
+    instanceId: component.instanceId,
+    deploymentGeneration: generation,
+    artifactDigest,
+    executor: {
+      id: remoteComponentExecutorId(workerId),
+      type: "remote",
+      workerId,
+    },
+  });
+
+  await host.restoreTermination(component);
+
+  assert.deepEqual(shared.lifecycle, ["restore-termination", "drain"]);
+  assert.deepEqual(shared.terminationRestorations, [
+    {
+      identity: { applicationId, pluginId, componentId },
+      target,
+      configuration: component.executionBinding.configuration,
+      permissionGrants: component.executionBinding.permissionGrants,
+      capabilityDefinitions: component.executionBinding.capabilityDefinitions,
+      capabilityBindings: component.executionBinding.capabilityBindings,
+      bindingFingerprint: component.executionBinding.fingerprint,
+    },
+  ]);
+  await registry.close();
+});
+
+test("remote stopping checkpoint adopts the persisted activation before exact stop without redrain", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-restore-stopping");
+  const shared = new ControlledRemoteExecutor();
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    runtimeId: "runtime-remote-restore-stopping",
+  });
+  const component = binding();
+
+  await host.restoreTermination(component, "stopping");
+  await host.stop(component);
+
+  assert.deepEqual(shared.lifecycle, ["restore-termination", "stop"]);
+  assert.deepEqual(shared.stopFingerprints, [component.executionBinding.fingerprint]);
+  await registry.close();
+});
+
+test("remote task recovery resolves a non-accepting exact-target executor after component stop", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-task-recovery");
+  const shared = new ControlledRemoteExecutor();
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    runtimeId: "runtime-remote-task-recovery",
+  });
+  const component = binding();
+  const target = parseTaskExecutionTarget({
+    instanceId: component.instanceId,
+    deploymentGeneration: generation,
+    artifactDigest,
+    executor: {
+      id: remoteComponentExecutorId(workerId),
+      type: "remote",
+      workerId,
+    },
+  });
+
+  const recoveryTaskId = parseTaskId("remote-recovery-task");
+  const recoveryAttemptId = parseAttemptId("remote-recovery-attempt");
+  const recovery = host.resolveTaskRecoveryExecutor(
+    target,
+    component.executionBinding.fingerprint,
+    { taskId: recoveryTaskId, attemptId: recoveryAttemptId },
+  );
+
+  assert.equal((await recovery.probe()).available, false);
+  await assert.rejects(
+    recovery.submit({
+      taskId: parseTaskId("remote-recovery-submit"),
+      attemptId: parseAttemptId("remote-recovery-submit"),
+      target,
+      binding: component.executionBinding,
+      applicationId,
+      pluginId,
+      componentId,
+      input: null,
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+      orphanPolicy: "finish-and-buffer",
+    }),
+    /draining|accepting/iu,
+  );
+  assert.equal(
+    await (
+      recovery as Executor & {
+        resume(
+          taskId: ReturnType<typeof parseTaskId>,
+          attemptId: ReturnType<typeof parseAttemptId>,
+        ): Promise<ExecutionHandle | undefined>;
+      }
+    ).resume(recoveryTaskId, recoveryAttemptId),
+    undefined,
+  );
+  await assert.rejects(
+    recovery.cancel(parseTaskId("another-task"), recoveryAttemptId),
+    /does not own/iu,
+  );
   await registry.close();
 });
 

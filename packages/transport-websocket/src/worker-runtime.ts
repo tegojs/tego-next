@@ -873,9 +873,8 @@ export class WorkerRuntime {
   }
 
   async #drainComponent(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
-    const target = parseTaskExecutionTarget(
-      asObject(message.payload, REMOTE_COMPONENT_DRAIN).target,
-    );
+    const payload = asObject(message.payload, REMOTE_COMPONENT_DRAIN);
+    const target = parseTaskExecutionTarget(payload.target);
     const activation = this.#activations.get(this.#activationKey(target));
     if (activation === undefined || !this.#sameTarget(activation.activation.target, target)) {
       await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_DRAIN, message.messageId, {
@@ -884,6 +883,18 @@ export class WorkerRuntime {
         error: {
           code: "LIFECYCLE_COMPONENT_NOT_ACTIVE",
           message: "Worker has no matching exact component activation",
+        },
+      });
+      return;
+    }
+    if (payload.bindingFingerprint !== activation.activation.bindingFingerprint) {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_DRAIN, message.messageId, {
+        ok: false,
+        target,
+        bindingFingerprint: activation.activation.bindingFingerprint,
+        error: {
+          code: "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+          message: "Worker component drain requires the exact activation binding fingerprint",
         },
       });
       return;
@@ -921,9 +932,8 @@ export class WorkerRuntime {
   }
 
   async #stopComponent(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
-    const target = parseTaskExecutionTarget(
-      asObject(message.payload, REMOTE_COMPONENT_STOP).target,
-    );
+    const payload = asObject(message.payload, REMOTE_COMPONENT_STOP);
+    const target = parseTaskExecutionTarget(payload.target);
     const key = this.#activationKey(target);
     const activation = this.#activations.get(key);
     if (activation === undefined || !this.#sameTarget(activation.activation.target, target)) {
@@ -933,6 +943,18 @@ export class WorkerRuntime {
         error: {
           code: "LIFECYCLE_COMPONENT_NOT_ACTIVE",
           message: "Worker has no matching exact component activation",
+        },
+      });
+      return;
+    }
+    if (payload.bindingFingerprint !== activation.activation.bindingFingerprint) {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_STOP, message.messageId, {
+        ok: false,
+        target,
+        bindingFingerprint: activation.activation.bindingFingerprint,
+        error: {
+          code: "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+          message: "Worker component stop binding fingerprint does not match the activation",
         },
       });
       return;
@@ -1639,18 +1661,17 @@ export class WorkerRuntime {
     for (const candidate of reconciledActivations) {
       if (candidate.existing !== undefined) continue;
       await this.#activateComponentCallback?.(cloneJson(candidate.activation));
+      this.#activations.set(candidate.key, {
+        activation: cloneJson(candidate.activation),
+        state: candidate.state,
+      });
     }
     for (const candidate of reconciledActivations) {
       if (candidate.existing !== undefined) {
         if (candidate.state === "draining") {
           candidate.existing.state = "draining";
         }
-        continue;
       }
-      this.#activations.set(candidate.key, {
-        activation: cloneJson(candidate.activation),
-        state: candidate.state,
-      });
     }
     const attempts = [...this.#attempts.values()];
     const buffered = this.#results.list();

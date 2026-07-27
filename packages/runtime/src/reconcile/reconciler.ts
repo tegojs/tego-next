@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   type ApplicationId,
   type ArtifactDigest,
@@ -7,6 +8,7 @@ import {
   DiagnosticError,
   diagnosticCode,
   type ExecutorKind,
+  type ExecutionBinding,
   type Generation,
   type JsonObject,
   type OperationId,
@@ -20,6 +22,7 @@ import {
   parseCapabilityName,
   parseComponentId,
   parseGeneration,
+  parseExecutionBinding,
   parseMessageId,
   parseOperationId,
   parsePluginDeployment,
@@ -77,7 +80,10 @@ const defaultMaxConvergencePasses = 10_000;
 
 export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
-  perform(effect: ReconcileEffect): Promise<void>;
+  perform(
+    effect: ReconcileEffect,
+    // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+  ): Promise<void | { readonly executionBinding?: ExecutionBinding }>;
   restore?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   restoreStarting?(effect: ReconcileEffect & { readonly kind: "start" }): Promise<void>;
   restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
@@ -204,6 +210,9 @@ function startingEffect(instance: ComponentInstance): ReconcileEffect & { readon
     artifactDigest: instance.artifactDigest,
     executor: instance.executor,
     ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
+    ...(instance.executionBinding === undefined
+      ? {}
+      : { executionBinding: instance.executionBinding }),
   };
 }
 
@@ -236,6 +245,7 @@ interface PersistedComponentInstance extends JsonObject {
   readonly executor: ComponentInstance["executor"];
   readonly workerId?: string;
   readonly artifactDigest?: ArtifactDigest;
+  readonly executionBinding?: ExecutionBinding;
   readonly attempt?: number;
   readonly retryAt?: string;
   readonly retryEffect?: ReconcileEffectKind;
@@ -532,6 +542,9 @@ function parseReconcileEffect(claim: OutboxClaim): ParsedReconcileEffect {
     operationId: parseOperationId(value.operationId),
     pluginId: parsePluginId(value.pluginId),
     ...(value.workerId === undefined ? {} : { workerId: value.workerId }),
+    ...(value.executionBinding === undefined
+      ? {}
+      : { executionBinding: parseExecutionBinding(value.executionBinding) }),
   };
   if (
     effect.messageId !== claim.message.messageId ||
@@ -2099,26 +2112,67 @@ export class Reconciler {
             instance.lifecycle === "ready" ||
             instance.lifecycle === "degraded" ||
             instance.lifecycle === "draining" ||
-            instance.lifecycle === "stopping") &&
+            instance.lifecycle === "stopping" ||
+            (instance.lifecycle === "failed" &&
+              (instance.retryEffect === "drain" || instance.retryEffect === "stop"))) &&
           (instance.retryAt === undefined || instance.retryAt <= now) &&
           (instance.workerId === undefined ||
             this.#options.workers?.some((worker) => worker.workerId === instance.workerId) ===
               true) &&
           instance.artifactDigest !== undefined &&
           this.#options.effects.supportedExecutors.includes(instance.executor) &&
-          deployments.some(
+          (deployments.some(
             (deployment) =>
               deployment.state === "active" &&
               deployment.applicationId === instance.applicationId &&
               deployment.pluginId === instance.pluginId &&
               deployment.generation === instance.deploymentGeneration &&
               deployment.artifactDigest === instance.artifactDigest,
-          ),
+          ) ||
+            (instance.executionBinding !== undefined &&
+              (instance.lifecycle === "ready" ||
+                instance.lifecycle === "degraded" ||
+                instance.lifecycle === "draining" ||
+                instance.lifecycle === "stopping" ||
+                (instance.lifecycle === "failed" &&
+                  (instance.retryEffect === "drain" || instance.retryEffect === "stop"))) &&
+              deployments.some(
+                (deployment) =>
+                  deployment.applicationId === instance.applicationId &&
+                  deployment.pluginId === instance.pluginId,
+              ) &&
+              installations.some(
+                (installation) =>
+                  installation.pluginId === instance.pluginId &&
+                  installation.digest === instance.artifactDigest,
+              ))),
       )
       .sort((left, right) =>
         left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
       );
     for (const instance of restorable) {
+      const currentDeployment = deployments.find(
+        (deployment) =>
+          deployment.applicationId === instance.applicationId &&
+          deployment.pluginId === instance.pluginId,
+      );
+      const requiresHistoricalTermination =
+        currentDeployment !== undefined &&
+        instance.executionBinding !== undefined &&
+        (currentDeployment.state === "disabled" ||
+          currentDeployment.generation !== instance.deploymentGeneration ||
+          currentDeployment.artifactDigest !== instance.artifactDigest);
+      if (requiresHistoricalTermination) {
+        if (this.#componentLifecycle.restoreTermination === undefined) continue;
+        try {
+          await this.#componentLifecycle.restoreTermination(instance, this.#options.authority);
+          await this.#markTerminationRestored(instance);
+          await this.#clearRestorationFailure(instance);
+        } catch (error) {
+          await this.#recordRestorationFailure(instance, error, decisionNow);
+        }
+        continue;
+      }
       const providerLossHold = providerLosses.find(
         (loss) =>
           loss.value.consumer.applicationId === instance.applicationId &&
@@ -2339,12 +2393,10 @@ export class Reconciler {
       ).toISOString();
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
-          const { retryEffect: _retryEffect, ...stable } = current.value;
-          void _retryEffect;
           await transaction.put(
             key,
             {
-              ...stable,
+              ...current.value,
               attempt: nextAttempt,
               retryAt,
               diagnostic,
@@ -3062,6 +3114,12 @@ export class Reconciler {
     }
     const instance = current.value;
     const instanceActivation = parsePersistedActivation(instance);
+    const bindingMatchesCheckpoint =
+      instance.executionBinding === undefined
+        ? effect.executionBinding === undefined
+        : effect.executionBinding !== undefined &&
+          instance.executionBinding.fingerprint === effect.executionBinding.fingerprint &&
+          isDeepStrictEqual(instance.executionBinding, effect.executionBinding);
     if (
       instance.instanceId !== effect.instanceId ||
       instanceActivation !== effect.activation ||
@@ -3072,7 +3130,8 @@ export class Reconciler {
       instance.observedGeneration !== effect.deploymentGeneration ||
       instance.artifactDigest !== effect.artifactDigest ||
       instance.executor !== effect.executor ||
-      instance.workerId !== effect.workerId
+      instance.workerId !== effect.workerId ||
+      !bindingMatchesCheckpoint
     ) {
       await this.#rejectInvalidClaim(
         claim,
@@ -3347,8 +3406,10 @@ export class Reconciler {
         return;
       }
     }
+    // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+    let effectResult: void | { readonly executionBinding?: ExecutionBinding };
     try {
-      await this.#options.effects.perform(effect);
+      effectResult = await this.#options.effects.perform(effect);
     } catch (error) {
       await this.#commitFailedEffect(effect, claim, error, decisionNow);
       return;
@@ -3357,13 +3418,19 @@ export class Reconciler {
       this.#interrupted = true;
       return;
     }
-    await this.#commitEffect(effect, claim, "completed");
+    await this.#commitEffect(
+      effect,
+      claim,
+      "completed",
+      effectResult === undefined ? undefined : effectResult,
+    );
   }
 
   async #commitEffect(
     effect: ReconcileEffect,
     claim: OutboxClaim,
     outcome: "completed",
+    result?: { readonly executionBinding?: ExecutionBinding },
   ): Promise<void> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const key = instanceKey(effect.instanceId);
@@ -3400,6 +3467,9 @@ export class Reconciler {
             {
               ...stable,
               lifecycle,
+              ...(effect.kind === "prepare" && result?.executionBinding !== undefined
+                ? { executionBinding: result.executionBinding }
+                : {}),
               ...(effect.kind === "start" ? { hasStarted: true } : {}),
               observedGeneration: effect.deploymentGeneration,
               completedOperationId: effect.operationId,

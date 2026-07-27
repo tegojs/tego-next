@@ -1063,7 +1063,9 @@ test("stop retries retained reconciler cleanup, closes every service, and aggreg
     .map((entry, index) => (entry === "reconciler.stop:14" ? index : -1))
     .filter((index) => index !== -1);
   assert.equal(reconcilerStops.length, 2);
-  assert.ok(value.log.indexOf("workers.authority:none") > (reconcilerStops[1] ?? -1));
+  const workerRevoke = value.log.indexOf("workers.authority:none");
+  assert.ok(workerRevoke > (reconcilerStops[0] ?? -1));
+  assert.ok(workerRevoke < (reconcilerStops[1] ?? Number.POSITIVE_INFINITY));
   for (const entry of [
     "coordination.release:14",
     "tasks.close",

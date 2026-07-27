@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   DiagnosticError,
   type ExecutorKind,
+  type ExecutionBinding,
   type PluginDeployment,
   parseMessageId,
   parseOperationId,
@@ -21,14 +22,27 @@ import {
 import type { ComponentEffectExecutor } from "../reconcile/reconciler.js";
 import type {
   ComponentBinding,
+  ComponentBindingPreparation,
   ComponentRegistry,
   RegisteredComponent,
 } from "./component-registry.js";
 
 export interface ComponentLifecycleHost {
+  prepare(
+    binding: ComponentBindingPreparation,
+    persisted?: ExecutionBinding,
+  ): Promise<ExecutionBinding>;
   start(binding: ComponentBinding): Promise<void>;
   drain(binding: ComponentBinding): Promise<void>;
+  restoreTermination?(
+    binding: ComponentBinding,
+    checkpoint: "draining" | "stopping",
+  ): Promise<void>;
   stop(binding: ComponentBinding): Promise<void>;
+}
+
+export interface ComponentEffectResult {
+  readonly executionBinding?: ExecutionBinding;
 }
 
 export interface ComponentEffectsOptions {
@@ -51,7 +65,8 @@ type StartEffect = ReconcileEffect & { readonly kind: "start" };
 
 interface CachedOperation {
   readonly fingerprint: string;
-  readonly result: Promise<void>;
+  // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+  readonly result: Promise<void | ComponentEffectResult>;
   readonly instanceId: string;
   readonly authority: RuntimeAuthority | undefined;
   status: "pending" | "succeeded";
@@ -83,6 +98,7 @@ function effectFingerprint(effect: ReconcileEffect): string {
     effect.artifactDigest,
     effect.executor,
     effect.workerId ?? null,
+    effect.executionBinding ?? null,
     effect.messageId,
   ]);
 }
@@ -148,7 +164,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
     this.supportedExecutors = Object.freeze([...new Set(options.supportedExecutors)]);
   }
 
-  perform(effect: ReconcileEffect): Promise<void> {
+  // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+  perform(effect: ReconcileEffect): Promise<void | ComponentEffectResult> {
     try {
       parseActivation(effect.activation);
     } catch (error) {
@@ -286,21 +303,43 @@ export class ComponentEffects implements ComponentEffectExecutor {
     return result;
   }
 
-  restoreTermination(
+  async restoreTermination(
     instance: ComponentInstance,
     authority: RuntimeAuthority | undefined = this.#authority(),
   ): Promise<void> {
-    try {
-      parseActivation(instance.activation);
-      const effect = this.#restorationEffect(instance, "stop");
-      this.#assertCurrentAuthority(effect, authority);
-      return this.#prepare(effect, authority);
-    } catch (error) {
-      return Promise.reject(error);
+    parseActivation(instance.activation);
+    const effect = this.#restorationEffect(instance, "stop");
+    this.#assertCurrentAuthority(effect, authority);
+    await this.#prepare(effect, authority);
+    const entry = this.#registry.require(instance.instanceId);
+    this.#registry.assertMatches(effect, entry, authority);
+    if (entry.state === "stopping") return;
+    if (
+      instance.lifecycle !== "ready" &&
+      instance.lifecycle !== "degraded" &&
+      instance.lifecycle !== "draining" &&
+      instance.lifecycle !== "stopping" &&
+      !(
+        instance.lifecycle === "failed" &&
+        (instance.retryEffect === "drain" || instance.retryEffect === "stop")
+      )
+    ) {
+      throw effectError(
+        "LIFECYCLE_TRANSITION_INVALID",
+        "Only a durable running or terminating component can restore teardown",
+        effect,
+      );
     }
+    const checkpoint =
+      instance.lifecycle === "stopping" ||
+      (instance.lifecycle === "failed" && instance.retryEffect === "stop")
+        ? "stopping"
+        : "draining";
+    await this.#host.restoreTermination?.(entry.binding, checkpoint);
+    this.#registry.transition(effect, entry.state, "stopping", authority);
   }
 
-  restoreStarting(effect: StartEffect): Promise<void> {
+  async restoreStarting(effect: StartEffect): Promise<void> {
     if (effect.kind !== "start") {
       return Promise.reject(new TypeError("Only a start effect can restore a starting checkpoint"));
     }
@@ -328,12 +367,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
         ),
       );
     }
-    try {
-      this.#assertCurrentAuthority(effect, authority);
-      return this.#prepare(effect, authority);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    this.#assertCurrentAuthority(effect, authority);
+    await this.#prepare(effect, authority);
   }
 
   async #restore(
@@ -478,7 +513,11 @@ export class ComponentEffects implements ComponentEffectExecutor {
     return failures;
   }
 
-  async #perform(effect: ReconcileEffect, authority: RuntimeAuthority | undefined): Promise<void> {
+  async #perform(
+    effect: ReconcileEffect,
+    authority: RuntimeAuthority | undefined,
+    // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+  ): Promise<void | ComponentEffectResult> {
     if (!this.supportedExecutors.includes(effect.executor)) {
       throw effectError(
         "LIFECYCLE_EXECUTOR_UNSUPPORTED",
@@ -488,8 +527,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
     }
     this.#assertCurrentAuthority(effect, authority);
     if (effect.kind === "prepare") {
-      await this.#prepare(effect, authority);
-      return;
+      const executionBinding = await this.#prepare(effect, authority);
+      return { executionBinding };
     }
     let entry = this.#registry.require(effect.instanceId);
     if (effect.kind === "stop" && entry.state === "stopping") {
@@ -544,11 +583,14 @@ export class ComponentEffects implements ComponentEffectExecutor {
     await this.#stop(effect, entry, authority);
   }
 
-  async #prepare(effect: ReconcileEffect, authority: RuntimeAuthority | undefined): Promise<void> {
+  async #prepare(
+    effect: ReconcileEffect,
+    authority: RuntimeAuthority | undefined,
+  ): Promise<ExecutionBinding> {
     const current = this.#registry.get(effect.instanceId);
     if (current !== undefined) {
       this.#registry.assertMatches(effect, current, authority);
-      return;
+      return current.binding.executionBinding;
     }
     const resolved = await this.#resolveDeployment(effect);
     if (
@@ -590,7 +632,7 @@ export class ComponentEffects implements ComponentEffectExecutor {
           effect,
         );
       }
-      const binding: ComponentBinding = {
+      const preparation: ComponentBindingPreparation = {
         instanceId: effect.instanceId,
         activation: effect.activation,
         executor: effect.executor,
@@ -600,7 +642,13 @@ export class ComponentEffects implements ComponentEffectExecutor {
         component: validatedComponent,
         ...(authority === undefined ? {} : { authority }),
       };
+      const executionBinding = await this.#host.prepare(preparation, effect.executionBinding);
+      const binding: ComponentBinding = {
+        ...preparation,
+        executionBinding,
+      };
       this.#registry.register(effect, binding, authority);
+      return executionBinding;
     } catch (error) {
       try {
         await this.#artifacts.release(effect.artifactDigest);
@@ -726,6 +774,10 @@ export class ComponentEffects implements ComponentEffectExecutor {
     instance: ComponentInstance,
     kind: "prepare" | "start" | "stop",
   ): ReconcileEffect {
+    const retryingTermination =
+      kind === "stop" &&
+      instance.lifecycle === "failed" &&
+      (instance.retryEffect === "drain" || instance.retryEffect === "stop");
     if (
       instance.artifactDigest === undefined ||
       (kind === "prepare"
@@ -733,7 +785,8 @@ export class ComponentEffects implements ComponentEffectExecutor {
         : instance.lifecycle !== "ready" &&
           instance.lifecycle !== "degraded" &&
           instance.lifecycle !== "draining" &&
-          instance.lifecycle !== "stopping")
+          instance.lifecycle !== "stopping" &&
+          !retryingTermination)
     ) {
       throw new TypeError("Only exact persisted restorable component instances can be restored");
     }
@@ -752,6 +805,9 @@ export class ComponentEffects implements ComponentEffectExecutor {
       artifactDigest: instance.artifactDigest,
       executor: instance.executor,
       ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
+      ...(instance.executionBinding === undefined
+        ? {}
+        : { executionBinding: instance.executionBinding }),
     };
   }
 

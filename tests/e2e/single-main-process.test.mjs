@@ -38,12 +38,12 @@ const workerResources = {
   storageBytes: 256 * 1024 * 1024,
 };
 
-async function runCli(arguments_) {
+async function runCli(arguments_, timeout = processDeadlineMs) {
   const { stdout, stderr } = await executeFile(process.execPath, [cliBinary, ...arguments_], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 1024 * 1024,
-    timeout: processDeadlineMs,
+    timeout,
   });
   assert.equal(stderr, "");
   return JSON.parse(stdout);
@@ -131,7 +131,7 @@ export default defineComponent({
         ? Reflect.get(input, "delayMs")
         : undefined;
     if (typeof requestedDelay === "number" && Number.isFinite(requestedDelay)) {
-      const delayMs = Math.max(0, Math.min(requestedDelay, 10_000));
+      const delayMs = Math.max(0, Math.min(requestedDelay, 30_000));
       await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
     }
     if (
@@ -802,8 +802,69 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       const record = snapshot.tasks.items
         .map((item) => item.value)
         .find((candidate) => candidate.taskId === activeTask.taskId);
-      return record !== undefined && record.state !== "terminal" ? record : undefined;
-    }, "remote task remains active before authority transfer");
+      return record?.state === "running" ? record : undefined;
+    }, "remote task is running before authority transfer");
+    let replacementOutcome;
+    const replacementDeployment = runCli([
+      "plugin",
+      "deploy",
+      "org.example.echo",
+      "--digest",
+      installation.digest,
+      "--permissions",
+      JSON.stringify([
+        { kind: "executor", executors: ["remote"] },
+        { kind: "worker", labels: {}, resources: workerResources },
+      ]),
+      "--configuration",
+      "{}",
+      "--essential",
+      "--endpoint",
+      leader.candidate.configuration.endpoint,
+      "--json",
+    ]).then(
+      (value) => (replacementOutcome = { value }),
+      (error) => (replacementOutcome = { error }),
+    );
+    let latestReplacementInstances = [];
+    const statePool = new Pool({ connectionString: postgresUrl, max: 1 });
+    try {
+      await eventually(async () => {
+        if (replacementOutcome !== undefined && "error" in replacementOutcome) {
+          throw replacementOutcome.error;
+        }
+        const result = await statePool.query(
+          `SELECT collection_name, value_json
+             FROM tego_records
+            WHERE driver_namespace = $1
+              AND namespace = 'tego'
+              AND collection_name IN ('component-instances', 'deployments')`,
+          [runtimeId],
+        );
+        latestReplacementInstances = result.rows
+          .filter((row) => row.collection_name === "component-instances")
+          .map((row) => row.value_json);
+        const desiredReplacement = result.rows
+          .filter((row) => row.collection_name === "deployments")
+          .map((row) => row.value_json)
+          .find((deployment) => deployment.generation === "2");
+        const retainedRunning = latestReplacementInstances.find(
+          (instance) =>
+            instance.deploymentGeneration === "1" &&
+            instance.executor === "remote" &&
+            instance.lifecycle === "ready",
+        );
+        return desiredReplacement === undefined || retainedRunning === undefined
+          ? undefined
+          : { desiredReplacement, retainedRunning };
+      }, "replacement desired state is durable before authority transfer");
+    } catch (error) {
+      throw new Error(
+        `${String(error)} replacement=${JSON.stringify(replacementOutcome)} instances=${JSON.stringify(latestReplacementInstances)}`,
+      );
+    } finally {
+      await statePool.end();
+    }
 
     const oldEpoch = BigInt(leader.status.authority.epoch);
     const pool = new Pool({ connectionString: postgresUrl, max: 1 });
@@ -852,17 +913,24 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
         ? status
         : undefined;
     }, "Worker placement moves to the promoted PostgreSQL Main");
-    await waitForDeployment(follower.candidate.configuration.endpoint, "1");
-    const completed = await runCli([
-      "task",
-      "wait",
-      activeTask.taskId,
-      "--timeout-ms",
-      String(processDeadlineMs),
-      "--endpoint",
-      follower.candidate.configuration.endpoint,
-      "--json",
-    ]);
+    const replacementResult = await replacementDeployment;
+    if ("value" in replacementResult) {
+      assert.equal(replacementResult.value.generation, "2");
+    }
+    await waitForDeployment(follower.candidate.configuration.endpoint, "2");
+    const completed = await runCli(
+      [
+        "task",
+        "wait",
+        activeTask.taskId,
+        "--timeout-ms",
+        String(processDeadlineMs * 3),
+        "--endpoint",
+        follower.candidate.configuration.endpoint,
+        "--json",
+      ],
+      processDeadlineMs * 3,
+    );
     assert.equal(completed.result.status, "succeeded");
     assert.deepEqual(completed.result.output, {
       delayMs: 10_000,
@@ -877,6 +945,19 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
     assert.equal(taskRecords[0]?.attemptId, activeTask.attemptId);
     assert.equal(taskRecords[0]?.state, "terminal");
     assert.equal(taskRecords[0]?.result.status, "succeeded");
+    const componentInstances = snapshot.instances.items.map((item) => item.value);
+    assert.equal(
+      componentInstances.some(
+        (instance) => instance.deploymentGeneration === "1" && instance.lifecycle === "stopped",
+      ),
+      true,
+    );
+    assert.equal(
+      componentInstances.some(
+        (instance) => instance.deploymentGeneration === "2" && instance.lifecycle === "ready",
+      ),
+      true,
+    );
   } catch (error) {
     operationError = error;
   } finally {

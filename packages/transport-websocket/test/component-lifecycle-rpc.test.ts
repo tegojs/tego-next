@@ -4,6 +4,8 @@ import {
   createExecutionBinding,
   parseApplicationId,
   parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
   parsePluginId,
 } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
@@ -55,6 +57,7 @@ async function connected(
   > = {},
 ): Promise<{
   readonly local: TestLocalExecutor;
+  readonly mainSession: ReturnType<typeof memorySessionPair>[0];
   readonly remote: RemoteExecutor;
   readonly validated: RemoteComponentActivation[];
 }> {
@@ -87,7 +90,7 @@ async function connected(
     }
     await Promise.all([remote.close(), runtime.close()]);
   });
-  return { local, remote, validated };
+  return { local, mainSession, remote, validated };
 }
 
 afterEach(async () => {
@@ -229,6 +232,33 @@ test("component stop removes the exact activation", async () => {
 
   await assert.rejects(remote.submit(request), /activation|active/iu);
   assert.equal(local.executions, 0);
+});
+
+test("Worker rejects a stop fingerprint mismatch before callback or activation deletion", async () => {
+  let stopCalls = 0;
+  const { local, mainSession, remote } = await connected({
+    stopComponent: () => {
+      stopCalls += 1;
+    },
+  });
+  const request = executionRequest({ mode: "echo", value: "retained" }, "stop-mismatch");
+  await remote.activateComponent(activationFor(request));
+
+  const response = await mainSession.request("component.stop", {
+    target: request.target,
+    bindingFingerprint: "0".repeat(64),
+  });
+  assert.equal((response.payload as { ok?: unknown }).ok, false);
+  assert.equal(
+    (response.payload as { error?: { code?: unknown } }).error?.code,
+    "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+  );
+  assert.equal(stopCalls, 0);
+  assert.equal((await (await remote.submit(request)).result).status, "succeeded");
+  assert.equal(local.executions, 1);
+
+  await remote.stopComponent(request.target, request.binding.fingerprint);
+  assert.equal(stopCalls, 1);
 });
 
 test("activation materialization completes before ACK and failed materialization is not stored", async () => {
@@ -536,6 +566,224 @@ test("fresh Main hydrates retained draining Worker state and completes teardown"
   assert.deepEqual(stopped, [activationFor(request)]);
 });
 
+test("fresh Main adopts an exact retained active Worker activation only for teardown", async () => {
+  const request = executionRequest(null, "active-takeover");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const drained: RemoteComponentActivation[] = [];
+  const stopped: RemoteComponentActivation[] = [];
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    drainComponent: (activation) => {
+      drained.push(activation);
+    },
+    stopComponent: (activation) => {
+      stopped.push(activation);
+    },
+  });
+  await runtime.attach(firstWorker);
+  const firstRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await firstRemote.attach(firstMain);
+  const activation = activationFor(request);
+  await firstRemote.activateComponent(activation);
+  firstMain.close();
+
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  await runtime.attach(replacementWorker);
+  const replacementRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await replacementRemote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([firstRemote.close(), replacementRemote.close(), runtime.close()]);
+  });
+
+  await replacementRemote.restoreComponentForTermination(activation);
+  await assert.rejects(replacementRemote.submit(request), /drain|active/iu);
+  await replacementRemote.drainComponent(request.target, activation.bindingFingerprint);
+  await replacementRemote.stopComponent(request.target, activation.bindingFingerprint);
+  assert.deepEqual(drained, [activation]);
+  assert.deepEqual(stopped, [activation]);
+});
+
+test("fresh Main teardown converges when the exact Worker activation was already stopped", async () => {
+  const request = executionRequest(null, "already-stopped-takeover");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const stopped: RemoteComponentActivation[] = [];
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    stopComponent: (activation) => {
+      stopped.push(activation);
+    },
+  });
+  await runtime.attach(firstWorker);
+  const firstRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await firstRemote.attach(firstMain);
+  const activation = activationFor(request);
+  await firstRemote.activateComponent(activation);
+  await firstRemote.stopComponent(request.target, activation.bindingFingerprint);
+  firstMain.close();
+
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  await runtime.attach(replacementWorker);
+  const replacementRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await replacementRemote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([firstRemote.close(), replacementRemote.close(), runtime.close()]);
+  });
+
+  await replacementRemote.restoreComponentForTermination(activation);
+  await replacementRemote.drainComponent(request.target, activation.bindingFingerprint);
+  await replacementRemote.stopComponent(request.target, activation.bindingFingerprint);
+  assert.deepEqual(stopped, [activation]);
+});
+
+test("Worker teardown candidate requires the exact Main fingerprint for drain", async () => {
+  const request = executionRequest(null, "draining-exact-fingerprint");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  let failDrain = true;
+  let drainCalls = 0;
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    drainComponent: () => {
+      drainCalls += 1;
+      if (failDrain) throw new Error("drain interrupted");
+    },
+  });
+  const firstRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  await runtime.attach(firstWorker);
+  await firstRemote.attach(firstMain);
+  await firstRemote.activateComponent(activationFor(request));
+  await assert.rejects(firstRemote.drainComponent(request.target), /drain/iu);
+  firstMain.close();
+
+  const replacementRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  await runtime.attach(replacementWorker);
+  await replacementRemote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([firstRemote.close(), replacementRemote.close(), runtime.close()]);
+  });
+  failDrain = false;
+  const drainExact = replacementRemote.drainComponent as (
+    target: typeof request.target,
+    bindingFingerprint?: string,
+  ) => Promise<void>;
+
+  await assert.rejects(drainExact.call(replacementRemote, request.target), /fingerprint|binding/iu);
+  await assert.rejects(
+    drainExact.call(replacementRemote, request.target, "0".repeat(64)),
+    /fingerprint|binding/iu,
+  );
+  assert.equal(drainCalls, 1);
+
+  await drainExact.call(
+    replacementRemote,
+    request.target,
+    activationFor(request).bindingFingerprint,
+  );
+  assert.equal(drainCalls, 2);
+  await assert.rejects(replacementRemote.submit(request), /drain|active/iu);
+});
+
+test("Worker teardown candidate survives an exact second reconnect for Main-authorized stop", async () => {
+  const request = executionRequest(null, "draining-second-reconnect");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const stopped: RemoteComponentActivation[] = [];
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    drainComponent: () => {
+      throw new Error("drain interrupted");
+    },
+    stopComponent: (activation) => {
+      stopped.push(activation);
+    },
+  });
+  const firstRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  await runtime.attach(firstWorker);
+  await firstRemote.attach(firstMain);
+  await firstRemote.activateComponent(activationFor(request));
+  await assert.rejects(firstRemote.drainComponent(request.target), /drain/iu);
+  firstMain.close();
+
+  const candidateRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const [candidateMain, candidateWorker] = memorySessionPair("2");
+  await runtime.attach(candidateWorker);
+  await candidateRemote.attach(candidateMain);
+  candidateMain.close();
+
+  const [replacementMain, replacementWorker] = memorySessionPair("3");
+  await runtime.attach(replacementWorker);
+  await candidateRemote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([firstRemote.close(), candidateRemote.close(), runtime.close()]);
+  });
+
+  const stopExact = candidateRemote.stopComponent as (
+    target: typeof request.target,
+    bindingFingerprint: string,
+  ) => Promise<void>;
+  await stopExact.call(candidateRemote, request.target, activationFor(request).bindingFingerprint);
+  assert.deepEqual(stopped, [activationFor(request)]);
+});
+
 test("Worker-reported draining state is never replayed to another replacement Worker", async () => {
   const request = executionRequest(null, "draining-provenance");
   const target = request.target.executor;
@@ -682,4 +930,96 @@ test("Worker validates a complete activation inventory before materialization", 
 
   assert.notEqual((response.payload as { readonly error?: unknown }).error, undefined);
   assert.deepEqual(materialized, []);
+});
+
+test("Worker reconciliation checkpoints exact activations after partial materialization failure", async () => {
+  const firstRequest = executionRequest(null, "worker-partial-materialization");
+  const target = firstRequest.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const firstActivation = activationFor(firstRequest);
+  const secondTarget = {
+    ...firstRequest.target,
+    instanceId: parseComponentInstanceId("app.org.example.remote.echo.g2"),
+    deploymentGeneration: parseGeneration("2"),
+  };
+  const secondIdentity = {
+    applicationId: firstRequest.applicationId,
+    pluginId: firstRequest.pluginId,
+    componentId: firstRequest.componentId,
+    target: secondTarget,
+  };
+  const secondBinding = createExecutionBinding(secondIdentity, {
+    configuration: firstRequest.binding.configuration,
+    permissionGrants: firstRequest.binding.permissionGrants,
+    capabilityDefinitions: firstRequest.binding.capabilityDefinitions,
+    capabilityBindings: firstRequest.binding.capabilityBindings,
+  });
+  const secondActivation: RemoteComponentActivation = {
+    identity: {
+      applicationId: secondIdentity.applicationId,
+      pluginId: secondIdentity.pluginId,
+      componentId: secondIdentity.componentId,
+    },
+    target: secondTarget,
+    configuration: secondBinding.configuration,
+    permissionGrants: secondBinding.permissionGrants,
+    capabilityDefinitions: secondBinding.capabilityDefinitions,
+    capabilityBindings: secondBinding.capabilityBindings,
+    bindingFingerprint: secondBinding.fingerprint,
+  };
+  const materialized: string[] = [];
+  let failSecond = true;
+  const [main, worker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    activateComponent: (candidate) => {
+      materialized.push(candidate.bindingFingerprint);
+      if (candidate.bindingFingerprint === secondActivation.bindingFingerprint && failSecond) {
+        failSecond = false;
+        throw new Error("second materialization failed");
+      }
+    },
+  });
+  await runtime.attach(worker);
+  cleanups.push(async () => runtime.close());
+  const inventory = {
+    workerId: target.workerId,
+    epoch: main.epoch,
+    activations: [
+      { activation: firstActivation, state: "active" },
+      { activation: secondActivation, state: "active" },
+    ],
+  } as const;
+
+  const failed = await main.request("session.reconcile", inventory);
+  assert.notEqual((failed.payload as { readonly error?: unknown }).error, undefined);
+  assert.deepEqual(materialized, [
+    firstActivation.bindingFingerprint,
+    secondActivation.bindingFingerprint,
+  ]);
+
+  const recovered = await main.request("session.reconcile", inventory);
+  assert.equal((recovered.payload as { readonly error?: unknown }).error, undefined);
+  assert.deepEqual(materialized, [
+    firstActivation.bindingFingerprint,
+    secondActivation.bindingFingerprint,
+    secondActivation.bindingFingerprint,
+  ]);
+  assert.deepEqual(
+    (
+      recovered.payload as {
+        readonly componentActivations: readonly {
+          readonly activation: RemoteComponentActivation;
+          readonly state: string;
+        }[];
+      }
+    ).componentActivations,
+    [
+      { activation: firstActivation, state: "active" },
+      { activation: secondActivation, state: "active" },
+    ],
+  );
 });

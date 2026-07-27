@@ -39,6 +39,7 @@ export {
 export {
   ComponentRegistry,
   type ComponentBinding,
+  type ComponentBindingPreparation,
   type ComponentBindingState,
   type RegisteredComponent,
 } from "./components/component-registry.js";

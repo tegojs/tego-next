@@ -301,22 +301,13 @@ export async function createNodeRuntimeHost(
           target,
         ),
       ),
-    resolveTeardownExecutionBinding: (binding, target) =>
-      drivers.state.transact({}, async (transaction) =>
-        resolveExecutionBinding(
-          transaction,
-          {
-            applicationId: binding.deployment.applicationId,
-            pluginId: binding.deployment.pluginId,
-            componentId: binding.component.componentId,
-          },
-          target,
-          { allowInactiveDeployment: true },
-        ),
-      ),
     runtimeId: options.runtimeId,
   });
   const lifecycleHost: ComponentLifecycleHost = {
+    prepare: (binding, persisted) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.prepare(binding, persisted)
+        : componentHost.prepare(binding, persisted),
     start: (binding) =>
       binding.executor === "remote"
         ? remoteComponentHost.start(binding)
@@ -325,6 +316,10 @@ export async function createNodeRuntimeHost(
       binding.executor === "remote"
         ? remoteComponentHost.drain(binding)
         : componentHost.drain(binding),
+    restoreTermination: (binding, checkpoint) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.restoreTermination(binding, checkpoint)
+        : componentHost.restoreTermination(binding, checkpoint),
     stop: (binding) =>
       binding.executor === "remote"
         ? remoteComponentHost.stop(binding)
@@ -675,7 +670,35 @@ export async function createNodeRuntimeHost(
   const tasks = new TaskService({
     state: drivers.state,
     clock: drivers.clock,
-    selectExecutor: async (request, target, _signal, persistedBinding) => {
+    selectExecutor: async (request, target, _signal, persistedBinding, identity) => {
+      if (
+        target !== undefined &&
+        target.executor.type === "remote" &&
+        persistedBinding !== undefined &&
+        sessionRegistry.findExact(target) === undefined
+      ) {
+        if (identity === undefined) {
+          throw new TypeError("Remote task recovery requires an exact durable task identity");
+        }
+        const binding = assertExecutionBindingMatches(
+          {
+            applicationId: request.applicationId,
+            pluginId: request.pluginId,
+            componentId: request.componentId,
+            target,
+          },
+          persistedBinding,
+        );
+        return {
+          target,
+          binding,
+          executor: remoteComponentHost.resolveTaskRecoveryExecutor(
+            target,
+            binding.fingerprint,
+            identity,
+          ),
+        };
+      }
       const selection =
         target === undefined
           ? sessionRegistry.resolveFresh(
@@ -1008,9 +1031,7 @@ export async function createNodeRuntimeHost(
             const deployment = parsePluginDeployment(durableDeployment.value);
             if (
               deployment.applicationId !== effect.applicationId ||
-              deployment.pluginId !== effect.pluginId ||
-              deployment.generation !== effect.deploymentGeneration ||
-              deployment.artifactDigest !== effect.artifactDigest
+              deployment.pluginId !== effect.pluginId
             ) {
               return undefined;
             }
@@ -1034,27 +1055,53 @@ export async function createNodeRuntimeHost(
             ) {
               return undefined;
             }
-            const durableInstallation = await drivers.state.read({
+            let installation: ReturnType<typeof parsePluginInstallation> | undefined;
+            for await (const record of drivers.state.scan({
               namespace: "tego",
               collection: "installations",
-              id: `${deployment.pluginId}@${deployment.version}@${deployment.artifactDigest}`,
-            });
-            if (durableInstallation === undefined) return undefined;
-            const installation = parsePluginInstallation(durableInstallation.value);
+            })) {
+              const candidate = parsePluginInstallation(record.value);
+              if (
+                candidate.pluginId === effect.pluginId &&
+                candidate.digest === effect.artifactDigest
+              ) {
+                installation = candidate;
+                break;
+              }
+            }
+            if (installation === undefined) return undefined;
             const artifact = await localArtifactGate.validate({
               digest: effect.artifactDigest,
             });
             if (
-              installation.pluginId !== deployment.pluginId ||
-              installation.version !== deployment.version ||
-              installation.digest !== deployment.artifactDigest ||
+              installation.pluginId !== effect.pluginId ||
+              installation.digest !== effect.artifactDigest ||
               artifact.digest !== installation.digest ||
               !canonicalJsonEqual(artifact.manifest, installation.manifest)
             ) {
               return undefined;
             }
+            const historical =
+              deployment.generation === effect.deploymentGeneration &&
+              deployment.artifactDigest === effect.artifactDigest
+                ? deployment
+                : effect.executionBinding === undefined
+                  ? undefined
+                  : {
+                      applicationId: effect.applicationId,
+                      pluginId: effect.pluginId,
+                      version: installation.version,
+                      artifactDigest: effect.artifactDigest,
+                      generation: effect.deploymentGeneration,
+                      state: "disabled" as const,
+                      essential: deployment.essential,
+                      configuration: effect.executionBinding.configuration,
+                      permissionGrants: effect.executionBinding.permissionGrants,
+                      capabilityBindings: {},
+                    };
+            if (historical === undefined) return undefined;
             return {
-              deployment,
+              deployment: historical,
               artifact,
             };
           },

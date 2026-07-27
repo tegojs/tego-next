@@ -165,6 +165,14 @@ function harness(
     resolveDeployment: async () => validatedDeployment,
     authority: () => authority,
     host: {
+      prepare: async (_binding, persisted) =>
+        persisted ?? {
+          configuration: null,
+          permissionGrants: [],
+          capabilityDefinitions: [],
+          capabilityBindings: [],
+          fingerprint: "1".repeat(64),
+        },
       start: async (binding) => {
         assert.equal(Object.isFrozen(binding), true);
         calls.push(`start:${binding.instanceId}`);
@@ -298,16 +306,20 @@ test("starting checkpoint restoration prepares the exact binding without reporti
 });
 
 test("termination restoration prepares held sessions without externally starting them", async () => {
-  for (const lifecycle of ["ready", "draining", "stopping"] as const) {
+  for (const instance of [
+    readyInstance({ lifecycle: "ready" }),
+    readyInstance({ lifecycle: "draining" }),
+    readyInstance({ lifecycle: "stopping" }),
+    readyInstance({ lifecycle: "failed", retryEffect: "stop" }),
+  ]) {
     const { calls, effects, registry } = harness();
     const termination = effects as ComponentEffects & {
       restoreTermination(instance: ComponentInstance): Promise<void>;
     };
-    const instance = readyInstance({ lifecycle });
 
     await termination.restoreTermination(instance);
 
-    assert.equal(registry.require(instanceId).state, "prepared");
+    assert.equal(registry.require(instanceId).state, "stopping");
     assert.deepEqual(calls, []);
     await effects.perform(effect("stop"));
     assert.deepEqual(calls, [`stop:${instanceId}`]);

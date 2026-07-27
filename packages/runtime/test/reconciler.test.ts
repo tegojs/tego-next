@@ -5,6 +5,7 @@ import {
   type Clock,
   type ClusterTime,
   compareOperationJournalCursors,
+  createExecutionBinding,
   DiagnosticError,
   type DriverHealth,
   type ExecutorKind,
@@ -24,6 +25,7 @@ import {
   parseArtifactDigest,
   parseCapabilityName,
   parseComponentId,
+  parseComponentInstanceId,
   parseFencingEpoch,
   parseGeneration,
   parseMessageId,
@@ -3552,6 +3554,87 @@ test("claimed effects revalidate current placement before journaling or performi
   await reconciler.stop();
 });
 
+test("claimed lifecycle effects cannot replace the durable execution binding checkpoint", async () => {
+  const clock = new ManualClock();
+  const effects = new RecordingEffects();
+  const state = await createHarnessStore(clock);
+  const desired = deployment("1");
+  const planned = planReconcile(snapshot(desired)).steps[0]?.effect;
+  assert.ok(planned);
+  const target = {
+    instanceId: parseComponentInstanceId(planned.instanceId),
+    deploymentGeneration: planned.deploymentGeneration,
+    artifactDigest: planned.artifactDigest,
+    executor: { id: "process", type: "process" as const },
+  };
+  const identity = { applicationId, pluginId, componentId, target };
+  const checkpoint = createExecutionBinding(identity, {
+    configuration: { source: "checkpoint" },
+    permissionGrants: [],
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
+  const divergent = createExecutionBinding(identity, {
+    configuration: { source: "outbox-replay" },
+    permissionGrants: [],
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
+  const replay = { ...planned, executionBinding: divergent };
+  const now = clock.now().toISOString();
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: planned.artifactDigest,
+        componentId,
+        deploymentGeneration: planned.deploymentGeneration,
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        activation: planned.activation,
+        lifecycle: "preparing",
+        observedGeneration: planned.deploymentGeneration,
+        pluginId,
+        executionBinding: checkpoint,
+      },
+      { expectedRevision: "absent" },
+    );
+    await transaction.enqueueOutbox({
+      availableAt: now,
+      createdAt: now,
+      messageId: replay.messageId,
+      operationId: replay.operationId,
+      payload: replay,
+      topic: "component.lifecycle",
+    });
+    return null;
+  });
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [desired],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+
+  assert.equal(
+    effects.calls.some(
+      (candidate) => candidate.executionBinding?.fingerprint === divergent.fingerprint,
+    ),
+    false,
+  );
+  assert.equal(state.outbox.get(replay.messageId)?.acknowledgement?.outcome, "retry");
+  await reconciler.stop();
+});
+
 test("claimed remote effects require the current worker placement to match exactly", async () => {
   const resources = { cpuMillis: 1_000, memoryBytes: 1_000_000, storageBytes: 1_000_000 };
   const workerPermission = {
@@ -4238,6 +4321,102 @@ test("persisted local restoration failures are isolated and durably retryable", 
     assert.equal(reconciler.applicationReady(), !essential);
     await reconciler.stop();
   }
+});
+
+test("failed historical teardown restoration retains its stop retry until recovery succeeds", async () => {
+  const clock = new ScheduledClock();
+  const state = await createHarnessStore(clock);
+  const oldDeployment = deployment("1");
+  const replacement = deployment("2");
+  const planned = planReconcile(snapshot(oldDeployment)).steps[0]?.effect;
+  assert.ok(planned);
+  const target = {
+    instanceId: parseComponentInstanceId(planned.instanceId),
+    deploymentGeneration: planned.deploymentGeneration,
+    artifactDigest: planned.artifactDigest,
+    executor: { id: "process", type: "process" as const },
+  };
+  const executionBinding = createExecutionBinding(
+    { applicationId, pluginId, componentId, target },
+    {
+      configuration: null,
+      permissionGrants: [],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    },
+  );
+  await state.transact({}, async (transaction) => {
+    await transaction.put(
+      {
+        namespace: "tego",
+        collection: "component-instances",
+        id: planned.instanceId,
+      },
+      {
+        applicationId,
+        artifactDigest: planned.artifactDigest,
+        componentId,
+        deploymentGeneration: planned.deploymentGeneration,
+        executor: planned.executor,
+        instanceId: planned.instanceId,
+        activation: planned.activation,
+        lifecycle: "failed",
+        observedGeneration: planned.deploymentGeneration,
+        pluginId,
+        retryEffect: "stop",
+        executionBinding,
+      },
+      { expectedRevision: "absent" },
+    );
+    return null;
+  });
+  const effects = new RecordingEffects() as RecordingEffects & {
+    restoreTermination(instance: ComponentInstance): Promise<void>;
+  };
+  let restorations = 0;
+  effects.restoreTermination = async () => {
+    restorations += 1;
+    if (restorations === 1) throw new Error("transient teardown restoration failure");
+  };
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    state,
+    loadDeployments: async () => [replacement],
+    loadInstallations: async () => [installation()],
+  });
+
+  await reconciler.start();
+  const failed = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  const failedValue = failed?.value as
+    | {
+        readonly retryEffect?: string;
+        readonly diagnostic?: { readonly code?: string };
+      }
+    | undefined;
+  assert.equal(failedValue?.retryEffect, "stop");
+  assert.equal(failedValue?.diagnostic?.code, "LIFECYCLE_RESTORE_FAILED");
+
+  clock.advance(60_000);
+  await reconciler.wake();
+
+  assert.equal(restorations, 2);
+  const recovered = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: planned.instanceId,
+  });
+  assert.notEqual(
+    (recovered?.value as { readonly diagnostic?: { readonly code?: string } } | undefined)
+      ?.diagnostic?.code,
+    "LIFECYCLE_RESTORE_FAILED",
+  );
+  await reconciler.stop();
 });
 
 test("persisted preparing local sessions are restored before their start effect resumes", async () => {

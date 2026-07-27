@@ -29,6 +29,7 @@ export class DeterministicRemoteSession {
         payload: {
           acknowledged: [],
           attemptPersistenceAvailable: true,
+          componentActivations: [],
           epoch: this.epoch,
           preparedArtifacts: [],
           running: [],

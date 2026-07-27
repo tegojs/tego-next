@@ -691,19 +691,15 @@ class TegoRuntime implements Runtime {
     } catch (error) {
       errors.push(error);
     }
-    let reconcilerStopped = false;
     try {
       await this.#stopReconciler();
-      reconcilerStopped = true;
     } catch (error) {
       errors.push(error);
     }
-    if (reconcilerStopped) {
-      try {
-        await this.#revokeWorkerAuthority();
-      } catch (error) {
-        errors.push(error);
-      }
+    try {
+      await this.#revokeWorkerAuthority();
+    } catch (error) {
+      errors.push(error);
     }
     if (errors.length > 0) {
       throw new DiagnosticError(

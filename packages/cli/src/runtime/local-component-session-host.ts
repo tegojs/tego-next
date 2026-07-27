@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  assertExecutionBindingMatches,
   type Clock,
   type ComponentCapabilityInvocation,
   DiagnosticError,
@@ -24,6 +25,7 @@ import {
 } from "@tegojs/executor-node";
 import {
   type ComponentBinding,
+  type ComponentBindingPreparation,
   type ComponentInstanceIdentity,
   type ComponentLifecycleHost,
   canonicalJsonBytes,
@@ -43,7 +45,7 @@ export interface LocalComponentSessionHostOptions {
   readonly secretProvider: SecretProvider;
   readonly registry: LocalComponentSessionRegistry;
   readonly resolveExecutionBinding: (
-    binding: ComponentBinding,
+    binding: ComponentBindingPreparation,
     target: TaskExecutionTarget,
   ) => Promise<ExecutionBinding>;
   readonly invokeCapability: (
@@ -85,6 +87,23 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
     this.#options = options;
   }
 
+  async prepare(
+    binding: ComponentBindingPreparation,
+    persisted?: ExecutionBinding,
+  ): Promise<ExecutionBinding> {
+    const target = this.#target(binding);
+    const candidate = persisted ?? (await this.#options.resolveExecutionBinding(binding, target));
+    return assertExecutionBindingMatches(
+      {
+        applicationId: binding.deployment.applicationId,
+        pluginId: binding.deployment.pluginId,
+        componentId: binding.component.componentId,
+        target,
+      },
+      candidate,
+    );
+  }
+
   async start(binding: ComponentBinding): Promise<void> {
     parseActivation(binding.activation);
     assertLocalComponentManifestSupported(binding.artifact.manifest);
@@ -97,7 +116,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
       pluginId: binding.deployment.pluginId,
       componentId: binding.component.componentId,
     };
-    const executionBinding = await this.#options.resolveExecutionBinding(binding, target);
+    const executionBinding = binding.executionBinding;
     const consumer: ComponentInstanceIdentity = {
       ...identity,
       activation: binding.activation,
@@ -205,6 +224,11 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
     await registration.drainLifecycle({});
   }
 
+  async restoreTermination(
+    _binding: ComponentBinding,
+    _checkpoint: "draining" | "stopping",
+  ): Promise<void> {}
+
   async stop(binding: ComponentBinding): Promise<void> {
     const target = this.#target(binding);
     const registration = this.#options.registry.findExact(target);
@@ -214,7 +238,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
     this.#options.registry.remove(target);
   }
 
-  #target(binding: ComponentBinding): TaskExecutionTarget {
+  #target(binding: ComponentBindingPreparation): TaskExecutionTarget {
     parseActivation(binding.activation);
     if (binding.executor !== "process" && binding.executor !== "thread") {
       throw new TypeError("Local component sessions support only process and thread executors");

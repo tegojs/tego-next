@@ -169,7 +169,7 @@ export class RemoteExecutor implements Executor {
     string,
     {
       readonly activation: RemoteComponentActivation;
-      readonly provenance: "main" | "worker-teardown";
+      readonly provenance: "main" | "main-teardown" | "worker-teardown";
       state: "active" | "draining";
     }
   >();
@@ -431,7 +431,34 @@ export class RemoteExecutor implements Executor {
     });
   }
 
-  async drainComponent(targetValue: TaskExecutionTarget): Promise<void> {
+  async restoreComponentForTermination(activationValue: RemoteComponentActivation): Promise<void> {
+    const activation = parseRemoteComponentActivation(activationValue);
+    this.#assertExactTarget(activation.target, "component termination restoration");
+    this.#lifecycleManaged = true;
+    const key = this.#activationKey(activation.target);
+    const existing = this.#componentActivations.get(key);
+    if (
+      existing !== undefined &&
+      jsonFingerprint(existing.activation) !== jsonFingerprint(activation)
+    ) {
+      throw remoteError(
+        "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+        "Exact component termination restoration conflicts with retained activation state",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    this.#componentActivations.set(key, {
+      activation: cloneJson(activation),
+      provenance: "main-teardown",
+      state: "draining",
+    });
+  }
+
+  async drainComponent(
+    targetValue: TaskExecutionTarget,
+    bindingFingerprint?: string,
+  ): Promise<void> {
     const target = parseTaskExecutionTarget(targetValue);
     this.#assertExactTarget(target, "component drain");
     const activation = this.#componentActivations.get(this.#activationKey(target));
@@ -443,14 +470,36 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
+    if (
+      (activation.provenance !== "main" || bindingFingerprint !== undefined) &&
+      bindingFingerprint !== activation.activation.bindingFingerprint
+    ) {
+      throw remoteError(
+        "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+        "Remote component drain requires the Main-derived binding fingerprint",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     activation.state = "draining";
-    await this.#componentLifecycleRequest(
-      REMOTE_COMPONENT_DRAIN,
-      REMOTE_COMPONENT_DRAIN,
-      { target },
-      target,
-      activation.activation.bindingFingerprint,
-    );
+    try {
+      await this.#componentLifecycleRequest(
+        REMOTE_COMPONENT_DRAIN,
+        REMOTE_COMPONENT_DRAIN,
+        { target, bindingFingerprint: activation.activation.bindingFingerprint },
+        target,
+        activation.activation.bindingFingerprint,
+      );
+    } catch (error) {
+      if (
+        activation.provenance === "main-teardown" &&
+        error instanceof DiagnosticError &&
+        error.diagnostic.code === "LIFECYCLE_COMPONENT_NOT_ACTIVE"
+      ) {
+        return;
+      }
+      throw error;
+    }
   }
 
   async stopComponent(
@@ -469,10 +518,10 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    if (
-      activation.provenance === "worker-teardown" &&
-      bindingFingerprint !== activation.activation.bindingFingerprint
-    ) {
+    const requestedFingerprint =
+      bindingFingerprint ??
+      (activation.provenance === "main" ? activation.activation.bindingFingerprint : undefined);
+    if (requestedFingerprint !== activation.activation.bindingFingerprint) {
       throw remoteError(
         "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
         "Worker-reported teardown requires the Main-derived binding fingerprint",
@@ -481,13 +530,23 @@ export class RemoteExecutor implements Executor {
       );
     }
     activation.state = "draining";
-    await this.#componentLifecycleRequest(
-      REMOTE_COMPONENT_STOP,
-      REMOTE_COMPONENT_STOP,
-      { target },
-      target,
-      activation.activation.bindingFingerprint,
-    );
+    try {
+      await this.#componentLifecycleRequest(
+        REMOTE_COMPONENT_STOP,
+        REMOTE_COMPONENT_STOP,
+        { target, bindingFingerprint: activation.activation.bindingFingerprint },
+        target,
+        activation.activation.bindingFingerprint,
+      );
+    } catch (error) {
+      if (
+        activation.provenance !== "main-teardown" ||
+        !(error instanceof DiagnosticError) ||
+        error.diagnostic.code !== "LIFECYCLE_COMPONENT_NOT_ACTIVE"
+      ) {
+        throw error;
+      }
+    }
     this.#componentActivations.delete(key);
     this.#clearCapabilityHistory(target);
   }
@@ -552,10 +611,7 @@ export class RemoteExecutor implements Executor {
       );
     }
     const result = parseRemoteComponentLifecycleResponse(response.payload);
-    if (
-      !this.#sameTarget(result.target, target) ||
-      (bindingFingerprint !== undefined && result.bindingFingerprint !== bindingFingerprint)
-    ) {
+    if (!this.#sameTarget(result.target, target)) {
       throw remoteError(
         "PROTOCOL_COMPONENT_LIFECYCLE_INVALID",
         "Worker component lifecycle response does not match its exact target",
@@ -567,6 +623,14 @@ export class RemoteExecutor implements Executor {
       throw remoteError(
         result.error?.code ?? "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
         result.error?.message ?? "Worker rejected remote component lifecycle",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    if (bindingFingerprint !== undefined && result.bindingFingerprint !== bindingFingerprint) {
+      throw remoteError(
+        "PROTOCOL_COMPONENT_LIFECYCLE_INVALID",
+        "Worker component lifecycle response does not match its exact binding",
         this.id,
         this.#clock.now().toISOString(),
       );
@@ -902,6 +966,19 @@ export class RemoteExecutor implements Executor {
     };
   }
 
+  async observeTarget(
+    targetValue: TaskExecutionTarget,
+    taskId: TaskId,
+    attemptId: AttemptId,
+  ): Promise<AttemptStatus | undefined> {
+    const target = parseTaskExecutionTarget(targetValue);
+    this.#assertExactTarget(target, "attempt observation");
+    const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
+    if (attempt === undefined) return undefined;
+    this.#assertAttemptTarget(attempt, target, "observation");
+    return this.observe(taskId, attemptId);
+  }
+
   async resumeTarget(
     targetValue: TaskExecutionTarget,
     taskId: TaskId,
@@ -910,23 +987,22 @@ export class RemoteExecutor implements Executor {
     const target = parseTaskExecutionTarget(targetValue);
     const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
     if (attempt === undefined) return undefined;
-    const actual = attempt.request.target;
-    if (
-      actual.instanceId !== target.instanceId ||
-      actual.deploymentGeneration !== target.deploymentGeneration ||
-      actual.artifactDigest !== target.artifactDigest ||
-      actual.executor.id !== target.executor.id ||
-      actual.executor.type !== target.executor.type ||
-      actual.executor.workerId !== target.executor.workerId
-    ) {
-      throw remoteError(
-        "PROTOCOL_EXECUTION_TARGET_INVALID",
-        "Recovered execution target does not match this RemoteExecutor attempt",
-        this.id,
-        this.#clock.now().toISOString(),
-      );
-    }
+    this.#assertAttemptTarget(attempt, target, "recovery");
     return attempt.handle;
+  }
+
+  #assertAttemptTarget(
+    attempt: RemoteAttempt,
+    target: TaskExecutionTarget,
+    operation: string,
+  ): void {
+    if (this.#sameTarget(attempt.request.target, target)) return;
+    throw remoteError(
+      "PROTOCOL_EXECUTION_TARGET_INVALID",
+      `Remote attempt target does not match this ${operation} request`,
+      this.id,
+      this.#clock.now().toISOString(),
+    );
   }
 
   revokeAuthority(): void {
@@ -971,6 +1047,19 @@ export class RemoteExecutor implements Executor {
       return;
     }
     await this.#requestCancel(attempt, session);
+  }
+
+  async cancelTarget(
+    targetValue: TaskExecutionTarget,
+    taskId: TaskId,
+    attemptId: AttemptId,
+  ): Promise<void> {
+    const target = parseTaskExecutionTarget(targetValue);
+    this.#assertExactTarget(target, "attempt cancellation");
+    const attempt = this.#attempts.get(attemptKey(taskId, attemptId));
+    if (attempt === undefined) return;
+    this.#assertAttemptTarget(attempt, target, "cancellation");
+    await this.cancel(taskId, attemptId);
   }
 
   drain(options: DrainOptions): Promise<void> {
@@ -1640,11 +1729,23 @@ export class RemoteExecutor implements Executor {
       const existing = this.#componentActivations.get(key);
       if (existing !== undefined) {
         if (
-          existing.state !== retained.state ||
           existing.activation.bindingFingerprint !== activation.bindingFingerprint ||
           !this.#sameTarget(existing.activation.target, activation.target)
         ) {
           throw new Error("Remote component activation inventory conflicts with Main state");
+        }
+        if (existing.provenance !== "main-teardown" && existing.state !== retained.state) {
+          throw new Error("Remote component activation inventory conflicts with Main state");
+        }
+        if (existing.provenance === "worker-teardown") {
+          if (existing.state !== "draining") {
+            throw new Error("Remote Worker teardown candidate state is invalid");
+          }
+          workerTeardownCandidates.set(key, {
+            activation: cloneJson(existing.activation),
+            provenance: "worker-teardown",
+            state: "draining",
+          });
         }
         continue;
       }

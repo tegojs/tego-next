@@ -15,6 +15,7 @@ import {
   parseFencingEpoch,
   parseGeneration,
   parsePluginId,
+  parseTaskExecutionTarget,
   parseTaskId,
   parseWorkerId,
 } from "@tegojs/contracts";
@@ -176,6 +177,29 @@ function realComponentEffects(startDeliveries, options = {}) {
       };
     },
     host: {
+      async prepare(binding, persisted) {
+        if (persisted !== undefined) return persisted;
+        const target = parseTaskExecutionTarget({
+          instanceId: binding.instanceId,
+          deploymentGeneration: binding.deployment.generation,
+          artifactDigest: binding.artifact.digest,
+          executor: { id: "fault-thread", type: "thread" },
+        });
+        return createExecutionBinding(
+          {
+            applicationId: binding.deployment.applicationId,
+            pluginId: binding.deployment.pluginId,
+            componentId: binding.component.componentId,
+            target,
+          },
+          {
+            configuration: binding.deployment.configuration,
+            permissionGrants: binding.deployment.permissionGrants,
+            capabilityDefinitions: [],
+            capabilityBindings: [],
+          },
+        );
+      },
       async start(binding) {
         assert.equal(registry.require(binding.instanceId).state, "prepared");
         startDeliveries.push({
