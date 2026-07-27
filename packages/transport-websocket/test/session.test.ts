@@ -985,7 +985,7 @@ test("a consumer listener failure cannot terminate the authenticated session", a
   }
 });
 
-test("an identical raw replay is deduplicated and a conflicting replay closes the session", async () => {
+test("a canonical replay is deduplicated and same-ID equivocation closes the session", async () => {
   const connection = await directConnection();
   try {
     const received: JsonValue[] = [];
@@ -993,11 +993,14 @@ test("an identical raw replay is deduplicated and a conflicting replay closes th
     await connection.mainSession.send("session.reconcile", { once: true });
     const original = connection.mainSocket.sent[0];
     assert.equal(typeof original, "string");
-    connection.workerSocket.inject(original as string);
+    const reordered = Object.fromEntries(
+      Object.entries(JSON.parse(original as string) as Record<string, JsonValue>).reverse(),
+    );
+    connection.workerSocket.inject(JSON.stringify(reordered));
     assert.deepEqual(received, [{ once: true }]);
 
     const conflict = JSON.parse(original as string) as Record<string, JsonValue>;
-    conflict.messageId = "message-conflict";
+    conflict.payload = { once: false };
     connection.workerSocket.inject(JSON.stringify(conflict));
     assert.equal(connection.workerSession.state, "closed");
     assert.equal(connection.workerSession.diagnostic?.code, "PROTOCOL_SEQUENCE_REPLAY");

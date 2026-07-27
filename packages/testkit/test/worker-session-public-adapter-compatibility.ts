@@ -1,4 +1,9 @@
-import type { JsonObject, WorkerId } from "@tegojs/contracts";
+import type {
+  JsonObject,
+  JsonValue,
+  WorkerId,
+  WorkerMessageType,
+} from "@tegojs/contracts";
 import {
   type MainEndpointLike,
   type WorkerEndpointFactoryOptions,
@@ -6,6 +11,7 @@ import {
   type WorkerRegistration,
   type WorkerRegistrationInput,
   type WorkerSessionLike,
+  type WorkerSessionMessage,
   type WorkerSessionSocket,
   workerSessionConformance,
 } from "@tegojs/testkit";
@@ -28,6 +34,30 @@ interface PublicAdapterWorkerRegistrationInput {
 interface PublicAdapterWorkerSession extends Omit<WorkerSessionLike, "epoch"> {
   readonly epoch: string;
 }
+
+type ExpectedPublicRequest = (
+  type: WorkerMessageType,
+  payload: JsonValue,
+  options?: {
+    readonly binary?: Uint8Array;
+    readonly timeoutMs?: number;
+  },
+) => Promise<WorkerSessionMessage>;
+
+type Exact<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2
+    ? (<Value>() => Value extends Right ? 1 : 2) extends <Value>() => Value extends Left ? 1 : 2
+      ? true
+      : false
+    : false;
+
+const requestSignatureIsExact: Exact<WorkerSessionLike["request"], ExpectedPublicRequest> = true;
+
+interface PublicAdapterWithoutRequest extends Omit<PublicAdapterWorkerSession, "request"> {}
+
+declare const publicAdapterWithoutRequest: PublicAdapterWithoutRequest;
+// @ts-expect-error A public Worker session adapter must implement request().
+const rejectedPublicAdapter: WorkerSessionLike = publicAdapterWithoutRequest;
 
 interface PublicAdapterMainEndpoint
   extends Omit<MainEndpointLike, "attach" | "current" | "registration"> {
@@ -69,4 +99,6 @@ const publicEpoch: WorkerSessionLike["epoch"] = epoch;
 
 void registration;
 void publicEpoch;
+void requestSignatureIsExact;
+void rejectedPublicAdapter;
 workerSessionConformance(publicAdapterMainFactory, publicAdapterWorkerFactory);

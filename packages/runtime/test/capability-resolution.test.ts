@@ -1,18 +1,21 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DiagnosticError,
   type PluginDeploymentIdentity,
   parseApplicationId,
   parseCapabilityName,
   parsePluginId,
 } from "@tegojs/contracts";
-import { type ProviderLossDecision, strongestProviderLoss } from "../src/capabilities/resolver.js";
 import {
   type CapabilityResolutionDeployment,
+  parseActivation,
+  type ProviderLossDecision,
   isValidVersion,
   isValidVersionRange,
   resolveCapabilities,
   satisfiesVersionRange,
+  strongestProviderLoss,
 } from "../src/index.js";
 
 const applicationId = parseApplicationId("application-01");
@@ -75,6 +78,31 @@ test("provider loss precedence is explicit and independent of action order", () 
     );
   }
   assert.equal(strongestProviderLoss([]), undefined);
+});
+
+test("invalid activations expose a stable public diagnostic with canonical bounds", () => {
+  for (const value of [
+    -1,
+    "01",
+    "18446744073709551616",
+    "not-an-activation",
+  ] as const) {
+    assert.throws(
+      () => parseActivation(value),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ACTIVATION_INVALID");
+        assert.equal(error.diagnostic.message, "Activation is invalid");
+        assert.deepEqual(error.diagnostic.details, {
+          canonicalFormat: "unsigned decimal string",
+          minimum: "0",
+          maximum: "18446744073709551615",
+        });
+        assert.equal(error.diagnostic.cause, undefined);
+        return true;
+      },
+    );
+  }
 });
 
 test("@spec:capability-resolution/deterministic-provider-selection/one-compatible-provider", () => {
