@@ -31,6 +31,30 @@ test("defineComponent snapshots and deeply freezes a functional definition", () 
   }, TypeError);
 });
 
+test("defineComponent accepts a task capability provider hook", async () => {
+  const invokeCapability = async (_context: ComponentContext, request: JsonValue) => request;
+  const definition = defineComponent({
+    kind: "task",
+    invokeCapability,
+  } as never);
+
+  assert.equal(
+    (definition as unknown as { readonly invokeCapability?: unknown }).invokeCapability,
+    invokeCapability,
+  );
+});
+
+test("defineComponent explicitly rejects capability provider hooks on services", () => {
+  assert.throws(
+    () =>
+      defineComponent({
+        kind: "service",
+        invokeCapability: async () => null,
+      } as never),
+    /task components/u,
+  );
+});
+
 test("defineComponent rejects class instances and accessor-backed definitions without invoking them", () => {
   class ComponentClass {
     readonly kind = "task";

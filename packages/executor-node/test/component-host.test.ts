@@ -319,6 +319,51 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
   assert.equal(calls, 0);
 });
 
+test("provider capability invocation commands preserve the exact bounded wire contract", () => {
+  const invocation = {
+    protocol: "1.0",
+    commandId: "invoke-capability-01",
+    deadline: futureDeadline,
+    type: "invokeCapability",
+    payload: {
+      artifactDigest: digest,
+      invocation: {
+        invocationId: "operation-01",
+        identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+        method: "echo",
+        input: { message: "hello" },
+      },
+    },
+  };
+
+  assert.deepEqual(parseComponentHostCommand(invocation), invocation);
+  assert.throws(
+    () =>
+      parseComponentHostCommand({
+        ...invocation,
+        payload: {
+          ...invocation.payload,
+          invocation: { ...invocation.payload.invocation, invocationId: "" },
+        },
+      }),
+    /invocation/u,
+  );
+  assert.throws(
+    () =>
+      parseComponentHostCommand({
+        ...invocation,
+        payload: {
+          ...invocation.payload,
+          invocation: {
+            ...invocation.payload.invocation,
+            input: "x".repeat(1024 * 1024 + 1),
+          },
+        },
+      }),
+    /bounded|limit|size/u,
+  );
+});
+
 test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sdk", async (t) => {
   const fixture = await artifactFixture(
     t,
@@ -1509,6 +1554,78 @@ test("capability calls are forced through permission, request, invoke, and respo
   assert.equal(invalidResponse.ok, false);
   assert.deepEqual(order, ["permission:capability", "request", "invoke", "response"]);
   assert.equal(invalidResponse.diagnostics[0]?.code, "CAPABILITY_RESPONSE_INVALID");
+});
+
+test("provider capability commands invoke only the task provider hook", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => { throw new Error("run must not handle provider calls"); },
+        invokeCapability: async (_context, request) => ({
+          invocationId: request.invocationId,
+          method: request.method,
+          input: request.input
+        })
+      });
+    `,
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "provider-import", { artifactDigest: digest }));
+  await host.handle(command("start", "provider-start", { artifactDigest: digest }));
+
+  const result = await host.handle(
+    command("invokeCapability" as never, "provider-invoke", {
+      artifactDigest: digest,
+      invocation: {
+        invocationId: "operation-provider-01",
+        identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+        method: "echo",
+        input: { message: "hello" },
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, {
+    invocationId: "operation-provider-01",
+    method: "echo",
+    input: { message: "hello" },
+  });
+});
+
+test("service components explicitly reject provider capability hooks", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default {
+        protocol: "tego.component/1.0",
+        kind: "service",
+        invokeCapability: async () => null
+      };
+    `,
+    { componentId: "component" },
+  );
+  const component = fixture.manifest.components[0]!;
+  const serviceManifest = {
+    ...fixture.manifest,
+    components: [{ ...component, kind: "service" as const }],
+  } satisfies PluginManifest;
+  const host = new ComponentHost(
+    allowedOptions({ ...fixture, manifest: serviceManifest }),
+  );
+  await host.handle(prepareCommand({ ...fixture, manifest: serviceManifest }));
+  const result = await host.handle(
+    command("import", "service-provider-import", { artifactDigest: digest }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "EXECUTOR_COMPONENT_DEFINITION_INVALID");
+  assert.match(result.diagnostics[0]?.message ?? "", /task|unsupported/u);
 });
 
 test("duplicate task attempts execute once and cooperative cancellation reaches the hook", async (t) => {

@@ -124,6 +124,34 @@ test("component session close applies a default shutdown deadline", async () => 
   assert.equal((await handle.result).status, "cancelled");
 });
 
+test("component session delegates exact provider capability invocations to its transport", async () => {
+  const fixture = hangingTransport();
+  let received: unknown;
+  const transport = {
+    ...fixture.transport,
+    async invokeCapability(invocation: unknown) {
+      received = invocation;
+      return { echoed: invocation };
+    },
+  };
+  const sandbox = session(transport);
+  const invocation = {
+    invocationId: "operation-session-01",
+    identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+    method: "echo",
+    input: { message: "hello" },
+  };
+
+  const value = await (
+    sandbox as unknown as {
+      invokeCapability(request: typeof invocation): Promise<unknown>;
+    }
+  ).invokeCapability(invocation);
+
+  assert.deepEqual(received, invocation);
+  assert.deepEqual(value, { echoed: invocation });
+});
+
 test("component session close does not await a non-settling transport termination forever", async () => {
   const run = Promise.withResolvers<never>();
   const transport = {

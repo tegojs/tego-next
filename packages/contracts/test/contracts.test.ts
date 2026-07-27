@@ -234,6 +234,7 @@ const validCapabilityIdentity = {
 
 const validCapabilityDefinition = {
   identity: validCapabilityIdentity,
+  methods: ["echo"],
   requestSchema: {
     type: "object",
     additionalProperties: false,
@@ -247,6 +248,15 @@ const validCapabilityDefinition = {
     properties: { echo: { type: "string" } },
   },
 } satisfies CapabilityDefinition;
+
+const validCapabilityProvision = {
+  name: validCapabilityIdentity.name,
+  protocolVersion: validCapabilityIdentity.protocolVersion,
+  componentId: validManifest.components[0]!.componentId,
+  methods: ["echo", "inspect"],
+  requestSchema: validCapabilityDefinition.requestSchema,
+  responseSchema: validCapabilityDefinition.responseSchema,
+} as const;
 
 const validCapabilityBinding = {
   capability: validCapabilityIdentity,
@@ -382,6 +392,74 @@ test("plugin permission contracts are structured and empty arrays remain valid",
         }),
       (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
       path,
+    );
+  }
+});
+
+test("plugin capability provisions carry a canonical method set, schemas, and a task provider", () => {
+  const manifest = {
+    ...validManifest,
+    capabilities: {
+      provides: [validCapabilityProvision],
+      requires: [],
+    },
+  };
+
+  assert.deepEqual(parsePluginManifest(manifest), manifest);
+  for (const provides of [
+    [{ ...validCapabilityProvision, methods: [] }],
+    [{ ...validCapabilityProvision, methods: ["echo", "echo"] }],
+    [{ ...validCapabilityProvision, methods: ["inspect", "echo"] }],
+    [
+      validCapabilityProvision,
+      { ...validCapabilityProvision, componentId: parseComponentId("other") },
+    ],
+  ]) {
+    assert.throws(
+      () =>
+        parsePluginManifest({
+          ...validManifest,
+          capabilities: { provides, requires: [] },
+        }),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+    );
+  }
+});
+
+test("plugin capability provisions reject undeclared and non-task provider components", () => {
+  assert.throws(
+    () =>
+      parsePluginManifest({
+        ...validManifest,
+        capabilities: {
+          provides: [
+            { ...validCapabilityProvision, componentId: parseComponentId("undeclared") },
+          ],
+          requires: [],
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
+  assert.throws(
+    () =>
+      parsePluginManifest({
+        ...validManifest,
+        components: [{ ...validManifest.components[0], kind: "service" }],
+        capabilities: {
+          provides: [validCapabilityProvision],
+          requires: [],
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
+});
+
+test("capability definitions require canonical non-empty unique methods", () => {
+  assert.deepEqual(parseCapabilityDefinition(validCapabilityDefinition), validCapabilityDefinition);
+  for (const methods of [[], ["echo", "echo"], ["inspect", "echo"]]) {
+    assert.throws(
+      () => parseCapabilityDefinition({ ...validCapabilityDefinition, methods }),
+      (error: unknown) => diagnosticCode(error) === "CAPABILITY_DEFINITION_INVALID",
     );
   }
 });
