@@ -13,6 +13,7 @@ import {
   type ArtifactDigest,
   type AttemptId,
   type ComponentId,
+  type Generation,
   type OperationId,
   type PluginId,
   type TaskId,
@@ -22,6 +23,7 @@ import {
   parseExecutionResult,
   parsePermissionSet,
   parsePluginDeployment,
+  parsePluginDeploymentObservation,
   parseRuntimeDiagnostic,
 } from "./schema.js";
 import {
@@ -71,7 +73,25 @@ export interface RunTaskRequest extends JsonObject {
 export interface PluginDeploymentStatus extends JsonObject {
   readonly identity: PluginDeploymentIdentity;
   readonly desired?: PluginDeployment;
-  readonly observation?: JsonValue;
+  readonly observation?: PluginDeploymentObservation;
+}
+
+export type PluginDeploymentObservationStatus =
+  | "blocked"
+  | "degraded"
+  | "disabled"
+  | "failed"
+  | "ready"
+  | "reconciling"
+  | "suspended";
+
+export interface PluginDeploymentObservation extends JsonObject {
+  readonly applicationId: ApplicationId;
+  readonly pluginId: PluginId;
+  readonly generation: Generation;
+  readonly status: PluginDeploymentObservationStatus;
+  readonly diagnostics: readonly RuntimeDiagnostic[];
+  readonly updatedAt: string;
 }
 
 export type TaskRecordState = "accepted" | "running" | "terminal";
@@ -310,7 +330,7 @@ export function parsePluginDeploymentStatus(input: unknown): PluginDeploymentSta
       : { desired: structuredClone(parsePluginDeployment(value.desired)) }),
     ...(value.observation === undefined
       ? {}
-      : { observation: cloneStrictJson(value.observation as JsonValue) }),
+      : { observation: structuredClone(parsePluginDeploymentObservation(value.observation)) }),
   };
 }
 

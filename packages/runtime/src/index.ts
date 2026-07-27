@@ -69,6 +69,8 @@ export {
   createRuntimeHost,
   type RuntimeHost,
   type RuntimeHostServices,
+  type RuntimeObservedStatus,
+  type RuntimeObservedStatusReader,
 } from "./runtime-host.js";
 export {
   RuntimeOperationController,

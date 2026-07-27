@@ -25,6 +25,19 @@ export interface RuntimeHostServices {
   readonly onDiagnostic?: (diagnostic: RuntimeDiagnostic) => void | Promise<void>;
 }
 
+export interface RuntimeObservedStatus {
+  readonly deploymentCount: number;
+  readonly installationCount: number;
+  readonly deploymentReadiness: readonly {
+    readonly essential: boolean;
+    readonly ready: boolean;
+  }[];
+}
+
+export interface RuntimeObservedStatusReader {
+  read(): Promise<RuntimeObservedStatus>;
+}
+
 export type RuntimeHost = Runtime;
 
 export function createRuntimeHost(

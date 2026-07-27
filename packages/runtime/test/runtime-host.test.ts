@@ -600,14 +600,7 @@ const liveStatusDeployment = {
 } satisfies PluginDeployment;
 
 function liveStatusObservation(
-  status:
-    | "blocked"
-    | "degraded"
-    | "disabled"
-    | "failed"
-    | "ready"
-    | "reconciling"
-    | "suspended",
+  status: "blocked" | "degraded" | "disabled" | "failed" | "ready" | "reconciling" | "suspended",
   overrides: Readonly<Record<string, JsonValue>> = {},
 ): JsonValue {
   return {
@@ -640,11 +633,7 @@ function seedLiveDeployment(
     pluginId: deployment.pluginId,
     digest: deployment.artifactDigest,
   });
-  state.set(
-    "deployments",
-    `${deployment.applicationId}/${deployment.pluginId}`,
-    deployment,
-  );
+  state.set("deployments", `${deployment.applicationId}/${deployment.pluginId}`, deployment);
   if (observation !== undefined) {
     state.set(
       "deployment-observations",
@@ -662,8 +651,18 @@ test("typed deployment observation parser enforces exact canonical public fields
   ).parsePluginDeploymentObservation;
   assert.equal(typeof parseObservation, "function");
 
-  const valid = liveStatusObservation("reconciling");
-  assert.deepEqual(parseObservation(valid), valid);
+  for (const status of [
+    "blocked",
+    "degraded",
+    "disabled",
+    "failed",
+    "ready",
+    "reconciling",
+    "suspended",
+  ] as const) {
+    const valid = liveStatusObservation(status);
+    assert.deepEqual(parseObservation(valid), valid);
+  }
   for (const invalid of [
     liveStatusObservation("ready", { extra: true }),
     liveStatusObservation("ready", { generation: "01" }),
@@ -709,6 +708,20 @@ test("live runtime status reads empty durable state and deploy-after-start witho
     { deployments: 1, installations: 1 },
   );
   assert.equal(reconciling.readiness, false);
+
+  value.state.set(
+    "deployment-observations",
+    "application-01/plugin-01",
+    liveStatusObservation("ready", { generation: "0" }),
+  );
+  assert.equal((await runtime.status()).readiness, false);
+
+  value.state.set("deployments", "application-01/plugin-01", {
+    ...liveStatusDeployment,
+    state: "disabled",
+  });
+  value.state.delete("deployment-observations", "application-01/plugin-01");
+  assert.equal((await runtime.status()).readiness, true);
   assert.ok(value.state.transactionReadCount >= 2);
   await runtime.stop();
 });

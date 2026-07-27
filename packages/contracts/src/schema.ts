@@ -14,7 +14,9 @@ import {
   type ExecutionResult,
   parseTaskExecutionTarget,
 } from "./execution.js";
+import { parseApplicationId, parseGeneration, parsePluginId } from "./identity.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
+import type { PluginDeploymentObservation } from "./operations.js";
 import type { Permission } from "./permission.js";
 import type { PluginDeployment, PluginInstallation, PluginManifest } from "./plugin.js";
 import type { RuntimeConfiguration, RuntimeEvent, RuntimeStatus } from "./runtime.js";
@@ -527,6 +529,31 @@ const runtimeDiagnosticSchema = {
   },
 } as const;
 
+const pluginDeploymentObservationSchema = {
+  $id: "https://tegojs.dev/schemas/plugin-deployment-observation-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["applicationId", "pluginId", "generation", "status", "diagnostics", "updatedAt"],
+  properties: {
+    applicationId: { type: "string", pattern: IDENTITY_PATTERN },
+    pluginId: { type: "string", pattern: IDENTITY_PATTERN },
+    generation: { type: "string", pattern: DECIMAL_PATTERN },
+    status: {
+      enum: ["blocked", "degraded", "disabled", "failed", "ready", "reconciling", "suspended"],
+    },
+    diagnostics: {
+      type: "array",
+      items: { $ref: DIAGNOSTIC_SCHEMA_ID },
+    },
+    updatedAt: {
+      type: "string",
+      format: "date-time",
+      pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+    },
+  },
+} as const;
+
 const pluginInstallationSchema = {
   $id: "https://tegojs.dev/schemas/plugin-installation-1.0.json",
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -832,6 +859,7 @@ const validateLeadership = ajv.compile(leadershipSchema);
 const validateRuntimeStatus = ajv.compile(runtimeStatusSchema);
 const validateRuntimeEvent = ajv.compile(runtimeEventSchema);
 const validateRuntimeDiagnostic = ajv.compile(runtimeDiagnosticSchema);
+const validatePluginDeploymentObservation = ajv.compile(pluginDeploymentObservationSchema);
 const validatePermissionSet = ajv.compile(permissionSetSchema);
 const validatePluginManifest = ajv.compile(pluginManifestSchema);
 const validatePluginInstallation = ajv.compile(pluginInstallationSchema);
@@ -978,6 +1006,26 @@ export function parseRuntimeDiagnostic(input: unknown): RuntimeDiagnostic {
     "Runtime diagnostic is invalid",
     { kind: "protocol", id: "diagnostic" },
   );
+}
+
+export function parsePluginDeploymentObservation(input: unknown): PluginDeploymentObservation {
+  const parsed = parseWithValidator<PluginDeploymentObservation>(
+    validatePluginDeploymentObservation,
+    input,
+    "PROTOCOL_DEPLOYMENT_OBSERVATION_INVALID",
+    "Plugin deployment observation is invalid",
+    { kind: "protocol", id: "plugin-deployment-observation" },
+  );
+  return {
+    applicationId: parseApplicationId(parsed.applicationId),
+    pluginId: parsePluginId(parsed.pluginId),
+    generation: parseGeneration(parsed.generation),
+    status: parsed.status,
+    diagnostics: parsed.diagnostics.map((diagnostic) =>
+      structuredClone(parseRuntimeDiagnostic(diagnostic)),
+    ),
+    updatedAt: parsed.updatedAt,
+  };
 }
 
 export function parsePluginManifest(input: unknown): PluginManifest {

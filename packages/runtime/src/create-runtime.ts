@@ -1,6 +1,11 @@
 import {
   type Clock,
   DiagnosticError,
+  type JsonValue,
+  type PluginDeployment,
+  type PluginDeploymentObservation,
+  parsePluginDeployment,
+  parsePluginDeploymentObservation,
   parseRuntimeConfiguration,
   parseRuntimeEvent,
   parseRuntimeStatus,
@@ -11,6 +16,8 @@ import {
   type RuntimeEvent,
   type RuntimeLifecycleState,
   type RuntimeStatus,
+  type StateStore,
+  type StateTransaction,
   runtimeDiagnostic,
   type StopOptions,
   serializeCause,
@@ -20,7 +27,11 @@ import { LeadershipController } from "./leadership-controller.js";
 import { isRuntimeReady } from "./readiness.js";
 import type { Reconciler } from "./reconcile/reconciler.js";
 import { type RuntimeRecoverySnapshot, recoverRuntimeState } from "./recovery.js";
-import type { RuntimeHostServices } from "./runtime-host.js";
+import type {
+  RuntimeHostServices,
+  RuntimeObservedStatus,
+  RuntimeObservedStatusReader,
+} from "./runtime-host.js";
 import { RuntimeOperationController } from "./runtime-operations.js";
 import { transitionRuntimeState } from "./runtime-state.js";
 
@@ -48,6 +59,91 @@ export async function wakeReconcilerForAuthority(
     );
   }
   await reconciler.wake();
+}
+
+const observedStatusPageSize = 100;
+
+async function scanObservedStatusCollection<T extends JsonValue>(
+  transaction: StateTransaction,
+  collection: "deployment-observations" | "deployments" | "installations",
+  idPrefix?: string,
+): Promise<readonly T[]> {
+  const values: T[] = [];
+  let afterId: string | undefined;
+  while (true) {
+    const page = [];
+    for await (const record of transaction.scan<T>({
+      namespace: "tego",
+      collection,
+      ...(idPrefix === undefined ? {} : { idPrefix }),
+      ...(afterId === undefined ? {} : { afterId }),
+      limit: observedStatusPageSize,
+    })) {
+      page.push(record);
+    }
+    values.push(...page.map((record) => record.value));
+    if (page.length < observedStatusPageSize) return values;
+    afterId = page.at(-1)?.key.id;
+    if (afterId === undefined) return values;
+  }
+}
+
+class DurableRuntimeObservedStatusReader implements RuntimeObservedStatusReader {
+  readonly #applicationId: RuntimeConfiguration["applicationId"];
+  readonly #state: StateStore;
+
+  constructor(state: StateStore, applicationId: RuntimeConfiguration["applicationId"]) {
+    this.#state = state;
+    this.#applicationId = applicationId;
+  }
+
+  read(): Promise<RuntimeObservedStatus> {
+    return this.#state.transact({}, async (transaction) => {
+      const installations = await scanObservedStatusCollection<JsonValue>(
+        transaction,
+        "installations",
+      );
+      const deployments = (
+        await scanObservedStatusCollection<PluginDeployment>(
+          transaction,
+          "deployments",
+          `${this.#applicationId}/`,
+        )
+      )
+        .map((deployment) => parsePluginDeployment(deployment))
+        .filter((deployment) => deployment.applicationId === this.#applicationId);
+      const observations = (
+        await scanObservedStatusCollection<PluginDeploymentObservation>(
+          transaction,
+          "deployment-observations",
+          `${this.#applicationId}/`,
+        )
+      )
+        .map((observation) => parsePluginDeploymentObservation(observation))
+        .filter((observation) => observation.applicationId === this.#applicationId);
+      const observationByDeployment = new Map(
+        observations.map((observation) => [
+          `${observation.applicationId}/${observation.pluginId}`,
+          observation,
+        ]),
+      );
+      return {
+        deploymentCount: deployments.length,
+        installationCount: installations.length,
+        deploymentReadiness: deployments.map((deployment) => {
+          const observation = observationByDeployment.get(
+            `${deployment.applicationId}/${deployment.pluginId}`,
+          );
+          return {
+            essential: deployment.essential,
+            ready:
+              deployment.state === "disabled" ||
+              (observation?.generation === deployment.generation && observation.status === "ready"),
+          };
+        }),
+      };
+    });
+  }
 }
 
 class RuntimeEventIterator implements AsyncIterable<RuntimeEvent>, AsyncIterator<RuntimeEvent> {
@@ -134,6 +230,7 @@ class TegoRuntime implements Runtime {
   readonly #services: RuntimeHostServices | undefined;
   readonly #supervisor: DriverSupervisor;
   readonly #eventStream = new RuntimeEventStream();
+  readonly #observedStatus: RuntimeObservedStatusReader;
   #lifecycle: RuntimeLifecycleState = "created";
   #recovery: RuntimeRecoverySnapshot = {
     installationCount: 0,
@@ -161,6 +258,10 @@ class TegoRuntime implements Runtime {
     this.#configuration = parseRuntimeConfiguration(configuration);
     this.#drivers = drivers;
     this.#services = services;
+    this.#observedStatus = new DurableRuntimeObservedStatusReader(
+      drivers.state,
+      this.#configuration.applicationId,
+    );
     this.#supervisor = new DriverSupervisor(drivers);
     this.operations = new RuntimeOperationController({
       clock: drivers.clock,
@@ -303,6 +404,7 @@ class TegoRuntime implements Runtime {
     if (this.#lifecycle === "running") {
       this.#driverHealth = await this.#supervisor.health(this.#drivers.clock.now().toISOString());
     }
+    const observed = await this.#observedStatus.read();
     const driverHealth = this.#driverHealth.map(({ health }) => health);
     const status = {
       identity: {
@@ -316,13 +418,16 @@ class TegoRuntime implements Runtime {
       readiness: isRuntimeReady({
         lifecycle: this.#lifecycle,
         drivers: driverHealth,
-        deployments: this.#recovery.deploymentReadiness,
+        deployments: observed.deploymentReadiness.map((deployment) => ({
+          desired: true,
+          ...deployment,
+        })),
       }),
       acceptingOperations: this.operations.accepting,
       drivers: this.#driverHealth,
       counts: {
-        deployments: this.#recovery.deploymentCount,
-        installations: this.#recovery.installationCount,
+        deployments: observed.deploymentCount,
+        installations: observed.installationCount,
         recoverableOperations: this.#recovery.operations.length,
         tasks: this.#services?.tasks.count() ?? this.#recovery.taskCount,
         workers: this.#services?.workers.count() ?? 0,

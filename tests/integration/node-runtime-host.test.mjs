@@ -132,12 +132,22 @@ test("@spec:runtime-operations/local-node-runtime-host/thread-process-convergenc
     const packed = await prepareArtifact(directory, pluginWorkspace);
     host = await createHost(dataDirectory);
     await host.runtime.start();
+    assert.deepEqual((await host.runtime.status()).counts, {
+      deployments: 0,
+      installations: 0,
+      recoverableOperations: 0,
+      tasks: 0,
+      workers: 0,
+    });
     const ingested = await host.artifactIngress.putPath(packed.artifactPath);
     assert.equal(ingested, packed.digest);
     const installation = await host.runtime.operations.installPlugin({ digest: packed.digest });
     assert.equal(installation.digest, packed.digest);
 
     await deploy(host.runtime, packed.digest, "thread", "1");
+    assert.equal((await host.runtime.status()).readiness, true);
+    assert.equal((await host.runtime.status()).counts.deployments, 1);
+    assert.equal((await host.runtime.status()).counts.installations, 1);
     await runEcho(host.runtime, "thread", "integration-thread");
     await deploy(host.runtime, packed.digest, "process", "2");
     const processTask = await runEcho(host.runtime, "process", "integration-process");
@@ -148,6 +158,9 @@ test("@spec:runtime-operations/local-node-runtime-host/thread-process-convergenc
     restarted = await createHost(dataDirectory);
     await restarted.runtime.start();
     await waitForReady(restarted.runtime, "2");
+    assert.equal((await restarted.runtime.status()).readiness, true);
+    assert.equal((await restarted.runtime.status()).counts.deployments, 1);
+    assert.equal((await restarted.runtime.status()).counts.installations, 1);
     const recovered = await restarted.runtime.operations.taskStatus(processTask.taskId);
     assert.equal(recovered?.attemptId, processTask.attemptId);
     assert.deepEqual(recovered?.result?.output, processTask.result?.output);

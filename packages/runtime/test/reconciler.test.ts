@@ -3741,10 +3741,7 @@ test("non-canonical persisted instance identities remain durably inconsistent ac
   const observation = [...state.records.values()].find(
     (record) => record.key.collection === "deployment-observations",
   );
-  assert.equal(
-    (observation?.value as { readonly status?: string } | undefined)?.status,
-    "inconsistent",
-  );
+  assert.equal((observation?.value as { readonly status?: string } | undefined)?.status, "blocked");
   assert.deepEqual(effects.calls, []);
   await reconciler.stop();
 });
@@ -5553,11 +5550,11 @@ test("an exhausted lifecycle commit conflict is recovered automatically after it
   await reconciler.stop();
 });
 
-test("deployment observations distinguish unavailable, inconsistent, and degraded states", async () => {
+test("deployment observations expose blocked and degraded public states", async () => {
   for (const [expected, instances, installations] of [
-    ["unavailable", [], []],
+    ["blocked", [], []],
     [
-      "inconsistent",
+      "blocked",
       [
         {
           key: "duplicate-a",

@@ -12,6 +12,7 @@ import {
   type OutboxClaim,
   type PluginDeployment,
   type PluginDeploymentIdentity,
+  type PluginDeploymentObservation,
   type PluginInstallation,
   parseApplicationId,
   parseArtifactDigest,
@@ -21,6 +22,7 @@ import {
   parseMessageId,
   parseOperationId,
   parsePluginDeployment,
+  parsePluginDeploymentObservation,
   parsePluginId,
   parsePluginInstallation,
   type Revision,
@@ -258,23 +260,6 @@ interface LoadedComponentInstance {
   readonly legacyActivation: boolean;
 }
 
-interface DeploymentObservation extends JsonObject {
-  readonly applicationId: PluginDeployment["applicationId"];
-  readonly pluginId: PluginDeployment["pluginId"];
-  readonly generation: PluginDeployment["generation"];
-  readonly status:
-    | "blocked"
-    | "converging"
-    | "degraded"
-    | "failed"
-    | "inconsistent"
-    | "ready"
-    | "suspended"
-    | "unavailable";
-  readonly diagnostics: readonly JsonObject[];
-  readonly updatedAt: string;
-}
-
 function deploymentKey(identity: PluginDeploymentIdentity): string {
   return `${identity.applicationId}/${identity.pluginId}`;
 }
@@ -350,7 +335,7 @@ function isInstanceContextConsistent(
   );
 }
 
-function observationKey(deployment: PluginDeployment): StateKey<DeploymentObservation> {
+function observationKey(deployment: PluginDeployment): StateKey<PluginDeploymentObservation> {
   return {
     namespace,
     collection: "deployment-observations",
@@ -448,7 +433,7 @@ function conflictCode(error: unknown): string | undefined {
   );
 }
 
-function observationDiagnosticsFingerprint(diagnostics: readonly JsonObject[]): string {
+function observationDiagnosticsFingerprint(diagnostics: readonly RuntimeDiagnostic[]): string {
   return JSON.stringify(
     diagnostics.map((diagnostic) => {
       const { observedAt: _observedAt, ...stable } = diagnostic;
@@ -2796,35 +2781,24 @@ export class Reconciler {
     diagnostics: readonly RuntimeDiagnostic[],
   ): Promise<void> {
     this.#diagnosticsByDeployment.set(deploymentKey(deployment), diagnostics);
-    const codes = diagnostics.map((diagnostic) => diagnostic.code);
-    const status: DeploymentObservation["status"] = codes.some((code) =>
-      code.includes("INCONSISTENT"),
-    )
-      ? "inconsistent"
-      : codes.some(
-            (code) =>
-              code.includes("UNAVAILABLE") ||
-              code === "DEPLOYMENT_INSTALLATION_MISSING" ||
-              code === "DEPLOYMENT_EXECUTOR_UNAVAILABLE",
-          )
-        ? "unavailable"
-        : "blocked";
-    await this.#recordObservation(deployment, status, diagnostics);
+    await this.#recordObservation(deployment, "blocked", diagnostics);
   }
 
   async #recordObservation(
     deployment: PluginDeployment,
-    status: DeploymentObservation["status"],
+    status: PluginDeploymentObservation["status"],
     diagnostics: readonly RuntimeDiagnostic[],
   ): Promise<void> {
     const key = observationKey(deployment);
     const current = await this.#options.state.read(key);
+    const currentObservation =
+      current === undefined ? undefined : parsePluginDeploymentObservation(current.value);
     if (
-      current?.value.applicationId === deployment.applicationId &&
-      current.value.pluginId === deployment.pluginId &&
-      current.value.generation === deployment.generation &&
-      current.value.status === status &&
-      observationDiagnosticsFingerprint(current.value.diagnostics) ===
+      currentObservation?.applicationId === deployment.applicationId &&
+      currentObservation.pluginId === deployment.pluginId &&
+      currentObservation.generation === deployment.generation &&
+      currentObservation.status === status &&
+      observationDiagnosticsFingerprint(currentObservation.diagnostics) ===
         observationDiagnosticsFingerprint(diagnostics)
     ) {
       return;
@@ -3533,7 +3507,17 @@ export class Reconciler {
         this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
         await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
-      if (deployment.state !== "active") continue;
+      if (deployment.state !== "active") {
+        if (failedDiagnostics.length > 0) continue;
+        await this.#recordObservation(
+          deployment,
+          deploymentInstances.every((instance) => instance.lifecycle === "stopped")
+            ? "disabled"
+            : "reconciling",
+          [],
+        );
+        continue;
+      }
       const failedProviderLoss = providerLosses.find(
         (loss) =>
           loss.value.consumer.applicationId === deployment.applicationId &&
@@ -3586,7 +3570,7 @@ export class Reconciler {
               .sort((left, right) => compareActivations(right.activation, left.activation))[0];
             return latest?.lifecycle === "stopped";
           }) === true;
-        await this.#recordObservation(deployment, allStopped ? "suspended" : "converging", []);
+        await this.#recordObservation(deployment, allStopped ? "suspended" : "reconciling", []);
         continue;
       }
       const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
@@ -3624,7 +3608,7 @@ export class Reconciler {
       ) {
         await this.#recordObservation(deployment, "degraded", []);
       } else if (failedDiagnostics.length === 0) {
-        await this.#recordObservation(deployment, "converging", []);
+        await this.#recordObservation(deployment, "reconciling", []);
       }
     }
   }
