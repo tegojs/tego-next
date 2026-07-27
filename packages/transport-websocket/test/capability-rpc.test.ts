@@ -85,6 +85,7 @@ async function connected(
     attemptStore: new MemoryRemoteAttemptStore(),
     selectExecutor: () => new TestLocalExecutor(),
     invokeCapability,
+    ...options,
   });
   await runtime.attach(workerSession);
   const remote = new RemoteExecutor({
@@ -222,18 +223,75 @@ test("disconnect before the authoritative response is indeterminate and never re
 });
 
 test("capability invocation admission is bounded", async () => {
-  const { remote } = await connected((received) => received.invocation.input, {
-    maxCapabilityInvocations: 1,
-  });
-  const bounded = remote as RemoteExecutor;
-
-  assert.deepEqual(await bounded.invokeCapability(request("bounded-1")), {
-    value: "hello",
-  });
+  const releases: Array<PromiseWithResolvers<void>> = [];
+  const { remote } = await connected(
+    async (received) => {
+      const release = Promise.withResolvers<void>();
+      releases.push(release);
+      await release.promise;
+      return received.invocation.input;
+    },
+    {
+      maxCapabilityInvocations: 1,
+    },
+  );
+  const first = remote.invokeCapability(request("bounded-1"));
+  await Promise.resolve();
   await assert.rejects(
-    bounded.invokeCapability(request("bounded-2")),
+    remote.invokeCapability(request("bounded-2")),
     /capacity|bounded|exhausted/iu,
   );
+  releases[0]?.resolve();
+  assert.deepEqual(await first, { value: "hello" });
+  const afterSettlement = remote.invokeCapability(request("bounded-3"));
+  releases[1]?.resolve();
+  assert.deepEqual(await afterSettlement, { value: "hello" });
+});
+
+test("remote consumer capability admission reuses settled capacity", async () => {
+  const releases: Array<PromiseWithResolvers<void>> = [];
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    validateActivation: () => undefined,
+    maxCapabilityInvocations: 1,
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxCapabilityInvocations: 1,
+    routeCapability: async (received) => {
+      const release = Promise.withResolvers<void>();
+      releases.push(release);
+      await release.promise;
+      return received.invocation.input;
+    },
+  });
+  await remote.attach(mainSession);
+  cleanups.push(async () => {
+    for (const release of releases) release.resolve();
+    await Promise.all([remote.close(), runtime.close()]);
+  });
+  const firstRequest = request("consumer-bounded-1");
+  await remote.activateComponent(activationFor(firstRequest));
+
+  const first = runtime.invokeMainCapability(firstRequest);
+  await Promise.resolve();
+  await assert.rejects(
+    runtime.invokeMainCapability(request("consumer-bounded-2")),
+    /capacity|bounded|exhausted/iu,
+  );
+  releases[0]?.resolve();
+  assert.deepEqual(await first, { value: "hello" });
+  const afterSettlement = runtime.invokeMainCapability(request("consumer-bounded-3"));
+  releases[1]?.resolve();
+  assert.deepEqual(await afterSettlement, { value: "hello" });
 });
 
 test("remote consumer invokes Main through its authenticated exact activation", async () => {
