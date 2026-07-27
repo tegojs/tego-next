@@ -181,7 +181,16 @@ function commonSteps({ checkoutWith } = {}) {
 
 function postgresServiceIsValid(job) {
   const postgres = job.services?.postgres;
-  const options = postgres?.options;
+  const options =
+    typeof postgres?.options === "string"
+      ? postgres.options.trim().replaceAll(/\s+/gu, " ")
+      : undefined;
+  const expectedOptions = [
+    '--health-cmd "pg_isready -U tego_test -d tego_next_test"',
+    "--health-interval 1s",
+    "--health-timeout 3s",
+    "--health-retries 30",
+  ].join(" ");
   return (
     postgres?.image === "postgres:16.14-alpine" &&
     sameValue(postgres.env, {
@@ -190,13 +199,7 @@ function postgresServiceIsValid(job) {
       POSTGRES_USER: "tego_test",
     }) &&
     sameValue(postgres.ports, ["5432/tcp"]) &&
-    typeof options === "string" &&
-    [
-      '--health-cmd "pg_isready -U tego_test -d tego_next_test"',
-      "--health-interval 1s",
-      "--health-timeout 3s",
-      "--health-retries 30",
-    ].every((option) => options.includes(option))
+    options === expectedOptions
   );
 }
 
