@@ -77,19 +77,37 @@ function diagnostic(code, message, details = {}) {
   return { level: "error", code, message, ...details };
 }
 
-function workflowDocument(workflow) {
+function parseWorkflow(workflow) {
   try {
-    const document = parseYaml(workflow);
-    return typeof document === "object" && document !== null ? document : undefined;
+    const openNodes = [];
+    const ranges = new WeakMap();
+    const document = parseYaml(workflow, {
+      listener(event, state) {
+        if (event === "open") {
+          openNodes.push(state.position);
+          return;
+        }
+        const start = openNodes.pop();
+        if (start !== undefined && typeof state.result === "object" && state.result !== null) {
+          ranges.set(state.result, { end: state.position, start });
+        }
+      },
+    });
+    return typeof document === "object" && document !== null ? { document, ranges } : undefined;
   } catch {
     return undefined;
   }
 }
 
-export function parseWorkflowJobs(workflow) {
-  const jobs = workflowDocument(workflow)?.jobs;
+function workflowJobs(document) {
+  const jobs = document?.jobs;
   if (typeof jobs !== "object" || jobs === null || Array.isArray(jobs)) return new Map();
   return new Map(Object.entries(jobs));
+}
+
+export function parseWorkflowJobs(workflow) {
+  const parsed = parseWorkflow(workflow);
+  return parsed === undefined ? new Map() : workflowJobs(parsed.document);
 }
 
 function sameValue(actual, expected) {
@@ -203,25 +221,7 @@ function postgresServiceIsValid(job) {
   );
 }
 
-function workflowStepSource(workflow, jobName, stepName) {
-  const lines = workflow.split("\n");
-  const jobStart = lines.indexOf(`  ${jobName}:`);
-  if (jobStart === -1) return [];
-  const jobEnd = lines.findIndex(
-    (line, index) => index > jobStart && /^ {2}[a-zA-Z0-9_-]+:\s*$/u.test(line),
-  );
-  const end = jobEnd === -1 ? lines.length : jobEnd;
-  const stepStart = lines.findIndex(
-    (line, index) => index > jobStart && index < end && line === `      - name: ${stepName}`,
-  );
-  if (stepStart === -1) return [];
-  const stepEnd = lines.findIndex(
-    (line, index) => index > stepStart && index < end && /^ {6}- /u.test(line),
-  );
-  return lines.slice(stepStart, stepEnd === -1 ? end : stepEnd);
-}
-
-function validateActionVersionComments(errors, workflow) {
+function validateActionVersionComments(errors, workflow, jobs, ranges) {
   for (const [jobName, stepName, pin] of [
     ["quality", "Check out repository", actionPins.checkout],
     ["quality", "Set up Node.js", actionPins.setupNode],
@@ -232,20 +232,24 @@ function validateActionVersionComments(errors, workflow) {
     ["system-e2e", "Set up Node.js", actionPins.setupNode],
     ["system-e2e", "Upload process diagnostics", actionPins.uploadArtifact],
   ]) {
+    const step = jobs.get(jobName)?.steps?.find((candidate) => candidate?.name === stepName);
+    const range = typeof step === "object" && step !== null ? ranges.get(step) : undefined;
     const expected = `        uses: ${pin.reference} # ${pin.version}`;
-    if (!workflowStepSource(workflow, jobName, stepName).includes(expected)) {
+    const source = range === undefined ? "" : workflow.slice(range.start, range.end);
+    if (!source.split("\n").includes(expected)) {
       errors.push(`${jobName} step ${stepName} must carry the ${pin.version} review comment`);
     }
   }
 }
 
 export function validateWorkflowContract(workflow) {
-  const document = workflowDocument(workflow);
-  const jobs = parseWorkflowJobs(workflow);
+  const parsed = parseWorkflow(workflow);
   const errors = [];
-  if (document === undefined) {
+  if (parsed === undefined) {
     return ["workflow must be valid active YAML"];
   }
+  const { document, ranges } = parsed;
+  const jobs = workflowJobs(document);
   const expectedJobs = ["quality", "integration", "system-e2e"];
   if (
     jobs.size !== expectedJobs.length ||
@@ -261,7 +265,7 @@ export function validateWorkflowContract(workflow) {
   if (!sameValue(document.permissions, { contents: "read" })) {
     errors.push("workflow permissions must be exactly contents: read");
   }
-  validateActionVersionComments(errors, workflow);
+  validateActionVersionComments(errors, workflow, jobs, ranges);
   validateRequiredSteps(errors, "quality", quality, [
     ...commonSteps({ checkoutWith: { "fetch-depth": 0 } }),
     {

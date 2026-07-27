@@ -367,10 +367,7 @@ test("CI workflow validation binds action review comments to their required step
         ].join("\n"),
       ),
     workflow
-      .replace(
-        "name: CI",
-        `name: CI\n\nx-checkout: &checkout ${checkoutReference} # v6.1.0`,
-      )
+      .replace("name: CI", `name: CI\n\nx-checkout: &checkout ${checkoutReference} # v6.1.0`)
       .replace(`        uses: ${checkout}`, "        uses: *checkout"),
   ];
 
