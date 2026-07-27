@@ -344,24 +344,49 @@ test("CI workflow validation binds action review comments to their required step
     )
   );
   const checkout = "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0";
-  const mutation = workflow
-    .replace(`        uses: ${checkout}`, `        uses: ${checkout.split(" # ")[0]}`)
-    .replace(
-      "permissions:\n  contents: read",
-      `permissions:\n  contents: read\n\nenv:\n  ACTION_REVIEW_SPOOF: |\n    uses: ${checkout}`,
-    );
-  const diagnostics = validateReleasePreflight({
-    gitStatus: "",
-    nodeVersion: "v26.5.0",
-    npmVersion: "11.13.0",
-    postgresUrl: "postgresql://localhost/tego",
-    workflow: mutation,
-  });
+  const checkoutReference = checkout.split(" # ")[0];
+  const mutations = [
+    workflow
+      .replace(`        uses: ${checkout}`, `        uses: ${checkoutReference}`)
+      .replace(
+        "permissions:\n  contents: read",
+        `permissions:\n  contents: read\n\nenv:\n  ACTION_REVIEW_SPOOF: |\n    uses: ${checkout}`,
+      ),
+    workflow
+      .replace(`        uses: ${checkout}`, `        uses: ${checkoutReference}`)
+      .replace(
+        "name: CI",
+        [
+          "name: |",
+          "  quality:",
+          "    steps:",
+          "      - name: Check out repository",
+          `        uses: ${checkout}`,
+          "      - name: Set up Node.js",
+          "        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0",
+        ].join("\n"),
+      ),
+    workflow
+      .replace(
+        "name: CI",
+        `name: CI\n\nx-checkout: &checkout ${checkoutReference} # v6.1.0`,
+      )
+      .replace(`        uses: ${checkout}`, "        uses: *checkout"),
+  ];
 
-  assert.equal(
-    diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
-    true,
-  );
+  for (const mutation of mutations) {
+    const diagnostics = validateReleasePreflight({
+      gitStatus: "",
+      nodeVersion: "v26.5.0",
+      npmVersion: "11.13.0",
+      postgresUrl: "postgresql://localhost/tego",
+      workflow: mutation,
+    });
+    assert.equal(
+      diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+      true,
+    );
+  }
 });
 
 test("deterministic package gate compares independent artifacts and manifests without residue", async () => {
