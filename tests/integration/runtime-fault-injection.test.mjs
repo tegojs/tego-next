@@ -22,6 +22,7 @@ import { PostgresStateStore } from "@tegojs/drivers-postgres";
 import { ComponentEffects, ComponentRegistry, Reconciler } from "@tegojs/runtime";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tegojs/transport-websocket";
+import { Pool } from "pg";
 import { DeterministicRemoteSession } from "../fixtures/runtime-fault-session.mjs";
 
 const applicationId = parseApplicationId("app");
@@ -330,6 +331,26 @@ async function withFaultStateStores(t, run) {
   });
 }
 
+async function cleanupPostgresFaultNamespace(connectionString, namespace) {
+  const pool = new Pool({ connectionString, max: 1 });
+  try {
+    for (const table of [
+      "tego_operation_history",
+      "tego_operations",
+      "tego_outbox",
+      "tego_idempotency",
+      "tego_state_changes",
+      "tego_records",
+      "tego_fences",
+      "tego_state_revisions",
+    ]) {
+      await pool.query(`DELETE FROM ${table} WHERE driver_namespace = $1`, [namespace]);
+    }
+  } finally {
+    await pool.end();
+  }
+}
+
 test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-before-commit", async () => {
   const clock = new FakeClock(new Date(0));
   const backingState = new MemoryStateStore({ clock });
@@ -486,6 +507,7 @@ test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
     await assertStaleAuthorityRejected(state);
   } finally {
     await state.close();
+    await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
   }
 });
 
