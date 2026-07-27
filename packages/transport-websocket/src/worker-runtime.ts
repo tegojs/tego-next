@@ -572,11 +572,10 @@ export class WorkerRuntime {
     if (this.#hydrated) return;
     this.#assertAttemptPersistenceAvailable();
     const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
-    const parsedRecords = records.map((record) => this.#parseStoredRecord(record));
-    const activeRecords = parsedRecords.filter(({ record }) => record.state !== "expired");
-    if (activeRecords.length > this.#maxInventoryItems) {
+    if (records.length > this.#maxInventoryItems) {
       throw new Error("Worker attempt inventory exceeds maxInventoryItems");
     }
+    const parsedRecords = records.map((record) => this.#parseStoredRecord(record));
     const durableResults = new Map(
       ((await this.#resultStore?.list()) ?? []).map((result) => [
         attemptKey(result.taskId, result.attemptId),
@@ -1295,17 +1294,23 @@ export class WorkerRuntime {
         attemptId: request.attemptId,
       }).record;
     }
+    if (persisted !== undefined && persisted.fingerprint !== fingerprint) {
+      await this.#sendRejected(
+        session,
+        message.messageId,
+        request,
+        "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
+        "Persisted remote attempt identity has a different request fingerprint",
+      );
+      return;
+    }
     if (persisted?.state === "expired") {
       await this.#sendRejected(
         session,
         message.messageId,
         request,
-        persisted.fingerprint === fingerprint
-          ? "EXECUTOR_REMOTE_ATTEMPT_EXPIRED"
-          : "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
-        persisted.fingerprint === fingerprint
-          ? "Remote attempt identity has expired and cannot be reused"
-          : "Expired remote attempt identity has a different request fingerprint",
+        "EXECUTOR_REMOTE_ATTEMPT_EXPIRED",
+        "Remote attempt identity has expired and cannot be reused",
       );
       return;
     }
@@ -1927,6 +1932,9 @@ export class WorkerRuntime {
       attemptId: expected.request.attemptId,
       fingerprint: expected.fingerprint,
     });
+    if (BigInt(parsed.record.revision) <= BigInt(parseAttemptRevision(expected.revision))) {
+      throw new TypeError("Committed Worker attempt revision must advance");
+    }
     const { revision: _committedRevision, ...committedValue } = parsed.record;
     const { revision: _expectedRevision, ...expectedValue } = expected;
     if (jsonFingerprint(committedValue) !== jsonFingerprint(expectedValue)) {

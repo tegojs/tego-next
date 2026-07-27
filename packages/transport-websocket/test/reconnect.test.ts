@@ -1118,31 +1118,53 @@ test("durable terminal evidence wins over an uncertain running record after Work
   await runtime.close();
 });
 
-test("expired tombstones do not consume active restart inventory capacity", async () => {
+test("RemoteExecutor bounds the total persisted list before parsing records", async () => {
   const clock = new FakeClock(new Date(0));
-  const store = new MemoryRemoteAttemptStore();
-  for (let index = 0; index < 513; index += 1) {
-    const request = executionRequest(null, `historical-${index}`);
-    await store.save({
-      workerId,
-      request,
-      fingerprint: requestFingerprint(request),
-      revision: "0",
-      state: "expired",
-      epoch: "1",
-      updatedAt: clock.now().toISOString(),
-    });
-  }
-  const remote = new RemoteExecutor({ id: "remote", workerId, clock, attemptStore: store });
+  const store: RemoteAttemptStore = {
+    save: async () => undefined,
+    commit: async () => undefined,
+    load: async () => undefined,
+    list: async () => [undefined, undefined] as unknown as RemoteAttemptRecord[],
+  };
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: store,
+    maxInventoryItems: 1,
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  const [main, worker] = memorySessionPair("2");
+  await runtime.attach(worker);
+
+  await assert.rejects(remote.attach(main), /inventory/iu);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("WorkerRuntime bounds the total persisted list before parsing records", async () => {
+  const clock = new FakeClock(new Date(0));
+  const store: RemoteAttemptStore = {
+    save: async () => undefined,
+    commit: async () => undefined,
+    load: async () => undefined,
+    list: async () => [undefined, undefined] as unknown as RemoteAttemptRecord[],
+  };
   const runtime = new WorkerRuntime({
     workerId,
     clock,
     attemptStore: store,
+    maxInventoryItems: 1,
     selectExecutor: () => new TestLocalExecutor(),
   });
+  const [, worker] = memorySessionPair("2");
 
-  await reconnect(remote, runtime, "2");
-  await Promise.all([remote.close(), runtime.close()]);
+  await assert.rejects(runtime.attach(worker), /inventory/iu);
+  await runtime.close();
 });
 
 test("Worker rejects a result buffer that cannot fit in one recovery inventory", () => {
@@ -2386,6 +2408,36 @@ test("RemoteExecutor rejects a commit response that differs from the requested r
   await Promise.all([remote.close(), runtime.close()]);
 });
 
+test("RemoteExecutor rejects a commit response whose revision does not advance", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: {
+      save: async () => undefined,
+      commit: async (record) => record,
+      load: async () => undefined,
+      list: async () => [],
+    },
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "7");
+
+  await assert.rejects(
+    remote.submit(executionRequest(null, "remote-non-advancing-commit")),
+    /revision|advance/iu,
+  );
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
 test("WorkerRuntime rejects invalid revisions returned by external store list, load, and commit", async () => {
   const clock = new FakeClock(new Date(0));
   const listed = invalidRevisionRecord("worker-invalid-list-revision");
@@ -2438,6 +2490,88 @@ test("WorkerRuntime rejects invalid revisions returned by external store list, l
   assert.match(commitResult.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
   assert.equal(commitLocal.executions, 0);
   await Promise.all([commitRemote.close(), commitRuntime.close()]);
+});
+
+test("WorkerRuntime rejects a commit response whose revision does not advance", async () => {
+  const clock = new FakeClock(new Date(0));
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: {
+      save: async () => undefined,
+      commit: async (record) => record,
+      load: async () => undefined,
+      list: async () => [],
+    },
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "5");
+
+  const result = await (await remote.submit(executionRequest(null, "worker-non-advancing-commit")))
+    .result;
+
+  assert.equal(result.status, "rejected");
+  assert.match(result.diagnostic?.code ?? "", /STATE_UNAVAILABLE/iu);
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("WorkerRuntime rejects a loaded attempt whose request fingerprint conflicts", async () => {
+  const clock = new FakeClock(new Date(0));
+  const incoming = executionRequest(
+    { mode: "echo", value: "incoming" },
+    "worker-load-fingerprint-conflict",
+  );
+  const persistedRequest = {
+    ...incoming,
+    input: { mode: "echo", value: "persisted" },
+  };
+  const persisted: RemoteAttemptRecord = {
+    workerId,
+    request: persistedRequest,
+    fingerprint: requestFingerprint(persistedRequest),
+    revision: "1",
+    state: "assigned",
+    epoch: "1",
+    updatedAt: clock.now().toISOString(),
+  };
+  const workerStore: RemoteAttemptStore = {
+    save: async () => undefined,
+    commit: async (record) => ({
+      ...record,
+      revision: (BigInt(record.revision) + 1n).toString(),
+    }),
+    load: async () => persisted,
+    list: async () => [],
+  };
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: workerStore,
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "2");
+
+  const result = await (await remote.submit(incoming)).result;
+
+  assert.equal(result.status, "rejected");
+  assert.match(result.diagnostic?.code ?? "", /IDENTITY_CONFLICT/iu);
+  assert.equal(local.executions, 0);
+  await Promise.all([remote.close(), runtime.close()]);
 });
 
 test("WorkerRuntime does not retry a malformed external revision forever", async () => {

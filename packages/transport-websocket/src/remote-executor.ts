@@ -1235,9 +1235,7 @@ export class RemoteExecutor implements Executor {
     if (this.#hydrated) return;
     this.#assertPersistenceAvailable();
     const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
-    const validatedRecords = records.map((record) => this.#parseStoredRecord(record));
-    const activeRecords = validatedRecords.filter(({ record }) => record.state !== "expired");
-    if (activeRecords.length > this.#maxInventoryItems) {
+    if (records.length > this.#maxInventoryItems) {
       throw remoteError(
         "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
         "Persisted RemoteExecutor inventory exceeds maxInventoryItems",
@@ -1245,6 +1243,7 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
+    const validatedRecords = records.map((record) => this.#parseStoredRecord(record));
     for (const { record, request, result: terminalResult } of validatedRecords) {
       const persistedEpoch = BigInt(record.epoch);
       if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
@@ -1996,6 +1995,9 @@ export class RemoteExecutor implements Executor {
       attemptId: expected.request.attemptId,
       fingerprint: expected.fingerprint,
     });
+    if (BigInt(parsed.record.revision) <= BigInt(parseAttemptRevision(expected.revision))) {
+      throw new TypeError("Committed remote attempt revision must advance");
+    }
     const { revision: _committedRevision, ...committedValue } = parsed.record;
     const { revision: _expectedRevision, ...expectedValue } = expected;
     if (jsonFingerprint(committedValue) !== jsonFingerprint(expectedValue)) {
