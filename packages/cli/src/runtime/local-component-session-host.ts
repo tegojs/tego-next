@@ -179,6 +179,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
         target,
         executor: activeExecutor,
         drainLifecycle: (options) => activeExecutor.drainLifecycle(options),
+        capabilityConsumer: consumer,
         releaseBoundaries: () => boundaries.capability.clear(),
       };
       this.#options.registry.register(registration);

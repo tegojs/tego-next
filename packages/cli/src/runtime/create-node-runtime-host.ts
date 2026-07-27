@@ -236,6 +236,18 @@ export async function createNodeRuntimeHost(
   const remoteComponentHost = new RemoteComponentSessionHost({
     registry: sessionRegistry,
     resolveExecutor: (workerId) => (workerId === configuredWorkerId ? remoteExecutor : undefined),
+    resolveExecutionBinding: (binding, target) =>
+      drivers.state.transact({}, async (transaction) =>
+        resolveExecutionBinding(
+          transaction,
+          {
+            applicationId: binding.deployment.applicationId,
+            pluginId: binding.deployment.pluginId,
+            componentId: binding.component.componentId,
+          },
+          target,
+        ),
+      ),
     runtimeId: options.runtimeId,
   });
   const lifecycleHost: ComponentLifecycleHost = {
@@ -824,6 +836,19 @@ export async function createNodeRuntimeHost(
           workerId: configuredWorkerId,
           fencing: requested,
         }),
+        routeCapability: (request) => {
+          const registration = sessionRegistry.resolveExact(request.target);
+          const consumer = registration.capabilityConsumer;
+          if (
+            consumer === undefined ||
+            consumer.bindingFingerprint !== request.bindingFingerprint
+          ) {
+            throw new Error("Remote capability consumer binding is not the exact active session");
+          }
+          const router = capabilityRouter;
+          if (router === undefined) throw new Error("Capability router is unavailable");
+          return router.invoke(consumer, request.invocation);
+        },
       });
       activeWorkerAuthority = requested;
     });

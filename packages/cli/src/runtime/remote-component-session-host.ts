@@ -2,13 +2,16 @@ import { createHash } from "node:crypto";
 import {
   type AttemptId,
   type AttemptStatus,
+  type ComponentCapabilityInvocation,
   DiagnosticError,
   type DrainOptions,
+  type ExecutionBinding,
   type ExecutionHandle,
   type ExecutionRequest,
   type Executor,
   type ExecutorCapabilities,
   type ExecutorHealth,
+  type JsonValue,
   parseExecutorId,
   parseTaskExecutionTarget,
   parseWorkerId,
@@ -19,24 +22,37 @@ import {
 } from "@tegojs/contracts";
 import {
   type ComponentBinding,
+  type ComponentInstanceIdentity,
   type ComponentLifecycleHost,
   parseActivation,
 } from "@tegojs/runtime";
+import type {
+  RemoteCapabilityInvocation,
+  RemoteComponentActivation,
+} from "@tegojs/transport-websocket";
 import type { LocalComponentSessionRegistry } from "./local-component-session-registry.js";
 
 export interface RemoteComponentSessionHostOptions {
   readonly registry: LocalComponentSessionRegistry;
   readonly resolveExecutor: (workerId: WorkerId) => Executor | undefined;
+  readonly resolveExecutionBinding: (
+    binding: ComponentBinding,
+    target: TaskExecutionTarget,
+  ) => Promise<ExecutionBinding>;
   readonly runtimeId: string;
 }
 
 interface TargetDrainingExecutor extends Executor {
+  activateComponent(activation: RemoteComponentActivation): Promise<void>;
   drainTarget(target: TaskExecutionTarget, options: DrainOptions): Promise<void>;
+  drainComponent(target: TaskExecutionTarget): Promise<void>;
+  invokeCapability(request: RemoteCapabilityInvocation): Promise<JsonValue>;
   resumeTarget(
     target: TaskExecutionTarget,
     taskId: TaskId,
     attemptId: AttemptId,
   ): Promise<ExecutionHandle | undefined>;
+  stopComponent(target: TaskExecutionTarget): Promise<void>;
 }
 
 export function remoteComponentExecutorId(workerIdValue: WorkerId | string): string {
@@ -79,8 +95,16 @@ function supportsTargetDrain(executor: Executor): executor is TargetDrainingExec
   return (
     "drainTarget" in executor &&
     typeof (executor as Partial<TargetDrainingExecutor>).drainTarget === "function" &&
+    "drainComponent" in executor &&
+    typeof (executor as Partial<TargetDrainingExecutor>).drainComponent === "function" &&
+    "activateComponent" in executor &&
+    typeof (executor as Partial<TargetDrainingExecutor>).activateComponent === "function" &&
+    "invokeCapability" in executor &&
+    typeof (executor as Partial<TargetDrainingExecutor>).invokeCapability === "function" &&
     "resumeTarget" in executor &&
-    typeof (executor as Partial<TargetDrainingExecutor>).resumeTarget === "function"
+    typeof (executor as Partial<TargetDrainingExecutor>).resumeTarget === "function" &&
+    "stopComponent" in executor &&
+    typeof (executor as Partial<TargetDrainingExecutor>).stopComponent === "function"
   );
 }
 
@@ -89,14 +113,20 @@ class ScopedRemoteExecutor implements Executor {
   readonly type = "remote" as const;
   readonly #shared: TargetDrainingExecutor;
   readonly #target: TaskExecutionTarget;
+  readonly #bindingFingerprint: string;
   readonly #active = new Set<Promise<void>>();
   #submitTail = Promise.resolve();
   #accepting = true;
   #drainPromise: Promise<void> | undefined;
 
-  constructor(shared: TargetDrainingExecutor, target: TaskExecutionTarget) {
+  constructor(
+    shared: TargetDrainingExecutor,
+    target: TaskExecutionTarget,
+    bindingFingerprint: string,
+  ) {
     this.#shared = shared;
     this.#target = target;
+    this.#bindingFingerprint = bindingFingerprint;
     this.id = target.executor.id;
   }
 
@@ -149,12 +179,22 @@ class ScopedRemoteExecutor implements Executor {
     return this.#shared.cancel(taskId, attemptId);
   }
 
+  invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+    return this.#shared.invokeCapability({
+      invocationId: invocation.invocationId,
+      bindingFingerprint: this.#bindingFingerprint,
+      target: this.#target,
+      invocation,
+    });
+  }
+
   drain(_options: DrainOptions): Promise<void> {
     this.#accepting = false;
     this.#drainPromise ??= this.#submitTail.then(async () => {
       await Promise.all([
         Promise.all([...this.#active]),
         this.#shared.drainTarget(this.#target, _options),
+        this.#shared.drainComponent(this.#target),
       ]);
     });
     return this.#drainPromise;
@@ -184,15 +224,49 @@ export class RemoteComponentSessionHost implements ComponentLifecycleHost {
   async start(binding: ComponentBinding): Promise<void> {
     const target = this.#target(binding);
     const shared = this.#resolveShared(binding, target);
-    this.#options.registry.register({
-      applicationId: binding.deployment.applicationId,
-      pluginId: binding.deployment.pluginId,
-      componentId: binding.component.componentId,
+    const executionBinding = await this.#options.resolveExecutionBinding(binding, target);
+    const activation: RemoteComponentActivation = {
+      identity: {
+        applicationId: binding.deployment.applicationId,
+        pluginId: binding.deployment.pluginId,
+        componentId: binding.component.componentId,
+      },
       target,
-      executor: new ScopedRemoteExecutor(shared, target),
-      drainLifecycle: async (options) =>
-        this.#options.registry.resolveExact(target).executor.drain(options),
-    });
+      configuration: executionBinding.configuration,
+      permissionGrants: executionBinding.permissionGrants,
+      capabilityDefinitions: executionBinding.capabilityDefinitions,
+      capabilityBindings: executionBinding.capabilityBindings,
+      bindingFingerprint: executionBinding.fingerprint,
+    };
+    await shared.activateComponent(activation);
+    const capabilityConsumer: ComponentInstanceIdentity = {
+      ...activation.identity,
+      activation: binding.activation,
+      target,
+      bindingFingerprint: executionBinding.fingerprint,
+    };
+    try {
+      this.#options.registry.register({
+        applicationId: binding.deployment.applicationId,
+        pluginId: binding.deployment.pluginId,
+        componentId: binding.component.componentId,
+        target,
+        executor: new ScopedRemoteExecutor(shared, target, executionBinding.fingerprint),
+        drainLifecycle: async (options) =>
+          this.#options.registry.resolveExact(target).executor.drain(options),
+        capabilityConsumer,
+      });
+    } catch (error) {
+      try {
+        await shared.stopComponent(target);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Remote component activation registration rollback failed",
+        );
+      }
+      throw error;
+    }
   }
 
   async drain(binding: ComponentBinding): Promise<void> {
@@ -207,10 +281,11 @@ export class RemoteComponentSessionHost implements ComponentLifecycleHost {
     const registration = this.#options.registry.findExact(target);
     if (registration !== undefined) {
       await registration.executor.close();
+      await this.#resolveShared(binding, target).stopComponent(target);
       this.#options.registry.remove(target);
       return;
     }
-    await this.#resolveShared(binding, target).drainTarget(target, {});
+    await this.#resolveShared(binding, target).stopComponent(target);
   }
 
   #resolveShared(binding: ComponentBinding, target: TaskExecutionTarget): TargetDrainingExecutor {

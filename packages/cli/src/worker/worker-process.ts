@@ -4,6 +4,7 @@ import { mkdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type ArtifactDigest,
+  createExecutionBinding,
   DiagnosticError,
   type ExecutionRequest,
   type Executor,
@@ -18,15 +19,25 @@ import {
 } from "@tegojs/contracts";
 import { createLocalDrivers } from "@tegojs/drivers-local";
 import {
+  type ComponentSandboxSession,
+  createProcessComponentSession,
+  createThreadComponentSession,
   ProcessExecutor,
   type ResolvedThreadComponent,
   ThreadExecutor,
 } from "@tegojs/executor-node";
-import { ArtifactService, type PreparedArtifact, PreparedArtifactCache } from "@tegojs/runtime";
+import {
+  ArtifactService,
+  createComponentBoundaries,
+  type PreparedArtifact,
+  PreparedArtifactCache,
+} from "@tegojs/runtime";
 import {
   connectWorker,
   createWorkerEndpoint,
   listenForWorker,
+  type RemoteCapabilityInvocation,
+  type RemoteComponentActivation,
   type WebSocketListener,
   type WorkerAssignmentRejection,
   WorkerRuntime,
@@ -46,7 +57,10 @@ export interface PreparedArtifactSelection {
     request: ExecutionRequest,
     executor?: { readonly id: string; readonly type: "process" | "thread" },
   ): ResolvedThreadComponent;
+  resolveActivation(activation: RemoteComponentActivation): ResolvedThreadComponent;
+  selectActivationExecutorKind(activation: RemoteComponentActivation): "process" | "thread";
   selectExecutorKind(request: ExecutionRequest): "process" | "thread";
+  validateActivation(activation: RemoteComponentActivation): WorkerAssignmentRejection | undefined;
   validateAssignment(request: ExecutionRequest): WorkerAssignmentRejection | undefined;
 }
 
@@ -111,6 +125,31 @@ export function createPreparedArtifactSelection(
     return { artifact, component };
   };
 
+  const selectActivation = (
+    activation: RemoteComponentActivation,
+  ): { readonly artifact: PreparedArtifact; readonly component: PluginComponent } => {
+    const rejection = validateActivation(activation);
+    if (rejection !== undefined) {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: rejection.code,
+          message: rejection.message,
+          source: { kind: "executor", id: "worker-artifact-selection" },
+        }),
+      );
+    }
+    const artifact = byPlugin
+      .get(activation.identity.pluginId)
+      ?.find((candidate) => candidate.digest === activation.target.artifactDigest);
+    if (artifact === undefined) {
+      throw new Error("Validated Worker activation artifact selection is unavailable");
+    }
+    const component = artifact.manifest.components.find(
+      (candidate) => candidate.componentId === activation.identity.componentId,
+    ) as PluginComponent;
+    return { artifact, component };
+  };
+
   const validateAssignment = (request: ExecutionRequest): WorkerAssignmentRejection | undefined => {
     try {
       parseExecutionRequest(request);
@@ -142,10 +181,57 @@ export function createPreparedArtifactSelection(
     }
     return undefined;
   };
+  const validateActivation = (
+    activation: RemoteComponentActivation,
+  ): WorkerAssignmentRejection | undefined => {
+    const identity = {
+      ...activation.identity,
+      target: activation.target,
+    };
+    const binding = createExecutionBinding(identity, {
+      configuration: activation.configuration,
+      permissionGrants: activation.permissionGrants,
+      capabilityDefinitions: activation.capabilityDefinitions,
+      capabilityBindings: activation.capabilityBindings,
+    });
+    if (binding.fingerprint !== activation.bindingFingerprint) {
+      return {
+        code: "PROTOCOL_EXECUTION_BINDING_INVALID",
+        message: "Remote component activation binding fingerprint is invalid",
+      };
+    }
+    const candidates = (byPlugin.get(activation.identity.pluginId) ?? []).filter(
+      (candidate) => candidate.digest === activation.target.artifactDigest,
+    );
+    if (candidates.length !== 1) {
+      return artifactSelectionError(
+        candidates.length === 0
+          ? "No prepared artifact matches the component activation"
+          : "Multiple prepared artifacts match the component activation",
+      );
+    }
+    const components = candidates[0]?.manifest.components.filter(
+      (component) => component.componentId === activation.identity.componentId,
+    );
+    if (components?.length !== 1) {
+      return artifactSelectionError("Prepared artifact does not contain the activation component");
+    }
+    if (
+      !components[0]?.executors.some((executor) => executor === "thread" || executor === "process")
+    ) {
+      return artifactSelectionError("Prepared activation has no local Worker executor");
+    }
+    return undefined;
+  };
 
   return Object.freeze({
     digests,
+    validateActivation,
     validateAssignment,
+    selectActivationExecutorKind(activation: RemoteComponentActivation) {
+      const { component } = selectActivation(activation);
+      return component.executors.includes("thread") ? "thread" : "process";
+    },
     selectExecutorKind(request: ExecutionRequest) {
       const { component } = select(request);
       return component.executors.includes("thread") ? "thread" : "process";
@@ -171,6 +257,20 @@ export function createPreparedArtifactSelection(
         configuration: structuredClone(request.binding.configuration),
         permissionGrants: structuredClone(request.binding.permissionGrants),
         capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
+      };
+    },
+    resolveActivation(activation: RemoteComponentActivation) {
+      const { artifact } = selectActivation(activation);
+      return {
+        target: activation.target,
+        artifactDigest: artifact.digest,
+        artifactRoot: artifact.root,
+        manifest: artifact.manifest,
+        runtimeId,
+        instanceId: activation.target.instanceId,
+        configuration: structuredClone(activation.configuration),
+        permissionGrants: structuredClone(activation.permissionGrants),
+        capabilityDefinitions: structuredClone(activation.capabilityDefinitions),
       };
     },
   });
@@ -278,6 +378,18 @@ function hasAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
+function remoteTargetKey(target: RemoteComponentActivation["target"]): string {
+  return [
+    target.instanceId,
+    target.deploymentGeneration,
+    target.artifactDigest,
+    target.executor.id,
+    target.executor.workerId ?? "",
+  ]
+    .map((field) => `${field.length}:${field}`)
+    .join("");
+}
+
 const RETRYABLE_NETWORK_CODES = new Set([
   "EAI_AGAIN",
   "ECONNABORTED",
@@ -368,6 +480,15 @@ export async function runWorkerProcess(
   let session: WorkerSession | undefined;
   let thread: ThreadExecutor | undefined;
   let processExecutor: ProcessExecutor | undefined;
+  const componentSessions = new Map<
+    string,
+    {
+      readonly activation: RemoteComponentActivation;
+      readonly executor: Executor;
+      readonly session: ComponentSandboxSession;
+      readonly release: () => void;
+    }
+  >();
   const cleanupErrors: unknown[] = [];
   try {
     await openWorkerDrivers(drivers);
@@ -390,10 +511,6 @@ export async function runWorkerProcess(
       remoteWorkerIsolation: true,
       secretProvider: drivers.secrets,
     });
-    const executors = new Map<"process" | "thread", Executor>([
-      ["thread", createWorkerLocalExecutor(thread)],
-      ["process", createWorkerLocalExecutor(processExecutor)],
-    ]);
     const capabilities = await Promise.all([thread.probe(), processExecutor.probe()]);
     runtime = new WorkerRuntime({
       workerId,
@@ -401,12 +518,129 @@ export async function runWorkerProcess(
       attemptStore: new StateRemoteAttemptStore({ state: drivers.state, workerId }),
       preparedArtifacts: () => selection.digests,
       selectExecutor: (request) => {
-        const executor = executors.get(selection.selectExecutorKind(request));
-        if (executor === undefined)
-          throw new Error("Prepared local Worker executor is unavailable");
-        return executor;
+        const active = componentSessions.get(remoteTargetKey(request.target));
+        if (
+          active === undefined ||
+          active.activation.bindingFingerprint !== request.binding.fingerprint
+        ) {
+          throw new Error("Prepared local Worker component activation is unavailable");
+        }
+        return active.executor;
       },
       validateAssignment: selection.validateAssignment,
+      validateActivation: (activation) => {
+        const rejection = selection.validateActivation(activation);
+        if (rejection !== undefined) throw new Error(rejection.message);
+      },
+      activateComponent: async (activation) => {
+        const key = remoteTargetKey(activation.target);
+        if (componentSessions.has(key)) {
+          throw new Error("Remote component activation is already materialized");
+        }
+        const isolation = selection.selectActivationExecutorKind(activation);
+        const boundaries = createComponentBoundaries({
+          invoke: (invocation) => {
+            const activeRuntime = runtime;
+            if (activeRuntime === undefined) {
+              throw new Error("Worker capability routing is unavailable");
+            }
+            return activeRuntime.invokeMainCapability({
+              invocationId: invocation.invocationId,
+              bindingFingerprint: activation.bindingFingerprint,
+              target: activation.target,
+              invocation,
+            });
+          },
+        });
+        const registration = boundaries.capability.register(activation.capabilityDefinitions);
+        if (!registration.ok) {
+          boundaries.capability.clear();
+          throw new Error(
+            registration.diagnostics[0]?.message ??
+              "Remote component capability definitions are invalid",
+          );
+        }
+        const component = selection.resolveActivation(activation);
+        let componentSession: ComponentSandboxSession | undefined;
+        try {
+          componentSession =
+            isolation === "thread"
+              ? await createThreadComponentSession({
+                  target: activation.target,
+                  identity: activation.identity,
+                  component,
+                  executorOptions: {
+                    id: `${workerId}:thread`,
+                    clock: drivers.clock,
+                    resolveComponent: async () => component,
+                    remoteWorkerIsolation: true,
+                    secretProvider: drivers.secrets,
+                    capabilityBoundary: boundaries.capability,
+                  },
+                })
+              : await createProcessComponentSession({
+                  target: activation.target,
+                  identity: activation.identity,
+                  component,
+                  executorOptions: {
+                    id: `${workerId}:process`,
+                    clock: drivers.clock,
+                    processHost: drivers.processHost,
+                    resolveComponent: async () => component,
+                    remoteWorkerIsolation: true,
+                    secretProvider: drivers.secrets,
+                    capabilityBoundary: boundaries.capability,
+                  },
+                });
+          const activeSession = componentSession;
+          componentSessions.set(key, {
+            activation: structuredClone(activation),
+            executor: createWorkerLocalExecutor(activeSession),
+            session: activeSession,
+            release: () => boundaries.capability.clear(),
+          });
+        } catch (error) {
+          await componentSession?.close().catch(() => undefined);
+          boundaries.capability.clear();
+          throw error;
+        }
+      },
+      drainComponent: async (activation) => {
+        const active = componentSessions.get(remoteTargetKey(activation.target));
+        if (
+          active === undefined ||
+          active.activation.bindingFingerprint !== activation.bindingFingerprint
+        ) {
+          throw new Error("Remote component activation is unavailable for drain");
+        }
+        await active.session.drainLifecycle({});
+      },
+      stopComponent: async (activation) => {
+        const key = remoteTargetKey(activation.target);
+        const active = componentSessions.get(key);
+        if (
+          active === undefined ||
+          active.activation.bindingFingerprint !== activation.bindingFingerprint
+        ) {
+          throw new Error("Remote component activation is unavailable for stop");
+        }
+        try {
+          await active.session.close();
+        } finally {
+          active.release();
+          componentSessions.delete(key);
+        }
+      },
+      invokeCapability: (request: RemoteCapabilityInvocation) => {
+        const active = componentSessions.get(remoteTargetKey(request.target));
+        if (
+          active === undefined ||
+          active.activation.bindingFingerprint !== request.bindingFingerprint
+        ) {
+          throw new Error("Remote capability provider activation is unavailable");
+        }
+        return active.session.invokeCapability(request.invocation);
+      },
     });
     await runtime.initialize();
     endpoint = createWorkerEndpoint({
@@ -498,6 +732,11 @@ export async function runWorkerProcess(
       }
     };
     await settle(async () => runtime?.close());
+    for (const active of componentSessions.values()) {
+      await settle(async () => active.session.close());
+      active.release();
+    }
+    componentSessions.clear();
     await settle(async () => listener?.close());
     await settle(async () => session?.close());
     await settle(async () => endpoint?.close());

@@ -7,6 +7,7 @@ import {
   runtimeDiagnostic,
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
+import type { ComponentInstanceIdentity } from "@tegojs/runtime";
 
 export interface LocalComponentSessionRegistration {
   readonly applicationId: RunTaskRequest["applicationId"];
@@ -15,6 +16,7 @@ export interface LocalComponentSessionRegistration {
   readonly target: TaskExecutionTarget;
   readonly executor: Executor;
   readonly drainLifecycle: Executor["drain"];
+  readonly capabilityConsumer?: ComponentInstanceIdentity;
   readonly releaseBoundaries?: () => void;
 }
 
@@ -214,6 +216,9 @@ export class LocalComponentSessionRegistry {
       target: deepFreeze(structuredClone(session.target)),
       executor: session.executor,
       drainLifecycle: session.drainLifecycle,
+      ...(session.capabilityConsumer === undefined
+        ? {}
+        : { capabilityConsumer: deepFreeze(structuredClone(session.capabilityConsumer)) }),
       ...(session.releaseBoundaries === undefined
         ? {}
         : { releaseBoundaries: session.releaseBoundaries }),

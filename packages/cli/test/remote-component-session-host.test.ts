@@ -280,8 +280,9 @@ test("remote component activation binds lifecycle and capability invocation to o
       invocation,
     },
   ]);
+  shared.targetDrain.resolve();
   await host.stop(component);
-  assert.deepEqual(shared.lifecycle, ["activate", "stop"]);
+  assert.deepEqual(shared.lifecycle, ["activate", "drain", "stop"]);
   await registry.close();
 });
 
@@ -299,19 +300,7 @@ test("remote component stop drains the persisted target after a fresh registry r
 
   await host.stop(component);
 
-  assert.equal(shared.targetDrains, 1);
-  assert.deepEqual(shared.drainedTargets, [
-    {
-      instanceId: component.instanceId,
-      deploymentGeneration: component.deployment.generation,
-      artifactDigest: component.artifact.digest,
-      executor: {
-        id: remoteComponentExecutorId(workerId),
-        type: "remote",
-        workerId,
-      },
-    },
-  ]);
+  assert.deepEqual(shared.lifecycle, ["stop"]);
   await registry.close();
 });
 

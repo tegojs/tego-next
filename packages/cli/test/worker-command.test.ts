@@ -16,8 +16,8 @@ import {
   parseComponentInstanceId,
   parseFencingEpoch,
   parseGeneration,
-  parsePluginManifest,
   parsePluginId,
+  parsePluginManifest,
   parseWorkerId,
   type StateFencing,
   type StateTransaction,
@@ -32,6 +32,7 @@ import {
   MemoryRemoteAttemptStore,
   MemoryWorkerEpochAllocator,
   type RemoteAttemptRecord,
+  type RemoteComponentActivation,
   RemoteExecutor,
   requestFingerprint,
   systemWorkerClock,
@@ -331,6 +332,22 @@ function assignment(
     input: null,
     deadline: new Date(Date.now() + 60_000).toISOString(),
     orphanPolicy: "cancel",
+  };
+}
+
+function activation(request: ExecutionRequest): RemoteComponentActivation {
+  return {
+    identity: {
+      applicationId: request.applicationId,
+      pluginId: request.pluginId,
+      componentId: request.componentId,
+    },
+    target: request.target,
+    configuration: request.binding.configuration,
+    permissionGrants: request.binding.permissionGrants,
+    capabilityDefinitions: request.binding.capabilityDefinitions,
+    capabilityBindings: request.binding.capabilityBindings,
+    bindingFingerprint: request.binding.fingerprint,
   };
 }
 
@@ -911,7 +928,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
     await remote.attach(session);
     assert.deepEqual(main.registration(workerId)?.preparedArtifacts, [digest]);
 
-    const request = {
+    const request: ExecutionRequest = {
       ...assignment("org.example.worker-echo", {
         artifactDigest: parseArtifactDigest(digest),
         id: remote.id,
@@ -920,6 +937,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
       input: { usable: true },
       deadline: new Date(Date.now() + 60_000).toISOString(),
     };
+    await remote.activateComponent(activation(request));
     const result = await beforeDeadline(
       (await remote.submit(request)).result,
       "prepared Worker echo result",
@@ -982,18 +1000,18 @@ test("@spec:worker-protocol/independent-worker-command/process-only-artifact-exe
     session = await connectMain({ endpoint: main, url: new URL(readiness.url) });
     await session.ready;
     await remote.attach(session);
+    const request = {
+      ...assignment(pluginId, {
+        artifactDigest: parseArtifactDigest(digest),
+        id: remote.id,
+        workerId,
+      }),
+      input: { processOnly: true },
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await remote.activateComponent(activation(request));
     const result = await beforeDeadline(
-      (
-        await remote.submit({
-          ...assignment(pluginId, {
-            artifactDigest: parseArtifactDigest(digest),
-            id: remote.id,
-            workerId,
-          }),
-          input: { processOnly: true },
-          deadline: new Date(Date.now() + 60_000).toISOString(),
-        })
-      ).result,
+      (await remote.submit(request)).result,
       "process-only Worker result",
     );
 
@@ -1290,7 +1308,7 @@ test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered
     firstSession.onStateChange((state) => {
       if (state === "closed") firstSessionClosed.resolve();
     });
-    const handle = await remote.submit({
+    const request: ExecutionRequest = {
       ...assignment("org.example.worker-echo", {
         artifactDigest: parseArtifactDigest(digest),
         id: remote.id,
@@ -1299,7 +1317,9 @@ test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered
       input: { delayMs: 200, recovered: true },
       deadline: new Date(Date.now() + 60_000).toISOString(),
       orphanPolicy: "finish-and-buffer",
-    });
+    };
+    await remote.activateComponent(activation(request));
+    const handle = await remote.submit(request);
     let terminalResults = 0;
     void handle.result.then(() => {
       terminalResults += 1;
