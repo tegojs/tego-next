@@ -13,6 +13,7 @@ import {
   parseGeneration,
   parsePluginId,
   parseRevision,
+  runtimeDiagnostic,
   type StateKey,
   type StateStore,
   type StateTransaction,
@@ -282,6 +283,50 @@ test("capability router revalidates the durable binding before dispatch", async 
     router.invoke(consumer, call()),
     (error: unknown) =>
       error instanceof DiagnosticError && error.diagnostic.code === "CAPABILITY_BINDING_STALE",
+  );
+  assert.equal(dispatched, false);
+});
+
+test("capability router fences authority loss after revalidation and before provider dispatch", async () => {
+  const revalidationStarted = Promise.withResolvers<void>();
+  const releaseRevalidation = Promise.withResolvers<void>();
+  let authorityActive = true;
+  let dispatched = false;
+  const router = new CapabilityRouter({
+    state: durableState(),
+    resolve: async () => route(),
+    revalidate: async () => {
+      revalidationStarted.resolve();
+      await releaseRevalidation.promise;
+      return true;
+    },
+    dispatch: async () => {
+      dispatched = true;
+      return { echoed: "unreachable" };
+    },
+  });
+  const invoking = router.invoke(consumer, call(), {
+    assertActive: () => {
+      if (!authorityActive) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: "COORDINATION_FENCE_REJECTED",
+            message: "Capability invocation authority was revoked before provider dispatch",
+            source: { kind: "runtime", id: "capability-router-test" },
+          }),
+        );
+      }
+    },
+  });
+
+  await revalidationStarted.promise;
+  authorityActive = false;
+  releaseRevalidation.resolve();
+
+  await assert.rejects(
+    invoking,
+    (error: unknown) =>
+      error instanceof DiagnosticError && error.diagnostic.code === "COORDINATION_FENCE_REJECTED",
   );
   assert.equal(dispatched, false);
 });

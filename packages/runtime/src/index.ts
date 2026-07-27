@@ -63,6 +63,7 @@ export {
 } from "./capabilities/resolver.js";
 export {
   CapabilityRouter,
+  type CapabilityInvocationAuthority,
   type CapabilityProviderRoute,
   type CapabilityProvisionRoute,
   type CapabilityRoute,

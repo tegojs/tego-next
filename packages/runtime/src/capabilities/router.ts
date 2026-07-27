@@ -94,6 +94,10 @@ export interface CapabilityRouterOptions {
   readonly maxSchemaGates?: number;
 }
 
+export interface CapabilityInvocationAuthority {
+  assertActive(): void;
+}
+
 interface InvocationEntry {
   readonly fingerprint: string;
   readonly result: Promise<JsonValue>;
@@ -252,6 +256,7 @@ export class CapabilityRouter {
   invoke(
     consumer: ComponentInstanceIdentity,
     input: RoutedCapabilityInvocation,
+    authority?: CapabilityInvocationAuthority,
   ): Promise<JsonValue> {
     const call = normalizeCall(input);
     const key = invocationKey(consumer, call.invocationId as OperationId);
@@ -278,7 +283,7 @@ export class CapabilityRouter {
     const entry: InvocationEntry = {
       fingerprint: callFingerprint,
       result: Promise.resolve().then(async () =>
-        this.#executeDurable(consumer, call, key, callFingerprint),
+        this.#executeDurable(consumer, call, key, callFingerprint, authority),
       ),
       settled: false,
     };
@@ -303,6 +308,7 @@ export class CapabilityRouter {
   async #execute(
     consumer: ComponentInstanceIdentity,
     call: RoutedCapabilityInvocation,
+    authority: CapabilityInvocationAuthority | undefined,
   ): Promise<JsonValue> {
     const route = await this.#options.resolve(consumer, call);
     if (!sameConsumer(route.consumer, consumer)) {
@@ -356,6 +362,7 @@ export class CapabilityRouter {
         "Capability binding changed before exact provider dispatch",
       );
     }
+    authority?.assertActive();
     const response = await this.#options.dispatch(route, { ...call, input: request.value });
     const decision = gateCapabilityResponse(gate, response);
     if (!decision.allowed || decision.value === undefined) {
@@ -372,6 +379,7 @@ export class CapabilityRouter {
     call: RoutedCapabilityInvocation,
     invocationIdentity: string,
     callFingerprint: string,
+    authority: CapabilityInvocationAuthority | undefined,
   ): Promise<JsonValue> {
     const key = durableInvocationKey(invocationIdentity);
     const admission = await this.#options.state.transact({}, async (transaction) => {
@@ -414,7 +422,7 @@ export class CapabilityRouter {
     }
     let result: JsonValue;
     try {
-      result = await this.#execute(consumer, call);
+      result = await this.#execute(consumer, call, authority);
     } catch (cause) {
       const diagnostic =
         cause instanceof DiagnosticError

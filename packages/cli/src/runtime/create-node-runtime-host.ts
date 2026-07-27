@@ -35,6 +35,7 @@ import { createLocalDrivers } from "@tegojs/drivers-local";
 import { createPostgresDrivers } from "@tegojs/drivers-postgres";
 import {
   ArtifactService,
+  type CapabilityInvocationAuthority,
   type CapabilityRoute,
   CapabilityRouter,
   ComponentEffects,
@@ -96,13 +97,18 @@ export interface NodeRuntimeHost {
 export interface AuthorityCapabilityAdmission {
   open(authority: RuntimeAuthority): void;
   close(authority: RuntimeAuthority): void;
-  invoke<T>(operation: () => Promise<T>): Promise<T>;
+  invoke<T>(operation: (authority: CapabilityInvocationAuthority) => Promise<T>): Promise<T>;
 }
 
 export function createAuthorityCapabilityAdmission(
   unavailableError: () => Error = () => new Error("Capability invocation authority is unavailable"),
 ): AuthorityCapabilityAdmission {
-  let authority: RuntimeAuthority | undefined;
+  interface AuthorityLease {
+    readonly authority: RuntimeAuthority;
+    readonly token: CapabilityInvocationAuthority;
+    readonly state: { active: boolean };
+  }
+  let lease: AuthorityLease | undefined;
   const sameAuthority = (
     left: RuntimeAuthority | undefined,
     right: RuntimeAuthority | undefined,
@@ -113,16 +119,30 @@ export function createAuthorityCapabilityAdmission(
 
   return {
     open: (nextAuthority) => {
-      authority = structuredClone(nextAuthority);
+      if (sameAuthority(lease?.authority, nextAuthority)) return;
+      if (lease !== undefined) lease.state.active = false;
+      const state = { active: true };
+      const token = Object.freeze({
+        assertActive: () => {
+          if (!state.active || lease?.token !== token) throw unavailableError();
+        },
+      });
+      lease = {
+        authority: structuredClone(nextAuthority),
+        token,
+        state,
+      };
     },
     close: (closedAuthority) => {
-      if (sameAuthority(authority, closedAuthority)) {
-        authority = undefined;
-      }
+      const closed = lease;
+      if (!sameAuthority(closed?.authority, closedAuthority) || closed === undefined) return;
+      closed.state.active = false;
+      lease = undefined;
     },
     invoke: async (operation) => {
-      if (authority === undefined) throw unavailableError();
-      return operation();
+      const admitted = lease;
+      if (admitted === undefined) throw unavailableError();
+      return operation(admitted.token);
     },
   };
 }
@@ -276,10 +296,10 @@ export async function createNodeRuntimeHost(
         ),
       ),
     invokeCapability: (consumer, invocation) => {
-      return capabilityAdmission.invoke(() => {
+      return capabilityAdmission.invoke((authority) => {
         const router = capabilityRouter;
         if (router === undefined) throw new Error("Capability router is unavailable");
-        return router.invoke(consumer, invocation);
+        return router.invoke(consumer, invocation, authority);
       });
     },
   });
@@ -943,7 +963,7 @@ export async function createNodeRuntimeHost(
           fencing: requested,
         }),
         routeCapability: (request) => {
-          return capabilityAdmission.invoke(() => {
+          return capabilityAdmission.invoke((authority) => {
             const registration = sessionRegistry.resolveExact(request.target);
             const consumer = registration.capabilityConsumer;
             if (
@@ -954,7 +974,7 @@ export async function createNodeRuntimeHost(
             }
             const router = capabilityRouter;
             if (router === undefined) throw new Error("Capability router is unavailable");
-            return router.invoke(consumer, request.invocation);
+            return router.invoke(consumer, request.invocation, authority);
           });
         },
       });

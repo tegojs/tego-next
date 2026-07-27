@@ -191,6 +191,32 @@ test("capability authority admission rejects post-loss calls while admitted call
   assert.equal(await admitted, "completed");
 });
 
+test("capability authority token fences an admitted call that has not entered provider code", async () => {
+  const admission = createAuthorityCapabilityAdmission();
+  const authority = {
+    epoch: parseFencingEpoch("3"),
+    resource: "runtime:runtime-listener",
+  };
+  const beforeDispatch = Promise.withResolvers<void>();
+  const releaseDispatch = Promise.withResolvers<void>();
+  let providerEntered = false;
+
+  admission.open(authority);
+  const invoking = admission.invoke(async (token) => {
+    beforeDispatch.resolve();
+    await releaseDispatch.promise;
+    token.assertActive();
+    providerEntered = true;
+    return "unreachable";
+  });
+  await beforeDispatch.promise;
+  admission.close(authority);
+  releaseDispatch.resolve();
+
+  await assert.rejects(invoking, /capability invocation authority is unavailable/iu);
+  assert.equal(providerEntered, false);
+});
+
 test("stale capability authority close cannot fence a newer leadership epoch", async () => {
   const admission = createAuthorityCapabilityAdmission();
   const first = {
@@ -212,6 +238,34 @@ test("stale capability authority close cannot fence a newer leadership epoch", a
     admission.invoke(async () => "not admitted"),
     /capability invocation authority is unavailable/iu,
   );
+});
+
+test("a newer capability authority epoch revokes the previous pre-dispatch token", async () => {
+  const admission = createAuthorityCapabilityAdmission();
+  const first = {
+    epoch: parseFencingEpoch("3"),
+    resource: "runtime:runtime-listener",
+  };
+  const second = {
+    epoch: parseFencingEpoch("4"),
+    resource: "runtime:runtime-listener",
+  };
+  const firstAdmitted = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+
+  admission.open(first);
+  const oldInvocation = admission.invoke(async (token) => {
+    firstAdmitted.resolve();
+    await releaseFirst.promise;
+    token.assertActive();
+    return "old leader";
+  });
+  await firstAdmitted.promise;
+  admission.open(second);
+  releaseFirst.resolve();
+
+  await assert.rejects(oldInvocation, /capability invocation authority is unavailable/iu);
+  assert.equal(await admission.invoke(async () => "new leader"), "new leader");
 });
 
 test("SQLite-backed Worker epochs advance across Main restart", async () => {
