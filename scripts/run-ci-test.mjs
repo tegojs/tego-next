@@ -90,6 +90,9 @@ async function taskkill(processId, force) {
 function createWindowsTreeStrategy() {
   const provenTerminated = new Set();
   return {
+    // taskkill only has a numeric PID. Once the leader has closed that PID may
+    // be reused, so the default strategy must never target it after close.
+    canTerminateAfterLeaderExit: false,
     async probe(processId) {
       return provenTerminated.has(processId);
     },
@@ -148,6 +151,7 @@ export async function runManagedProcessTree({
   let timedOut = false;
   let terminationSignal = null;
   let processTreeTerminated = false;
+  let cleanupError;
   let spawnError;
   const child = spawn(command, args, {
     cwd,
@@ -172,10 +176,23 @@ export async function runManagedProcessTree({
   let closeResult;
   if (initial.settled) {
     closeResult = initial.value;
-    processTreeTerminated =
-      child.pid === undefined ||
-      (await isProcessTreeTerminated(child.pid, platform, windowsTreeStrategy));
-    if (!processTreeTerminated && child.pid !== undefined) {
+    const closedWindowsLeaderWithoutStableTreeOwnership =
+      platform === "win32" &&
+      child.pid !== undefined &&
+      windowsTreeStrategy.canTerminateAfterLeaderExit !== true;
+    if (closedWindowsLeaderWithoutStableTreeOwnership) {
+      cleanupError =
+        "stable Windows process-tree ownership is unavailable; refusing to target a closed PID";
+    } else {
+      processTreeTerminated =
+        child.pid === undefined ||
+        (await isProcessTreeTerminated(child.pid, platform, windowsTreeStrategy));
+    }
+    if (
+      !processTreeTerminated &&
+      child.pid !== undefined &&
+      !closedWindowsLeaderWithoutStableTreeOwnership
+    ) {
       terminationSignal = "SIGTERM";
       const terminated = await signalProcessTree(child, "SIGTERM", platform, windowsTreeStrategy);
       const gracefulTreeExit =
@@ -254,7 +271,10 @@ export async function runManagedProcessTree({
     exitCode: timedOut ? 124 : processTreeTerminated ? (closeResult.childExitCode ?? 1) : 125,
     ...(spawnError === undefined ? {} : { error: spawnError.message }),
     ...(!processTreeTerminated
-      ? { error: "process tree did not terminate within the bounded cleanup deadline" }
+      ? {
+          error:
+            cleanupError ?? "process tree did not terminate within the bounded cleanup deadline",
+        }
       : {}),
   };
 }
