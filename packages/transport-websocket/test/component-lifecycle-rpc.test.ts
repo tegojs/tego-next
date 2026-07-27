@@ -111,7 +111,7 @@ test("Worker rejects assignment until the exact target and binding fingerprint a
       configuration: { changed: true },
     }),
   };
-  assert.equal((await (await remote.submit(changed)).result).status, "rejected");
+  await assert.rejects(remote.submit(changed), /activation|binding/iu);
   assert.equal(local.executions, 0);
 });
 
@@ -130,7 +130,7 @@ test("component drain blocks new assignments and waits for active exact-target w
   assert.equal(drained, false);
 
   const rejected = executionRequest({ mode: "echo", value: "late" }, "drain-late");
-  assert.equal((await (await remote.submit(rejected)).result).status, "rejected");
+  await assert.rejects(remote.submit(rejected), /activation|drain/iu);
   const localAttempt = [...local.attempts.values()][0];
   assert.ok(localAttempt);
   local.complete(localAttempt, "succeeded", "done");
@@ -145,6 +145,6 @@ test("component stop removes the exact activation", async () => {
   await remote.activateComponent(activationFor(request));
   await remote.stopComponent(request.target);
 
-  assert.equal((await (await remote.submit(request)).result).status, "rejected");
+  await assert.rejects(remote.submit(request), /activation|active/iu);
   assert.equal(local.executions, 0);
 });

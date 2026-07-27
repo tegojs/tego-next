@@ -23,6 +23,7 @@ const workerId = parseWorkerId("worker-capability");
 const cleanups: Array<() => Promise<void>> = [];
 
 const invocation: ComponentCapabilityInvocation = {
+  invocationId: "placeholder",
   identity: {
     name: "org.example.echo",
     protocolVersion: "1.0",
@@ -35,9 +36,11 @@ function request(
   invocationId: string,
   input: JsonValue = invocation.input,
 ): RemoteCapabilityInvocation {
-  const target = executionRequest(null, "capability-target").target;
+  const seed = executionRequest(null, "capability-target", "cancel", workerId);
+  const target = seed.target;
   return {
     invocationId,
+    bindingFingerprint: seed.binding.fingerprint,
     target: {
       ...target,
       executor: {
@@ -48,8 +51,26 @@ function request(
     },
     invocation: {
       ...invocation,
+      invocationId,
       input,
     },
+  };
+}
+
+function activationFor(request: RemoteCapabilityInvocation) {
+  const seed = executionRequest(null, "capability-target", "cancel", workerId);
+  return {
+    identity: {
+      applicationId: seed.applicationId,
+      pluginId: seed.pluginId,
+      componentId: seed.componentId,
+    },
+    target: request.target,
+    configuration: seed.binding.configuration,
+    permissionGrants: seed.binding.permissionGrants,
+    capabilityDefinitions: seed.binding.capabilityDefinitions,
+    capabilityBindings: seed.binding.capabilityBindings,
+    bindingFingerprint: request.bindingFingerprint,
   };
 }
 
@@ -153,7 +174,8 @@ test("capability invocation rejects a target outside the authenticated remote wo
       target: {
         ...expected.target,
         executor: {
-          ...expected.target.executor,
+          id: "remote",
+          type: "remote",
           workerId: parseWorkerId("worker-other"),
         },
       },
@@ -193,7 +215,7 @@ test("disconnect before the authoritative response is indeterminate and never re
     assert.deepEqual(diagnostic?.details, {
       invocationId: expected.invocationId,
       fingerprint:
-        "287a988529542112148b958085323a459d2a6fd8c50aa57834965b92b0caec24",
+        "dce44506310a7d61b9f667a9355ae1399efd28e175c2a7868563670aa509bccd",
     });
     return true;
   });
@@ -217,4 +239,85 @@ test("capability invocation admission is bounded", async () => {
     bounded.invokeCapability(request("bounded-2")),
     /capacity|bounded|exhausted/iu,
   );
+});
+
+test("remote consumer invokes Main through its authenticated exact activation", async () => {
+  const routed: RemoteCapabilityInvocation[] = [];
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    validateActivation: () => undefined,
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    routeCapability: (received) => {
+      routed.push(received);
+      return { fromMain: received.invocation.input };
+    },
+  });
+  await remote.attach(mainSession);
+  cleanups.push(async () => {
+    await Promise.all([remote.close(), runtime.close()]);
+  });
+  const expected = request("remote-consumer-main");
+  await remote.activateComponent(activationFor(expected));
+
+  assert.deepEqual(await runtime.invokeMainCapability(expected), {
+    fromMain: { value: "hello" },
+  });
+  assert.deepEqual(routed, [expected]);
+});
+
+test("remote consumer to Main disconnect is indeterminate and is not auto-retried", async () => {
+  let calls = 0;
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    validateActivation: () => undefined,
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    routeCapability: async () => {
+      calls += 1;
+      started.resolve();
+      await release.promise;
+      return null;
+    },
+  });
+  await remote.attach(mainSession);
+  cleanups.push(async () => {
+    release.resolve();
+    await Promise.all([remote.close(), runtime.close()]);
+  });
+  const expected = request("remote-consumer-disconnect");
+  await remote.activateComponent(activationFor(expected));
+  const pending = runtime.invokeMainCapability(expected);
+  await started.promise;
+  workerSession.close();
+
+  await assert.rejects(pending, (error: unknown) => {
+    const diagnostic = (error as { diagnostic?: { code?: unknown; retryable?: unknown } })
+      .diagnostic;
+    assert.equal(diagnostic?.code, "CAPABILITY_INVOCATION_INDETERMINATE");
+    assert.equal(diagnostic?.retryable, false);
+    return true;
+  });
+  await assert.rejects(runtime.invokeMainCapability(expected), /indeterminate/iu);
+  assert.equal(calls, 1);
 });
