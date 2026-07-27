@@ -646,9 +646,11 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
       { expectedRevision: "2", expectedEpoch: "1" },
     );
     assert.equal(terminal?.revision, "3");
+    if (terminal === undefined) throw new Error("terminal attempt was not committed");
+    const { result: _terminalResult, ...terminalWithoutResult } = terminal;
     const expired = await store.commit(
       {
-        ...(terminal ?? initial),
+        ...terminalWithoutResult,
         state: "expired",
         updatedAt: new Date(4).toISOString(),
         acknowledgedAt: new Date(4).toISOString(),
@@ -656,6 +658,11 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
       { expectedRevision: "3", expectedEpoch: "1" },
     );
     assert.equal(expired?.revision, "4");
+    await state.close();
+    state = new SqliteStateStore({ databasePath });
+    await state.open();
+    store = new StateRemoteAttemptStore({ state, workerId });
+    assert.deepEqual(await store.load(request.taskId, request.attemptId), expired);
     assert.deepEqual(await store.recover(workerId, 2), {
       highestEpoch: "1",
       records: [],

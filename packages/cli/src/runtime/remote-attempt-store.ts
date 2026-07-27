@@ -143,7 +143,10 @@ function parsePersistedAttempt(
   ) {
     throw new Error("Persisted Worker attempt result identity does not match its request");
   }
-  if ((state === "terminal" || state === "expired") !== (result !== undefined)) {
+  if (
+    (state === "terminal" && result === undefined) ||
+    (state !== "terminal" && state !== "expired" && result !== undefined)
+  ) {
     throw new Error("Persisted Worker attempt state and result are inconsistent");
   }
   const acknowledgedAt =
