@@ -163,12 +163,16 @@ class ScopedRemoteExecutor implements Executor {
   }
 
   #track(handle: ExecutionHandle): void {
-    const active = handle.result.then(
+    this.#trackActive(handle.result);
+  }
+
+  #trackActive(result: Promise<unknown>): void {
+    const active = result.then(
       () => undefined,
       () => undefined,
     );
     this.#active.add(active);
-    void active.finally(() => this.#active.delete(active));
+    void active.then(() => this.#active.delete(active));
   }
 
   observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {
@@ -180,19 +184,26 @@ class ScopedRemoteExecutor implements Executor {
   }
 
   invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
-    return this.#shared.invokeCapability({
+    if (!this.#accepting) {
+      return Promise.reject(
+        new Error("Remote component session is draining and not accepting capability invocations"),
+      );
+    }
+    const result = this.#shared.invokeCapability({
       invocationId: invocation.invocationId,
       bindingFingerprint: this.#bindingFingerprint,
       target: this.#target,
       invocation,
     });
+    this.#trackActive(result);
+    return result;
   }
 
   drain(_options: DrainOptions): Promise<void> {
     this.#accepting = false;
     this.#drainPromise ??= this.#submitTail.then(async () => {
+      await Promise.all([...this.#active]);
       await Promise.all([
-        Promise.all([...this.#active]),
         this.#shared.drainTarget(this.#target, _options),
         this.#shared.drainComponent(this.#target),
       ]);

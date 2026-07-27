@@ -712,6 +712,13 @@ export class ComponentHost {
       );
     }
     if (outcome.kind === "error") throw outcome.error;
+    const output = cloneComponentHostValue(outcome.value);
+    if (this.#containsSecret(output)) {
+      throw this.#diagnosticError(
+        "PERMISSION_SECRET_EXFILTRATION_BLOCKED",
+        "Secret values cannot be returned through capability calls",
+      );
+    }
     return this.#success(command, this.#wireOutput(outcome.value));
   }
 

@@ -161,6 +161,7 @@ export class ComponentSandboxSession implements Executor {
   readonly #shutdownGraceMs: number;
   readonly #attempts = new Map<string, SessionAttempt>();
   readonly #queue: SessionAttempt[] = [];
+  readonly #activeCapabilities = new Set<Promise<void>>();
   #active = 0;
   #accepting = true;
   #drainPromise: Promise<void> | undefined;
@@ -276,6 +277,18 @@ export class ComponentSandboxSession implements Executor {
   }
 
   invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+    if (!this.#accepting) {
+      return Promise.reject(
+        new DiagnosticError(
+          diagnostic(
+            "EXECUTOR_DRAINING",
+            "Component session is draining and refuses new capability invocations",
+            this.type,
+            this.#clock.now(),
+          ),
+        ),
+      );
+    }
     const invoke = this.#transport.invokeCapability;
     if (invoke === undefined) {
       return Promise.reject(
@@ -289,7 +302,19 @@ export class ComponentSandboxSession implements Executor {
         ),
       );
     }
-    return invoke.call(this.#transport, invocation);
+    let result: Promise<JsonValue>;
+    try {
+      result = invoke.call(this.#transport, invocation);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const active = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#activeCapabilities.add(active);
+    void active.then(() => this.#activeCapabilities.delete(active));
+    return result;
   }
 
   async observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {
@@ -502,9 +527,10 @@ export class ComponentSandboxSession implements Executor {
 
   async #converge(deadline: string | undefined): Promise<void> {
     const entries = [...this.#attempts.values()];
-    const completed = Promise.all(entries.map((entry) => entry.completed.promise)).then(
-      () => undefined,
-    );
+    const completed = Promise.all([
+      ...entries.map((entry) => entry.completed.promise),
+      ...this.#activeCapabilities,
+    ]).then(() => undefined);
     if (deadline === undefined) {
       await completed;
       return;
