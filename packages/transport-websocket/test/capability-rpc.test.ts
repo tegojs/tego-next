@@ -8,15 +8,11 @@ import {
 import { FakeClock } from "@tegojs/testkit";
 import {
   MemoryRemoteAttemptStore,
-  RemoteExecutor,
   type RemoteCapabilityInvocation,
+  RemoteExecutor,
   WorkerRuntime,
 } from "../src/index.js";
-import {
-  executionRequest,
-  memorySessionPair,
-  TestLocalExecutor,
-} from "./remote-test-support.js";
+import { executionRequest, memorySessionPair, TestLocalExecutor } from "./remote-test-support.js";
 
 const clock = new FakeClock(new Date(0));
 const workerId = parseWorkerId("worker-capability");
@@ -75,9 +71,7 @@ function activationFor(request: RemoteCapabilityInvocation) {
 }
 
 async function connected(
-  invokeCapability: (
-    request: RemoteCapabilityInvocation,
-  ) => JsonValue | Promise<JsonValue>,
+  invokeCapability: (request: RemoteCapabilityInvocation) => JsonValue | Promise<JsonValue>,
   options: { readonly maxCapabilityInvocations?: number } = {},
 ): Promise<{
   readonly remote: RemoteExecutor;
@@ -207,15 +201,16 @@ test("disconnect before the authoritative response is indeterminate and never re
   mainSession.close();
 
   await assert.rejects(pending, (error: unknown) => {
-    const diagnostic = (error as {
-      diagnostic?: { code?: unknown; retryable?: unknown; details?: unknown };
-    }).diagnostic;
+    const diagnostic = (
+      error as {
+        diagnostic?: { code?: unknown; retryable?: unknown; details?: unknown };
+      }
+    ).diagnostic;
     assert.equal(diagnostic?.code, "CAPABILITY_INVOCATION_INDETERMINATE");
     assert.equal(diagnostic?.retryable, false);
     assert.deepEqual(diagnostic?.details, {
       invocationId: expected.invocationId,
-      fingerprint:
-        "dce44506310a7d61b9f667a9355ae1399efd28e175c2a7868563670aa509bccd",
+      fingerprint: "faca55c698a0b5172aaafdaccc8c4062270debbea0aee3fe7cc7d403d4b160cf",
     });
     return true;
   });

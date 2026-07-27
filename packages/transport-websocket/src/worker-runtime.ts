@@ -1,47 +1,68 @@
 import {
-  parseAttemptId,
-  parseExecutionResult,
-  parseTaskId,
   type Clock,
+  DiagnosticError,
   type ExecutionHandle,
   type ExecutionRequest,
   type ExecutionResult,
   type Executor,
   type JsonValue,
+  parseAttemptId,
+  parseExecutionResult,
+  parseTaskExecutionTarget,
+  parseTaskId,
   type RuntimeDiagnostic,
+  serializeWireValue,
+  type TaskExecutionTarget,
   type WorkerId,
+  type WorkerMessageType,
 } from "@tegojs/contracts";
-import { ResultBuffer, type ResultBufferOptions } from "./result-buffer.js";
 import {
+  asObject,
+  attemptKey,
+  capabilityInvocationFingerprint,
+  cloneJson,
+  isRemoteAttemptRevisionError,
+  jsonBytes,
+  jsonFingerprint,
+  parseAttemptRevision,
+  parseRemoteCapabilityInvocation,
+  parseRemoteCapabilityResponse,
+  parseRemoteComponentActivation,
+  parseRemoteRequest,
+  positiveLimit,
   REMOTE_ACK,
   REMOTE_ASSIGN,
   REMOTE_CANCEL,
   REMOTE_CANCEL_ACK,
+  REMOTE_CAPABILITY_INVOKE,
+  REMOTE_COMPONENT_ACTIVATE,
+  REMOTE_COMPONENT_ACTIVATED,
+  REMOTE_COMPONENT_DRAIN,
+  REMOTE_COMPONENT_STOP,
   REMOTE_INVENTORY,
   REMOTE_INVENTORY_RESULT,
   REMOTE_RESULT,
   REMOTE_RESULT_ACK,
-  asObject,
-  attemptKey,
-  cloneJson,
-  jsonBytes,
-  isRemoteAttemptRevisionError,
-  parseAttemptRevision,
-  parseRemoteRequest,
-  positiveLimit,
-  remoteDiagnostic,
-  requestFingerprint,
   type RemoteAttemptRecord,
   type RemoteAttemptStore,
+  type RemoteCapabilityInvocation,
+  type RemoteCapabilityInvocationResponse,
+  type RemoteComponentActivation,
+  type RemoteComponentLifecycleResponse,
   type RemoteResultStore,
   type RemoteSession,
   type RemoteSessionMessage,
+  remoteDiagnostic,
+  requestFingerprint,
 } from "./remote-protocol.js";
+import { ResultBuffer, type ResultBufferOptions } from "./result-buffer.js";
 
 const DEFAULT_MAX_ASSIGNMENTS = 256;
 const DEFAULT_MAX_CONTROL_PAYLOAD_BYTES = 48 * 1024;
 const DEFAULT_MAX_ASSIGNMENT_BYTES = DEFAULT_MAX_CONTROL_PAYLOAD_BYTES;
 const DEFAULT_MAX_INVENTORY = 512;
+const DEFAULT_MAX_CAPABILITY_INVOCATIONS = 256;
+const DEFAULT_MAX_COMPONENT_ACTIVATIONS = 256;
 const INVENTORY_ENVELOPE_RESERVE_BYTES = 4 * 1024;
 const MAX_PERSISTENCE_ATTEMPTS = 8;
 
@@ -67,6 +88,13 @@ export interface WorkerRuntimeOptions {
     request: ExecutionRequest,
   ) => Promise<WorkerAssignmentRejection | undefined> | WorkerAssignmentRejection | undefined;
   readonly preparedArtifacts?: () => readonly string[] | Promise<readonly string[]>;
+  readonly invokeCapability?: (
+    request: RemoteCapabilityInvocation,
+  ) => JsonValue | Promise<JsonValue>;
+  readonly maxCapabilityInvocations?: number;
+  readonly maxCapabilityInvocationBytes?: number;
+  readonly validateActivation?: (activation: RemoteComponentActivation) => void | Promise<void>;
+  readonly maxComponentActivations?: number;
   readonly maxAssignments?: number;
   readonly maxAssignmentBytes?: number;
   readonly maxInventoryItems?: number;
@@ -90,6 +118,18 @@ interface WorkerAttempt {
   result?: ExecutionResult;
   acknowledgedAt?: number;
   cancellation?: "cancelled" | "timed-out";
+  readonly completion: PromiseWithResolvers<void>;
+}
+
+interface WorkerActivation {
+  readonly activation: RemoteComponentActivation;
+  state: "active" | "draining";
+}
+
+function attemptCompletion(completed = false): PromiseWithResolvers<void> {
+  const completion = Promise.withResolvers<void>();
+  if (completed) completion.resolve();
+  return completion;
 }
 
 export class WorkerRuntime {
@@ -100,6 +140,11 @@ export class WorkerRuntime {
   readonly #selectExecutor: WorkerRuntimeOptions["selectExecutor"];
   readonly #validateAssignment: WorkerRuntimeOptions["validateAssignment"];
   readonly #preparedArtifacts: WorkerRuntimeOptions["preparedArtifacts"];
+  readonly #invokeCapability: WorkerRuntimeOptions["invokeCapability"];
+  readonly #maxCapabilityInvocations: number;
+  readonly #maxCapabilityInvocationBytes: number;
+  readonly #validateActivation: WorkerRuntimeOptions["validateActivation"];
+  readonly #maxComponentActivations: number;
   readonly #maxAssignments: number;
   readonly #maxAssignmentBytes: number;
   readonly #maxInventoryItems: number;
@@ -110,6 +155,15 @@ export class WorkerRuntime {
   readonly #retentionMs: number;
   readonly #results: ResultBuffer;
   readonly #attempts = new Map<string, WorkerAttempt>();
+  readonly #capabilityInvocations = new Map<
+    string,
+    { readonly fingerprint: string; readonly response: Promise<RemoteCapabilityInvocationResponse> }
+  >();
+  readonly #mainCapabilityInvocations = new Map<
+    string,
+    { readonly fingerprint: string; readonly result: Promise<JsonValue> }
+  >();
+  readonly #activations = new Map<string, WorkerActivation>();
   #session: RemoteSession | undefined;
   #removeMessageListener: (() => void) | undefined;
   #removeStateListener: (() => void) | undefined;
@@ -133,6 +187,23 @@ export class WorkerRuntime {
     this.#selectExecutor = options.selectExecutor;
     this.#validateAssignment = options.validateAssignment;
     this.#preparedArtifacts = options.preparedArtifacts;
+    this.#invokeCapability = options.invokeCapability;
+    this.#maxCapabilityInvocations = positiveLimit(
+      options.maxCapabilityInvocations,
+      DEFAULT_MAX_CAPABILITY_INVOCATIONS,
+      "maxCapabilityInvocations",
+    );
+    this.#maxCapabilityInvocationBytes = positiveLimit(
+      options.maxCapabilityInvocationBytes,
+      DEFAULT_MAX_CONTROL_PAYLOAD_BYTES,
+      "maxCapabilityInvocationBytes",
+    );
+    this.#validateActivation = options.validateActivation;
+    this.#maxComponentActivations = positiveLimit(
+      options.maxComponentActivations,
+      DEFAULT_MAX_COMPONENT_ACTIVATIONS,
+      "maxComponentActivations",
+    );
     this.#maxAssignments = positiveLimit(
       options.maxAssignments,
       DEFAULT_MAX_ASSIGNMENTS,
@@ -191,6 +262,138 @@ export class WorkerRuntime {
 
   get bufferedResultCount(): number {
     return this.#results.count;
+  }
+
+  async invokeMainCapability(requestValue: RemoteCapabilityInvocation): Promise<JsonValue> {
+    const request = parseRemoteCapabilityInvocation(requestValue);
+    if (
+      request.target.executor.type !== "remote" ||
+      request.target.executor.workerId !== this.#workerId
+    ) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "PROTOCOL_CAPABILITY_TARGET_INVALID",
+          "Capability invocation target does not match this authenticated Worker",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+        ),
+      );
+    }
+    if (this.#validateActivation !== undefined) {
+      const activation = this.#activations.get(this.#activationKey(request.target));
+      if (
+        activation === undefined ||
+        activation.state !== "active" ||
+        activation.activation.bindingFingerprint !== request.bindingFingerprint
+      ) {
+        throw new DiagnosticError(
+          remoteDiagnostic(
+            "CAPABILITY_CONSUMER_NOT_READY",
+            "Capability invocation does not match an active exact remote consumer binding",
+            this.#workerId,
+            this.#clock.now().toISOString(),
+          ),
+        );
+      }
+    }
+    const fingerprint = capabilityInvocationFingerprint(request);
+    const existing = this.#mainCapabilityInvocations.get(request.invocationId);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new DiagnosticError(
+          remoteDiagnostic(
+            "PROTOCOL_CAPABILITY_INVOCATION_CONFLICT",
+            "Capability invocation identity has a different canonical fingerprint",
+            this.#workerId,
+            this.#clock.now().toISOString(),
+          ),
+        );
+      }
+      return existing.result;
+    }
+    if (this.#mainCapabilityInvocations.size >= this.#maxCapabilityInvocations) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "CAPABILITY_INVOCATION_EXHAUSTED",
+          "Worker to Main capability invocation capacity is exhausted",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+        ),
+      );
+    }
+    const session = this.#session;
+    if (session === undefined || session.state !== "ready" || !session.available) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "CAPABILITY_REMOTE_NOT_AVAILABLE",
+          "Main capability invocation requires an authenticated ready session",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+        ),
+      );
+    }
+    const result = this.#requestMainCapability(session, request, fingerprint);
+    this.#mainCapabilityInvocations.set(request.invocationId, { fingerprint, result });
+    return result;
+  }
+
+  async #requestMainCapability(
+    session: RemoteSession,
+    request: RemoteCapabilityInvocation,
+    fingerprint: string,
+  ): Promise<JsonValue> {
+    let response: RemoteSessionMessage;
+    try {
+      response = await session.request(REMOTE_CAPABILITY_INVOKE, { request, fingerprint });
+    } catch {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "CAPABILITY_INVOCATION_INDETERMINATE",
+          "Main capability invocation is indeterminate because the session ended before an authoritative response",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+          { invocationId: request.invocationId, fingerprint },
+        ),
+      );
+    }
+    if (
+      this.#session !== session ||
+      session.state !== "ready" ||
+      response.type !== REMOTE_CAPABILITY_INVOKE
+    ) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "CAPABILITY_INVOCATION_INDETERMINATE",
+          "Main capability invocation is indeterminate because session authority changed before its response",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+          { invocationId: request.invocationId, fingerprint },
+        ),
+      );
+    }
+    const payload = parseRemoteCapabilityResponse(response.payload);
+    if (payload.invocationId !== request.invocationId || payload.fingerprint !== fingerprint) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "PROTOCOL_CAPABILITY_RESPONSE_INVALID",
+          "Main capability response identity does not match its invocation",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+        ),
+      );
+    }
+    if (!payload.ok) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          payload.error?.code ?? "CAPABILITY_INVOCATION_FAILED",
+          payload.error?.message ?? "Main capability invocation failed",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+          { invocationId: request.invocationId, fingerprint },
+        ),
+      );
+    }
+    return cloneJson(payload.value ?? null);
   }
 
   initialize(): Promise<void> {
@@ -304,6 +507,7 @@ export class WorkerRuntime {
           epoch: record.epoch,
           reservedBytes: 0,
           result: durableResult,
+          completion: attemptCompletion(true),
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
           ...(record.acknowledgedAt === undefined
             ? {}
@@ -325,6 +529,7 @@ export class WorkerRuntime {
           epoch: record.epoch,
           reservedBytes: 0,
           result: record.result,
+          completion: attemptCompletion(true),
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
           ...(record.acknowledgedAt === undefined
             ? {}
@@ -341,6 +546,7 @@ export class WorkerRuntime {
           state: "acknowledged",
           epoch: record.epoch,
           reservedBytes: this.#resultReservationBytes(record.request),
+          completion: attemptCompletion(),
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
         });
       }
@@ -375,6 +581,18 @@ export class WorkerRuntime {
       switch (message.type) {
         case REMOTE_ASSIGN:
           await this.#assign(session, message);
+          break;
+        case REMOTE_CAPABILITY_INVOKE:
+          await this.#capabilityInvoke(session, message);
+          break;
+        case REMOTE_COMPONENT_ACTIVATE:
+          await this.#activateComponent(session, message);
+          break;
+        case REMOTE_COMPONENT_DRAIN:
+          await this.#drainComponent(session, message);
+          break;
+        case REMOTE_COMPONENT_STOP:
+          await this.#stopComponent(session, message);
           break;
         case REMOTE_CANCEL:
           await this.#cancel(session, message);
@@ -426,6 +644,17 @@ export class WorkerRuntime {
         }
         return;
       }
+      if (message.type === REMOTE_CAPABILITY_INVOKE) {
+        // #capabilityInvoke converts all authoritative failures into responses.
+        return;
+      }
+      if (
+        message.type === REMOTE_COMPONENT_ACTIVATE ||
+        message.type === REMOTE_COMPONENT_DRAIN ||
+        message.type === REMOTE_COMPONENT_STOP
+      ) {
+        return;
+      }
       if (message.type === REMOTE_CANCEL) {
         await session.send(
           REMOTE_CANCEL_ACK,
@@ -439,6 +668,313 @@ export class WorkerRuntime {
         );
       }
     }
+  }
+
+  async #activateComponent(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
+    let activation: RemoteComponentActivation;
+    try {
+      activation = parseRemoteComponentActivation(
+        asObject(message.payload, REMOTE_COMPONENT_ACTIVATE).activation,
+      );
+    } catch {
+      return;
+    }
+    const key = this.#activationKey(activation.target);
+    const existing = this.#activations.get(key);
+    if (existing !== undefined) {
+      if (existing.activation.bindingFingerprint !== activation.bindingFingerprint) {
+        await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+          ok: false,
+          target: activation.target,
+          bindingFingerprint: activation.bindingFingerprint,
+          error: {
+            code: "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+            message: "Exact component activation has a different binding fingerprint",
+          },
+        });
+        return;
+      }
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+        ok: true,
+        target: activation.target,
+        bindingFingerprint: activation.bindingFingerprint,
+      });
+      return;
+    }
+    if (this.#activations.size >= this.#maxComponentActivations) {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+        ok: false,
+        target: activation.target,
+        bindingFingerprint: activation.bindingFingerprint,
+        error: {
+          code: "LIFECYCLE_COMPONENT_ACTIVATION_EXHAUSTED",
+          message: "Worker component activation capacity is exhausted",
+        },
+      });
+      return;
+    }
+    if (
+      activation.target.executor.type !== "remote" ||
+      activation.target.executor.workerId !== this.#workerId
+    ) {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+        ok: false,
+        target: activation.target,
+        bindingFingerprint: activation.bindingFingerprint,
+        error: {
+          code: "PROTOCOL_COMPONENT_ACTIVATION_TARGET_INVALID",
+          message: "Component activation target does not match this authenticated Worker",
+        },
+      });
+      return;
+    }
+    try {
+      await this.#validateActivation?.(cloneJson(activation));
+    } catch {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+        ok: false,
+        target: activation.target,
+        bindingFingerprint: activation.bindingFingerprint,
+        error: {
+          code: "LIFECYCLE_COMPONENT_ACTIVATION_INVALID",
+          message: "Worker rejected component activation validation",
+        },
+      });
+      return;
+    }
+    this.#activations.set(key, { activation: cloneJson(activation), state: "active" });
+    await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+      ok: true,
+      target: activation.target,
+      bindingFingerprint: activation.bindingFingerprint,
+    });
+  }
+
+  async #drainComponent(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
+    const target = parseTaskExecutionTarget(
+      asObject(message.payload, REMOTE_COMPONENT_DRAIN).target,
+    );
+    const activation = this.#activations.get(this.#activationKey(target));
+    if (activation === undefined || !this.#sameTarget(activation.activation.target, target)) {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_DRAIN, message.messageId, {
+        ok: false,
+        target,
+        error: {
+          code: "LIFECYCLE_COMPONENT_NOT_ACTIVE",
+          message: "Worker has no matching exact component activation",
+        },
+      });
+      return;
+    }
+    activation.state = "draining";
+    await Promise.all(
+      [...this.#attempts.values()]
+        .filter(
+          (attempt) =>
+            attempt.state !== "terminal" &&
+            attempt.request.binding.fingerprint === activation.activation.bindingFingerprint &&
+            this.#sameTarget(attempt.request.target, target),
+        )
+        .map(async (attempt) => attempt.completion.promise),
+    );
+    await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_DRAIN, message.messageId, {
+      ok: true,
+      target,
+      bindingFingerprint: activation.activation.bindingFingerprint,
+    });
+  }
+
+  async #stopComponent(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
+    const target = parseTaskExecutionTarget(
+      asObject(message.payload, REMOTE_COMPONENT_STOP).target,
+    );
+    const key = this.#activationKey(target);
+    const activation = this.#activations.get(key);
+    if (activation === undefined || !this.#sameTarget(activation.activation.target, target)) {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_STOP, message.messageId, {
+        ok: false,
+        target,
+        error: {
+          code: "LIFECYCLE_COMPONENT_NOT_ACTIVE",
+          message: "Worker has no matching exact component activation",
+        },
+      });
+      return;
+    }
+    activation.state = "draining";
+    await Promise.all(
+      [...this.#attempts.values()]
+        .filter(
+          (attempt) =>
+            attempt.state !== "terminal" &&
+            attempt.request.binding.fingerprint === activation.activation.bindingFingerprint &&
+            this.#sameTarget(attempt.request.target, target),
+        )
+        .map(async (attempt) => attempt.completion.promise),
+    );
+    this.#activations.delete(key);
+    await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_STOP, message.messageId, {
+      ok: true,
+      target,
+      bindingFingerprint: activation.activation.bindingFingerprint,
+    });
+  }
+
+  async #sendLifecycleResponse(
+    session: RemoteSession,
+    type: WorkerMessageType,
+    correlationId: string,
+    response: RemoteComponentLifecycleResponse,
+  ): Promise<void> {
+    if (this.#session !== session || session.state !== "ready") return;
+    await session.send(type, response, { correlationId });
+  }
+
+  #activationKey(target: TaskExecutionTarget): string {
+    return jsonFingerprint(target);
+  }
+
+  #sameTarget(left: TaskExecutionTarget, right: TaskExecutionTarget): boolean {
+    return (
+      left.instanceId === right.instanceId &&
+      left.deploymentGeneration === right.deploymentGeneration &&
+      left.artifactDigest === right.artifactDigest &&
+      left.executor.id === right.executor.id &&
+      left.executor.type === right.executor.type &&
+      left.executor.workerId === right.executor.workerId
+    );
+  }
+
+  async #capabilityInvoke(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
+    const payload = asObject(message.payload, REMOTE_CAPABILITY_INVOKE);
+    if (jsonBytes(payload) > this.#maxCapabilityInvocationBytes) {
+      throw new Error("Remote capability invocation exceeds maxCapabilityInvocationBytes");
+    }
+    const request = parseRemoteCapabilityInvocation(payload.request);
+    const fingerprint = capabilityInvocationFingerprint(request);
+    const suppliedFingerprint = payload.fingerprint;
+    if (suppliedFingerprint !== fingerprint) {
+      await this.#sendCapabilityResponse(session, message.messageId, {
+        invocationId: request.invocationId,
+        fingerprint,
+        ok: false,
+        error: {
+          code: "PROTOCOL_CAPABILITY_INVOCATION_CONFLICT",
+          message: "Capability invocation fingerprint is not canonical",
+        },
+      });
+      return;
+    }
+    if (
+      request.target.executor.type !== "remote" ||
+      request.target.executor.workerId !== this.#workerId
+    ) {
+      await this.#sendCapabilityResponse(session, message.messageId, {
+        invocationId: request.invocationId,
+        fingerprint,
+        ok: false,
+        error: {
+          code: "PROTOCOL_CAPABILITY_TARGET_INVALID",
+          message: "Capability invocation target does not match this authenticated Worker",
+        },
+      });
+      return;
+    }
+    if (this.#validateActivation !== undefined) {
+      const activation = this.#activations.get(this.#activationKey(request.target));
+      if (
+        activation === undefined ||
+        activation.state !== "active" ||
+        activation.activation.bindingFingerprint !== request.bindingFingerprint
+      ) {
+        await this.#sendCapabilityResponse(session, message.messageId, {
+          invocationId: request.invocationId,
+          fingerprint,
+          ok: false,
+          error: {
+            code: "CAPABILITY_PROVIDER_NOT_READY",
+            message: "Capability invocation does not match an active exact provider binding",
+          },
+        });
+        return;
+      }
+    }
+    const existing = this.#capabilityInvocations.get(request.invocationId);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) {
+        await this.#sendCapabilityResponse(session, message.messageId, {
+          invocationId: request.invocationId,
+          fingerprint,
+          ok: false,
+          error: {
+            code: "PROTOCOL_CAPABILITY_INVOCATION_CONFLICT",
+            message: "Capability invocation identity has a different canonical fingerprint",
+          },
+        });
+        return;
+      }
+      await this.#sendCapabilityResponse(session, message.messageId, await existing.response);
+      return;
+    }
+    if (this.#capabilityInvocations.size >= this.#maxCapabilityInvocations) {
+      await this.#sendCapabilityResponse(session, message.messageId, {
+        invocationId: request.invocationId,
+        fingerprint,
+        ok: false,
+        error: {
+          code: "CAPABILITY_INVOCATION_EXHAUSTED",
+          message: "Worker capability invocation capacity is exhausted",
+        },
+      });
+      return;
+    }
+    const response = this.#executeCapability(request, fingerprint);
+    this.#capabilityInvocations.set(request.invocationId, { fingerprint, response });
+    await this.#sendCapabilityResponse(session, message.messageId, await response);
+  }
+
+  async #executeCapability(
+    request: RemoteCapabilityInvocation,
+    fingerprint: string,
+  ): Promise<RemoteCapabilityInvocationResponse> {
+    if (this.#invokeCapability === undefined) {
+      return {
+        invocationId: request.invocationId,
+        fingerprint,
+        ok: false,
+        error: {
+          code: "CAPABILITY_INVOCATION_UNAVAILABLE",
+          message: "Worker has no capability invocation handler",
+        },
+      };
+    }
+    try {
+      return {
+        invocationId: request.invocationId,
+        fingerprint,
+        ok: true,
+        value: serializeWireValue(await this.#invokeCapability(cloneJson(request))),
+      };
+    } catch {
+      return {
+        invocationId: request.invocationId,
+        fingerprint,
+        ok: false,
+        error: {
+          code: "CAPABILITY_INVOCATION_FAILED",
+          message: "Worker capability invocation handler failed",
+        },
+      };
+    }
+  }
+
+  async #sendCapabilityResponse(
+    session: RemoteSession,
+    correlationId: string,
+    response: RemoteCapabilityInvocationResponse,
+  ): Promise<void> {
+    if (this.#session !== session || session.state !== "ready") return;
+    await session.send(REMOTE_CAPABILITY_INVOKE, response, { correlationId });
   }
 
   async #assign(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
@@ -459,6 +995,27 @@ export class WorkerRuntime {
         "Execution request target does not match this Worker",
       );
       return;
+    }
+    if (this.#validateActivation !== undefined) {
+      const activation = this.#activations.get(this.#activationKey(request.target));
+      if (
+        activation === undefined ||
+        activation.state !== "active" ||
+        activation.activation.bindingFingerprint !== request.binding.fingerprint ||
+        activation.activation.identity.applicationId !== request.applicationId ||
+        activation.activation.identity.pluginId !== request.pluginId ||
+        activation.activation.identity.componentId !== request.componentId ||
+        !this.#sameTarget(activation.activation.target, request.target)
+      ) {
+        await this.#sendRejected(
+          session,
+          message.messageId,
+          request,
+          "EXECUTOR_REMOTE_ACTIVATION_NOT_READY",
+          "Execution request does not match an active exact component binding",
+        );
+        return;
+      }
     }
     const rejection = await this.#validateAssignment?.(request);
     if (rejection !== undefined) {
@@ -575,6 +1132,7 @@ export class WorkerRuntime {
       state: "acknowledged",
       epoch: session.epoch,
       reservedBytes: this.#resultReservationBytes(request),
+      completion: attemptCompletion(),
     };
     try {
       await this.#create(attempt);
@@ -758,6 +1316,7 @@ export class WorkerRuntime {
         ),
       );
     }
+    attempt.completion.resolve();
     this.#background(this.#publish(attempt.result ?? terminal));
   }
 
@@ -766,6 +1325,7 @@ export class WorkerRuntime {
     const terminal = cloneJson(result);
     attempt.result = terminal;
     attempt.state = "terminal";
+    attempt.completion.resolve();
     this.#results.put(terminal);
     this.#reservedResultBytes = Math.max(0, this.#reservedResultBytes - attempt.reservedBytes);
     attempt.reservedBytes = 0;
@@ -1101,6 +1661,7 @@ export class WorkerRuntime {
         if (latest.result !== undefined || latest.state === "terminal") {
           attempt.state = "terminal";
           if (latest.result !== undefined) attempt.result = latest.result;
+          attempt.completion.resolve();
           return;
         }
         throw new Error("Worker attempt transition lost epoch or revision authority");

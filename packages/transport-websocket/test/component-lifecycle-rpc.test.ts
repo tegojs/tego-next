@@ -13,18 +13,26 @@ import {
   RemoteExecutor,
   WorkerRuntime,
 } from "../src/index.js";
-import {
-  executionRequest,
-  memorySessionPair,
-  TestLocalExecutor,
-} from "./remote-test-support.js";
+import { executionRequest, memorySessionPair, TestLocalExecutor } from "./remote-test-support.js";
 
 const clock = new FakeClock(new Date(0));
 const cleanups: Array<() => Promise<void>> = [];
 
-function activationFor(
-  request: ReturnType<typeof executionRequest>,
-): RemoteComponentActivation {
+async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not settle`)), 1_000);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function activationFor(request: ReturnType<typeof executionRequest>): RemoteComponentActivation {
   return {
     identity: {
       applicationId: request.applicationId,
@@ -45,7 +53,6 @@ async function connected(): Promise<{
   readonly remote: RemoteExecutor;
   readonly validated: RemoteComponentActivation[];
 }> {
-  const request = executionRequest(null, "lifecycle-seed");
   const workerId = executionRequest(null, "lifecycle-seed").target.executor;
   if (workerId.type !== "remote") throw new Error("test target must be remote");
   const local = new TestLocalExecutor();
@@ -69,13 +76,18 @@ async function connected(): Promise<{
   });
   await remote.attach(mainSession);
   cleanups.push(async () => {
+    for (const attempt of local.attempts.values()) {
+      if (attempt.terminal === undefined) local.complete(attempt, "cancelled");
+    }
     await Promise.all([remote.close(), runtime.close()]);
   });
   return { local, remote, validated };
 }
 
 afterEach(async () => {
-  await Promise.all(cleanups.splice(0).map(async (cleanup) => cleanup()));
+  await Promise.all(
+    cleanups.splice(0).map(async (cleanup) => bounded(cleanup(), "lifecycle cleanup")),
+  );
 });
 
 test("component activation is acknowledged only after Worker validation", async () => {
@@ -118,25 +130,38 @@ test("Worker rejects assignment until the exact target and binding fingerprint a
 test("component drain blocks new assignments and waits for active exact-target work", async () => {
   const { local, remote } = await connected();
   const request = executionRequest({ mode: "wait" }, "drain-active");
-  await remote.activateComponent(activationFor(request));
-  const active = await remote.submit(request);
-  await eventually(() => assert.equal(local.executions, 1));
+  await bounded(remote.activateComponent(activationFor(request)), "component activation");
+  const active = await bounded(remote.submit(request), "active submit");
+  await bounded(
+    eventually(() => assert.equal(local.executions, 1)),
+    "local execution start",
+  );
 
   let drained = false;
   const draining = remote.drainComponent(request.target).then(() => {
     drained = true;
   });
-  await Promise.resolve();
-  assert.equal(drained, false);
+  try {
+    await Promise.resolve();
+    assert.equal(drained, false);
 
-  const rejected = executionRequest({ mode: "echo", value: "late" }, "drain-late");
-  await assert.rejects(remote.submit(rejected), /activation|drain/iu);
-  const localAttempt = [...local.attempts.values()][0];
-  assert.ok(localAttempt);
-  local.complete(localAttempt, "succeeded", "done");
-  assert.equal((await active.result).status, "succeeded");
-  await draining;
-  assert.equal(drained, true);
+    const rejected = executionRequest({ mode: "echo", value: "late" }, "drain-late");
+    await bounded(
+      assert.rejects(remote.submit(rejected), /activation|active|drain/iu),
+      "draining admission",
+    );
+    const localAttempt = [...local.attempts.values()][0];
+    assert.ok(localAttempt);
+    local.complete(localAttempt, "succeeded", "done");
+    assert.equal((await bounded(active.result, "active result")).status, "succeeded");
+    await bounded(draining, "component drain");
+    assert.equal(drained, true);
+  } finally {
+    for (const attempt of local.attempts.values()) {
+      if (attempt.terminal === undefined) local.complete(attempt, "cancelled");
+    }
+    await bounded(draining, "component drain cleanup");
+  }
 });
 
 test("component stop removes the exact activation", async () => {
