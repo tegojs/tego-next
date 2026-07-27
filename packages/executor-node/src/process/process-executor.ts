@@ -113,6 +113,9 @@ export interface ProcessExecutorOptions {
   readonly permissionBoundary?: ComponentPermissionBoundary;
   readonly remoteWorkerIsolation?: boolean;
   readonly capabilityBoundary?: ComponentCapabilityBoundary;
+  readonly resolveCapabilityBoundary?: (
+    request: ExecutionRequest,
+  ) => ComponentCapabilityBoundary | Promise<ComponentCapabilityBoundary>;
   readonly secretProvider?: SecretProvider;
   readonly logger?: ProcessExecutorLogger;
   readonly events?: {
@@ -253,6 +256,7 @@ class ProcessChannel {
   readonly #process: HostedProcess;
   readonly #options: ProcessExecutorOptions;
   readonly #component: ResolvedProcessComponent;
+  readonly #capabilityBoundary: ComponentCapabilityBoundary | undefined;
   readonly #channelKey = randomBytes(32);
   readonly #capabilityValidators = new Map<
     string,
@@ -281,10 +285,12 @@ class ProcessChannel {
     process_: HostedProcess,
     options: ProcessExecutorOptions,
     component: ResolvedProcessComponent,
+    capabilityBoundary: ComponentCapabilityBoundary | undefined = options.capabilityBoundary,
   ) {
     this.#process = process_;
     this.#options = options;
     this.#component = component;
+    this.#capabilityBoundary = capabilityBoundary;
     for (const definition of component.capabilityDefinitions) {
       this.#capabilityValidators.set(this.#capabilityKey(definition.identity), {
         request: compileSchemaValidator<JsonValue>(definition.requestSchema),
@@ -457,11 +463,11 @@ class ProcessChannel {
         const validators = this.#capabilityValidators.get(this.#capabilityKey(capabilityIdentity));
         if (validators === undefined) throw new Error("Capability RPC is not registered");
         const input = validators.request.parse(payload.input);
-        if (this.#options.capabilityBoundary === undefined) {
+        if (this.#capabilityBoundary === undefined) {
           throw new Error("Capability boundary is unavailable");
         }
         value = validators.response.parse(
-          await this.#options.capabilityBoundary.invoke({
+          await this.#capabilityBoundary.invoke({
             invocationId: parseOperationId(payload.invocationId),
             identity: capabilityIdentity,
             method: payload.method,
@@ -578,6 +584,14 @@ export class ProcessExecutor implements Executor {
   constructor(options: ProcessExecutorOptions) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(options.id)) {
       throw new TypeError("Process executor identity is invalid");
+    }
+    if (
+      options.capabilityBoundary !== undefined &&
+      options.resolveCapabilityBoundary !== undefined
+    ) {
+      throw new TypeError(
+        "Process executor capability boundary must be fixed or per-execution, not both",
+      );
     }
     const maxConcurrency = options.maxConcurrency ?? 1;
     const maxQueue = options.maxQueue ?? PROCESS_EXECUTOR_MAX_QUEUE;
@@ -816,6 +830,10 @@ export class ProcessExecutor implements Executor {
         return;
       }
       const component = resolution.value;
+      const capabilityBoundary =
+        this.#options.resolveCapabilityBoundary === undefined
+          ? this.#options.capabilityBoundary
+          : await this.#options.resolveCapabilityBoundary(entry.request);
       if (this.#fatalDiagnostic !== undefined) {
         this.#settleFatal(entry, this.#fatalDiagnostic);
         return;
@@ -856,7 +874,7 @@ export class ProcessExecutor implements Executor {
         this.#decide(entry, this.#cancelledResult(entry, entry.cancellation));
         return;
       }
-      channel = new ProcessChannel(process_, this.#options, component);
+      channel = new ProcessChannel(process_, this.#options, component, capabilityBoundary);
       entry.channel = channel;
       const bootstrap = await channel.request({
         kind: "bootstrap",
@@ -1422,7 +1440,12 @@ export async function createProcessComponentSession(
   const { executorOptions: options, identity } = input;
   const clock = options.clock ?? systemClock;
   const target = parseTaskExecutionTarget(input.target);
-  if (target.executor.type !== "process" || target.executor.id !== options.id) {
+  const remoteIsolation =
+    options.remoteWorkerIsolation === true && target.executor.type === "remote";
+  if (
+    !remoteIsolation &&
+    (target.executor.type !== "process" || target.executor.id !== options.id)
+  ) {
     throw executorError(
       "EXECUTOR_REQUEST_TARGET_MISMATCH",
       "Process session target does not match the selected executor",
@@ -1431,6 +1454,13 @@ export async function createProcessComponentSession(
   }
   const artifactDigest = parseArtifactDigest(input.component.artifactDigest);
   const resolvedTarget = parseTaskExecutionTarget(input.component.target);
+  const isolatedRemoteTarget =
+    remoteIsolation &&
+    resolvedTarget.executor.type === "process" &&
+    resolvedTarget.executor.id === options.id &&
+    resolvedTarget.instanceId === target.instanceId &&
+    resolvedTarget.deploymentGeneration === target.deploymentGeneration &&
+    resolvedTarget.artifactDigest === target.artifactDigest;
   const manifest = parsePluginManifest(input.component.manifest);
   const definition = manifest.components.find(
     (candidate) => candidate.componentId === identity.componentId,
@@ -1448,7 +1478,7 @@ export async function createProcessComponentSession(
     );
   }
   if (
-    !taskExecutionTargetsEqual(resolvedTarget, target) ||
+    (!taskExecutionTargetsEqual(resolvedTarget, target) && !isolatedRemoteTarget) ||
     artifactDigest !== target.artifactDigest
   ) {
     throw executorError(
@@ -1475,12 +1505,14 @@ export async function createProcessComponentSession(
       clock.now(),
     );
   }
+  const authoritativeExecutor = remoteIsolation ? "remote" : "process";
   const processGranted = input.component.permissionGrants.some(
-    (permission) => permission.kind === "executor" && permission.executors.includes("process"),
+    (permission) =>
+      permission.kind === "executor" && permission.executors.includes(authoritativeExecutor),
   );
   const executorDecision = options.permissionBoundary?.authorize(input.component.permissionGrants, {
     kind: "executor",
-    executor: "process",
+    executor: authoritativeExecutor,
   });
   if (!processGranted || executorDecision?.allowed === false) {
     throw executorError(
@@ -1727,7 +1759,7 @@ export async function createProcessComponentSession(
         configuration: component.configuration,
         permissionGrants: component.permissionGrants,
         capabilityDefinitions: component.capabilityDefinitions,
-        runtime: { executor: "process", mode: "single-main" },
+        runtime: { executor: remoteIsolation ? "remote" : "process", mode: "single-main" },
       },
     };
     await hostCommand(prepare);
