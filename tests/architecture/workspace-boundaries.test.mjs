@@ -199,6 +199,34 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
     });
   });
 
+  for (const [name, importLine] of [
+    [
+      "accepts pathToFileURL among multiple named imports",
+      'import { fileURLToPath, pathToFileURL } from "node:url";',
+    ],
+    [
+      "accepts pathToFileURL before another named import",
+      'import { pathToFileURL, fileURLToPath } from "node:url";',
+    ],
+    [
+      "accepts multiline spacing around named imports",
+      ['import {', "  fileURLToPath,", "  pathToFileURL,", '} from "node:url";'].join("\n"),
+    ],
+  ]) {
+    await t.test(name, async () => {
+      await withWorkspace(workspaces, async (root) => {
+        const loaderDirectory = new URL("packages/executor-node/dist/src/host/", root);
+        await mkdir(loaderDirectory, { recursive: true });
+        await writeFile(
+          new URL("component-loader.js", loaderDirectory),
+          directLoader.replace('import { pathToFileURL } from "node:url";', importLine),
+        );
+
+        assert.deepEqual(await checkWorkspaceBoundaries(root), []);
+      });
+    });
+  }
+
   for (const [name, source] of [
     [
       "rejects a second computed import in the same loader",

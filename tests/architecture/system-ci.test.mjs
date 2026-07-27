@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,118 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const workflowPath = join(root, ".github", "workflows", "ci.yml");
+const requiredStepsByJob = {
+  integration: [
+    "Check out repository",
+    "Set up Node.js",
+    "Install pinned npm",
+    "Verify npm version",
+    "Install dependencies",
+    "Build",
+    "Run integration tests",
+    "Upload integration diagnostics",
+  ],
+  quality: [
+    "Check out repository",
+    "Set up Node.js",
+    "Install pinned npm",
+    "Verify npm version",
+    "Install dependencies",
+    "Validate commit messages",
+    "Check formatting",
+    "Lint",
+    "Build",
+    "Verify deterministic plugin package",
+    "Typecheck",
+    "Run unit and architecture tests",
+    "Validate OpenSpec",
+  ],
+  "system-e2e": [
+    "Check out repository",
+    "Set up Node.js",
+    "Install pinned npm",
+    "Verify npm version",
+    "Install dependencies",
+    "Build",
+    "Run single-Main system smoke",
+    "Run multi-Main takeover",
+    "Upload process diagnostics",
+  ],
+};
+
+function jobRange(workflow, jobName) {
+  const start = workflow.search(new RegExp(`^  ${jobName}:\\s*$`, "mu"));
+  assert.notEqual(start, -1, `missing job ${jobName}`);
+  const tail = workflow.slice(start);
+  const next = tail.slice(tail.indexOf("\n") + 1).search(/^ {2}[a-zA-Z0-9_-]+:\s*$/mu);
+  return {
+    end: next === -1 ? workflow.length : start + tail.indexOf("\n") + 1 + next,
+    start,
+  };
+}
+
+function stepRanges(workflow, jobName) {
+  const job = jobRange(workflow, jobName);
+  const source = workflow.slice(job.start, job.end);
+  const starts = [...source.matchAll(/^ {6}- name:\s*(.+?)\s*$/gmu)].map((match) => ({
+    name: match[1],
+    start: job.start + match.index,
+  }));
+  return starts.map((step, index) => ({
+    ...step,
+    end: starts[index + 1]?.start ?? job.end,
+  }));
+}
+
+function mutateStepField(workflow, jobName, stepName, field, value) {
+  const step = stepRanges(workflow, jobName).find(({ name }) => name === stepName);
+  assert.ok(step, `missing step ${jobName}/${stepName}`);
+  const block = workflow.slice(step.start, step.end);
+  const fieldPattern = new RegExp(`^ {8}${field}:.*$`, "mu");
+  const replacement = `        ${field}: ${value}`;
+  const mutated = fieldPattern.test(block)
+    ? block.replace(fieldPattern, replacement)
+    : block.replace(/^ {6}- name:.*$/mu, (line) => `${line}\n${replacement}`);
+  return `${workflow.slice(0, step.start)}${mutated}${workflow.slice(step.end)}`;
+}
+
+function moveStep(workflow, sourceJob, stepName, targetJob) {
+  const step = stepRanges(workflow, sourceJob).find(({ name }) => name === stepName);
+  assert.ok(step, `missing step ${sourceJob}/${stepName}`);
+  const block = workflow.slice(step.start, step.end);
+  const without = `${workflow.slice(0, step.start)}${workflow.slice(step.end)}`;
+  const target = jobRange(without, targetJob);
+  const stepsHeader = without.slice(target.start, target.end).match(/^ {4}steps:\s*$/mu);
+  assert.ok(stepsHeader?.index !== undefined, `missing steps in ${targetJob}`);
+  const insertion = target.start + stepsHeader.index + stepsHeader[0].length + 1;
+  return `${without.slice(0, insertion)}${block}${without.slice(insertion)}`;
+}
+
+function replaceStepCommandWithNoop(workflow, jobName, stepName) {
+  const step = stepRanges(workflow, jobName).find(({ name }) => name === stepName);
+  assert.ok(step, `missing step ${jobName}/${stepName}`);
+  const block = workflow.slice(step.start, step.end);
+  const mutated = /^ {8}run:/mu.test(block)
+    ? block.replace(/^ {8}run:.*$/mu, "        run: ':'")
+    : block.replace(/^ {8}uses:.*$/mu, "        # uses: intentionally disabled");
+  assert.notEqual(mutated, block, `${jobName}/${stepName} must have a command`);
+  return `${workflow.slice(0, step.start)}${mutated}${workflow.slice(step.end)}`;
+}
+
+function swapStepOrder(workflow, jobName, stepName) {
+  const steps = stepRanges(workflow, jobName);
+  const index = steps.findIndex(({ name }) => name === stepName);
+  assert.notEqual(index, -1, `missing step ${jobName}/${stepName}`);
+  const leftIndex = index === steps.length - 1 ? index - 1 : index;
+  const left = steps[leftIndex];
+  const right = steps[leftIndex + 1];
+  return [
+    workflow.slice(0, left.start),
+    workflow.slice(right.start, right.end),
+    workflow.slice(left.start, left.end),
+    workflow.slice(right.end),
+  ].join("");
+}
 
 test("@spec:runtime-operations/ci-authoritative-system-acceptance/workflow-gates", async () => {
   const workflow = await readFile(workflowPath, "utf8");
@@ -95,81 +207,12 @@ test("release verification preflight fails closed with structured diagnostics", 
   const { validateReleasePreflight } = await import(
     new URL(`../../scripts/verify-release.mjs?preflight=${Date.now()}`, import.meta.url)
   );
-  const expressionPrefix = "$";
-  const runnerTemp = `${expressionPrefix}{{ runner.temp }}`;
-  const postgresPort = `${expressionPrefix}{{ job.services.postgres.ports['5432'] }}`;
   const valid = {
     gitStatus: "",
     nodeVersion: "v26.5.0",
     npmVersion: "11.13.0",
     postgresUrl: "postgresql://localhost/tego",
-    workflow: [
-      "jobs:",
-      "  quality:",
-      "    timeout-minutes: 15",
-      "    steps:",
-      "      - run: npm install --global npm@11.13.0",
-      "      - run: npm --version",
-      "      - run: npm ci",
-      "      - run: npm run commitlint:ci",
-      "      - run: npm run format:check",
-      "      - run: npm run lint",
-      "      - run: npm run build",
-      "      - run: npm run typecheck",
-      "      - run: npm test",
-      "      - run: npm run openspec:validate",
-      "  integration:",
-      "    timeout-minutes: 15",
-      "    services:",
-      "      postgres:",
-      "        image: postgres:16.14-alpine",
-      "        ports:",
-      "          - 5432/tcp",
-      "    steps:",
-      "      - run: npm run build",
-      "      - name: Run integration tests",
-      "        if: always()",
-      "        timeout-minutes: 10",
-      `        run: node scripts/run-ci-test.mjs --name integration --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 540000 -- npm run test:integration`,
-      "        env:",
-      `          TEGO_POSTGRES_URL: postgresql://localhost:${postgresPort}/tego`,
-      `          TEGO_TEST_ARTIFACTS_DIR: ${runnerTemp}/tego-test-artifacts`,
-      "      - name: Upload integration diagnostics",
-      "        if: always()",
-      "        uses: actions/upload-artifact@v7",
-      "        with:",
-      `          path: ${runnerTemp}/tego-test-artifacts`,
-      "          if-no-files-found: error",
-      "  system-e2e:",
-      "    timeout-minutes: 15",
-      "    services:",
-      "      postgres:",
-      "        image: postgres:16.14-alpine",
-      "        ports:",
-      "          - 5432/tcp",
-      "    steps:",
-      "      - run: npm run build",
-      "      - name: Run single-Main system smoke",
-      "        if: always()",
-      "        timeout-minutes: 8",
-      `        run: node scripts/run-ci-test.mjs --name single-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:single-main`,
-      "        env:",
-      `          TEGO_POSTGRES_URL: postgresql://localhost:${postgresPort}/tego`,
-      `          TEGO_TEST_ARTIFACTS_DIR: ${runnerTemp}/tego-test-artifacts`,
-      "      - name: Run multi-Main takeover",
-      "        if: always()",
-      "        timeout-minutes: 8",
-      `        run: node scripts/run-ci-test.mjs --name multi-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:multi-main`,
-      "        env:",
-      `          TEGO_POSTGRES_URL: postgresql://localhost:${postgresPort}/tego`,
-      `          TEGO_TEST_ARTIFACTS_DIR: ${runnerTemp}/tego-test-artifacts`,
-      "      - name: Upload process diagnostics",
-      "        if: always()",
-      "        uses: actions/upload-artifact@v7",
-      "        with:",
-      `          path: ${runnerTemp}/tego-test-artifacts`,
-      "          if-no-files-found: error",
-    ].join("\n"),
+    workflow: await readFile(workflowPath, "utf8"),
   };
 
   assert.deepEqual(validateReleasePreflight(valid), []);
@@ -192,72 +235,97 @@ test("release verification preflight fails closed with structured diagnostics", 
   }
 });
 
-test("CI workflow validation rejects evidence and commands placed in the wrong job", async () => {
+test("CI workflow validation rejects every disabled, soft-fail, misplaced, no-op, or reordered required step", async (t) => {
   const workflow = await readFile(workflowPath, "utf8");
-  const { validateWorkflowContract } = await import(
+  const { validateReleasePreflight } = await import(
     new URL(`../../scripts/verify-release.mjs?mutations=${Date.now()}`, import.meta.url)
   );
-  const misplacedOpenSpec = workflow.replace(
-    "        run: npm run openspec:validate",
-    "        run: npm test",
-  );
-  const staleSystemAnchor = workflow.replace(
-    "node scripts/run-ci-test.mjs --name single-main",
-    "node scripts/run-ci-test.mjs --name real-process",
-  );
-  const conditionalUpload = workflow.replace(
-    "- name: Upload integration diagnostics\n        if: always()",
-    "- name: Upload integration diagnostics\n        if: success()",
-  );
+  const base = {
+    gitStatus: "",
+    nodeVersion: "v26.5.0",
+    npmVersion: "11.13.0",
+    postgresUrl: "postgresql://localhost/tego",
+  };
+  const wrongJobs = {
+    integration: "system-e2e",
+    quality: "integration",
+    "system-e2e": "quality",
+  };
 
-  assert.ok(validateWorkflowContract(misplacedOpenSpec).length > 0);
-  assert.ok(validateWorkflowContract(staleSystemAnchor).length > 0);
-  assert.ok(validateWorkflowContract(conditionalUpload).length > 0);
+  for (const [jobName, stepNames] of Object.entries(requiredStepsByJob)) {
+    for (const stepName of stepNames) {
+      const mutations = {
+        "commented or no-op command": replaceStepCommandWithNoop(workflow, jobName, stepName),
+        disabled: mutateStepField(workflow, jobName, stepName, "if", "false"),
+        misplaced: moveStep(workflow, jobName, stepName, wrongJobs[jobName]),
+        reordered: swapStepOrder(workflow, jobName, stepName),
+        "soft fail": mutateStepField(workflow, jobName, stepName, "continue-on-error", "true"),
+      };
+      for (const [mutationName, mutation] of Object.entries(mutations)) {
+        await t.test(`${jobName}/${stepName}: ${mutationName}`, () => {
+          assert.notEqual(mutation, workflow);
+          const diagnostics = validateReleasePreflight({ ...base, workflow: mutation });
+          assert.equal(
+            diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+            true,
+          );
+        });
+      }
+    }
+  }
 });
 
-test("CI workflow validation rejects required gates that only appear in comments", async () => {
+test("CI workflow validation requires the deterministic package step after build", async () => {
   const workflow = await readFile(workflowPath, "utf8");
-  const { validateWorkflowContract } = await import(
-    new URL(`../../scripts/verify-release.mjs?comment-mutations=${Date.now()}`, import.meta.url)
+  const { validateReleasePreflight } = await import(
+    new URL(`../../scripts/verify-release.mjs?package-mutation=${Date.now()}`, import.meta.url)
   );
-  const mutations = [
-    [
-      "commented OpenSpec gate",
-      workflow.replace(
-        "        run: npm run openspec:validate",
-        "        # run: npm run openspec:validate",
-      ),
-    ],
-    [
-      "commented single-Main command",
-      workflow.replace(
-        / {8}run: (node scripts\/run-ci-test\.mjs --name single-main[^\n]+)/u,
-        "        # run: $1",
-      ),
-    ],
-    [
-      "commented multi-Main command",
-      workflow.replace(
-        / {8}run: (node scripts\/run-ci-test\.mjs --name multi-main[^\n]+)/u,
-        "        # run: $1",
-      ),
-    ],
-    [
-      "commented upload condition",
-      workflow.replace(
-        "- name: Upload integration diagnostics\n        if: always()",
-        "- name: Upload integration diagnostics\n        # if: always()",
-      ),
-    ],
-  ];
+  const step = stepRanges(workflow, "quality").find(
+    ({ name }) => name === "Verify deterministic plugin package",
+  );
+  assert.ok(step);
+  const mutation = `${workflow.slice(0, step.start)}${workflow.slice(step.end)}`;
+  const diagnostics = validateReleasePreflight({
+    gitStatus: "",
+    nodeVersion: "v26.5.0",
+    npmVersion: "11.13.0",
+    postgresUrl: "postgresql://localhost/tego",
+    workflow: mutation,
+  });
 
-  for (const [name, mutation] of mutations) {
-    assert.notEqual(mutation, workflow, `${name} mutation must change the workflow`);
-    assert.ok(
-      validateWorkflowContract(mutation).length > 0,
-      `${name} must not satisfy the active workflow contract`,
-    );
-  }
+  assert.equal(
+    diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+    true,
+  );
+});
+
+test("deterministic package gate compares independent artifacts and manifests without residue", async () => {
+  const beforeStatus = spawnSync("git", ["status", "--porcelain=v1"], {
+    cwd: root,
+    encoding: "utf8",
+  }).stdout;
+  const beforeTemporaryDirectories = (await readdir(tmpdir()))
+    .filter((name) => name.startsWith("tego-release-package-"))
+    .sort();
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts", "verify-release.mjs"), "--deterministic-package"],
+    { cwd: root, encoding: "utf8", timeout: 120_000 },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /"artifactSha256":"[a-f0-9]{64}"/u);
+  assert.match(result.stdout, /"manifestSha256":"[a-f0-9]{64}"/u);
+  assert.equal(
+    spawnSync("git", ["status", "--porcelain=v1"], { cwd: root, encoding: "utf8" }).stdout,
+    beforeStatus,
+  );
+  assert.deepEqual(
+    (await readdir(tmpdir()))
+      .filter((name) => name.startsWith("tego-release-package-"))
+      .sort(),
+    beforeTemporaryDirectories,
+  );
 });
 
 test("CI reporter always writes nonempty JSON metadata and process logs", async () => {
