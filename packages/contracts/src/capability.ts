@@ -10,6 +10,7 @@ export interface CapabilityIdentity extends JsonObject {
 
 export interface CapabilityDefinition extends JsonObject {
   readonly identity: CapabilityIdentity;
+  readonly methods: readonly string[];
   readonly requestSchema: JsonSchema;
   readonly responseSchema: JsonSchema;
 }

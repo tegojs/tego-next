@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type ComponentCapabilityInvocation,
   createExecutionBinding,
   type ExecutionRequest,
   parseApplicationId,
@@ -129,7 +130,7 @@ test("component session delegates exact provider capability invocations to its t
   let received: unknown;
   const transport = {
     ...fixture.transport,
-    async invokeCapability(invocation: unknown) {
+    async invokeCapability(invocation: ComponentCapabilityInvocation) {
       received = invocation;
       return { echoed: invocation };
     },

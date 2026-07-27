@@ -331,10 +331,30 @@ const pluginManifestSchema = {
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["name", "protocolVersion"],
+            required: [
+              "name",
+              "protocolVersion",
+              "componentId",
+              "methods",
+              "requestSchema",
+              "responseSchema",
+            ],
             properties: {
               name: { $ref: "#/$defs/identity" },
               protocolVersion: { type: "string", pattern: SEMVER_PATTERN },
+              componentId: { $ref: "#/$defs/identity" },
+              methods: {
+                type: "array",
+                minItems: 1,
+                uniqueItems: true,
+                items: { type: "string", pattern: PORTABLE_NAME_PATTERN },
+              },
+              requestSchema: {
+                anyOf: [{ type: "boolean" }, jsonObjectSchema],
+              },
+              responseSchema: {
+                anyOf: [{ type: "boolean" }, jsonObjectSchema],
+              },
             },
           },
         },
@@ -651,9 +671,15 @@ const capabilityDefinitionSchema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
   type: "object",
   additionalProperties: false,
-  required: ["identity", "requestSchema", "responseSchema"],
+  required: ["identity", "methods", "requestSchema", "responseSchema"],
   properties: {
     identity: { $ref: CAPABILITY_IDENTITY_SCHEMA_ID },
+    methods: {
+      type: "array",
+      minItems: 1,
+      uniqueItems: true,
+      items: { type: "string", pattern: PORTABLE_NAME_PATTERN },
+    },
     requestSchema: {
       anyOf: [{ type: "boolean" }, jsonObjectSchema],
     },
@@ -989,6 +1015,23 @@ function compatibilityError(code: DiagnosticCode, message: string): DiagnosticEr
   );
 }
 
+function semanticValidationError(
+  code: DiagnosticCode,
+  message: string,
+  source: DiagnosticSource,
+): DiagnosticError {
+  return new DiagnosticError(runtimeDiagnostic({ code, message, source }));
+}
+
+function canonicalMethods(methods: readonly string[]): boolean {
+  for (let index = 1; index < methods.length; index += 1) {
+    const previous = methods[index - 1];
+    const current = methods[index];
+    if (previous === undefined || current === undefined || previous >= current) return false;
+  }
+  return true;
+}
+
 export function parseRuntimeConfiguration(input: unknown): RuntimeConfiguration {
   return parseWithValidator(
     validateRuntimeConfiguration,
@@ -1084,13 +1127,44 @@ export function parsePluginManifest(input: unknown): PluginManifest {
       `Plugin schema version ${String(schemaVersion)} is unsupported`,
     );
   }
-  return parseWithValidator(
+  const manifest = parseWithValidator<PluginManifest>(
     validatePluginManifest,
     input,
     "ARTIFACT_MANIFEST_INVALID",
     "Plugin manifest is invalid",
     { kind: "artifact", id: "manifest.json" },
   );
+  const provisions = new Set<string>();
+  const components = new Map(
+    manifest.components.map((component) => [component.componentId, component] as const),
+  );
+  for (const provision of manifest.capabilities.provides) {
+    if (!canonicalMethods(provision.methods)) {
+      throw semanticValidationError(
+        "ARTIFACT_MANIFEST_INVALID",
+        "Capability provision methods must be canonical, non-empty, and unique",
+        { kind: "artifact", id: "manifest.json" },
+      );
+    }
+    const key = `${provision.name.length}:${provision.name}${provision.protocolVersion}`;
+    if (provisions.has(key)) {
+      throw semanticValidationError(
+        "ARTIFACT_MANIFEST_INVALID",
+        "Capability provision is duplicated",
+        { kind: "artifact", id: "manifest.json" },
+      );
+    }
+    provisions.add(key);
+    const component = components.get(provision.componentId);
+    if (component === undefined || component.kind !== "task") {
+      throw semanticValidationError(
+        "ARTIFACT_MANIFEST_INVALID",
+        "Capability provider component must be a declared task",
+        { kind: "artifact", id: "manifest.json" },
+      );
+    }
+  }
+  return manifest;
 }
 
 export function parsePermissionSet(input: unknown): readonly Permission[] {
@@ -1134,13 +1208,21 @@ export function parseCapabilityIdentity(input: unknown): CapabilityIdentity {
 }
 
 export function parseCapabilityDefinition(input: unknown): CapabilityDefinition {
-  return parseWithValidator(
+  const definition = parseWithValidator<CapabilityDefinition>(
     validateCapabilityDefinition,
     input,
     "CAPABILITY_DEFINITION_INVALID",
     "Capability definition is invalid",
     { kind: "capability", id: "definition" },
   );
+  if (!canonicalMethods(definition.methods)) {
+    throw semanticValidationError(
+      "CAPABILITY_DEFINITION_INVALID",
+      "Capability definition methods must be canonical, non-empty, and unique",
+      { kind: "capability", id: "definition" },
+    );
+  }
+  return definition;
 }
 
 export function parseCapabilityBinding(input: unknown): CapabilityBinding {

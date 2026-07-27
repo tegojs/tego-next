@@ -2,6 +2,7 @@ import {
   type AttemptId,
   type AttemptStatus,
   type Clock,
+  type ComponentCapabilityInvocation,
   DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
@@ -28,6 +29,7 @@ export interface ComponentSessionRunResult {
 export interface ComponentSessionTransport {
   readonly executor: ExecutionResult["executor"];
   run(request: ExecutionRequest): Promise<ComponentSessionRunResult>;
+  invokeCapability?(invocation: ComponentCapabilityInvocation): Promise<JsonValue>;
   cancel(taskId: TaskId, attemptId: AttemptId, reason: "cancelled" | "timed-out"): Promise<void>;
   health(): Promise<{
     readonly status: ExecutorHealth["status"];
@@ -271,6 +273,23 @@ export class ComponentSandboxSession implements Executor {
     this.#armDeadline(entry);
     this.#schedule();
     return entry.handle;
+  }
+
+  invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+    const invoke = this.#transport.invokeCapability;
+    if (invoke === undefined) {
+      return Promise.reject(
+        new DiagnosticError(
+          diagnostic(
+            "EXECUTOR_COMPONENT_HOOK_MISSING",
+            "Component session transport cannot invoke provider capabilities",
+            this.type,
+            this.#clock.now(),
+          ),
+        ),
+      );
+    }
+    return invoke.call(this.#transport, invocation);
   }
 
   async observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {

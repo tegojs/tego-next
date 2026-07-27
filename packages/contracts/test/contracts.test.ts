@@ -252,7 +252,7 @@ const validCapabilityDefinition = {
 const validCapabilityProvision = {
   name: validCapabilityIdentity.name,
   protocolVersion: validCapabilityIdentity.protocolVersion,
-  componentId: validManifest.components[0]!.componentId,
+  componentId: parseComponentId("echo"),
   methods: ["echo", "inspect"],
   requestSchema: validCapabilityDefinition.requestSchema,
   responseSchema: validCapabilityDefinition.responseSchema,
@@ -432,9 +432,7 @@ test("plugin capability provisions reject undeclared and non-task provider compo
       parsePluginManifest({
         ...validManifest,
         capabilities: {
-          provides: [
-            { ...validCapabilityProvision, componentId: parseComponentId("undeclared") },
-          ],
+          provides: [{ ...validCapabilityProvision, componentId: parseComponentId("undeclared") }],
           requires: [],
         },
       }),

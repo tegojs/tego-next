@@ -1,24 +1,18 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MessageChannel, Worker, type MessagePort, type Transferable } from "node:worker_threads";
+import { MessageChannel, type MessagePort, type Transferable, Worker } from "node:worker_threads";
 import {
-  compileSchemaValidator,
-  DiagnosticError,
-  parseArtifactDigest,
-  parseCapabilityName,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parsePluginManifest,
-  parseTaskExecutionTarget,
-  runtimeDiagnostic,
   type ArtifactDigest,
   type AttemptId,
   type AttemptStatus,
   type CapabilityDefinition,
   type Clock,
   type ComponentCapabilityBoundary,
+  type ComponentCapabilityInvocation,
   type ComponentPermissionBoundary,
+  compileSchemaValidator,
+  DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -29,26 +23,34 @@ import {
   type JsonValue,
   type Permission,
   type PluginManifest,
+  parseArtifactDigest,
+  parseCapabilityName,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parseOperationId,
+  parsePluginManifest,
+  parseTaskExecutionTarget,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type SecretProvider,
-  type TaskId,
   type TaskExecutionTarget,
+  type TaskId,
 } from "@tegojs/contracts";
 import {
   COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
   ComponentSandboxSession,
-  raceComponentSessionOperation,
   type ComponentSessionRunResult,
   type ComponentSessionTransport,
+  raceComponentSessionOperation,
   taskExecutionTargetsEqual,
 } from "../host/component-session.js";
 import {
   COMPONENT_HOST_PROTOCOL,
-  cloneComponentHostValue,
-  parseComponentHostResult,
   type ComponentHostCommand,
   type ComponentHostResult,
+  cloneComponentHostValue,
   type PrepareComponentHostCommand,
+  parseComponentHostResult,
 } from "../host/protocol.js";
 
 export const THREAD_EXECUTOR_MAX_MESSAGE_BYTES = 1024 * 1024;
@@ -651,6 +653,7 @@ class ThreadChannel {
         }
         value = validators.response.parse(
           await this.#options.capabilityBoundary.invoke({
+            invocationId: parseOperationId(message.id),
             identity: capabilityIdentity,
             method: payload.method,
             input,
@@ -2069,6 +2072,23 @@ export async function createThreadComponentSession(
           payload: { artifactDigest, execution: request },
         });
         return parseSessionRunResult(result, clock);
+      },
+      async invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+        const result = await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-capability-${++commandSequence}-${invocation.invocationId}`,
+          deadline: controlDeadline(),
+          type: "invokeCapability",
+          payload: { artifactDigest, invocation },
+        });
+        if (result.value === undefined) {
+          throw executorError(
+            "EXECUTOR_COMPONENT_HOST_FAILED",
+            "Capability provider returned no wire value",
+            clock.now(),
+          );
+        }
+        return result.value;
       },
       async cancel(taskId, attemptId, reason): Promise<void> {
         await hostCommand({

@@ -2,22 +2,16 @@ import { randomBytes } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  compileSchemaValidator,
-  DiagnosticError,
-  parseArtifactDigest,
-  parseCapabilityName,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parsePluginManifest,
-  parseTaskExecutionTarget,
-  runtimeDiagnostic,
   type ArtifactDigest,
   type AttemptId,
   type AttemptStatus,
   type CapabilityDefinition,
   type Clock,
   type ComponentCapabilityBoundary,
+  type ComponentCapabilityInvocation,
   type ComponentPermissionBoundary,
+  compileSchemaValidator,
+  DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -30,29 +24,37 @@ import {
   type Permission,
   type PluginManifest,
   type ProcessHost,
+  parseArtifactDigest,
+  parseCapabilityName,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parseOperationId,
+  parsePluginManifest,
+  parseTaskExecutionTarget,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type SecretProvider,
-  type TaskId,
   type TaskExecutionTarget,
+  type TaskId,
 } from "@tegojs/contracts";
 import {
   COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
   ComponentSandboxSession,
-  raceComponentSessionOperation,
   type ComponentSessionRunResult,
   type ComponentSessionTransport,
+  raceComponentSessionOperation,
   taskExecutionTargetsEqual,
 } from "../host/component-session.js";
 import {
   COMPONENT_HOST_PROTOCOL,
-  cloneComponentHostValue,
-  parseComponentHostResult,
   type ComponentHostCommand,
   type ComponentHostResult,
+  cloneComponentHostValue,
   type PrepareComponentHostCommand,
+  parseComponentHostResult,
 } from "../host/protocol.js";
 import { authenticateProcessMessage, signProcessMessage } from "./authentication.js";
-import { ProcessFrameDecoder, encodeProcessFrame } from "./framing.js";
+import { encodeProcessFrame, ProcessFrameDecoder } from "./framing.js";
 
 export const PROCESS_EXECUTOR_MAX_RETAINED_ATTEMPTS = 256;
 export const PROCESS_EXECUTOR_MAX_QUEUE = 256;
@@ -455,6 +457,7 @@ class ProcessChannel {
         }
         value = validators.response.parse(
           await this.#options.capabilityBoundary.invoke({
+            invocationId: parseOperationId(message.id),
             identity: capabilityIdentity,
             method: payload.method,
             input,
@@ -1765,6 +1768,23 @@ export async function createProcessComponentSession(
           payload: { artifactDigest, execution: request },
         });
         return parseProcessSessionRunResult(result, clock);
+      },
+      async invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+        const result = await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-capability-${++commandSequence}-${invocation.invocationId}`,
+          deadline: controlDeadline(),
+          type: "invokeCapability",
+          payload: { artifactDigest, invocation },
+        });
+        if (result.value === undefined) {
+          throw executorError(
+            "EXECUTOR_COMPONENT_HOST_FAILED",
+            "Capability provider returned no wire value",
+            clock.now(),
+          );
+        }
+        return result.value;
       },
       async cancel(taskId, attemptId, reason): Promise<void> {
         await hostCommand({

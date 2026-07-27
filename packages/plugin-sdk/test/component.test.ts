@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { JsonValue } from "@tegojs/contracts";
 import {
+  type ComponentContext,
   createComponentContext,
   createDisposableStack,
   defineComponent,
-  type ComponentContext,
 } from "../src/index.js";
 
 test("defineComponent snapshots and deeply freezes a functional definition", () => {

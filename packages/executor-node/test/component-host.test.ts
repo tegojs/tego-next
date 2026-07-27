@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  type JsonValue,
+  type PluginManifest,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
+  parseCapabilityName,
   parseComponentId,
   parseComponentInstanceId,
   parseGeneration,
@@ -14,18 +17,16 @@ import {
   parsePluginManifest,
   parseRuntimeId,
   parseTaskId,
-  type JsonValue,
-  type PluginManifest,
   type SecretProvider,
 } from "@tegojs/contracts";
 import {
-  cloneComponentHostValue,
   ComponentHost,
-  parseComponentHostCommand,
   type ComponentHostCommand,
   type ComponentHostOptions,
   type ComponentHostResult,
+  cloneComponentHostValue,
   type PrepareComponentHostCommand,
+  parseComponentHostCommand,
 } from "../src/index.js";
 
 const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
@@ -51,6 +52,7 @@ async function artifactFixture(
     readonly entrypoint?: string;
     readonly isolated?: boolean;
     readonly permissions?: PluginManifest["permissions"];
+    readonly provides?: PluginManifest["capabilities"]["provides"];
   } = {},
 ): Promise<ArtifactFixture> {
   const directory = await mkdtemp(
@@ -79,7 +81,7 @@ async function artifactFixture(
       },
     ],
     permissions: options.permissions ?? [],
-    capabilities: { provides: [], requires: [] },
+    capabilities: { provides: options.provides ?? [], requires: [] },
   });
   return { directory: await realpath(directory), manifest };
 }
@@ -346,7 +348,7 @@ test("provider capability invocation commands preserve the exact bounded wire co
           invocation: { ...invocation.payload.invocation, invocationId: "" },
         },
       }),
-    /invocation/u,
+    /invocation|OperationId/u,
   );
   assert.throws(
     () =>
@@ -1441,7 +1443,7 @@ test("capability calls are forced through permission, request, invoke, and respo
       export default defineComponent({
         kind: "task",
         run: async (context, input) => context.capabilities.call({
-          name: "org.example.echo",
+          name: parseCapabilityName("org.example.echo"),
           protocolVersion: "1.0.0",
           method: "echo",
           input
@@ -1571,6 +1573,18 @@ test("provider capability commands invoke only the task provider hook", async (t
         })
       });
     `,
+    {
+      provides: [
+        {
+          name: parseCapabilityName("org.example.echo"),
+          protocolVersion: "1.0.0",
+          componentId: parseComponentId("component"),
+          methods: ["echo"],
+          requestSchema: true,
+          responseSchema: true,
+        },
+      ],
+    },
   );
   const host = new ComponentHost(allowedOptions(fixture));
   await host.handle(prepareCommand(fixture));
@@ -1610,14 +1624,13 @@ test("service components explicitly reject provider capability hooks", async (t)
     `,
     { componentId: "component" },
   );
-  const component = fixture.manifest.components[0]!;
+  const component = fixture.manifest.components[0];
+  if (component === undefined) throw new Error("Service fixture component is missing");
   const serviceManifest = {
     ...fixture.manifest,
     components: [{ ...component, kind: "service" as const }],
   } satisfies PluginManifest;
-  const host = new ComponentHost(
-    allowedOptions({ ...fixture, manifest: serviceManifest }),
-  );
+  const host = new ComponentHost(allowedOptions({ ...fixture, manifest: serviceManifest }));
   await host.handle(prepareCommand({ ...fixture, manifest: serviceManifest }));
   const result = await host.handle(
     command("import", "service-provider-import", { artifactDigest: digest }),

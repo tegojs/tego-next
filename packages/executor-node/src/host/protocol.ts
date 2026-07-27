@@ -1,25 +1,28 @@
 import {
+  type ArtifactDigest,
+  type CapabilityDefinition,
+  type ComponentCapabilityInvocation,
+  type ComponentId,
   DiagnosticError,
+  type ExecutionRequest,
+  type JsonObject,
+  type JsonValue,
+  type Permission,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
   parseCapabilityDefinition,
+  parseCapabilityIdentity,
   parseComponentId,
   parseExecutionRequest,
+  parseOperationId,
   parsePermissionSet,
   parsePluginId,
   parseRuntimeDiagnostic,
   parseRuntimeId,
   parseTaskId,
-  runtimeDiagnostic,
-  type ArtifactDigest,
-  type CapabilityDefinition,
-  type ComponentId,
-  type ExecutionRequest,
-  type JsonObject,
-  type JsonValue,
-  type Permission,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
 } from "@tegojs/contracts";
 
 export const COMPONENT_HOST_PROTOCOL = "1.0" as const;
@@ -29,6 +32,7 @@ const COMMAND_TYPES = new Set([
   "start",
   "health",
   "run",
+  "invokeCapability",
   "drain",
   "stop",
   "cancel",
@@ -100,6 +104,14 @@ export interface RunComponentHostCommand extends CommandBase {
   };
 }
 
+export interface InvokeCapabilityComponentHostCommand extends CommandBase {
+  readonly type: "invokeCapability";
+  readonly payload: {
+    readonly artifactDigest: ArtifactDigest;
+    readonly invocation: ComponentCapabilityInvocation;
+  };
+}
+
 export interface CancelComponentHostCommand extends CommandBase {
   readonly type: "cancel";
   readonly payload: {
@@ -113,6 +125,7 @@ export type ComponentHostCommand =
   | ArtifactComponentHostCommand
   | CancelComponentHostCommand
   | ImportComponentHostCommand
+  | InvokeCapabilityComponentHostCommand
   | PrepareComponentHostCommand
   | RunComponentHostCommand;
 
@@ -344,6 +357,30 @@ export function parseComponentHostCommand(input: unknown): ComponentHostCommand 
           execution: parseExecutionRequest(payload.execution),
         },
       };
+    case "invokeCapability": {
+      exactFields(payload, ["artifactDigest", "invocation"]);
+      const invocation = objectValue(payload.invocation ?? null, "Capability invocation");
+      exactFields(invocation, ["identity", "input", "invocationId", "method"]);
+      const method = text(invocation.method, "Capability invocation method");
+      if (!COMMAND_ID.test(method)) {
+        throw wireError("Capability invocation method is invalid");
+      }
+      return {
+        protocol: COMPONENT_HOST_PROTOCOL,
+        commandId,
+        deadline,
+        type,
+        payload: {
+          artifactDigest: parseArtifactDigest(payload.artifactDigest),
+          invocation: {
+            invocationId: parseOperationId(invocation.invocationId),
+            identity: parseCapabilityIdentity(invocation.identity),
+            method,
+            input: invocation.input as JsonValue,
+          },
+        },
+      };
+    }
     case "cancel":
       exactFields(payload, ["attemptId", "taskId"], ["reason"]);
       return {
