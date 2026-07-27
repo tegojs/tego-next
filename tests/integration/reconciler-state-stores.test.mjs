@@ -10,6 +10,7 @@ import {
   parseComponentId,
   parseFencingEpoch,
   parseGeneration,
+  parsePluginDeploymentObservation,
   parsePluginId,
 } from "@tegojs/contracts";
 import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
@@ -196,6 +197,59 @@ async function readObservation(store, targetPluginId = pluginId) {
     id: `${applicationId}/${targetPluginId}`,
   });
 }
+
+test("legacy deployment observations migrate across Memory and SQLite restart", async (t) => {
+  for (const scenario of [
+    { legacy: "unavailable", current: "blocked", hasInstallation: false },
+    { legacy: "inconsistent", current: "blocked", hasInstallation: false },
+    { legacy: "converging", current: "reconciling", hasInstallation: true },
+  ]) {
+    await t.test(`${scenario.legacy}-to-${scenario.current}`, async (t) => {
+      await withRealStateStores(t, async (initialState, clock, reopen) => {
+        await initialState.transact({}, async (transaction) => {
+          await transaction.put(
+            {
+              namespace: "tego",
+              collection: "deployment-observations",
+              id: `${applicationId}/${pluginId}`,
+            },
+            {
+              applicationId,
+              pluginId,
+              generation: parseGeneration("1"),
+              status: scenario.legacy,
+              diagnostics: [],
+              updatedAt: clock.now().toISOString(),
+            },
+            { expectedRevision: "absent" },
+          );
+          return null;
+        });
+
+        const state = await reopen();
+        const effects = new RecordingEffects();
+        if (scenario.current === "reconciling") {
+          effects.isLive = () => false;
+        }
+        const reconciler = new Reconciler({
+          artifactGate: { validate: async () => gate().artifact },
+          clock,
+          effects,
+          state,
+          loadDeployments: async () => [deployment()],
+          loadInstallations: async () => (scenario.hasInstallation ? [installation()] : []),
+        });
+
+        await reconciler.start();
+        const migrated = await readObservation(state);
+        assert.ok(migrated);
+        assert.equal(migrated.value.status, scenario.current);
+        assert.deepEqual(parsePluginDeploymentObservation(migrated.value), migrated.value);
+        await reconciler.stop();
+      });
+    });
+  }
+});
 
 test("automatic capability binding survives reconciler and state-store restart", async (t) => {
   await withRealStateStores(t, async (initialState, clock, reopen) => {
@@ -947,7 +1001,7 @@ test("current instance context mismatches cannot satisfy essential readiness", a
 
         assert.equal(reconciler.applicationReady(), false);
         assert.equal(reconciler.diagnostics()[0]?.code, "DEPLOYMENT_INSTANCE_INCONSISTENT");
-        assert.equal((await readObservation(state))?.value.status, "inconsistent");
+        assert.equal((await readObservation(state))?.value.status, "blocked");
         assert.deepEqual(effects.calls, []);
         await reconciler.stop();
       });
@@ -1100,7 +1154,7 @@ test("current provider context mismatches cannot satisfy required capabilities",
             .some((diagnostic) => diagnostic.code === "CAPABILITY_REQUIRED_UNAVAILABLE"),
           true,
         );
-        assert.equal((await readObservation(state, providerId))?.value.status, "inconsistent");
+        assert.equal((await readObservation(state, providerId))?.value.status, "blocked");
         await reconciler.stop();
       });
     });
