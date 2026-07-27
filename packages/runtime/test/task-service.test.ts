@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   type Clock,
+  createExecutionBinding,
   DiagnosticError,
   diagnosticCode,
   type ExecutionHandle,
@@ -14,6 +15,7 @@ import {
   parseAttemptId,
   parseComponentId,
   parseComponentInstanceId,
+  parseCapabilityName,
   parseDeployPluginRequest,
   parseFencingEpoch,
   parseGeneration,
@@ -345,7 +347,7 @@ const generationTwoTarget: TaskExecutionTarget = {
   },
 };
 
-const immutableExecutionBinding = {
+const immutableExecutionBindingContent = {
   configuration: {
     nested: {
       retries: 3,
@@ -358,21 +360,20 @@ const immutableExecutionBinding = {
   ],
   capabilityDefinitions: [
     {
-      identity: { name: "records", protocolVersion: "1.0.0" },
+      identity: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
       requestSchema: { type: "object" },
       responseSchema: { type: "object" },
     },
   ],
   capabilityBindings: [
     {
-      capability: { name: "records", protocolVersion: "1.0.0" },
+      capability: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
       providerDeployment: {
-        applicationId: "application-01",
-        pluginId: "records-provider",
+        applicationId: parseApplicationId("application-01"),
+        pluginId: parsePluginId("records-provider"),
       },
     },
   ],
-  fingerprint: "a".repeat(64),
 } as const;
 
 function executorSelection(
@@ -390,14 +391,27 @@ function executorSelection(
           id: executor.id,
           type: executor.type,
         };
+  const selectedTarget = {
+    ...target,
+    executor: targetExecutor,
+  };
   return {
-    target: {
-      ...target,
-      executor: targetExecutor,
-    },
-    binding: immutableExecutionBinding,
+    target: selectedTarget,
+    binding: executionBinding(selectedTarget),
     executor,
-  } as unknown as TaskExecutorSelection;
+  };
+}
+
+function executionBinding(target: TaskExecutionTarget) {
+  return createExecutionBinding(
+    {
+      applicationId: request.applicationId,
+      pluginId: request.pluginId,
+      componentId: request.componentId,
+      target,
+    },
+    immutableExecutionBindingContent,
+  );
 }
 
 function serviceFixture(executor = new ControlledExecutor()) {
@@ -625,6 +639,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/tasks-recover-before-disp
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     target: executorSelection(executor).target,
+    binding: executorSelection(executor).binding,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
@@ -647,6 +662,7 @@ test("recovery commits a locally observed terminal attempt without redispatch", 
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     target: executorSelection(executor).target,
+    binding: executorSelection(executor).binding,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
@@ -679,6 +695,7 @@ test("missing local running attempt recovers as durable indeterminate without re
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     target: executorSelection(executor).target,
+    binding: executorSelection(executor).binding,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
@@ -738,6 +755,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/accepted-remote-unknown-i
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     target: executorSelection(executor).target,
+    binding: executorSelection(executor).binding,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: accepted, revision: 1 });
@@ -1201,6 +1219,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-observation-failur
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     target: executorSelection(executor).target,
+    binding: executorSelection(executor).binding,
     authority,
   });
   state.records.set(`tego/tasks/${identity.taskId}`, { value: running, revision: 1 });
@@ -1231,6 +1250,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/observation-is-clock-boun
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(executor).target,
+      binding: executorSelection(executor).binding,
       authority,
     }),
     revision: 1,
@@ -1390,6 +1410,7 @@ test("@spec:runtime-operations/task-operations/task-record-preserves-immutable-e
 
 test("execution binding parity persists one selection and reuses it after restart", async () => {
   const executor = new ControlledExecutor();
+  const immutableExecutionBinding = executorSelection(executor).binding;
   const state = new TransactionalState();
   const first = new TaskService({
     state,
@@ -1408,25 +1429,28 @@ test("execution binding parity persists one selection and reuses it after restar
     (executor.submitted[0] as ExecutionRequest & { readonly binding?: unknown }).binding,
     immutableExecutionBinding,
   );
+  const persistedBeforeRestart = state.records.get(`tego/tasks/${identity.taskId}`);
+  assert.notEqual(persistedBeforeRestart, undefined);
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      ...(persistedBeforeRestart?.value as TaskRecord),
+      state: "accepted",
+    }),
+    revision: (persistedBeforeRestart?.revision ?? 0) + 1,
+  });
   await first.close();
 
   const restartedExecutor = new ControlledExecutor();
-  let restartSelection:
-    | (TaskExecutorSelection & { readonly binding?: unknown })
-    | undefined;
+  let restartSelection: (TaskExecutorSelection & { readonly binding?: unknown }) | undefined;
   const restarted = new TaskService({
     state,
     clock,
-    selectExecutor: async (_request, target) => {
-      restartSelection = executorSelection(restartedExecutor, target);
-      return {
-        ...restartSelection,
-        binding: {
-          ...immutableExecutionBinding,
-          configuration: { nested: { retries: 99 } },
-          fingerprint: "b".repeat(64),
-        },
-      } as unknown as TaskExecutorSelection;
+    selectExecutor: async (_request, target, _signal, persistedBinding) => {
+      restartSelection = {
+        ...executorSelection(restartedExecutor, target),
+        binding: persistedBinding,
+      } as TaskExecutorSelection;
+      return restartSelection;
     },
   });
   await restarted.recover();
@@ -1436,7 +1460,7 @@ test("execution binding parity persists one selection and reuses it after restar
     (restartedExecutor.submitted[0] as ExecutionRequest & { readonly binding?: unknown }).binding,
     immutableExecutionBinding,
   );
-  assert.notDeepEqual(restartSelection?.binding, immutableExecutionBinding);
+  assert.deepEqual(restartSelection?.binding, immutableExecutionBinding);
 });
 
 test("@spec:runtime-operations/task-operations/admission-does-not-follow-a-generation-upgrade", async () => {
@@ -1447,7 +1471,7 @@ test("@spec:runtime-operations/task-operations/admission-does-not-follow-a-gener
     state,
     clock,
     selectExecutor: async () => {
-      const selection = { target: activeTarget, executor };
+      const selection = executorSelection(executor, activeTarget);
       activeTarget = generationTwoTarget;
       return selection;
     },
@@ -1477,6 +1501,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fail
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: generationOneTarget,
+      binding: executionBinding(generationOneTarget),
       authority,
     }),
     revision: 1,
@@ -1486,7 +1511,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fail
     clock,
     selectExecutor: async (_request, binding) => {
       resolvedBindings.push(binding);
-      return { target: generationTwoTarget, executor };
+      return executorSelection(executor, generationTwoTarget);
     },
     createIdentity: () => identity,
   });
@@ -1502,6 +1527,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/missing-exact-target-fail
 test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-mismatch-is-diagnostic", async () => {
   const executor = new ControlledExecutor("remote", "remote-02");
   const state = new TransactionalState();
+  const persistedBinding = executionBinding(generationOneTarget);
   state.records.set(`tego/tasks/${identity.taskId}`, {
     value: parseTaskRecord({
       taskId: identity.taskId,
@@ -1511,6 +1537,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-mismatch-is-
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: generationOneTarget,
+      binding: persistedBinding,
       authority,
     }),
     revision: 1,
@@ -1518,7 +1545,13 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-mismatch-is-
   const restarted = new TaskService({
     state,
     clock,
-    selectExecutor: async () => executorSelection(executor, generationTwoTarget),
+    selectExecutor: async (_request, _target, _signal, binding) => {
+      assert.equal(binding?.fingerprint, persistedBinding.fingerprint);
+      return {
+        ...executorSelection(executor, generationTwoTarget),
+        binding: persistedBinding,
+      };
+    },
   });
   await restarted.recover();
 
@@ -1543,6 +1576,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-mismatch-se
   const selectedExecutor = new ControlledExecutor("remote", "remote-02");
   const expectedTarget = executorSelection(expectedExecutor).target;
   const selectedTarget = executorSelection(selectedExecutor, generationTwoTarget).target;
+  const persistedBinding = executionBinding(expectedTarget);
   const state = new TransactionalState();
   state.records.set(`tego/tasks/${identity.taskId}`, {
     value: parseTaskRecord({
@@ -1553,6 +1587,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-mismatch-se
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: expectedTarget,
+      binding: persistedBinding,
       authority,
     }),
     revision: 1,
@@ -1560,7 +1595,13 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-mismatch-se
   const restarted = new TaskService({
     state,
     clock,
-    selectExecutor: async () => ({ target: selectedTarget, executor: selectedExecutor }),
+    selectExecutor: async (_request, _target, _signal, binding) => {
+      assert.equal(binding?.fingerprint, persistedBinding.fingerprint);
+      return {
+        ...executorSelection(selectedExecutor, selectedTarget),
+        binding: persistedBinding,
+      };
+    },
   });
   await restarted.recover();
 
@@ -1583,6 +1624,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-unavailable
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(expectedExecutor).target,
+      binding: executorSelection(expectedExecutor).binding,
       authority,
     }),
     revision: 1,
@@ -1630,6 +1672,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-worker-availabilit
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target,
+      binding: executionBinding(target),
       authority,
     }),
     revision: 1,
@@ -1640,7 +1683,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/remote-worker-availabilit
     clock,
     selectExecutor: async () => {
       if (!available) throw new Error("Worker is reconnecting");
-      return { target, executor };
+      return executorSelection(executor, target);
     },
   });
   await restarted.recover();
@@ -1693,6 +1736,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-unavailable-
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: generationOneTarget,
+      binding: executionBinding(generationOneTarget),
       authority,
     }),
     revision: 1,
@@ -1737,6 +1781,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-selection-ti
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: generationOneTarget,
+      binding: executionBinding(generationOneTarget),
       authority,
     }),
     revision: 1,
@@ -1771,6 +1816,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/exact-target-selection-ca
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         target: generationOneTarget,
+        binding: executionBinding(generationOneTarget),
         authority,
       }),
       revision: 1,
@@ -1837,6 +1883,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/replays-durable-cancellat
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(executor).target,
+      binding: executorSelection(executor).binding,
       authority,
       cancellation: { requestedAt: now.toISOString(), authority },
     }),
@@ -1877,6 +1924,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/local-observation-timeout
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(executor).target,
+      binding: executorSelection(executor).binding,
       authority,
     }),
     revision: 1,
@@ -1949,6 +1997,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(oldExecutor).target,
+      binding: executorSelection(oldExecutor).binding,
       authority,
     }),
     revision: 1,
@@ -1982,6 +2031,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-terminal-keeps-n
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(newExecutor).target,
+      binding: executorSelection(newExecutor).binding,
       authority: newerAuthority,
     }),
     revision: 100,
@@ -2043,6 +2093,7 @@ test("@spec:runtime-operations/task-operations/cancel-terminal-keeps-newer-regis
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
       target: executorSelection(newExecutor).target,
+      binding: executorSelection(newExecutor).binding,
       authority: { ...authority, epoch: parseFencingEpoch("8") },
       cancellation: {
         requestedAt: now.toISOString(),
@@ -2069,6 +2120,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/authority-loss-during-res
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     target: executorSelection(executor).target,
+    binding: executorSelection(executor).binding,
     authority,
     cancellation: { requestedAt: now.toISOString(), authority },
   });
@@ -2192,6 +2244,7 @@ test("@spec:runtime-operations/task-operations/unique-rejections-release-executo
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         target: record.target,
+        binding: record.binding,
         authority,
       }),
       revision: 100 + index,

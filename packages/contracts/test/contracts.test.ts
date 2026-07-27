@@ -5,6 +5,7 @@ import {
   type CapabilityBinding,
   type CapabilityDefinition,
   type CapabilityIdentity,
+  createExecutionBinding,
   DiagnosticError,
   type DriverHealth,
   diagnosticCode,
@@ -96,20 +97,32 @@ const validManifest = {
   },
 } satisfies PluginManifest;
 
-const validExecutionRequest = {
-  taskId: parseTaskId("task-01"),
-  attemptId: parseAttemptId("attempt-01"),
-  target: {
-    instanceId: parseComponentInstanceId("detector.org.example.echo.echo.1"),
-    deploymentGeneration: parseGeneration("1"),
-    artifactDigest: parseArtifactDigest(
-      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-    ),
-    executor: { id: "executor-01", type: "process" },
-  },
+const validExecutionTarget = {
+  instanceId: parseComponentInstanceId("detector.org.example.echo.echo.1"),
+  deploymentGeneration: parseGeneration("1"),
+  artifactDigest: parseArtifactDigest(
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  ),
+  executor: { id: "executor-01", type: "process" },
+} as const;
+
+const validExecutionIdentity = {
   applicationId: parseApplicationId("detector"),
   pluginId: parsePluginId("org.example.echo"),
   componentId: parseComponentId("echo"),
+  target: validExecutionTarget,
+} as const;
+
+const validExecutionRequest = {
+  taskId: parseTaskId("task-01"),
+  attemptId: parseAttemptId("attempt-01"),
+  ...validExecutionIdentity,
+  binding: createExecutionBinding(validExecutionIdentity, {
+    configuration: { nested: { enabled: true } },
+    permissionGrants: validManifest.permissions,
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  }),
   input: { message: "hello" },
   deadline: "2026-07-23T12:00:00.000Z",
   orphanPolicy: "finish-and-buffer",
@@ -381,6 +394,45 @@ test("execution request validation preserves JsonValue payloads", () => {
   );
 });
 
+test("execution binding canonicalization is deterministic and target-bound", () => {
+  const content = {
+    configuration: { secret: "never-log-this", nested: { enabled: true } },
+    permissionGrants: [
+      { kind: "secret" as const, names: ["zeta", "alpha"] },
+      { kind: "executor" as const, executors: ["thread" as const, "process" as const] },
+    ],
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  };
+  const reordered = createExecutionBinding(validExecutionIdentity, {
+    ...content,
+    permissionGrants: [
+      { kind: "executor", executors: ["process", "thread"] },
+      { kind: "secret", names: ["alpha", "zeta"] },
+    ],
+  });
+  const canonical = createExecutionBinding(validExecutionIdentity, content);
+  assert.deepEqual(reordered, canonical);
+
+  const nextTarget = {
+    ...validExecutionTarget,
+    deploymentGeneration: parseGeneration("2"),
+  };
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        target: nextTarget,
+        binding: canonical,
+      }),
+    (error: unknown) => {
+      assert.equal(diagnosticCode(error), "PROTOCOL_EXECUTION_BINDING_INVALID");
+      assert.doesNotMatch(JSON.stringify(error), /never-log-this/u);
+      return true;
+    },
+  );
+});
+
 test("task execution targets share one strict persisted and wire contract", () => {
   assert.deepEqual(
     parseTaskExecutionTarget(validExecutionRequest.target),
@@ -423,15 +475,20 @@ test("task execution targets share one strict persisted and wire contract", () =
 
 test("executor identifiers use one bounded wire-safe parser", () => {
   const executorId = "node-01:thread/worker:process";
+  const target = {
+    ...validExecutionRequest.target,
+    executor: { ...validExecutionRequest.target.executor, id: executorId },
+  };
 
   assert.equal(parseExecutorId(executorId), executorId);
   assert.equal(
     parseExecutionRequest({
       ...validExecutionRequest,
-      target: {
-        ...validExecutionRequest.target,
-        executor: { ...validExecutionRequest.target.executor, id: executorId },
-      },
+      target,
+      binding: createExecutionBinding(
+        { ...validExecutionIdentity, target },
+        validExecutionRequest.binding,
+      ),
     }).target.executor.id,
     executorId,
   );

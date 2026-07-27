@@ -1221,12 +1221,14 @@ export class ThreadExecutor implements Executor {
         this.#clock.now(),
       );
     }
+    const authoritativeExecutor = request.bindingTarget?.executor.type ?? "thread";
     const threadGranted = resolved.permissionGrants.some(
-      (permission) => permission.kind === "executor" && permission.executors.includes("thread"),
+      (permission) =>
+        permission.kind === "executor" && permission.executors.includes(authoritativeExecutor),
     );
     const executorDecision = this.#options.permissionBoundary?.authorize(
       resolved.permissionGrants,
-      { kind: "executor", executor: "thread" },
+      { kind: "executor", executor: authoritativeExecutor },
     );
     if (!threadGranted || executorDecision?.allowed === false) {
       throw executorError(

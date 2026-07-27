@@ -7,13 +7,17 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import {
   type ArtifactDigest,
+  createExecutionBinding,
   type ExecutionRequest,
   type JsonValue,
+  parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseComponentInstanceId,
   parseFencingEpoch,
   parseGeneration,
   parsePluginManifest,
+  parsePluginId,
   parseWorkerId,
   type StateFencing,
   type StateTransaction,
@@ -272,7 +276,7 @@ function preparedArtifact(
           executors,
         },
       ],
-      permissions: [{ kind: "executor", executors }],
+      permissions: [{ kind: "executor", executors: [...executors, "remote"] }],
       capabilities: { provides: [], requires: [] },
     }),
   };
@@ -289,27 +293,56 @@ function assignment(
     workerId: parseWorkerId("worker-01"),
   },
 ): ExecutionRequest {
-  return {
-    taskId: "task-artifact-selection" as ExecutionRequest["taskId"],
-    attemptId: "attempt-artifact-selection" as ExecutionRequest["attemptId"],
-    target: {
-      instanceId: parseComponentInstanceId("application-artifact-selection.plugin.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest:
-        remote.artifactDigest ??
-        parseArtifactDigest(
-          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
-      executor: {
-        id: remote.id,
-        type: "remote",
-        workerId: remote.workerId,
-      },
+  const target = {
+    instanceId: parseComponentInstanceId("application-artifact-selection.plugin.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest:
+      remote.artifactDigest ??
+      parseArtifactDigest(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+    executor: {
+      id: remote.id,
+      type: "remote" as const,
+      workerId: remote.workerId,
     },
+  };
+  const identity = {
     applicationId: "application-artifact-selection" as ExecutionRequest["applicationId"],
     pluginId: pluginId as ExecutionRequest["pluginId"],
     componentId: "echo" as ExecutionRequest["componentId"],
-    binding: {
+    target,
+  };
+  return {
+    taskId: "task-artifact-selection" as ExecutionRequest["taskId"],
+    attemptId: "attempt-artifact-selection" as ExecutionRequest["attemptId"],
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [
+        {
+          kind: "executor",
+          executors: ["remote"],
+        },
+      ],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
+    input: null,
+    deadline: new Date(Date.now() + 60_000).toISOString(),
+    orphanPolicy: "cancel",
+  };
+}
+
+test("execution binding parity forwards nested configuration, grants, and capabilities verbatim", () => {
+  const selection = createPreparedArtifactSelection(
+    [preparedArtifact("org.example.exact", "a")],
+    "worker-runtime",
+  );
+  const base = assignment("org.example.exact");
+  const request = {
+    ...base,
+    binding: createExecutionBinding(base, {
       configuration: {
         nested: {
           retries: 3,
@@ -322,34 +355,22 @@ function assignment(
       ],
       capabilityDefinitions: [
         {
-          identity: { name: "records", protocolVersion: "1.0.0" },
+          identity: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
           requestSchema: { type: "object" },
           responseSchema: { type: "object" },
         },
       ],
       capabilityBindings: [
         {
-          capability: { name: "records", protocolVersion: "1.0.0" },
+          capability: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
           providerDeployment: {
-            applicationId: "application-artifact-selection",
-            pluginId: "records-provider",
+            applicationId: parseApplicationId("application-artifact-selection"),
+            pluginId: parsePluginId("records-provider"),
           },
         },
       ],
-      fingerprint: "a".repeat(64),
-    },
-    input: null,
-    deadline: new Date(Date.now() + 60_000).toISOString(),
-    orphanPolicy: "cancel",
-  } as unknown as ExecutionRequest;
-}
-
-test("execution binding parity forwards nested configuration, grants, and capabilities verbatim", () => {
-  const selection = createPreparedArtifactSelection(
-    [preparedArtifact("org.example.exact", "a")],
-    "worker-runtime",
-  );
-  const request = assignment("org.example.exact");
+    }),
+  };
   const component = selection.resolveComponent(request);
 
   assert.deepEqual(
@@ -394,9 +415,10 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
   const exactRequest = assignment("org.example.exact");
   assert.equal(exact.validateAssignment(exactRequest), undefined);
   assert.equal(exact.resolveComponent(exactRequest).artifactDigest, `sha256:${"a".repeat(64)}`);
-  assert.deepEqual(exact.resolveComponent(exactRequest).permissionGrants, [
-    { kind: "executor", executors: ["thread"] },
-  ]);
+  assert.deepEqual(
+    exact.resolveComponent(exactRequest).permissionGrants,
+    exactRequest.binding.permissionGrants,
+  );
   const processOnly = createPreparedArtifactSelection(
     [preparedArtifact("org.example.process-only", "c", ["process"])],
     "worker-runtime",
@@ -407,9 +429,10 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
     workerId: parseWorkerId("worker-01"),
   });
   assert.equal(processOnly.selectExecutorKind(processRequest), "process");
-  assert.deepEqual(processOnly.resolveComponent(processRequest).permissionGrants, [
-    { kind: "executor", executors: ["process"] },
-  ]);
+  assert.deepEqual(
+    processOnly.resolveComponent(processRequest).permissionGrants,
+    processRequest.binding.permissionGrants,
+  );
 
   const missing = exact.validateAssignment(assignment("org.example.missing"));
   assert.equal(missing?.code, "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED");
@@ -820,7 +843,7 @@ async function createWorkerArtifact(
           executors,
         },
       ],
-      permissions: [{ kind: "executor", executors }],
+      permissions: [{ kind: "executor", executors: [...executors, "remote"] }],
       capabilities: { provides: [], requires: [] },
     }),
   );

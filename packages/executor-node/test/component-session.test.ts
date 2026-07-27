@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createExecutionBinding,
   type ExecutionRequest,
   parseApplicationId,
   parseArtifactDigest,
@@ -31,11 +32,21 @@ const identity = {
 };
 
 function request(suffix: string): ExecutionRequest {
+  const binding = createExecutionBinding(
+    { ...identity, target },
+    {
+      configuration: {},
+      permissionGrants: [{ kind: "executor", executors: ["thread"] }],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    },
+  );
   return {
     taskId: parseTaskId(`session-task-${suffix}`),
     attemptId: parseAttemptId(`session-attempt-${suffix}`),
     target,
     ...identity,
+    binding,
     input: { value: suffix },
     deadline: new Date(clock.now().getTime() + 60_000).toISOString(),
     orphanPolicy: "cancel",

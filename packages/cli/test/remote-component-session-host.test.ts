@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createExecutionBinding,
   type ExecutionHandle,
   type ExecutionRequest,
   type ExecutionResult,
@@ -28,6 +29,25 @@ const componentId = parseComponentId("echo");
 const generation = parseGeneration("1");
 const artifactDigest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
 const workerId = parseWorkerId("worker-remote");
+
+function executionBinding(target: ExecutionRequest["target"]) {
+  return createExecutionBinding(
+    { applicationId, pluginId, componentId, target },
+    {
+      configuration: {},
+      permissionGrants: [
+        { kind: "executor", executors: ["remote"] },
+        {
+          kind: "worker",
+          labels: {},
+          resources: { cpuMillis: 1_000, memoryBytes: 1_024, storageBytes: 1_024 },
+        },
+      ],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    },
+  );
+}
 
 const deployment: PluginDeployment = {
   applicationId,
@@ -246,6 +266,7 @@ test("remote component drain waits for a submit admitted before drain to reach t
     taskId,
     attemptId,
     target: registration.target,
+    binding: executionBinding(registration.target),
     applicationId,
     pluginId,
     componentId,
@@ -313,6 +334,7 @@ test("remote component sessions scope admission and drain without closing the sh
     taskId,
     attemptId,
     target: registration.target,
+    binding: executionBinding(registration.target),
     applicationId,
     pluginId,
     componentId,

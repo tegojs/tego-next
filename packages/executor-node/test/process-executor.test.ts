@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import {
+  createExecutionBinding,
   diagnosticCode,
   parseApplicationId,
   parseArtifactDigest,
@@ -636,18 +637,28 @@ async function loadProcessComponentSessionFactory(): Promise<CreateProcessCompon
 }
 
 function request(input: JsonValue, suffix: string): ExecutionRequest {
-  return {
-    taskId: parseTaskId(`task-${suffix}`),
-    attemptId: parseAttemptId(`attempt-${suffix}`),
-    target: {
-      instanceId: parseComponentInstanceId("app.org.example.process.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest: digest,
-      executor: { id: "process-local", type: "process" },
-    },
+  const target = {
+    instanceId: parseComponentInstanceId("app.org.example.process.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: digest,
+    executor: { id: "process-local", type: "process" as const },
+  };
+  const identity = {
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.process"),
     componentId: parseComponentId("echo"),
+    target,
+  };
+  return {
+    taskId: parseTaskId(`task-${suffix}`),
+    attemptId: parseAttemptId(`attempt-${suffix}`),
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [{ kind: "executor", executors: ["process"] }],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
     input,
     deadline: new Date(60_000).toISOString(),
     orphanPolicy: "cancel",
@@ -2142,13 +2153,15 @@ test("process component session owns one child across same-target attempts and r
     assert.equal(processHost.activeProcessCount, 1);
     assert.equal(processHost.peakActiveProcessCount, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    const mismatchedTarget = {
+      ...second.target,
+      artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
+    };
     await assert.rejects(
       session.submit({
         ...second,
-        target: {
-          ...second.target,
-          artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
-        },
+        target: mismatchedTarget,
+        binding: createExecutionBinding({ ...second, target: mismatchedTarget }, second.binding),
       }),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
     );

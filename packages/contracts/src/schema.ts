@@ -10,11 +10,20 @@ import {
 } from "./diagnostic.js";
 import type { Leadership } from "./drivers.js";
 import {
+  type ExecutionBinding,
+  type ExecutionBindingContent,
+  type ExecutionBindingIdentity,
   type ExecutionRequest,
   type ExecutionResult,
+  executionBindingFingerprint,
   parseTaskExecutionTarget,
 } from "./execution.js";
-import { parseApplicationId, parseGeneration, parsePluginId } from "./identity.js";
+import {
+  parseApplicationId,
+  parseComponentId,
+  parseGeneration,
+  parsePluginId,
+} from "./identity.js";
 import { type JsonObject, type JsonValue, serializeWireValue } from "./json.js";
 import type { PluginDeploymentObservation } from "./operations.js";
 import type { Permission } from "./permission.js";
@@ -674,6 +683,54 @@ const capabilityBindingSchema = {
   },
 } as const;
 
+const executionBindingSchema = {
+  $id: "https://tegojs.dev/schemas/execution-binding-1.0.json",
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "configuration",
+    "permissionGrants",
+    "capabilityDefinitions",
+    "capabilityBindings",
+    "fingerprint",
+  ],
+  properties: {
+    configuration: { $ref: JSON_VALUE_SCHEMA_ID },
+    permissionGrants: { $ref: PERMISSION_SET_SCHEMA_ID },
+    capabilityDefinitions: {
+      type: "array",
+      items: { $ref: capabilityDefinitionSchema.$id },
+    },
+    capabilityBindings: {
+      type: "array",
+      items: { $ref: capabilityBindingSchema.$id },
+    },
+    fingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+  },
+} as const;
+
+const taskExecutionTargetSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["instanceId", "deploymentGeneration", "artifactDigest", "executor"],
+  properties: {
+    instanceId: { type: "string", pattern: IDENTITY_PATTERN },
+    deploymentGeneration: { type: "string", pattern: DECIMAL_PATTERN, maxLength: 20 },
+    artifactDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    executor: {
+      type: "object",
+      additionalProperties: false,
+      required: ["id", "type"],
+      properties: {
+        id: { type: "string", pattern: EXECUTOR_ID_PATTERN },
+        type: { enum: ["process", "remote", "thread"] },
+        workerId: { type: "string", pattern: IDENTITY_PATTERN },
+      },
+    },
+  },
+} as const;
+
 const executionRequestSchema = {
   $id: "https://tegojs.dev/schemas/execution-request-1.0.json",
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -686,6 +743,7 @@ const executionRequestSchema = {
     "applicationId",
     "pluginId",
     "componentId",
+    "binding",
     "input",
     "deadline",
     "orphanPolicy",
@@ -693,29 +751,12 @@ const executionRequestSchema = {
   properties: {
     taskId: { $ref: "#/$defs/identity" },
     attemptId: { $ref: "#/$defs/identity" },
-    target: {
-      type: "object",
-      additionalProperties: false,
-      required: ["instanceId", "deploymentGeneration", "artifactDigest", "executor"],
-      properties: {
-        instanceId: { $ref: "#/$defs/identity" },
-        deploymentGeneration: { type: "string", pattern: DECIMAL_PATTERN, maxLength: 20 },
-        artifactDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-        executor: {
-          type: "object",
-          additionalProperties: false,
-          required: ["id", "type"],
-          properties: {
-            id: { type: "string", pattern: EXECUTOR_ID_PATTERN },
-            type: { enum: ["process", "remote", "thread"] },
-            workerId: { $ref: "#/$defs/identity" },
-          },
-        },
-      },
-    },
+    target: taskExecutionTargetSchema,
+    bindingTarget: taskExecutionTargetSchema,
     applicationId: { $ref: "#/$defs/identity" },
     pluginId: { $ref: "#/$defs/identity" },
     componentId: { $ref: "#/$defs/identity" },
+    binding: { $ref: executionBindingSchema.$id },
     input: { $ref: JSON_VALUE_SCHEMA_ID },
     deadline: { type: "string", format: "date-time" },
     orphanPolicy: { enum: ["cancel", "finish-and-buffer", "finish-and-persist"] },
@@ -867,6 +908,7 @@ const validatePluginDeployment = ajv.compile(pluginDeploymentSchema);
 const validateCapabilityIdentity = ajv.compile(capabilityIdentitySchema);
 const validateCapabilityDefinition = ajv.compile(capabilityDefinitionSchema);
 const validateCapabilityBinding = ajv.compile(capabilityBindingSchema);
+const validateExecutionBinding = ajv.compile(executionBindingSchema);
 const validateExecutionRequest = ajv.compile(executionRequestSchema);
 const validateExecutionResult = ajv.compile(executionResultSchema);
 const validateWorkerEnvelope = ajv.compile(workerEnvelopeSchema);
@@ -1112,6 +1154,146 @@ export function parseCapabilityBinding(input: unknown): CapabilityBinding {
   );
 }
 
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const object = value as JsonObject;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key] as JsonValue)}`)
+    .join(",")}}`;
+}
+
+function sortedStrings<T extends string>(values: readonly T[]): readonly T[] {
+  return [...values].sort();
+}
+
+function normalizedPermission(permission: Permission): Permission {
+  switch (permission.kind) {
+    case "capability":
+      return {
+        kind: permission.kind,
+        capabilities: [...permission.capabilities]
+          .map((entry) => ({ name: entry.name, methods: sortedStrings(entry.methods) }))
+          .sort((left, right) => left.name.localeCompare(right.name)),
+      };
+    case "environment":
+    case "secret":
+      return { kind: permission.kind, names: sortedStrings(permission.names) };
+    case "executor":
+      return { kind: permission.kind, executors: sortedStrings(permission.executors) };
+    case "filesystem":
+      return {
+        kind: permission.kind,
+        roots: [...permission.roots]
+          .map((root) => ({ path: root.path, access: sortedStrings(root.access) }))
+          .sort((left, right) => left.path.localeCompare(right.path)),
+      };
+    case "network":
+      return {
+        kind: permission.kind,
+        hosts: sortedStrings(permission.hosts),
+        ports: [...permission.ports].sort((left, right) => left - right),
+        methods: sortedStrings(permission.methods),
+      };
+    case "worker":
+      return structuredClone(permission);
+  }
+}
+
+function normalizeExecutionBindingContent(input: ExecutionBindingContent): ExecutionBindingContent {
+  const permissionGrants = parsePermissionSet(input.permissionGrants)
+    .map(normalizedPermission)
+    .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  const capabilityDefinitions = input.capabilityDefinitions
+    .map((definition) => structuredClone(parseCapabilityDefinition(definition)))
+    .sort(
+      (left, right) =>
+        left.identity.name.localeCompare(right.identity.name) ||
+        left.identity.protocolVersion.localeCompare(right.identity.protocolVersion),
+    );
+  const capabilityBindings = input.capabilityBindings
+    .map((binding) => structuredClone(parseCapabilityBinding(binding)))
+    .sort(
+      (left, right) =>
+        left.capability.name.localeCompare(right.capability.name) ||
+        left.capability.protocolVersion.localeCompare(right.capability.protocolVersion) ||
+        left.providerDeployment.applicationId.localeCompare(
+          right.providerDeployment.applicationId,
+        ) ||
+        left.providerDeployment.pluginId.localeCompare(right.providerDeployment.pluginId),
+    );
+  return {
+    configuration: structuredClone(input.configuration),
+    permissionGrants,
+    capabilityDefinitions,
+    capabilityBindings,
+  };
+}
+
+export function createExecutionBinding(
+  identityInput: ExecutionBindingIdentity,
+  contentInput: ExecutionBindingContent,
+): ExecutionBinding {
+  const identity = {
+    applicationId: parseApplicationId(identityInput.applicationId),
+    pluginId: parsePluginId(identityInput.pluginId),
+    componentId: parseComponentId(identityInput.componentId),
+    target: parseTaskExecutionTarget(identityInput.target),
+  } satisfies ExecutionBindingIdentity;
+  const candidate = parseExecutionBinding({
+    ...contentInput,
+    fingerprint: "0".repeat(64),
+  });
+  const content = normalizeExecutionBindingContent(candidate);
+  return {
+    ...content,
+    fingerprint: executionBindingFingerprint(identity, content),
+  };
+}
+
+export function parseExecutionBinding(input: unknown): ExecutionBinding {
+  return parseWithValidator<ExecutionBinding>(
+    validateExecutionBinding,
+    input,
+    "PROTOCOL_EXECUTION_BINDING_INVALID",
+    "Execution binding is invalid",
+    { kind: "executor", id: "execution-binding" },
+  );
+}
+
+export function assertExecutionBindingMatches(
+  identity: ExecutionBindingIdentity,
+  input: unknown,
+): ExecutionBinding {
+  const binding = parseExecutionBinding(input);
+  const normalized = normalizeExecutionBindingContent(binding);
+  const expected = executionBindingFingerprint(identity, normalized);
+  if (binding.fingerprint !== expected) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "PROTOCOL_EXECUTION_BINDING_INVALID",
+        message: "Execution binding fingerprint does not match its immutable target identity",
+        source: { kind: "executor", id: "execution-binding" },
+        details: {
+          applicationId: identity.applicationId,
+          pluginId: identity.pluginId,
+          componentId: identity.componentId,
+          instanceId: identity.target.instanceId,
+          deploymentGeneration: identity.target.deploymentGeneration,
+          artifactDigest: identity.target.artifactDigest,
+          executorId: identity.target.executor.id,
+          executorType: identity.target.executor.type,
+          ...(identity.target.executor.type === "remote"
+            ? { workerId: identity.target.executor.workerId }
+            : {}),
+        },
+      }),
+    );
+  }
+  return binding;
+}
+
 export function parseExecutionRequest(input: unknown): ExecutionRequest {
   const parsed = parseWithValidator<ExecutionRequest>(
     validateExecutionRequest,
@@ -1120,7 +1302,34 @@ export function parseExecutionRequest(input: unknown): ExecutionRequest {
     "Execution request is invalid",
     { kind: "executor", id: "request" },
   );
-  parseTaskExecutionTarget(parsed.target);
+  const target = parseTaskExecutionTarget(parsed.target);
+  const bindingTarget =
+    parsed.bindingTarget === undefined ? target : parseTaskExecutionTarget(parsed.bindingTarget);
+  if (
+    parsed.bindingTarget !== undefined &&
+    (bindingTarget.instanceId !== target.instanceId ||
+      bindingTarget.deploymentGeneration !== target.deploymentGeneration ||
+      bindingTarget.artifactDigest !== target.artifactDigest ||
+      bindingTarget.executor.type !== "remote" ||
+      target.executor.type === "remote")
+  ) {
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "PROTOCOL_EXECUTION_BINDING_INVALID",
+        message: "Execution binding target transformation is invalid",
+        source: { kind: "executor", id: "execution-binding" },
+      }),
+    );
+  }
+  assertExecutionBindingMatches(
+    {
+      applicationId: parseApplicationId(parsed.applicationId),
+      pluginId: parsePluginId(parsed.pluginId),
+      componentId: parseComponentId(parsed.componentId),
+      target: bindingTarget,
+    },
+    parsed.binding,
+  );
   return parsed;
 }
 

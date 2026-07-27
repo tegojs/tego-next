@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createExecutionBinding,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
@@ -45,9 +46,7 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
     deadline: "2026-07-25T00:05:00.000Z",
     orphanPolicy: "cancel",
   };
-  const executionBase = {
-    taskId: parseTaskId("task-real-process-envelope"),
-    attemptId: parseAttemptId("attempt-real-process-envelope"),
+  const executionIdentity = {
     target: {
       instanceId: parseComponentInstanceId("application-01.echo.echo.g1"),
       deploymentGeneration: parseGeneration("1"),
@@ -55,6 +54,18 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
       executor: { id: executor.id, type: executor.type },
     },
     ...base,
+  };
+  const binding = createExecutionBinding(executionIdentity, {
+    configuration: {},
+    permissionGrants: [{ kind: "executor", executors: ["process"] }],
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
+  const executionBase = {
+    taskId: parseTaskId("task-real-process-envelope"),
+    attemptId: parseAttemptId("attempt-real-process-envelope"),
+    ...executionIdentity,
+    binding,
   };
   let low = 0;
   let high = 1_048_576;
@@ -94,6 +105,7 @@ test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-a
     selectExecutor: async () => ({
       executor: rejectingExecutor,
       target: executionBase.target,
+      binding,
     }),
     createIdentity: () => ({
       taskId: parseTaskId("task-process-envelope"),

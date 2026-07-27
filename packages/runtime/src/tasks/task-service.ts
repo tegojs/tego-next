@@ -4,6 +4,7 @@ import {
   type Clock,
   DiagnosticError,
   diagnosticCode,
+  type ExecutionBinding,
   type ExecutionHandle,
   type ExecutionExecutor,
   type ExecutionResult,
@@ -40,6 +41,7 @@ export interface TaskIdentity {
 
 export interface TaskExecutorSelection {
   readonly target: TaskExecutionTarget;
+  readonly binding: ExecutionBinding;
   readonly executor: Executor;
 }
 
@@ -54,6 +56,7 @@ export interface TaskServiceOptions {
     request: RunTaskRequest,
     target?: TaskExecutionTarget,
     signal?: AbortSignal,
+    binding?: ExecutionBinding,
   ) => TaskExecutorSelection | Promise<TaskExecutorSelection>;
   readonly createIdentity?: (request: RunTaskRequest) => TaskIdentity;
 }
@@ -245,7 +248,11 @@ export class TaskService implements RuntimeTaskLifecycle {
     this.#validateSelection(selected, proposed.taskId);
     this.#assertAuthority(authority);
     const admitted = await this.#admit(request, fingerprint, proposed, selected, authority);
-    if (admitted.target !== undefined && sameTarget(admitted.target, selected.target)) {
+    if (
+      admitted.target !== undefined &&
+      admitted.binding?.fingerprint === selected.binding.fingerprint &&
+      sameTarget(admitted.target, selected.target)
+    ) {
       this.#executors.set(admitted.taskId, { executor: selected.executor, authority });
     }
     const existingDispatch = this.#dispatches.get(admitted.taskId);
@@ -394,6 +401,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       request,
       state: "accepted",
       target: selection.target,
+      binding: selection.binding,
       createdAt,
       updatedAt: createdAt,
       authority,
@@ -475,6 +483,10 @@ export class TaskService implements RuntimeTaskLifecycle {
     if (target === undefined) {
       throw this.#invalidResult(record.taskId, "Task execution target is missing");
     }
+    const binding = record.binding;
+    if (binding === undefined) {
+      throw this.#invalidResult(record.taskId, "Task execution binding is missing");
+    }
     this.#assertAuthority(authority);
     const registration = { executor, authority };
     this.#executors.set(record.taskId, registration);
@@ -485,6 +497,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       pluginId: record.request.pluginId,
       componentId: record.request.componentId,
       target,
+      binding,
       input: record.request.input,
       deadline: record.request.deadline,
       orphanPolicy: record.request.orphanPolicy,
@@ -744,6 +757,9 @@ export class TaskService implements RuntimeTaskLifecycle {
     if (target === undefined) {
       throw this.#invalidResult(record.taskId, "Task execution target is missing");
     }
+    if (record.binding === undefined) {
+      throw this.#invalidResult(record.taskId, "Task execution binding is missing");
+    }
     const registration = this.#executors.get(record.taskId);
     const retained = registration?.executor;
     if (
@@ -759,11 +775,15 @@ export class TaskService implements RuntimeTaskLifecycle {
       authority,
       record.taskId,
       target,
+      record.binding,
     );
     this.#validateSelection(resolved, record.taskId);
     const mismatchedFields = targetMismatchedFields(target, resolved.target);
     if (mismatchedFields.length > 0) {
       throw this.#targetMismatch(record.taskId, mismatchedFields);
+    }
+    if (resolved.binding.fingerprint !== record.binding.fingerprint) {
+      throw this.#targetMismatch(record.taskId, ["binding.fingerprint"]);
     }
     return resolved.executor;
   }
@@ -773,11 +793,12 @@ export class TaskService implements RuntimeTaskLifecycle {
     authority: RuntimeAuthority,
     taskId: TaskId,
     target: TaskExecutionTarget | undefined,
+    binding?: ExecutionBinding,
   ): Promise<TaskExecutorSelection> {
     const controller = new AbortController();
     this.#observationControllers.add(controller);
     const selection = Promise.resolve()
-      .then(() => this.#selectExecutor(request, target, controller.signal))
+      .then(() => this.#selectExecutor(request, target, controller.signal, binding))
       .then(
         (value) => ({ kind: "selected" as const, value }),
         (error: unknown) => ({ kind: "failed" as const, error }),

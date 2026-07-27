@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createNodeRuntimeHost, packPlugin } from "@tegojs/cli";
 import {
+  createExecutionBinding,
   diagnosticCode,
   parseApplicationId,
   parseArtifactDigest,
@@ -201,21 +202,34 @@ function faultStartCommitOnce(state) {
 }
 
 function executionRequest(workerId) {
-  return {
+  const target = {
+    instanceId: "app.org.example.fault.task.g1",
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: digest,
+    executor: { id: "fault-remote", type: "remote", workerId },
+  };
+  const request = {
     taskId: parseTaskId("fault-remote-task"),
     attemptId: parseAttemptId("fault-remote-attempt"),
-    target: {
-      instanceId: "app.org.example.fault.task.g1",
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest: digest,
-      executor: { id: "fault-remote", type: "remote", workerId },
-    },
+    target,
     applicationId,
     pluginId,
     componentId,
     input: { injected: "duplicate-terminal" },
     deadline: new Date(60_000).toISOString(),
     orphanPolicy: "finish-and-buffer",
+  };
+  return {
+    ...request,
+    binding: createExecutionBinding(
+      { applicationId, pluginId, componentId, target },
+      {
+        configuration: {},
+        permissionGrants: [{ kind: "executor", executors: ["remote"] }],
+        capabilityDefinitions: [],
+        capabilityBindings: [],
+      },
+    ),
   };
 }
 

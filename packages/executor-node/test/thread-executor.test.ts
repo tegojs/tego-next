@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { Worker, type Transferable } from "node:worker_threads";
 import {
+  createExecutionBinding,
   diagnosticCode,
   parseApplicationId,
   parseArtifactDigest,
@@ -535,18 +536,28 @@ async function loadThreadComponentSessionFactory(): Promise<CreateThreadComponen
 }
 
 function request(input: JsonValue, suffix: string): ExecutionRequest {
-  return {
-    taskId: parseTaskId(`thread-task-${suffix}`),
-    attemptId: parseAttemptId(`thread-attempt-${suffix}`),
-    target: {
-      instanceId: parseComponentInstanceId("app.org.example.thread.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest: digest,
-      executor: { id: "thread-local", type: "thread" },
-    },
+  const target = {
+    instanceId: parseComponentInstanceId("app.org.example.thread.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: digest,
+    executor: { id: "thread-local", type: "thread" as const },
+  };
+  const identity = {
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.thread"),
     componentId: parseComponentId("echo"),
+    target,
+  };
+  return {
+    taskId: parseTaskId(`thread-task-${suffix}`),
+    attemptId: parseAttemptId(`thread-attempt-${suffix}`),
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [{ kind: "executor", executors: ["thread"] }],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
     input,
     deadline: new Date(clock.now().getTime() + 60_000).toISOString(),
     orphanPolicy: "cancel",
@@ -1535,13 +1546,15 @@ test("thread component session owns one Worker across same-target attempts and r
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    const mismatchedTarget = {
+      ...second.target,
+      deploymentGeneration: parseGeneration("2"),
+    };
     await assert.rejects(
       session.submit({
         ...second,
-        target: {
-          ...second.target,
-          deploymentGeneration: parseGeneration("2"),
-        },
+        target: mismatchedTarget,
+        binding: createExecutionBinding({ ...second, target: mismatchedTarget }, second.binding),
       }),
       (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
     );

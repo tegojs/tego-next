@@ -1046,12 +1046,14 @@ export class ProcessExecutor implements Executor {
         this.#clock.now(),
       );
     }
+    const authoritativeExecutor = request.bindingTarget?.executor.type ?? "process";
     const processGranted = resolved.permissionGrants.some(
-      (permission) => permission.kind === "executor" && permission.executors.includes("process"),
+      (permission) =>
+        permission.kind === "executor" && permission.executors.includes(authoritativeExecutor),
     );
     const executorDecision = this.#options.permissionBoundary?.authorize(
       resolved.permissionGrants,
-      { kind: "executor", executor: "process" },
+      { kind: "executor", executor: authoritativeExecutor },
     );
     if (!processGranted || executorDecision?.allowed === false) {
       throw executorError(

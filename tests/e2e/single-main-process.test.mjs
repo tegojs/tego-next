@@ -205,7 +205,8 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
   });
 }
 
-async function runTask({ endpoint, expectedOutput = value, operationId, value }) {
+async function runTask({ endpoint, expectedOutput: expectedOutputInput, operationId, value }) {
+  const expectedOutput = expectedOutputInput ?? value;
   const accepted = await startTask({ endpoint, operationId, value });
   let completed;
   try {
@@ -238,7 +239,11 @@ async function runTask({ endpoint, expectedOutput = value, operationId, value })
     endpoint,
     "--json",
   ]);
-  assert.equal(completed.result.status, "succeeded");
+  assert.equal(
+    completed.result.status,
+    "succeeded",
+    `task did not succeed: ${JSON.stringify(completed)}`,
+  );
   assert.deepEqual(completed.result.output, expectedOutput);
   assert.deepEqual(status, completed);
   return completed;

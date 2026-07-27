@@ -3,9 +3,15 @@ import { createReadStream } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  assertExecutionBindingMatches,
+  type CapabilityBinding,
+  createExecutionBinding,
   DiagnosticError,
+  type ExecutionBinding,
+  type JsonObject,
   parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseNodeId,
   parsePermissionSet,
   parsePluginDeployment,
@@ -16,7 +22,10 @@ import {
   type RuntimeAuthority,
   type RuntimeConfiguration,
   type RuntimeDrivers,
+  type RunTaskRequest,
   runtimeDiagnostic,
+  type StateTransaction,
+  type TaskExecutionTarget,
 } from "@tegojs/contracts";
 import { createLocalDrivers } from "@tegojs/drivers-local";
 import { createPostgresDrivers } from "@tegojs/drivers-postgres";
@@ -218,10 +227,159 @@ export async function createNodeRuntimeHost(
         ? remoteComponentHost.stop(binding)
         : componentHost.stop(binding),
   };
+  const resolveExecutionBinding = async (
+    transaction: StateTransaction,
+    request: RunTaskRequest,
+    target: TaskExecutionTarget,
+  ): Promise<ExecutionBinding> => {
+    const durableDeployment = await transaction.get({
+      namespace: "tego",
+      collection: "deployments",
+      id: `${request.applicationId}/${request.pluginId}`,
+    });
+    if (durableDeployment === undefined) {
+      throw new Error("Task deployment is unavailable while building its execution binding");
+    }
+    const deployment = parsePluginDeployment(durableDeployment.value);
+    if (
+      deployment.applicationId !== request.applicationId ||
+      deployment.pluginId !== request.pluginId ||
+      deployment.state !== "active" ||
+      deployment.generation !== target.deploymentGeneration ||
+      deployment.artifactDigest !== target.artifactDigest
+    ) {
+      throw new Error("Task deployment does not match its immutable execution target");
+    }
+    const durableInstallation = await transaction.get({
+      namespace: "tego",
+      collection: "installations",
+      id: `${deployment.pluginId}@${deployment.version}@${deployment.artifactDigest}`,
+    });
+    if (durableInstallation === undefined) {
+      throw new Error("Task installation is unavailable while building its execution binding");
+    }
+    const installation = parsePluginInstallation(durableInstallation.value);
+    const component = installation.manifest.components.find(
+      (candidate) => candidate.componentId === request.componentId,
+    );
+    if (
+      installation.pluginId !== deployment.pluginId ||
+      installation.version !== deployment.version ||
+      installation.digest !== deployment.artifactDigest ||
+      component === undefined ||
+      !component.executors.includes(target.executor.type)
+    ) {
+      throw new Error("Task component does not match its immutable execution target");
+    }
+    const durableInstance = await transaction.get({
+      namespace: "tego",
+      collection: "component-instances",
+      id: target.instanceId,
+    });
+    const instance =
+      durableInstance?.value !== null &&
+      typeof durableInstance?.value === "object" &&
+      !Array.isArray(durableInstance.value)
+        ? (durableInstance.value as JsonObject)
+        : undefined;
+    if (
+      instance === undefined ||
+      instance.applicationId !== request.applicationId ||
+      instance.pluginId !== request.pluginId ||
+      instance.componentId !== request.componentId ||
+      instance.deploymentGeneration !== target.deploymentGeneration ||
+      instance.artifactDigest !== target.artifactDigest ||
+      instance.instanceId !== target.instanceId
+    ) {
+      throw new Error("Task component instance does not match its immutable execution target");
+    }
+
+    const capabilityBindings: CapabilityBinding[] = [];
+    for await (const record of transaction.scan({
+      namespace: "tego",
+      collection: "capability-bindings",
+      idPrefix: `${request.applicationId}/${request.pluginId}/`,
+    })) {
+      const value =
+        record.value !== null && typeof record.value === "object" && !Array.isArray(record.value)
+          ? (record.value as JsonObject)
+          : undefined;
+      const consumer =
+        value?.consumer !== null &&
+        typeof value?.consumer === "object" &&
+        !Array.isArray(value.consumer)
+          ? (value.consumer as JsonObject)
+          : undefined;
+      const provider =
+        value?.provider !== null &&
+        typeof value?.provider === "object" &&
+        !Array.isArray(value.provider)
+          ? (value.provider as JsonObject)
+          : undefined;
+      if (
+        consumer?.applicationId !== request.applicationId ||
+        consumer.pluginId !== request.pluginId ||
+        value?.deploymentGeneration !== deployment.generation ||
+        typeof value.capability !== "string" ||
+        typeof provider?.applicationId !== "string" ||
+        typeof provider.pluginId !== "string"
+      ) {
+        continue;
+      }
+      const providerDeploymentRecord = await transaction.get({
+        namespace: "tego",
+        collection: "deployments",
+        id: `${provider.applicationId}/${provider.pluginId}`,
+      });
+      if (providerDeploymentRecord === undefined) {
+        throw new Error("Capability provider deployment is unavailable");
+      }
+      const providerDeployment = parsePluginDeployment(providerDeploymentRecord.value);
+      const providerInstallationRecord = await transaction.get({
+        namespace: "tego",
+        collection: "installations",
+        id: `${providerDeployment.pluginId}@${providerDeployment.version}@${providerDeployment.artifactDigest}`,
+      });
+      if (providerInstallationRecord === undefined) {
+        throw new Error("Capability provider installation is unavailable");
+      }
+      const providerInstallation = parsePluginInstallation(providerInstallationRecord.value);
+      const provision = providerInstallation.manifest.capabilities.provides.find(
+        (candidate) => candidate.name === value.capability,
+      );
+      if (provision === undefined) {
+        throw new Error("Capability provider no longer provides the durable binding");
+      }
+      capabilityBindings.push({
+        capability: {
+          name: parseCapabilityName(provision.name),
+          protocolVersion: provision.protocolVersion,
+        },
+        providerDeployment: {
+          applicationId: providerDeployment.applicationId,
+          pluginId: providerDeployment.pluginId,
+        },
+      });
+    }
+    return createExecutionBinding(
+      {
+        applicationId: request.applicationId,
+        pluginId: request.pluginId,
+        componentId: request.componentId,
+        target,
+      },
+      {
+        configuration: deployment.configuration,
+        permissionGrants: deployment.permissionGrants,
+        capabilityDefinitions: [],
+        capabilityBindings,
+      },
+    );
+  };
   const tasks = new TaskService({
     state: drivers.state,
     clock: drivers.clock,
-    selectExecutor: (request, target) => {
+    selectExecutor: async (request, target, _signal, persistedBinding) => {
       const selection =
         target === undefined
           ? sessionRegistry.resolveFresh(
@@ -231,8 +389,23 @@ export async function createNodeRuntimeHost(
                 componentRegistry.get(candidate.instanceId)?.acceptingTasks === true,
             )
           : sessionRegistry.resolveExact(target);
+      const binding =
+        persistedBinding === undefined
+          ? await drivers.state.transact({}, async (transaction) =>
+              resolveExecutionBinding(transaction, request, selection.target),
+            )
+          : assertExecutionBindingMatches(
+              {
+                applicationId: request.applicationId,
+                pluginId: request.pluginId,
+                componentId: request.componentId,
+                target: selection.target,
+              },
+              persistedBinding,
+            );
       return {
         target: selection.target,
+        binding,
         executor: selection.executor,
       };
     },

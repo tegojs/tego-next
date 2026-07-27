@@ -8,7 +8,6 @@ import {
   type ExecutionRequest,
   type Executor,
   type ExecutorCapabilities,
-  type Permission,
   type PluginComponent,
   parseArtifactDigest,
   parseExecutionRequest,
@@ -61,6 +60,7 @@ function createWorkerLocalExecutor(executor: Executor): Executor {
       executor.submit(
         parseExecutionRequest({
           ...request,
+          bindingTarget: request.target,
           target: {
             instanceId: request.target.instanceId,
             deploymentGeneration: request.target.deploymentGeneration,
@@ -125,6 +125,14 @@ export function createPreparedArtifactSelection(
   };
 
   const validateAssignment = (request: ExecutionRequest): WorkerAssignmentRejection | undefined => {
+    try {
+      parseExecutionRequest(request);
+    } catch {
+      return {
+        code: "PROTOCOL_EXECUTION_BINDING_INVALID",
+        message: "Execution binding does not match the assignment target",
+      };
+    }
     const candidates = (byPlugin.get(request.pluginId) ?? []).filter(
       (candidate) => candidate.digest === request.target.artifactDigest,
     );
@@ -156,14 +164,7 @@ export function createPreparedArtifactSelection(
       return component.executors.includes("thread") ? "thread" : "process";
     },
     resolveComponent(request: ExecutionRequest) {
-      const { artifact, component } = select(request);
-      const executorKind = component.executors.includes("thread") ? "thread" : "process";
-      const permissionGrants: readonly Permission[] = [
-        {
-          kind: "executor",
-          executors: [executorKind],
-        },
-      ];
+      const { artifact } = select(request);
       return {
         target: request.target,
         artifactDigest: artifact.digest,
@@ -171,9 +172,9 @@ export function createPreparedArtifactSelection(
         manifest: artifact.manifest,
         runtimeId,
         instanceId: request.target.instanceId,
-        configuration: {},
-        permissionGrants,
-        capabilityDefinitions: [],
+        configuration: structuredClone(request.binding.configuration),
+        permissionGrants: structuredClone(request.binding.permissionGrants),
+        capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
       };
     },
   });

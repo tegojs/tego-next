@@ -1,4 +1,5 @@
 import {
+  createExecutionBinding,
   type AttemptId,
   type AttemptStatus,
   type DrainOptions,
@@ -343,24 +344,41 @@ export function executionRequest(
   orphanPolicy: ExecutionRequest["orphanPolicy"] = "cancel",
   targetWorkerId = parseWorkerId("worker-remote"),
 ): ExecutionRequest {
-  return {
-    taskId: parseTaskId(`remote-task-${suffix}`),
-    attemptId: parseAttemptId(`remote-attempt-${suffix}`),
-    target: {
-      instanceId: parseComponentInstanceId("app.org.example.remote.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest: parseArtifactDigest(
-        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-      ),
-      executor: {
-        id: "remote",
-        type: "remote",
-        workerId: targetWorkerId,
-      },
+  const target = {
+    instanceId: parseComponentInstanceId("app.org.example.remote.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: parseArtifactDigest(
+      "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    ),
+    executor: {
+      id: "remote",
+      type: "remote" as const,
+      workerId: targetWorkerId,
     },
+  };
+  const identity = {
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.remote"),
     componentId: parseComponentId("echo"),
+    target,
+  };
+  return {
+    taskId: parseTaskId(`remote-task-${suffix}`),
+    attemptId: parseAttemptId(`remote-attempt-${suffix}`),
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [
+        { kind: "executor", executors: ["remote"] },
+        {
+          kind: "worker",
+          labels: {},
+          resources: { cpuMillis: 1, memoryBytes: 1, storageBytes: 1 },
+        },
+      ],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
     input,
     deadline: new Date(60_000).toISOString(),
     orphanPolicy,
