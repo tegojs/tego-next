@@ -20,6 +20,7 @@ import {
   parsePluginId,
   parseSequence,
   parseTaskExecutionTarget,
+  parseWorkerId,
   type RuntimeDiagnostic,
   runtimeDiagnostic,
   serializeWireValue,
@@ -163,6 +164,20 @@ export interface RemoteAttemptStore {
   list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]>;
 }
 
+export interface RemoteAttemptRecordExpectation {
+  readonly workerId: WorkerId;
+  readonly executorId?: string;
+  readonly taskId?: ExecutionRequest["taskId"];
+  readonly attemptId?: ExecutionRequest["attemptId"];
+  readonly fingerprint?: string;
+}
+
+export interface ParsedRemoteAttemptRecord {
+  readonly record: RemoteAttemptRecord;
+  readonly request: ExecutionRequest;
+  readonly result?: ExecutionResult;
+}
+
 export interface MemoryRemoteAttemptStoreOptions {
   readonly onSave?: (record: RemoteAttemptRecord) => void;
 }
@@ -275,6 +290,125 @@ export function parseAttemptRevision(revision: unknown): string {
     );
   }
   return parsed;
+}
+
+function canonicalTimestamp(value: unknown, name: string): string {
+  if (
+    typeof value !== "string" ||
+    Number.isNaN(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  ) {
+    throw new TypeError(`${name} must be a canonical ISO timestamp`);
+  }
+  return value;
+}
+
+export function parseRemoteAttemptRecord(
+  value: unknown,
+  expectation: RemoteAttemptRecordExpectation,
+): ParsedRemoteAttemptRecord {
+  const object = asUnknownObject(value, "Remote attempt record");
+  const allowedKeys = new Set([
+    "acknowledgedAt",
+    "cancellation",
+    "epoch",
+    "fingerprint",
+    "request",
+    "result",
+    "revision",
+    "state",
+    "updatedAt",
+    "workerId",
+  ]);
+  if (Object.keys(object).some((key) => !allowedKeys.has(key))) {
+    throw new TypeError("Remote attempt record has unknown fields");
+  }
+  const workerId = parseWorkerId(object.workerId);
+  const request = parseRemoteRequest(object.request);
+  const fingerprint = sha256Fingerprint(object.fingerprint);
+  const state = object.state;
+  if (
+    state !== "acknowledged" &&
+    state !== "assigned" &&
+    state !== "expired" &&
+    state !== "running" &&
+    state !== "terminal" &&
+    state !== "unknown"
+  ) {
+    throw new TypeError("Remote attempt record state is invalid");
+  }
+  const epoch = parseAttemptRevision(object.epoch);
+  const revision = parseAttemptRevision(object.revision);
+  const updatedAt = canonicalTimestamp(object.updatedAt, "Remote attempt updatedAt");
+  const cancellation = object.cancellation;
+  if (cancellation !== undefined && cancellation !== "cancelled" && cancellation !== "timed-out") {
+    throw new TypeError("Remote attempt cancellation is invalid");
+  }
+  const acknowledgedAt =
+    object.acknowledgedAt === undefined
+      ? undefined
+      : canonicalTimestamp(object.acknowledgedAt, "Remote attempt acknowledgedAt");
+  if (acknowledgedAt !== undefined && state !== "terminal" && state !== "expired") {
+    throw new TypeError("Only terminal or expired remote attempts can be acknowledged");
+  }
+  if (acknowledgedAt !== undefined && Date.parse(acknowledgedAt) > Date.parse(updatedAt)) {
+    throw new TypeError("Remote attempt acknowledgement cannot be newer than its update");
+  }
+  const result = object.result === undefined ? undefined : parseExecutionResult(object.result);
+  if (state === "terminal" && result === undefined) {
+    throw new TypeError("Terminal remote attempt record requires a result");
+  }
+  if (state !== "terminal" && state !== "expired" && result !== undefined) {
+    throw new TypeError("Non-terminal remote attempt record cannot contain a result");
+  }
+  if (
+    workerId !== expectation.workerId ||
+    request.target.executor.type !== "remote" ||
+    request.target.executor.workerId !== expectation.workerId ||
+    (expectation.executorId !== undefined &&
+      request.target.executor.id !== expectation.executorId) ||
+    (expectation.taskId !== undefined && request.taskId !== expectation.taskId) ||
+    (expectation.attemptId !== undefined && request.attemptId !== expectation.attemptId) ||
+    (expectation.fingerprint !== undefined && fingerprint !== expectation.fingerprint)
+  ) {
+    throw new TypeError("Remote attempt record does not match its expected owner and identity");
+  }
+  if (requestFingerprint(request) !== fingerprint) {
+    throw new TypeError("Remote attempt record fingerprint does not match its request");
+  }
+  if (
+    result !== undefined &&
+    (result.taskId !== request.taskId ||
+      result.attemptId !== request.attemptId ||
+      result.executor.kind !== "remote" ||
+      result.executor.workerId !== expectation.workerId)
+  ) {
+    throw new TypeError("Remote attempt result does not match its request and Worker identity");
+  }
+  if (result !== undefined) {
+    canonicalTimestamp(result.startedAt, "Remote attempt result startedAt");
+    canonicalTimestamp(result.completedAt, "Remote attempt result completedAt");
+    if (Date.parse(result.startedAt) > Date.parse(result.completedAt)) {
+      throw new TypeError("Remote attempt result timestamps are inconsistent");
+    }
+  }
+  const record: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint,
+    state,
+    epoch,
+    updatedAt,
+    revision,
+    ...(result === undefined ? {} : { result }),
+    ...(cancellation === undefined ? {} : { cancellation }),
+    ...(acknowledgedAt === undefined ? {} : { acknowledgedAt }),
+  };
+  return {
+    record,
+    request,
+    ...(result === undefined ? {} : { result }),
+  };
 }
 
 export interface RemoteResultStore {

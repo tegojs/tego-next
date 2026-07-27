@@ -34,6 +34,7 @@ import {
   jsonBytes,
   jsonFingerprint,
   parseAttemptRevision,
+  parseRemoteAttemptRecord,
   parseRemoteCapabilityInvocation,
   parseRemoteCapabilityResponse,
   parseRemoteComponentActivation,
@@ -53,6 +54,7 @@ import {
   REMOTE_RESULT,
   REMOTE_RESULT_ACK,
   type RemoteAttemptRecord,
+  type RemoteAttemptRecordExpectation,
   type RemoteAttemptStore,
   type RemoteCapabilityInvocation,
   type RemoteCapabilityInvocationResponse,
@@ -816,16 +818,15 @@ export class RemoteExecutor implements Executor {
     const persisted = await this.#storeOperation(
       this.#attemptStore.load(request.taskId, request.attemptId),
     );
-    if (persisted !== undefined) parseAttemptRevision(persisted.revision);
-    if (persisted?.state === "expired") {
-      if (persisted.fingerprint !== fingerprint) {
-        throw remoteError(
-          "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
-          "Expired remote attempt identity has a different request fingerprint",
-          this.id,
-          this.#clock.now().toISOString(),
-        );
-      }
+    const persistedRecord =
+      persisted === undefined
+        ? undefined
+        : this.#parseStoredRecord(persisted, {
+            taskId: request.taskId,
+            attemptId: request.attemptId,
+            fingerprint,
+          }).record;
+    if (persistedRecord?.state === "expired") {
       throw remoteError(
         "EXECUTOR_REMOTE_ATTEMPT_EXPIRED",
         "Remote attempt result retention expired; the attempt identity cannot be reused",
@@ -1234,33 +1235,7 @@ export class RemoteExecutor implements Executor {
     if (this.#hydrated) return;
     this.#assertPersistenceAvailable();
     const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
-    const validatedRecords = records.map((record) => {
-      parseAttemptRevision(record.revision);
-      const request = parseRemoteRequest(record.request);
-      const executor = request.target.executor;
-      if (
-        record.workerId !== this.#workerId ||
-        executor.type !== this.type ||
-        executor.id !== this.id ||
-        executor.workerId !== this.#workerId
-      ) {
-        throw remoteError(
-          "PROTOCOL_EXECUTION_TARGET_INVALID",
-          "Persisted remote attempt does not belong to this executor and Worker",
-          this.id,
-          this.#clock.now().toISOString(),
-        );
-      }
-      if (requestFingerprint(request) !== record.fingerprint) {
-        throw remoteError(
-          "EXECUTOR_REMOTE_IDENTITY_CONFLICT",
-          "Persisted remote attempt fingerprint does not match its request",
-          this.id,
-          this.#clock.now().toISOString(),
-        );
-      }
-      return { record, request };
-    });
+    const validatedRecords = records.map((record) => this.#parseStoredRecord(record));
     const activeRecords = validatedRecords.filter(({ record }) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
       throw remoteError(
@@ -1270,7 +1245,7 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    for (const { record, request } of validatedRecords) {
+    for (const { record, request, result: terminalResult } of validatedRecords) {
       const persistedEpoch = BigInt(record.epoch);
       if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
       if (record.state === "expired") continue;
@@ -1292,15 +1267,15 @@ export class RemoteExecutor implements Executor {
         epoch: record.epoch,
         settled: record.result !== undefined,
         ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
-        ...(record.result === undefined ? {} : { terminal: record.result }),
-        ...(record.result === undefined
+        ...(terminalResult === undefined ? {} : { terminal: terminalResult }),
+        ...(terminalResult === undefined
           ? {}
-          : { terminalAt: Date.parse(record.result.completedAt) }),
+          : { terminalAt: Date.parse(terminalResult.completedAt) }),
       };
       this.#attempts.set(attemptKey(request.taskId, request.attemptId), attempt);
-      if (record.result !== undefined) {
+      if (terminalResult !== undefined) {
         attempt.deadline.abort();
-        result.resolve(record.result);
+        result.resolve(terminalResult);
       } else {
         this.#background(this.#watchDeadline(attempt));
       }
@@ -2004,9 +1979,35 @@ export class RemoteExecutor implements Executor {
     };
   }
 
+  #parseStoredRecord(
+    record: RemoteAttemptRecord,
+    expectation: Omit<RemoteAttemptRecordExpectation, "executorId" | "workerId"> = {},
+  ) {
+    return parseRemoteAttemptRecord(record, {
+      workerId: this.#workerId,
+      executorId: this.id,
+      ...expectation,
+    });
+  }
+
+  #parseCommittedRecord(committed: RemoteAttemptRecord, expected: RemoteAttemptRecord) {
+    const parsed = this.#parseStoredRecord(committed, {
+      taskId: expected.request.taskId,
+      attemptId: expected.request.attemptId,
+      fingerprint: expected.fingerprint,
+    });
+    const { revision: _committedRevision, ...committedValue } = parsed.record;
+    const { revision: _expectedRevision, ...expectedValue } = expected;
+    if (jsonFingerprint(committedValue) !== jsonFingerprint(expectedValue)) {
+      throw new TypeError("Committed remote attempt record does not match the requested write");
+    }
+    return parsed;
+  }
+
   async #create(attempt: RemoteAttempt): Promise<void> {
+    const record = this.#record(attempt);
     const committed = await this.#storeOperation(
-      this.#attemptStore.commit(this.#record(attempt), {
+      this.#attemptStore.commit(record, {
         expectedRevision: null,
       }),
     );
@@ -2018,7 +2019,7 @@ export class RemoteExecutor implements Executor {
         this.#clock.now().toISOString(),
       );
     }
-    attempt.revision = parseAttemptRevision(committed.revision);
+    attempt.revision = this.#parseCommittedRecord(committed, record).record.revision;
   }
 
   async #commit(
@@ -2048,7 +2049,7 @@ export class RemoteExecutor implements Executor {
         }
         if (attempt.persistenceFailed) return;
         if (committed !== undefined) {
-          const revision = parseAttemptRevision(committed.revision);
+          const revision = this.#parseCommittedRecord(committed, record).record.revision;
           if (attempt.terminal !== undefined && state !== "terminal") return;
           attempt.revision = revision;
           attempt.state = state;
@@ -2062,16 +2063,21 @@ export class RemoteExecutor implements Executor {
         if (latest === undefined) {
           throw new Error("Remote attempt state disappeared during a conditional commit");
         }
-        attempt.revision = parseAttemptRevision(latest.revision);
-        attempt.epoch = latest.epoch;
-        attempt.state = latest.state === "expired" ? "terminal" : latest.state;
-        if (latest.cancellation === undefined) {
+        const parsedLatest = this.#parseStoredRecord(latest, {
+          taskId: attempt.request.taskId,
+          attemptId: attempt.request.attemptId,
+          fingerprint: attempt.fingerprint,
+        }).record;
+        attempt.revision = parsedLatest.revision;
+        attempt.epoch = parsedLatest.epoch;
+        attempt.state = parsedLatest.state === "expired" ? "terminal" : parsedLatest.state;
+        if (parsedLatest.cancellation === undefined) {
           delete attempt.cancellation;
         } else {
-          attempt.cancellation = latest.cancellation;
+          attempt.cancellation = parsedLatest.cancellation;
         }
-        if (latest.result !== undefined) {
-          attempt.terminal = latest.result;
+        if (parsedLatest.result !== undefined) {
+          attempt.terminal = parsedLatest.result;
           attempt.state = "terminal";
         }
         if (attempt.state === "terminal") return;
@@ -2359,22 +2365,20 @@ export class RemoteExecutor implements Executor {
         await this.#transition(attempt, async () => {
           if (attempt.state !== "terminal") return;
           const { result: _result, ...record } = this.#record(attempt);
+          const expiredRecord = {
+            ...record,
+            state: "expired" as const,
+          };
           const committed = await this.#storeOperation(
-            this.#attemptStore.commit(
-              {
-                ...record,
-                state: "expired",
-              },
-              {
-                expectedRevision: attempt.revision,
-                expectedEpoch: attempt.epoch,
-              },
-            ),
+            this.#attemptStore.commit(expiredRecord, {
+              expectedRevision: attempt.revision,
+              expectedEpoch: attempt.epoch,
+            }),
           );
           if (committed === undefined) {
             throw new Error("Remote terminal tombstone lost conditional authority");
           }
-          parseAttemptRevision(committed.revision);
+          this.#parseCommittedRecord(committed, expiredRecord);
           this.#attempts.delete(key);
         });
       }

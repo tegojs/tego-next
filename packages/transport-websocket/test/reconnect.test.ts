@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type ExecutionResult, parseWorkerId } from "@tegojs/contracts";
+import {
+  type ExecutionResult,
+  parseAttemptId,
+  parseTaskId,
+  parseWorkerId,
+} from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import {
   MemoryRemoteAttemptStore,
@@ -8,6 +13,7 @@ import {
   type RemoteAttemptRecord,
   type RemoteAttemptStore,
   RemoteExecutor,
+  parseRemoteAttemptRecord,
   requestFingerprint,
   WorkerRuntime,
 } from "../src/index.js";
@@ -2168,6 +2174,47 @@ function invalidRevisionRecord(id: string): RemoteAttemptRecord {
   };
 }
 
+test("remote attempt record validation rejects malformed state, time, epoch, and cancellation", () => {
+  const request = executionRequest(null, "record-validation");
+  const completedAt = new Date(0).toISOString();
+  const valid: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    revision: "1",
+    state: "terminal",
+    epoch: "1",
+    updatedAt: completedAt,
+    result: {
+      taskId: request.taskId,
+      attemptId: request.attemptId,
+      status: "failed",
+      executor: { kind: "remote", workerId },
+      startedAt: completedAt,
+      completedAt,
+    },
+  };
+  const { result: _result, ...withoutResult } = valid;
+  const cases: readonly unknown[] = [
+    { ...withoutResult, state: "terminal" },
+    { ...valid, state: "running" },
+    { ...valid, epoch: "-1" },
+    { ...valid, updatedAt: "not-a-timestamp" },
+    { ...withoutResult, state: "running", acknowledgedAt: completedAt },
+    { ...valid, acknowledgedAt: new Date(1).toISOString() },
+    { ...withoutResult, state: "running", cancellation: "other" },
+    { ...valid, result: { ...valid.result, startedAt: new Date(1).toISOString() } },
+    { ...valid, unexpected: true },
+  ];
+
+  for (const candidate of cases) {
+    assert.throws(
+      () => parseRemoteAttemptRecord(candidate, { workerId, executorId: "remote" }),
+      /remote attempt|terminal|timestamp|revision|sequence|field|cancel/iu,
+    );
+  }
+});
+
 function externalStore(options: {
   readonly listed?: RemoteAttemptRecord;
   readonly loaded?: RemoteAttemptRecord;
@@ -2243,6 +2290,100 @@ test("RemoteExecutor rejects invalid revisions returned by external store list, 
     /revision|unsigned|64|range/iu,
   );
   await Promise.all([commitRemote.close(), commitRuntime.close()]);
+});
+
+test("RemoteExecutor rejects a forged CAS reload and preserves the live attempt result", async () => {
+  const clock = new FakeClock(new Date(0));
+  class ForgedConflictStore extends MemoryRemoteAttemptStore {
+    injected = false;
+    #forged: RemoteAttemptRecord | undefined;
+
+    override async commit(
+      record: Parameters<MemoryRemoteAttemptStore["commit"]>[0],
+      condition: Parameters<MemoryRemoteAttemptStore["commit"]>[1],
+    ) {
+      if (!this.injected && condition.expectedRevision !== null) {
+        this.injected = true;
+        const completedAt = clock.now().toISOString();
+        this.#forged = {
+          ...record,
+          revision: "2",
+          state: "terminal",
+          result: {
+            taskId: parseTaskId("forged-cas-task"),
+            attemptId: parseAttemptId("forged-cas-attempt"),
+            status: "succeeded",
+            output: "forged",
+            executor: { kind: "remote", workerId: parseWorkerId("forged-cas-worker") },
+            startedAt: completedAt,
+            completedAt,
+          },
+        };
+        return undefined;
+      }
+      return super.commit(record, condition);
+    }
+
+    override async load(
+      taskId: Parameters<MemoryRemoteAttemptStore["load"]>[0],
+      attemptId: Parameters<MemoryRemoteAttemptStore["load"]>[1],
+    ) {
+      if (this.#forged !== undefined) {
+        const forged = this.#forged;
+        this.#forged = undefined;
+        return forged;
+      }
+      return super.load(taskId, attemptId);
+    }
+  }
+
+  const store = new ForgedConflictStore();
+  const local = new TestLocalExecutor();
+  const remote = new RemoteExecutor({ id: "remote", workerId, clock, attemptStore: store });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => local,
+  });
+  await reconnect(remote, runtime, "5");
+  const request = executionRequest({ mode: "echo", value: "real" }, "forged-cas-reload");
+
+  const result = await (await remote.submit(request)).result;
+
+  assert.equal(store.injected, true);
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.output, "real");
+  assert.equal(local.executions, 1);
+  await Promise.all([remote.close(), runtime.close()]);
+});
+
+test("RemoteExecutor rejects a commit response that differs from the requested record", async () => {
+  const clock = new FakeClock(new Date(0));
+  const store: RemoteAttemptStore = {
+    save: async () => undefined,
+    commit: async (record) => ({
+      ...record,
+      revision: "1",
+      state: "running",
+    }),
+    load: async () => undefined,
+    list: async () => [],
+  };
+  const remote = new RemoteExecutor({ id: "remote", workerId, clock, attemptStore: store });
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await reconnect(remote, runtime, "6");
+
+  await assert.rejects(
+    remote.submit(executionRequest(null, "mismatched-commit-response")),
+    /committed remote attempt record|requested write/iu,
+  );
+  await Promise.all([remote.close(), runtime.close()]);
 });
 
 test("WorkerRuntime rejects invalid revisions returned by external store list, load, and commit", async () => {

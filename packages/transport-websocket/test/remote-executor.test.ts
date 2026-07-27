@@ -5,7 +5,9 @@ import {
   DiagnosticError,
   type ExecutionRequest,
   type JsonValue,
+  parseAttemptId,
   parseComponentInstanceId,
+  parseTaskId,
   parseWorkerId,
 } from "@tegojs/contracts";
 import {
@@ -401,12 +403,7 @@ test("hydration rejects foreign persisted attempts before target-scoped access",
       });
 
       try {
-        await assert.rejects(
-          remote.attach(mainSession),
-          (error: unknown) =>
-            error instanceof DiagnosticError &&
-            error.diagnostic.code === "PROTOCOL_EXECUTION_TARGET_INVALID",
-        );
+        await assert.rejects(remote.attach(mainSession), /owner|identity|target/iu);
         assert.equal(
           await remote.observeTarget(
             expectedRequest.target,
@@ -432,6 +429,65 @@ test("hydration rejects foreign persisted attempts before target-scoped access",
         await Promise.all([remote.close(), runtime.close()]);
       }
     });
+  }
+});
+
+test("hydration rejects a forged persisted terminal result before observation or recovery", async () => {
+  const request = executionRequest(null, "forged-persisted-result");
+  const completedAt = clock.now().toISOString();
+  const record: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "terminal",
+    epoch: "1",
+    updatedAt: completedAt,
+    revision: "1",
+    result: {
+      taskId: parseTaskId("foreign-task"),
+      attemptId: parseAttemptId("foreign-attempt"),
+      status: "succeeded",
+      output: "forged",
+      executor: { kind: "remote", workerId: parseWorkerId("foreign-worker") },
+      startedAt: completedAt,
+      completedAt,
+    },
+  };
+  const store: RemoteAttemptStore = {
+    save: async () => undefined,
+    commit: async () => undefined,
+    delete: async () => undefined,
+    load: async () => undefined,
+    list: async () => [record],
+  };
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: store,
+  });
+
+  try {
+    await assert.rejects(remote.attach(mainSession), /result|request|Worker|identity/iu);
+    assert.equal(
+      await remote.observeTarget(request.target, request.taskId, request.attemptId),
+      undefined,
+    );
+    assert.equal(
+      await remote.resumeTarget(request.target, request.taskId, request.attemptId),
+      undefined,
+    );
+    await remote.cancelTarget(request.target, request.taskId, request.attemptId);
+  } finally {
+    await Promise.all([remote.close(), runtime.close()]);
   }
 });
 

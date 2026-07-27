@@ -30,6 +30,7 @@ import {
   jsonBytes,
   jsonFingerprint,
   parseAttemptRevision,
+  parseRemoteAttemptRecord,
   parseRemoteCapabilityInvocation,
   parseRemoteCapabilityResponse,
   parseRemoteComponentActivation,
@@ -49,6 +50,7 @@ import {
   REMOTE_RESULT,
   REMOTE_RESULT_ACK,
   type RemoteAttemptRecord,
+  type RemoteAttemptRecordExpectation,
   type RemoteAttemptStore,
   type RemoteCapabilityInvocation,
   type RemoteCapabilityInvocationResponse,
@@ -570,8 +572,8 @@ export class WorkerRuntime {
     if (this.#hydrated) return;
     this.#assertAttemptPersistenceAvailable();
     const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
-    for (const record of records) this.#acceptRevision(record.revision);
-    const activeRecords = records.filter((record) => record.state !== "expired");
+    const parsedRecords = records.map((record) => this.#parseStoredRecord(record));
+    const activeRecords = parsedRecords.filter(({ record }) => record.state !== "expired");
     if (activeRecords.length > this.#maxInventoryItems) {
       throw new Error("Worker attempt inventory exceeds maxInventoryItems");
     }
@@ -581,21 +583,23 @@ export class WorkerRuntime {
         parseExecutionResult(result),
       ]),
     );
-    for (const record of records) {
+    for (const { record, request, result: terminalResult } of parsedRecords) {
       const persistedEpoch = BigInt(record.epoch);
       if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
-      const key = attemptKey(record.request.taskId, record.request.attemptId);
+      const key = attemptKey(request.taskId, request.attemptId);
       if (record.state === "expired") continue;
       const durableResult = durableResults.get(key);
       if (durableResult !== undefined) {
         if (
-          durableResult.taskId !== record.request.taskId ||
-          durableResult.attemptId !== record.request.attemptId
+          durableResult.taskId !== request.taskId ||
+          durableResult.attemptId !== request.attemptId ||
+          durableResult.executor.kind !== "remote" ||
+          durableResult.executor.workerId !== this.#workerId
         ) {
           throw new Error("Durable remote result identity does not match its attempt record");
         }
         const attempt: WorkerAttempt = {
-          request: record.request,
+          request,
           fingerprint: record.fingerprint,
           revision: this.#acceptRevision(record.revision),
           transition: Promise.resolve(),
@@ -615,16 +619,16 @@ export class WorkerRuntime {
         await this.#commit(attempt, "terminal", durableResult);
         continue;
       }
-      if (record.state === "terminal" && record.result !== undefined) {
+      if (record.state === "terminal" && terminalResult !== undefined) {
         const attempt: WorkerAttempt = {
-          request: record.request,
+          request,
           fingerprint: record.fingerprint,
           revision: this.#acceptRevision(record.revision),
           transition: Promise.resolve(),
           state: "terminal",
           epoch: record.epoch,
           reservedBytes: 0,
-          result: record.result,
+          result: terminalResult,
           completion: attemptCompletion(true),
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
           ...(record.acknowledgedAt === undefined
@@ -632,16 +636,16 @@ export class WorkerRuntime {
             : { acknowledgedAt: Date.parse(record.acknowledgedAt) }),
         };
         this.#attempts.set(key, attempt);
-        if (record.acknowledgedAt === undefined) this.#results.put(record.result);
+        if (record.acknowledgedAt === undefined) this.#results.put(terminalResult);
       } else if (record.state === "acknowledged" || record.state === "running") {
         this.#attempts.set(key, {
-          request: record.request,
+          request,
           fingerprint: record.fingerprint,
           revision: this.#acceptRevision(record.revision),
           transition: Promise.resolve(),
           state: "acknowledged",
           epoch: record.epoch,
-          reservedBytes: this.#resultReservationBytes(record.request),
+          reservedBytes: this.#resultReservationBytes(request),
           completion: attemptCompletion(),
           ...(record.cancellation === undefined ? {} : { cancellation: record.cancellation }),
         });
@@ -1285,7 +1289,12 @@ export class WorkerRuntime {
       await this.#rejectUnavailableAttemptStore(session, message.messageId, request);
       return;
     }
-    if (persisted !== undefined) this.#acceptRevision(persisted.revision);
+    if (persisted !== undefined) {
+      persisted = this.#parseStoredRecord(persisted, {
+        taskId: request.taskId,
+        attemptId: request.attemptId,
+      }).record;
+    }
     if (persisted?.state === "expired") {
       await this.#sendRejected(
         session,
@@ -1895,16 +1904,48 @@ export class WorkerRuntime {
     };
   }
 
+  #parseStoredRecord(
+    record: RemoteAttemptRecord,
+    expectation: Omit<RemoteAttemptRecordExpectation, "workerId"> = {},
+  ) {
+    try {
+      return parseRemoteAttemptRecord(record, {
+        workerId: this.#workerId,
+        ...expectation,
+      });
+    } catch (error) {
+      if (isRemoteAttemptRevisionError(error)) {
+        this.#attemptPersistenceAvailable = false;
+      }
+      throw error;
+    }
+  }
+
+  #parseCommittedRecord(committed: RemoteAttemptRecord, expected: RemoteAttemptRecord) {
+    const parsed = this.#parseStoredRecord(committed, {
+      taskId: expected.request.taskId,
+      attemptId: expected.request.attemptId,
+      fingerprint: expected.fingerprint,
+    });
+    const { revision: _committedRevision, ...committedValue } = parsed.record;
+    const { revision: _expectedRevision, ...expectedValue } = expected;
+    if (jsonFingerprint(committedValue) !== jsonFingerprint(expectedValue)) {
+      throw new TypeError("Committed Worker attempt record does not match the requested write");
+    }
+    return parsed;
+  }
+
   async #create(attempt: WorkerAttempt): Promise<void> {
+    const record = this.#record(attempt);
     const committed = await this.#storeOperation(
-      this.#attemptStore.commit(this.#record(attempt), {
+      this.#attemptStore.commit(record, {
         expectedRevision: null,
       }),
     );
     if (committed === undefined) {
       throw new Error("Remote attempt was concurrently admitted by another Worker session");
     }
-    attempt.revision = this.#acceptRevision(committed.revision);
+    attempt.revision = this.#parseCommittedRecord(committed, record).record.revision;
   }
 
   async #commit(
@@ -1929,7 +1970,7 @@ export class WorkerRuntime {
         }
         if (!this.#attemptPersistenceAvailable) return;
         if (committed !== undefined) {
-          attempt.revision = this.#acceptRevision(committed.revision);
+          attempt.revision = this.#parseCommittedRecord(committed, record).record.revision;
           attempt.state = state;
           if (result !== undefined) attempt.result = result;
           return;
@@ -1940,16 +1981,21 @@ export class WorkerRuntime {
         if (latest === undefined) {
           throw new Error("Worker attempt disappeared during a conditional commit");
         }
-        attempt.revision = this.#acceptRevision(latest.revision);
-        attempt.epoch = latest.epoch;
-        if (latest.cancellation === undefined) {
+        const parsedLatest = this.#parseStoredRecord(latest, {
+          taskId: attempt.request.taskId,
+          attemptId: attempt.request.attemptId,
+          fingerprint: attempt.fingerprint,
+        }).record;
+        attempt.revision = parsedLatest.revision;
+        attempt.epoch = parsedLatest.epoch;
+        if (parsedLatest.cancellation === undefined) {
           delete attempt.cancellation;
         } else {
-          attempt.cancellation = latest.cancellation;
+          attempt.cancellation = parsedLatest.cancellation;
         }
-        if (latest.result !== undefined || latest.state === "terminal") {
+        if (parsedLatest.result !== undefined || parsedLatest.state === "terminal") {
           attempt.state = "terminal";
-          if (latest.result !== undefined) attempt.result = latest.result;
+          if (parsedLatest.result !== undefined) attempt.result = parsedLatest.result;
           attempt.completion.resolve();
           return;
         }
@@ -2071,21 +2117,19 @@ export class WorkerRuntime {
         attempt.acknowledgedAt !== undefined &&
         attempt.acknowledgedAt <= cutoff
       ) {
+        const expiredRecord = {
+          ...this.#record(attempt),
+          state: "expired" as const,
+          updatedAt: this.#clock.now().toISOString(),
+        };
         const expired = await this.#storeOperation(
-          this.#attemptStore.commit(
-            {
-              ...this.#record(attempt),
-              state: "expired",
-              updatedAt: this.#clock.now().toISOString(),
-            },
-            {
-              expectedRevision: attempt.revision,
-              expectedEpoch: attempt.epoch,
-            },
-          ),
+          this.#attemptStore.commit(expiredRecord, {
+            expectedRevision: attempt.revision,
+            expectedEpoch: attempt.epoch,
+          }),
         );
         if (expired === undefined) continue;
-        this.#acceptRevision(expired.revision);
+        this.#parseCommittedRecord(expired, expiredRecord);
         this.#attempts.delete(key);
       }
     }
