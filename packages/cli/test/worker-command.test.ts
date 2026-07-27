@@ -673,6 +673,50 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
   }
 });
 
+test("StateRemoteAttemptStore rejects revision overflow without mutating recovery state", async () => {
+  const state = new MemoryStateStore();
+  const workerId = parseWorkerId("worker-attempt-revision-overflow");
+  const request = assignment("org.example.revision-overflow", {
+    id: "remote-revision-overflow",
+    workerId,
+  });
+  const maximumRevision = "18446744073709551615";
+  const initial = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "assigned" as const,
+    epoch: "1",
+    updatedAt: new Date(0).toISOString(),
+    revision: maximumRevision,
+  };
+  await state.open();
+  try {
+    const store = new StateRemoteAttemptStore({ state, workerId });
+    await store.save(initial);
+
+    await assert.rejects(
+      store.commit(
+        {
+          ...initial,
+          state: "unknown",
+          updatedAt: new Date(1).toISOString(),
+        },
+        { expectedRevision: maximumRevision, expectedEpoch: "1" },
+      ),
+      /revision|unsigned|64|range|exhaust/iu,
+    );
+
+    assert.deepEqual(await store.load(request.taskId, request.attemptId), initial);
+    assert.deepEqual(await store.recover(workerId, 2), {
+      highestEpoch: "1",
+      records: [initial],
+    });
+  } finally {
+    await state.close();
+  }
+});
+
 test("StateRemoteAttemptStore recovery keeps tombstones out of its bounded active index", async () => {
   const state = new MemoryStateStore();
   const workerId = parseWorkerId("worker-attempt-recovery-index");

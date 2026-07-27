@@ -14,6 +14,7 @@ import {
 } from "@tegojs/contracts";
 import {
   parseAttemptRevision,
+  RemoteAttemptRevisionError,
   type RemoteAttemptCommitCondition,
   type RemoteAttemptRecovery,
   type RemoteAttemptRecord,
@@ -179,7 +180,13 @@ function cloneRecord(record: RemoteAttemptRecord): RemoteAttemptRecord {
 }
 
 function incrementRevision(value: string): string {
-  return (BigInt(parseAttemptRevision(value)) + 1n).toString();
+  const current = BigInt(parseAttemptRevision(value));
+  if (current === 18_446_744_073_709_551_615n) {
+    throw new RemoteAttemptRevisionError(
+      "Remote attempt revision exhausted its unsigned 64-bit range",
+    );
+  }
+  return (current + 1n).toString();
 }
 
 export interface StateRemoteAttemptStoreOptions {
