@@ -337,6 +337,31 @@ test("codec accepts only exact JSON data fields and decimal sequence values", ()
   );
 });
 
+test("codec round-trips capability and component lifecycle messages but rejects unknown types", () => {
+  const codec = createWorkerCodec();
+  for (const type of [
+    "capability.invoke",
+    "component.activate",
+    "component.activated",
+    "component.drain",
+    "component.stop",
+  ] as const) {
+    const envelope = {
+      ...ENVELOPE,
+      type,
+    } as unknown as WorkerControlEnvelope;
+    assert.deepEqual(codec.decodeControl(codec.encodeControl(envelope)), envelope);
+  }
+  assert.throws(() =>
+    codec.decodeControl(
+      JSON.stringify({
+        ...ENVELOPE,
+        type: "component.unknown",
+      }),
+    ),
+  );
+});
+
 test("binary codec rejects partial, oversized, and inconsistent frames", () => {
   const codec = createWorkerCodec({ maxFrameBytes: 128, maxBinaryBytes: 64 });
   const frame = codec.encodeBinary({
