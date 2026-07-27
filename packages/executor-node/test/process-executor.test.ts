@@ -1,45 +1,50 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import {
-  createExecutionBinding,
-  diagnosticCode,
-  parseApplicationId,
-  parseArtifactDigest,
-  parseAttemptId,
-  parseComponentId,
-  parseComponentInstanceId,
-  parseGeneration,
-  parsePluginId,
-  parsePluginManifest,
-  parseTaskId,
+  type CapabilityDefinition,
   type Clock,
+  type ComponentCapabilityBoundary,
+  createExecutionBinding,
   type DriverHealth,
-  type Executor,
+  diagnosticCode,
   type ExecutionRequest,
+  type Executor,
   type HostedProcess,
   type HostedProcessExit,
   type JsonValue,
   type Permission,
   type ProcessHost,
   type ProcessSpawnRequest,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseAttemptId,
+  parseCapabilityName,
+  parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
+  parsePluginId,
+  parsePluginManifest,
+  parseTaskId,
+  parseWorkerId,
 } from "@tegojs/contracts";
 import {
+  type ExecutorConformanceFixture,
   eventually,
   executorConformance,
   FakeClock,
-  type ExecutorConformanceFixture,
 } from "@tegojs/testkit";
 import {
-  PROCESS_EXECUTOR_MAX_FRAME_BYTES,
-  ProcessFrameDecoder,
-  ProcessExecutor,
   encodeProcessFrame,
-  selectExecutor,
+  PROCESS_EXECUTOR_MAX_FRAME_BYTES,
+  ProcessExecutor,
   type ProcessExecutorOptions,
+  ProcessFrameDecoder,
+  selectExecutor,
 } from "../src/index.js";
 
 const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
@@ -512,6 +517,14 @@ export default {
       process.stderr.write("secret=" + secret);
       return { secretToken: secret };
     }
+    if (input.mode === "capability") {
+      return context.capabilities.call({
+        name: "org.example.route",
+        protocolVersion: "1.0.0",
+        method: "echo",
+        input: { marker: input.marker }
+      });
+    }
     if (input.mode === "large-output") return "x".repeat(${1024 * 1024 + 64});
     return input.value;
   }
@@ -835,6 +848,157 @@ test("submit snapshots mutable request data at admission", async () => {
   } finally {
     await executor.drain({});
   }
+});
+
+test("remote process attempts resolve one exact capability boundary without cross-target leakage", async () => {
+  const fixture = await artifact();
+  const capabilityDefinitions = [
+    {
+      identity: {
+        name: parseCapabilityName("org.example.route"),
+        protocolVersion: "1.0.0",
+      },
+      methods: ["echo"],
+      requestSchema: true,
+      responseSchema: true,
+    },
+  ] satisfies readonly CapabilityDefinition[];
+  const permissionGrants = [
+    { kind: "executor", executors: ["remote"] },
+    {
+      kind: "capability",
+      capabilities: [{ name: "org.example.route", methods: ["echo"] }],
+    },
+  ] satisfies readonly Permission[];
+  const manifest = parsePluginManifest({
+    ...fixture.manifest,
+    permissions: permissionGrants,
+  });
+  const resolutions: string[] = [];
+  const invocations: string[] = [];
+  const scopedOptions = {
+    ...(await options()),
+    remoteWorkerIsolation: true,
+    resolveComponent: async (execution: ExecutionRequest) => ({
+      target: {
+        ...execution.target,
+        executor: { id: "process-local", type: "process" as const },
+      },
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
+      configuration: {},
+      permissionGrants,
+      capabilityDefinitions,
+    }),
+    resolveCapabilityBoundary(execution: ExecutionRequest): ComponentCapabilityBoundary {
+      const marker = `${execution.target.instanceId}:${execution.binding.fingerprint}`;
+      resolutions.push(marker);
+      return {
+        register: () => ({ ok: true, diagnostics: [] }),
+        request: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+        async invoke(invocation) {
+          invocations.push(`${marker}:${invocation.invocationId}`);
+          return { marker, invocationId: invocation.invocationId };
+        },
+        response: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+        clear() {},
+      };
+    },
+  } as ProcessExecutorOptions & {
+    readonly resolveCapabilityBoundary: (request: ExecutionRequest) => ComponentCapabilityBoundary;
+  };
+  const executor = new ProcessExecutor(scopedOptions);
+  const remoteRequest = (suffix: string): ExecutionRequest => {
+    const target = {
+      instanceId: parseComponentInstanceId(`app.org.example.process.echo.${suffix}`),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: digest,
+      executor: {
+        id: "remote-worker",
+        type: "remote" as const,
+        workerId: parseWorkerId("worker-a"),
+      },
+    };
+    const identity = {
+      applicationId: parseApplicationId("app"),
+      pluginId: parsePluginId("org.example.process"),
+      componentId: parseComponentId("echo"),
+      target,
+    };
+    return {
+      taskId: parseTaskId(`task-route-${suffix}`),
+      attemptId: parseAttemptId(`attempt-route-${suffix}`),
+      ...identity,
+      binding: createExecutionBinding(identity, {
+        configuration: { route: suffix },
+        permissionGrants,
+        capabilityDefinitions,
+        capabilityBindings: [],
+      }),
+      input: { mode: "capability", marker: suffix },
+      deadline: new Date(60_000).toISOString(),
+      orphanPolicy: "cancel",
+    };
+  };
+  const first = remoteRequest("first");
+  const second = remoteRequest("second");
+
+  try {
+    const [firstResult, secondResult] = await Promise.all([
+      (await executor.submit(first)).result,
+      (await executor.submit(second)).result,
+    ]);
+    for (const [execution, result] of [
+      [first, firstResult],
+      [second, secondResult],
+    ] as const) {
+      const marker = `${execution.target.instanceId}:${execution.binding.fingerprint}`;
+      const expectedInvocationId = `cap.${createHash("sha256")
+        .update(`${execution.taskId.length}:${execution.taskId}${execution.attemptId}:1`)
+        .digest("hex")}`;
+      assert.equal(result.status, "succeeded");
+      assert.deepEqual(result.output, { marker, invocationId: expectedInvocationId });
+      assert.equal(
+        invocations.filter((entry) => entry === `${marker}:${expectedInvocationId}`).length,
+        1,
+      );
+    }
+    assert.deepEqual(
+      [...resolutions].sort(),
+      [
+        `${first.target.instanceId}:${first.binding.fingerprint}`,
+        `${second.target.instanceId}:${second.binding.fingerprint}`,
+      ].sort(),
+    );
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("process executor rejects fixed and per-execution capability boundaries together", async () => {
+  const base = await options();
+  const boundary: ComponentCapabilityBoundary = {
+    register: () => ({ ok: true, diagnostics: [] }),
+    request: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+    invoke: async () => null,
+    response: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+    clear() {},
+  };
+
+  assert.throws(
+    () =>
+      new ProcessExecutor({
+        ...base,
+        capabilityBoundary: boundary,
+        resolveCapabilityBoundary: () => boundary,
+      } as ProcessExecutorOptions & {
+        readonly resolveCapabilityBoundary: () => ComponentCapabilityBoundary;
+      }),
+    /capability boundar/u,
+  );
 });
 
 test("terminal results are deeply immutable cached snapshots", async () => {
