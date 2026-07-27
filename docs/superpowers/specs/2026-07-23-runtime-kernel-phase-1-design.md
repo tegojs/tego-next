@@ -608,8 +608,8 @@ interface RuntimeDiagnostic {
 }
 ```
 
-Codes are stable and grouped by bootstrap, artifact, deployment, capability,
-permission, lifecycle, executor, Worker, coordination, state, and protocol.
+Codes are stable and grouped by activation, bootstrap, artifact, deployment,
+capability, permission, lifecycle, executor, Worker, coordination, state, and protocol.
 Stack traces are diagnostic attachments and never the only error identity.
 
 ## 18. Testing Architecture
