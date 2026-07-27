@@ -14,7 +14,7 @@ import {
   parsePluginId,
 } from "@tegojs/contracts";
 import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import { planReconcile, reconcileEffectIdentities, Reconciler } from "@tegojs/runtime";
+import { planReconcile, Reconciler, reconcileEffectIdentities } from "@tegojs/runtime";
 
 const applicationId = parseApplicationId("app");
 const pluginId = parsePluginId("org.example.echo");
@@ -148,6 +148,17 @@ function gate() {
       granted: value.manifest.permissions,
       requested: value.manifest.permissions,
     },
+  };
+}
+
+function capabilityProvision(name, providerComponentId) {
+  return {
+    name,
+    protocolVersion: "1.0.0",
+    componentId: providerComponentId,
+    methods: ["invoke"],
+    requestSchema: true,
+    responseSchema: true,
   };
 }
 
@@ -787,10 +798,12 @@ test("failed provider hold survives Memory and SQLite reopen with essential read
     const providerManifest = {
       ...manifest(),
       pluginId: providerId,
-      components: [component("fail-store-provider")],
+      components: [{ ...component("fail-store-provider"), kind: "task" }],
       permissions: [{ kind: "executor", executors: ["process"] }],
       capabilities: {
-        provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        provides: [
+          capabilityProvision(capability, parseComponentId("fail-store-provider-service")),
+        ],
         requires: [],
       },
     };
@@ -1048,10 +1061,10 @@ test("current provider context mismatches cannot satisfy required capabilities",
   const providerManifest = {
     ...manifest(),
     pluginId: providerId,
-    components: [component("provider")],
+    components: [{ ...component("provider"), kind: "task" }],
     permissions: [{ kind: "executor", executors: ["process"] }],
     capabilities: {
-      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      provides: [capabilityProvision(capability, providerComponentId)],
       requires: [],
     },
   };
@@ -1387,10 +1400,7 @@ test("starting checkpoint lifecycle interruption restores exact effect across Me
       if (entry.operationId === start.operationId) operationHistory.push(entry);
     }
     assert.equal(operationHistory.at(-1)?.status, "completed");
-    assert.equal(
-      operationHistory.filter((entry) => entry.status === "completed").length,
-      1,
-    );
+    assert.equal(operationHistory.filter((entry) => entry.status === "completed").length, 1);
     assert.deepEqual(
       await state.claimOutbox({
         leaseDurationMs: 1_000,
@@ -1422,10 +1432,10 @@ test("suspended provider hold survives Memory and SQLite reopen before activatio
     const providerManifest = {
       ...manifest(),
       pluginId: providerId,
-      components: [component(providerComponentId)],
+      components: [{ ...component(providerComponentId), kind: "task" }],
       permissions: [{ kind: "executor", executors: ["process"] }],
       capabilities: {
-        provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        provides: [capabilityProvision(capability, providerComponentId)],
         requires: [],
       },
     };
@@ -1665,10 +1675,10 @@ test("stale recovery authorization is replaced after durable evidence returns", 
     const providerManifest = {
       ...manifest(),
       pluginId: providerId,
-      components: [component(providerComponentId)],
+      components: [{ ...component(providerComponentId), kind: "task" }],
       permissions: [{ kind: "executor", executors: ["process"] }],
       capabilities: {
-        provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        provides: [capabilityProvision(capability, providerComponentId)],
         requires: [],
       },
     };
@@ -2125,10 +2135,13 @@ test("provider generation upgrade recovery requires its exact durable capability
         const providerManifest = (targetPluginId, targetComponentId, provides) => ({
           ...manifest(),
           pluginId: targetPluginId,
-          components: [component(targetComponentId)],
+          components: [{ ...component(targetComponentId), kind: "task" }],
           permissions: [{ kind: "executor", executors: ["process"] }],
           capabilities: {
-            provides,
+            provides: provides.map((provision) => ({
+              ...capabilityProvision(provision.name, targetComponentId),
+              protocolVersion: provision.protocolVersion,
+            })),
             requires: [],
           },
         });

@@ -1,15 +1,16 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveNpmCli } from "./run-ci-test.mjs";
+import { resolveNpmCli, runManagedProcessTree } from "./run-ci-test.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const expectedNodeVersion = "v26.5.0";
 const expectedNpmVersion = "11.13.0";
+const defaultReleaseTimeoutMs = 10 * 60 * 1000;
 const npmCli = resolveNpmCli();
 const expressionPrefix = "$";
 const runnerTemp = `${expressionPrefix}{{ runner.temp }}`;
@@ -51,6 +52,7 @@ export const releaseCommands = [
   npmCommand("multi-Main takeover", "run", "test:e2e:multi-main"),
   npmCommand("strict OpenSpec validation", "run", "openspec:validate"),
 ];
+export const releaseStageResults = [];
 
 function diagnostic(code, message, details = {}) {
   return { level: "error", code, message, ...details };
@@ -299,17 +301,40 @@ function printDiagnostics(diagnostics) {
   process.stderr.write(`${JSON.stringify({ ok: false, diagnostics }, null, 2)}\n`);
 }
 
-export function runReleaseCommand({ name, command, args }) {
+export async function runReleaseCommand({
+  name,
+  command,
+  args,
+  timeoutMs = defaultReleaseTimeoutMs,
+}) {
   process.stdout.write(`\n[verify:release] ${name}\n`);
-  const result = spawnSync(command, args, {
+  const stage = await runManagedProcessTree({
+    name,
+    command,
+    args,
+    timeoutMs,
     cwd: root,
     env: process.env,
-    stdio: "inherit",
+    onStdout: (chunk) => process.stdout.write(chunk),
+    onStderr: (chunk) => process.stderr.write(chunk),
   });
-  if (result.error !== undefined || result.status !== 0) {
-    const cause = result.error?.message ?? `exit status ${String(result.status)}`;
-    throw diagnostic("command_failed", `${name} failed: ${cause}`, { command, args });
+  releaseStageResults.push(structuredClone(stage));
+  if (stage.timedOut) {
+    throw diagnostic("command_timed_out", `${name} timed out after ${timeoutMs}ms.`, {
+      command,
+      args,
+      stage,
+    });
   }
+  if (stage.error !== undefined || stage.exitCode !== 0) {
+    const cause = stage.error ?? `exit status ${String(stage.exitCode)}`;
+    throw diagnostic("command_failed", `${name} failed: ${cause}`, {
+      command,
+      args,
+      stage,
+    });
+  }
+  return stage;
 }
 
 async function sha256(path) {
@@ -325,12 +350,12 @@ async function verifyDeterministicPluginPackage() {
   const cli = join(root, "packages", "cli", "dist", "src", "bin.js");
   const plugin = join(root, "examples", "echo-plugin");
   try {
-    runReleaseCommand({
+    await runReleaseCommand({
       name: "first deterministic echo package",
       command: process.execPath,
       args: [cli, "plugin", "pack", plugin, "--output", first, "--json"],
     });
-    runReleaseCommand({
+    await runReleaseCommand({
       name: "second deterministic echo package",
       command: process.execPath,
       args: [cli, "plugin", "pack", plugin, "--output", second, "--json"],
@@ -351,7 +376,7 @@ async function verifyDeterministicPluginPackage() {
 async function main() {
   if (process.argv.length === 3 && process.argv[2] === "--openspec") {
     try {
-      runReleaseCommand(openspecInvocation);
+      await runReleaseCommand(openspecInvocation);
     } catch (error) {
       printDiagnostics([
         typeof error === "object" && error !== null && "code" in error
@@ -402,10 +427,12 @@ async function main() {
         process.stdout.write(`\n[verify:release] ${releaseCommand.name}\n`);
         await verifyDeterministicPluginPackage();
       } else {
-        runReleaseCommand(releaseCommand);
+        await runReleaseCommand(releaseCommand);
       }
     }
-    process.stdout.write(`${JSON.stringify({ ok: true, mode: "release" })}\n`);
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, mode: "release", stages: releaseStageResults })}\n`,
+    );
   } catch (error) {
     printDiagnostics([
       typeof error === "object" && error !== null && "code" in error
