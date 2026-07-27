@@ -299,6 +299,41 @@ test("CI workflow validation requires the deterministic package step after build
   );
 });
 
+test("CI workflow validation rejects extra or duplicate PostgreSQL health flags", async () => {
+  const workflow = await readFile(workflowPath, "utf8");
+  const { validateReleasePreflight } = await import(
+    new URL(`../../scripts/verify-release.mjs?health-mutations=${Date.now()}`, import.meta.url)
+  );
+  const base = {
+    gitStatus: "",
+    nodeVersion: "v26.5.0",
+    npmVersion: "11.13.0",
+    postgresUrl: "postgresql://localhost/tego",
+  };
+  const mutations = [
+    workflow.replace(
+      "          --health-retries 30",
+      "          --health-retries 30\n          --no-healthcheck",
+    ),
+    workflow.replace(
+      "          --health-retries 30",
+      "          --health-retries 30\n          --health-retries 30",
+    ),
+    workflow.replace(
+      '          --health-cmd "pg_isready -U tego_test -d tego_next_test"',
+      '          --health-cmd "pg_isready -U tego_test -d tego_next_test"\n          --health-cmd "true"',
+    ),
+  ];
+
+  for (const mutation of mutations) {
+    const diagnostics = validateReleasePreflight({ ...base, workflow: mutation });
+    assert.equal(
+      diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+      true,
+    );
+  }
+});
+
 test("deterministic package gate compares independent artifacts and manifests without residue", async () => {
   const beforeStatus = spawnSync("git", ["status", "--porcelain=v1"], {
     cwd: root,
