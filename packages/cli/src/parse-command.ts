@@ -129,6 +129,7 @@ interface WorkerStartCommandBase {
 export interface WorkerConnectStartCommand extends WorkerStartCommandBase {
   readonly direction: "connect";
   readonly url: string;
+  readonly fallbackUrls?: readonly string[];
 }
 
 export interface WorkerListenStartCommand extends WorkerStartCommandBase {

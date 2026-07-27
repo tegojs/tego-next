@@ -120,8 +120,10 @@ increments `generation`. Component instances record `deploymentGeneration` and
 effects are `prepare`, `start`, `drain`, and `stop`.
 
 The persisted deployment observation is derived rather than directly set by a
-plugin. Its status is `blocked`, `converging`, `degraded`, `failed`,
-`inconsistent`, `ready`, or `unavailable`. Compatibility, artifact,
+plugin. Its public status is `blocked`, `degraded`, `disabled`, `failed`,
+`ready`, `reconciling`, or `suspended`. Unavailable or inconsistent internal
+evidence is reported through structured diagnostics and maps to a safe public
+observation instead of widening the status contract. Compatibility, artifact,
 capability, permission, placement, and executor checks run before component
 import. Repeating reconciliation for the same generation uses stable instance,
 operation, and message identities so it converges without a duplicate live

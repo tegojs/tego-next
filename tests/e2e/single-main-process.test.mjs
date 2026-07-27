@@ -19,6 +19,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parseRuntimeSnapshotResponse } from "@tegojs/contracts";
+import { Pool } from "pg";
 import { requestControl } from "../../packages/cli/dist/src/control/client.js";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
@@ -639,8 +640,6 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
   ];
   const mains = [];
   let worker;
-  let restartedWorker;
-  let killedLeader;
   let operationError;
   try {
     const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
@@ -710,6 +709,7 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
           prepare: [artifactPath],
           resources: workerResources,
           url: leader.candidate.workerUrl,
+          fallbackUrls: [follower.candidate.workerUrl],
           workerId,
         }),
       },
@@ -736,16 +736,25 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       leader.candidate.configuration.endpoint,
       "--json",
     ]);
-    const beforeFailover = await deployAndRun({
-      endpoint: leader.candidate.configuration.endpoint,
-      executor: "remote",
-      generation: "1",
-      input: {
-        digest: installation.digest,
-        value: { executor: "remote", phase: "before-leader-failover", uniqueRun },
-      },
-    });
-
+    const deployment = await runCli([
+      "plugin",
+      "deploy",
+      "org.example.echo",
+      "--digest",
+      installation.digest,
+      "--permissions",
+      JSON.stringify([
+        { kind: "executor", executors: ["remote"] },
+        { kind: "worker", labels: {}, resources: workerResources },
+      ]),
+      "--configuration",
+      "{}",
+      "--endpoint",
+      leader.candidate.configuration.endpoint,
+      "--json",
+    ]);
+    assert.equal(deployment.generation, "1");
+    await waitForDeployment(leader.candidate.configuration.endpoint, "1");
     const followerSemanticBefore = JSON.stringify(
       await semanticSnapshotItems(follower.candidate.configuration.endpoint),
     );
@@ -777,42 +786,66 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
     assert.equal(leaderSemanticAfter, leaderSemanticBefore);
     assert.equal(followerSemanticAfter, leaderSemanticAfter);
 
-    killedLeader = leader.candidate.handle;
-    process.kill(killedLeader.pid, "SIGKILL");
-    await killedLeader.assertClean({ timeoutMs: processDeadlineMs });
+    const activeTask = await startTask({
+      endpoint: leader.candidate.configuration.endpoint,
+      operationId: `system-remote-authority-transfer-${uniqueRun}`,
+      orphanPolicy: "finish-and-buffer",
+      value: {
+        delayMs: 10_000,
+        executor: "remote",
+        phase: "across-leader-failover",
+        uniqueRun,
+      },
+    });
+    await eventually(async () => {
+      const snapshot = await runtimeSnapshot(leader.candidate.configuration.endpoint);
+      const record = snapshot.tasks.items
+        .map((item) => item.value)
+        .find((candidate) => candidate.taskId === activeTask.taskId);
+      return record !== undefined && record.state !== "terminal" ? record : undefined;
+    }, "remote task remains active before authority transfer");
+
     const oldEpoch = BigInt(leader.status.authority.epoch);
+    const pool = new Pool({ connectionString: postgresUrl, max: 1 });
+    try {
+      const terminated = await pool.query(
+        `SELECT pg_terminate_backend(activity.pid) AS terminated
+           FROM pg_locks AS locks
+           JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+          WHERE locks.locktype = 'advisory'
+            AND locks.granted = TRUE
+            AND activity.application_name = $1`,
+        [`tego:${runtimeId}:coordination`],
+      );
+      assert.equal(terminated.rowCount, 1);
+      assert.equal(terminated.rows[0]?.terminated, true);
+    } finally {
+      await pool.end();
+    }
     const promoted = await eventually(async () => {
       const status = await runtimeStatus(follower.candidate.configuration.endpoint);
       return status.authority !== undefined && BigInt(status.authority.epoch) > oldEpoch
         ? status
         : undefined;
     }, "PostgreSQL follower promotion with a newer authority epoch");
-
-    await stopProcess(worker);
-    worker = undefined;
-    restartedWorker = await spawnManagedProcess({
-      artifacts,
-      command: process.execPath,
-      args: [workerFixture],
-      env: {
-        TEGO_TEST_WORKER_COMMAND: JSON.stringify({
-          kind: "worker.start",
-          credential,
-          dataDirectory: join(directory, "worker"),
-          direction: "connect",
-          json: true,
-          labels: {},
-          prepare: [artifactPath],
-          resources: workerResources,
-          url: follower.candidate.workerUrl,
-          workerId,
-        }),
+    await eventually(async () => {
+      const status = await runtimeStatus(leader.candidate.configuration.endpoint);
+      return status.authority === undefined ? status : undefined;
+    }, "former PostgreSQL leader remains alive and loses authority");
+    await assert.rejects(
+      runCli([
+        "plugin",
+        "install",
+        artifactPath,
+        "--endpoint",
+        leader.candidate.configuration.endpoint,
+        "--json",
+      ]),
+      (error) => {
+        assert.equal(JSON.parse(error.stderr).diagnostic.code, "COORDINATION_NOT_LEADER");
+        return true;
       },
-      name: "worker-follower",
-    });
-    await restartedWorker.ready((event) => event.type === "worker.ready", {
-      timeoutMs: processDeadlineMs,
-    });
+    );
     await eventually(async () => {
       const status = await runtimeStatus(follower.candidate.configuration.endpoint);
       return status.counts.workers === 1 && status.authority?.epoch === promoted.authority.epoch
@@ -820,40 +853,41 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
         : undefined;
     }, "Worker placement moves to the promoted PostgreSQL Main");
     await waitForDeployment(follower.candidate.configuration.endpoint, "1");
-
-    const afterFailover = await runTask({
-      endpoint: follower.candidate.configuration.endpoint,
-      operationId: `system-remote-after-leader-failover-${uniqueRun}`,
-      value: { executor: "remote", phase: "after-leader-failover", uniqueRun },
+    const completed = await runCli([
+      "task",
+      "wait",
+      activeTask.taskId,
+      "--timeout-ms",
+      String(processDeadlineMs),
+      "--endpoint",
+      follower.candidate.configuration.endpoint,
+      "--json",
+    ]);
+    assert.equal(completed.result.status, "succeeded");
+    assert.deepEqual(completed.result.output, {
+      delayMs: 10_000,
+      executor: "remote",
+      phase: "across-leader-failover",
+      uniqueRun,
     });
     const snapshot = await runtimeSnapshot(follower.candidate.configuration.endpoint);
     const taskRecords = snapshot.tasks.items.map((item) => item.value);
-    assert.equal(taskRecords.length, 2);
-    assert.equal(new Set(taskRecords.map((task) => task.taskId)).size, 2);
-    assert.deepEqual(
-      new Set(taskRecords.map((task) => task.taskId)),
-      new Set([beforeFailover.taskId, afterFailover.taskId]),
-    );
-    for (const task of taskRecords) {
-      assert.equal(task.state, "terminal");
-      assert.equal(task.result.status, "succeeded");
-    }
+    assert.equal(taskRecords.length, 1);
+    assert.equal(taskRecords[0]?.taskId, activeTask.taskId);
+    assert.equal(taskRecords[0]?.attemptId, activeTask.attemptId);
+    assert.equal(taskRecords[0]?.state, "terminal");
+    assert.equal(taskRecords[0]?.result.status, "succeeded");
   } catch (error) {
     operationError = error;
   } finally {
     await settleWithCleanup(async () => {
       if (operationError !== undefined) throw operationError;
     }, [
-      ...mains.flatMap((main) =>
-        main.handle === killedLeader
-          ? []
-          : [
-              async () =>
-                runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]),
-              async () => stopProcess(main.handle),
-            ],
-      ),
-      async () => stopProcess(restartedWorker),
+      ...mains.flatMap((main) => [
+        async () =>
+          runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]),
+        async () => stopProcess(main.handle),
+      ]),
       async () => stopProcess(worker),
       ...mainConfigurations.map(
         (configuration) => async () => rm(configuration.endpoint, { force: true }),

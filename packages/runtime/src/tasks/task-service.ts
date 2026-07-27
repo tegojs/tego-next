@@ -204,6 +204,8 @@ export class TaskService implements RuntimeTaskLifecycle {
     }
     this.#authority = authority === undefined ? undefined : structuredClone(authority);
     if (authority === undefined) return;
+    await this.recover();
+    this.#assertAuthority(authority);
     const pending = [...this.#records.values()]
       .map((entry) => entry.record)
       .filter((record) => record.state !== "terminal");

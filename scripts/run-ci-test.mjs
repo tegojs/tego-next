@@ -29,12 +29,16 @@ export function parseReporterArguments(args) {
   let name;
   let artifacts;
   let timeoutMs = defaultTimeoutMs;
+  let readyPattern;
+  let startupTimeoutMs = defaultTimeoutMs;
   for (let index = 0; index < options.length; index += 2) {
     const option = options[index];
     const value = options[index + 1];
     if (option === "--name") name = value;
     else if (option === "--artifacts") artifacts = value;
     else if (option === "--timeout-ms") timeoutMs = Number(value);
+    else if (option === "--ready-pattern") readyPattern = value;
+    else if (option === "--startup-timeout-ms") startupTimeoutMs = Number(value);
     else throw new Error(`Unknown reporter option: ${option ?? ""}`);
   }
   if (
@@ -42,13 +46,23 @@ export function parseReporterArguments(args) {
     !artifacts ||
     command.length === 0 ||
     !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs <= 0
+    timeoutMs <= 0 ||
+    !Number.isSafeInteger(startupTimeoutMs) ||
+    startupTimeoutMs <= 0 ||
+    (readyPattern !== undefined && readyPattern.length === 0)
   ) {
     throw new Error(
       "Usage: run-ci-test.mjs --name <name> --artifacts <directory> [--timeout-ms <milliseconds>] -- <command> [args...]",
     );
   }
-  return { name, artifacts, timeoutMs, command: command[0], args: command.slice(1) };
+  return {
+    name,
+    artifacts,
+    timeoutMs,
+    command: command[0],
+    args: command.slice(1),
+    ...(readyPattern === undefined ? {} : { readyPattern, startupTimeoutMs }),
+  };
 }
 
 function wait(milliseconds) {
@@ -114,6 +128,7 @@ async function signalProcessTree(child, signal, platform, windowsTreeStrategy) {
     return true;
   } catch (error) {
     if (error?.code === "ESRCH") return true;
+    if (error?.code === "EPERM") return false;
     throw error;
   }
 }
@@ -143,12 +158,15 @@ export async function runManagedProcessTree({
   env = process.env,
   onStdout = () => {},
   onStderr = () => {},
+  readyPattern,
+  startupTimeoutMs = defaultTimeoutMs,
   platform = process.platform,
   windowsTreeStrategy = createWindowsTreeStrategy(),
 }) {
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
   let timedOut = false;
+  let startupTimedOut = false;
   let terminationSignal = null;
   let processTreeTerminated = false;
   let cleanupError;
@@ -160,7 +178,17 @@ export async function runManagedProcessTree({
     detached: platform !== "win32",
     windowsHide: true,
   });
-  child.stdout.on("data", onStdout);
+  let readinessBuffer = "";
+  const ready = Promise.withResolvers();
+  if (readyPattern === undefined) ready.resolve();
+  child.stdout.on("data", (chunk) => {
+    onStdout(chunk);
+    if (readyPattern === undefined) return;
+    readinessBuffer = `${readinessBuffer}${String(chunk)}`.slice(
+      -Math.max(4_096, readyPattern.length),
+    );
+    if (readinessBuffer.includes(readyPattern)) ready.resolve();
+  });
   child.stderr.on("data", onStderr);
   const closed = new Promise((resolveClose) => {
     child.once("error", (error) => {
@@ -172,7 +200,26 @@ export async function runManagedProcessTree({
     });
   });
 
-  const initial = await settleWithin(closed, timeoutMs);
+  let initial;
+  if (readyPattern === undefined) {
+    initial = await settleWithin(closed, timeoutMs);
+  } else {
+    const startup = await settleWithin(
+      Promise.race([
+        ready.promise.then(() => ({ kind: "ready" })),
+        closed.then((value) => ({ kind: "closed", value })),
+      ]),
+      startupTimeoutMs,
+    );
+    if (!startup.settled) {
+      startupTimedOut = true;
+      initial = { settled: false };
+    } else if (startup.value.kind === "closed") {
+      initial = { settled: true, value: startup.value.value };
+    } else {
+      initial = await settleWithin(closed, timeoutMs);
+    }
+  }
   let closeResult;
   if (initial.settled) {
     closeResult = initial.value;
@@ -262,6 +309,7 @@ export async function runManagedProcessTree({
     finishedAt: new Date(finishedAtMs).toISOString(),
     durationMs: finishedAtMs - startedAtMs,
     timedOut,
+    startupTimedOut,
     timeoutMs,
     terminationSignal,
     childPid: child.pid ?? null,
@@ -285,6 +333,8 @@ export async function runReportedCommand({
   timeoutMs = defaultTimeoutMs,
   command,
   args,
+  readyPattern,
+  startupTimeoutMs,
 }) {
   mkdirSync(artifacts, { recursive: true });
   const resultPath = join(artifacts, `${name}-result.json`);
@@ -301,6 +351,7 @@ export async function runReportedCommand({
     timeoutMs,
     command: actualCommand,
     args: actualArgs,
+    ...(readyPattern === undefined ? {} : { readyPattern, startupTimeoutMs }),
     onStdout: (chunk) => {
       process.stdout.write(chunk);
       appendFileSync(logPath, chunk);

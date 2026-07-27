@@ -790,6 +790,18 @@ export class WorkerRuntime {
         });
         return;
       }
+      if (existing.state !== "active") {
+        await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+          ok: false,
+          target: activation.target,
+          bindingFingerprint: activation.bindingFingerprint,
+          error: {
+            code: "LIFECYCLE_COMPONENT_NOT_ACTIVE",
+            message: "A draining component activation cannot be promoted back to active",
+          },
+        });
+        return;
+      }
       await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
         ok: true,
         target: activation.target,
@@ -1559,6 +1571,45 @@ export class WorkerRuntime {
   }
 
   async #inventory(session: RemoteSession, message: RemoteSessionMessage): Promise<void> {
+    const payload = asObject(message.payload, REMOTE_INVENTORY);
+    if (
+      !Array.isArray(payload.activations) ||
+      payload.activations.length > this.#maxComponentActivations
+    ) {
+      await this.#inventoryError(
+        session,
+        message.messageId,
+        "Worker reconnect component activation inventory is invalid",
+      );
+      return;
+    }
+    for (const value of payload.activations) {
+      const activation = parseRemoteComponentActivation(value);
+      const key = this.#activationKey(activation.target);
+      const existing = this.#activations.get(key);
+      if (existing !== undefined) {
+        if (
+          existing.state !== "active" ||
+          existing.activation.bindingFingerprint !== activation.bindingFingerprint ||
+          !this.#sameTarget(existing.activation.target, activation.target)
+        ) {
+          throw new Error("Worker reconnect component activation conflicts with retained state");
+        }
+        continue;
+      }
+      if (
+        activation.target.executor.type !== "remote" ||
+        activation.target.executor.workerId !== this.#workerId
+      ) {
+        throw new Error("Worker reconnect component activation target is invalid");
+      }
+      if (this.#activations.size >= this.#maxComponentActivations) {
+        throw new Error("Worker reconnect component activation capacity is exhausted");
+      }
+      await this.#validateActivation?.(cloneJson(activation));
+      await this.#activateComponentCallback?.(cloneJson(activation));
+      this.#activations.set(key, { activation: cloneJson(activation), state: "active" });
+    }
     const attempts = [...this.#attempts.values()];
     const buffered = this.#results.list();
     if (attempts.length + buffered.length > this.#maxInventoryItems) {

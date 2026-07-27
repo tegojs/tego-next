@@ -13,6 +13,9 @@ import {
   type OperationId,
   type Permission,
   type PluginId,
+  type RuntimeDiagnostic,
+  type StateKey,
+  type StateStore,
   parseCapabilityName,
   parseComponentId,
   parseOperationId,
@@ -77,6 +80,7 @@ export interface CapabilityRoute extends JsonObject {
 }
 
 export interface CapabilityRouterOptions {
+  readonly state: StateStore;
   readonly resolve: (
     consumer: ComponentInstanceIdentity,
     call: RoutedCapabilityInvocation,
@@ -94,6 +98,14 @@ interface InvocationEntry {
   readonly fingerprint: string;
   readonly result: Promise<JsonValue>;
   settled: boolean;
+}
+
+interface DurableInvocationRecord extends JsonObject {
+  readonly operationId: OperationId;
+  readonly fingerprint: string;
+  readonly status: "completed" | "executing" | "failed";
+  readonly result?: JsonValue;
+  readonly diagnostic?: RuntimeDiagnostic;
 }
 
 interface SchemaEntry {
@@ -171,6 +183,15 @@ function invocationKey(consumer: ComponentInstanceIdentity, invocationId: Operat
     bindingFingerprint: consumer.bindingFingerprint,
     invocationId,
   });
+}
+
+function durableInvocationKey(key: string): StateKey<DurableInvocationRecord> {
+  const operationId = parseOperationId(`capability-${fingerprint(key)}`);
+  return {
+    namespace: "tego",
+    collection: "capability-invocations",
+    id: operationId,
+  };
 }
 
 function normalizeCall(input: RoutedCapabilityInvocation): RoutedCapabilityInvocation {
@@ -256,7 +277,9 @@ export class CapabilityRouter {
     }
     const entry: InvocationEntry = {
       fingerprint: callFingerprint,
-      result: Promise.resolve().then(async () => this.#execute(consumer, call)),
+      result: Promise.resolve().then(async () =>
+        this.#executeDurable(consumer, call, key, callFingerprint),
+      ),
       settled: false,
     };
     this.#invocations.set(key, entry);
@@ -342,6 +365,100 @@ export class CapabilityRouter {
       );
     }
     return serializeWireValue(decision.value);
+  }
+
+  async #executeDurable(
+    consumer: ComponentInstanceIdentity,
+    call: RoutedCapabilityInvocation,
+    invocationIdentity: string,
+    callFingerprint: string,
+  ): Promise<JsonValue> {
+    const key = durableInvocationKey(invocationIdentity);
+    const admission = await this.#options.state.transact({}, async (transaction) => {
+      const existing = await transaction.get(key);
+      if (existing !== undefined) {
+        if (existing.value.fingerprint !== callFingerprint) {
+          throw error(
+            "PROTOCOL_IDEMPOTENCY_CONFLICT",
+            "Capability invocation identity was reused with a different fingerprint",
+          );
+        }
+        return { claimed: false, record: existing.value };
+      }
+      const record: DurableInvocationRecord = {
+        operationId: parseOperationId(key.id),
+        fingerprint: callFingerprint,
+        status: "executing",
+      };
+      await transaction.put(key, record, { expectedRevision: "absent" });
+      return { claimed: true, record };
+    });
+    const admitted = admission.record;
+    if (admitted.status === "completed") {
+      return serializeWireValue(admitted.result);
+    }
+    if (admitted.status === "failed") {
+      if (admitted.diagnostic === undefined) {
+        throw error(
+          "CAPABILITY_INVOCATION_INDETERMINATE",
+          "Durable capability failure evidence is incomplete",
+        );
+      }
+      throw new DiagnosticError(admitted.diagnostic);
+    }
+    if (!admission.claimed) {
+      throw error(
+        "CAPABILITY_INVOCATION_INDETERMINATE",
+        "Capability invocation is already executing under another runtime authority",
+      );
+    }
+    try {
+      const result = await this.#execute(consumer, call);
+      await this.#completeInvocation(key, callFingerprint, {
+        operationId: admitted.operationId,
+        fingerprint: callFingerprint,
+        status: "completed",
+        result,
+      });
+      return result;
+    } catch (cause) {
+      const diagnostic =
+        cause instanceof DiagnosticError
+          ? cause.diagnostic
+          : runtimeDiagnostic({
+              code: "CAPABILITY_INVOCATION_FAILED",
+              message: cause instanceof Error ? cause.message : "Capability invocation failed",
+              source: { kind: "runtime", id: "capability-router" },
+            });
+      await this.#completeInvocation(key, callFingerprint, {
+        operationId: admitted.operationId,
+        fingerprint: callFingerprint,
+        status: "failed",
+        diagnostic,
+      });
+      throw new DiagnosticError(diagnostic);
+    }
+  }
+
+  async #completeInvocation(
+    key: StateKey<DurableInvocationRecord>,
+    callFingerprint: string,
+    terminal: DurableInvocationRecord,
+  ): Promise<void> {
+    await this.#options.state.transact({}, async (transaction) => {
+      const current = await transaction.get(key);
+      if (current === undefined || current.value.fingerprint !== callFingerprint) {
+        throw error(
+          "PROTOCOL_IDEMPOTENCY_CONFLICT",
+          "Durable capability invocation identity changed before completion",
+        );
+      }
+      if (current.value.status !== "executing") {
+        return null;
+      }
+      await transaction.put(key, terminal, { expectedRevision: current.revision });
+      return null;
+    });
   }
 
   #schemaGate(provision: CapabilityProvisionRoute): CapabilitySchemaGate {

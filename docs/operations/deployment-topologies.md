@@ -106,6 +106,10 @@ Changing desired deployment state increments its generation. SQLite revisions,
 operation IDs, and stable component instance IDs make restart reconciliation
 idempotent.
 
+`single-main` accepts only local coordination, state, and artifact drivers.
+Supplying PostgreSQL in this mode is rejected before drivers open; PostgreSQL is
+reserved for the `multi-main` topology below.
+
 ## Multi-Main with PostgreSQL
 
 ### Topology and shared state

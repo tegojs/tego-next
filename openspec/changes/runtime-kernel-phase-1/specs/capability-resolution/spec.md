@@ -68,8 +68,20 @@ The runtime SHALL apply each consumer requirement's declared `degrade`, `suspend
 - **THEN** its prior activation remains `stopped` and the deployment observation remains `failed` until a higher desired generation is persisted
 
 ### Requirement: Runtime-owned capability invocation
-The runtime SHALL authorize a capability call against the consumer's permission grant and durable binding, resolve the exact ready provider deployment, activation, provision, component, and method, validate the request before provider code runs, dispatch to the phase-one task component's capability invocation handler through an internal exact-target execution using the provider's immutable execution binding, and validate the response before returning it. Main SHALL send an exact immutable activation binding before a remote component becomes ready and SHALL mediate remote consumer and provider calls; a Worker SHALL NOT resolve providers or grant permissions locally.
+The runtime SHALL authorize a capability call against the consumer's permission grant and durable binding, resolve the exact ready provider deployment, activation, provision, component, and method, validate the request before provider code runs, dispatch to the phase-one task component's capability invocation handler through an internal exact-target execution using the provider's immutable execution binding, and validate the response before returning it. The exact consumer identity and caller invocation ID SHALL derive one durable invocation operation identity that persists the canonical fingerprint and terminal or indeterminate evidence across memory eviction, Main restart, and authority transfer. Main SHALL send an exact immutable activation binding before a remote component becomes ready and SHALL mediate remote consumer and provider calls; a Worker SHALL NOT resolve providers or grant permissions locally.
 
 #### Scenario: Capability calls route to the exact ready provider and validate request/response schemas
 - **WHEN** an authorized consumer invokes a declared capability method through a durable binding whose exact provider activation is ready
 - **THEN** the runtime validates the request, dispatches only to that provider component and activation with its immutable execution binding, validates the response, and rejects any changed, unavailable, or schema-invalid target
+
+#### Scenario: Capability invocation replays after Main restart
+- **WHEN** the same exact consumer repeats a completed invocation ID and canonical payload after memory eviction or Main restart
+- **THEN** the runtime returns the durable terminal result without executing provider code again
+
+#### Scenario: Capability invocation is uncertain across an executing restart
+- **WHEN** a replacement Main observes durable executing evidence without a terminal result for the same invocation ID and fingerprint
+- **THEN** it reports the invocation as indeterminate and does not execute provider code again
+
+#### Scenario: Capability invocation identity cannot equivocate
+- **WHEN** the same exact consumer reuses an invocation ID with a different canonical payload
+- **THEN** the runtime rejects it as an idempotency conflict before provider dispatch

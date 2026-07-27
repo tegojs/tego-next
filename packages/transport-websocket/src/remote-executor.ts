@@ -394,6 +394,14 @@ export class RemoteExecutor implements Executor {
     this.#lifecycleManaged = true;
     const key = this.#activationKey(activation.target);
     const existing = this.#componentActivations.get(key);
+    if (existing?.state === "draining") {
+      throw remoteError(
+        "LIFECYCLE_COMPONENT_NOT_ACTIVE",
+        "A draining component activation cannot be promoted back to active",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     if (
       existing !== undefined &&
       existing.activation.bindingFingerprint !== activation.bindingFingerprint
@@ -1510,9 +1518,24 @@ export class RemoteExecutor implements Executor {
   }
 
   async #reconcile(session: RemoteSession): Promise<boolean> {
+    const activations = [...this.#componentActivations.values()]
+      .filter((entry) => entry.state === "active")
+      .map((entry) => cloneJson(entry.activation));
+    if (
+      activations.length > this.#maxInventoryItems ||
+      jsonBytes(activations) > this.#maxInventoryBytes
+    ) {
+      throw remoteError(
+        "EXECUTOR_REMOTE_INVENTORY_EXHAUSTED",
+        "Remote component activation inventory exceeds reconciliation limits",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
     const response = await session.request(REMOTE_INVENTORY, {
       workerId: this.#workerId,
       epoch: session.epoch,
+      activations,
     });
     if (this.#session !== session) throw new Error("Remote session changed during reconciliation");
     const payload = asObject(response.payload, REMOTE_INVENTORY);

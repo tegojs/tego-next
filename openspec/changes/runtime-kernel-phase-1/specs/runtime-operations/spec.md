@@ -48,7 +48,7 @@ The repository SHALL pin Node.js, package-manager, TypeScript, dependency lockfi
 - **THEN** one documented verification command installs from the lockfile, checks formatting and types, runs tests, builds packages, and runs the echo-plugin smoke test
 
 ### Requirement: CI-authoritative system acceptance
-GitHub Actions SHALL be the authoritative phase-one acceptance environment and SHALL execute real process-level single-Main and multi-Main system tests. Its required quality, PostgreSQL integration, system-E2E, and deterministic package-reproducibility gates SHALL be structurally validated as active, ordered, bounded steps and SHALL fail acceptance if disabled, moved outside the required job, commented out, or configured to continue on error.
+GitHub Actions SHALL be the authoritative phase-one acceptance environment and SHALL execute real process-level single-Main and multi-Main system tests. The CI workflow SHALL run automatically for pull requests targeting `main` and pushes to `main`, while retaining manual dispatch. Its required quality, PostgreSQL integration, system-E2E, and deterministic package-reproducibility gates SHALL be structurally validated as active, ordered, bounded steps and SHALL fail acceptance if disabled, moved outside the required job, commented out, or configured to continue on error.
 
 #### Scenario: Real single-Main executor parity
 - **WHEN** CI starts one Main and an independent Worker process, connects them through a real WebSocket socket, and deploys the echo plugin

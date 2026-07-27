@@ -393,6 +393,8 @@ export class WorkerSession {
   readonly #receivedReplayOrder: RetainedReplay[] = [];
   readonly #pendingBinary = new Map<string, PendingBinary>();
   readonly #pendingRequests = new Map<string, PendingRequest>();
+  readonly #issuedRequestIds = new Set<string>();
+  readonly #issuedRequestOrder: string[] = [];
   #state: WorkerSessionState = "authenticating";
   #available = false;
   #acceptingAssignments = false;
@@ -585,6 +587,7 @@ export class WorkerSession {
       reject: response.reject,
       timeout,
     });
+    this.#retainIssuedRequest(messageId);
     const timeoutMs = positiveDuration(options.timeoutMs, this.#requestTimeoutMs, "timeoutMs");
     void this.#clock
       .sleep(timeoutMs, timeout.signal)
@@ -592,6 +595,7 @@ export class WorkerSession {
         const pending = this.#pendingRequests.get(messageId);
         if (pending === undefined) return;
         this.#pendingRequests.delete(messageId);
+        this.#pruneIssuedRequests();
         pending.reject(
           diagnosticError(
             "WORKER_REQUEST_TIMEOUT",
@@ -604,6 +608,7 @@ export class WorkerSession {
       this.#sendEnvelope(type, payload, options, messageId);
     } catch (error) {
       this.#pendingRequests.delete(messageId);
+      this.#issuedRequestIds.delete(messageId);
       timeout.abort();
       response.reject(error);
       throw error;
@@ -843,15 +848,22 @@ export class WorkerSession {
       payload: envelope.payload,
       ...(binary === undefined ? {} : { binary }),
     };
-    const request =
-      envelope.correlationId === envelope.messageId
-        ? undefined
-        : this.#pendingRequests.get(envelope.correlationId);
-    if (request !== undefined) {
-      this.#pendingRequests.delete(envelope.correlationId);
-      request.timeout.abort();
-      request.resolve(message);
-      return;
+    if (envelope.correlationId !== envelope.messageId) {
+      const request = this.#pendingRequests.get(envelope.correlationId);
+      if (request !== undefined) {
+        this.#pendingRequests.delete(envelope.correlationId);
+        this.#pruneIssuedRequests();
+        request.timeout.abort();
+        request.resolve(message);
+        return;
+      }
+      if (this.#issuedRequestIds.has(envelope.correlationId)) {
+        return;
+      }
+      throw diagnosticError(
+        "PROTOCOL_MESSAGE_INVALID",
+        "Worker response correlation does not identify an issued request",
+      );
     }
     if (this.#listeners.size === 0 || this.#flushingPendingMessages) {
       const bytes = this.#applicationMessageBytes(message);
@@ -1248,6 +1260,27 @@ export class WorkerSession {
     }
   }
 
+  #retainIssuedRequest(messageId: string): void {
+    this.#issuedRequestIds.add(messageId);
+    this.#issuedRequestOrder.push(messageId);
+    this.#pruneIssuedRequests();
+  }
+
+  #pruneIssuedRequests(): void {
+    const retention = this.#codec.limits.replayRetention + this.#codec.limits.maxInflightMessages;
+    while (this.#issuedRequestIds.size > retention) {
+      const removed = this.#issuedRequestOrder.shift();
+      if (removed === undefined) {
+        return;
+      }
+      if (this.#pendingRequests.has(removed)) {
+        this.#issuedRequestOrder.push(removed);
+        continue;
+      }
+      this.#issuedRequestIds.delete(removed);
+    }
+  }
+
   #fail(error: DiagnosticError): void {
     if (this.#state === "closed" || this.#state === "unavailable") {
       return;
@@ -1291,6 +1324,8 @@ export class WorkerSession {
       request.reject(error);
     }
     this.#pendingRequests.clear();
+    this.#issuedRequestIds.clear();
+    this.#issuedRequestOrder.length = 0;
     this.#pendingBinary.clear();
     this.#pendingBinaryBytes = 0;
   }

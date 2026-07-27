@@ -106,6 +106,57 @@ test("component activation is acknowledged only after Worker validation", async 
   assert.equal((await (await remote.submit(request)).result).status, "succeeded");
 });
 
+test("replacement Worker materializes active components before accepting assignments", async () => {
+  const request = executionRequest({ mode: "echo", value: "recovered" }, "replacement");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const firstLocal = new TestLocalExecutor();
+  const firstMaterialized: RemoteComponentActivation[] = [];
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  const firstRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => firstLocal,
+    activateComponent: (activation) => {
+      firstMaterialized.push(activation);
+    },
+  });
+  await firstRuntime.attach(firstWorker);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await remote.attach(firstMain);
+  await remote.activateComponent(activationFor(request));
+  assert.equal(firstMaterialized.length, 1);
+  await firstRuntime.close();
+
+  const replacementLocal = new TestLocalExecutor();
+  const replacementMaterialized: RemoteComponentActivation[] = [];
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  const replacementRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => replacementLocal,
+    activateComponent: (activation) => {
+      replacementMaterialized.push(activation);
+    },
+  });
+  await replacementRuntime.attach(replacementWorker);
+  await remote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([remote.close(), replacementRuntime.close()]);
+  });
+
+  assert.deepEqual(replacementMaterialized, [activationFor(request)]);
+  assert.equal((await (await remote.submit(request)).result).status, "succeeded");
+  assert.equal(replacementLocal.executions, 1);
+});
+
 test("Worker rejects assignment until the exact target and binding fingerprint are activated", async () => {
   const { local, remote } = await connected();
   const request = executionRequest({ mode: "echo", value: "not-ready" }, "not-ready");
@@ -338,4 +389,36 @@ test("failed drain callback retains a non-accepting activation for safe retry", 
   fail = false;
   await remote.drainComponent(request.target);
   assert.equal(calls, 2);
+});
+
+test("a draining activation cannot be promoted by replay after a higher session epoch", async () => {
+  const request = executionRequest(null, "draining-replay");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const { remote } = await connected({
+    drainComponent: () => {
+      throw new Error("drain failed");
+    },
+  });
+  await remote.activateComponent(activationFor(request));
+  await assert.rejects(remote.drainComponent(request.target), /drain/iu);
+
+  const replacementMaterialized: RemoteComponentActivation[] = [];
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  const replacementRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    activateComponent: (activation) => {
+      replacementMaterialized.push(activation);
+    },
+  });
+  await replacementRuntime.attach(replacementWorker);
+  await remote.attach(replacementMain);
+  cleanups.push(async () => replacementRuntime.close());
+
+  await assert.rejects(remote.activateComponent(activationFor(request)), /drain|active/iu);
+  assert.deepEqual(replacementMaterialized, []);
+  await assert.rejects(remote.submit(request), /drain|active/iu);
 });

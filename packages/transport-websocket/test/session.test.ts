@@ -826,7 +826,7 @@ test("request correlation is installed before a synchronous transport can respon
   }
 });
 
-test("self-correlated one-way and unrelated messages cannot resolve a pending request", async () => {
+test("self-correlated one-way and late responses cannot resolve a pending request", async () => {
   const connection = await directConnection();
   try {
     await connection.mainSession.send("session.reconcile", { oneWay: true });
@@ -887,8 +887,24 @@ test("self-correlated one-way and unrelated messages cannot resolve a pending re
     );
     assert.deepEqual(
       received.map((message) => message.payload),
-      [{ selfCorrelated: true }, { unrelated: true }, { late: true }],
+      [{ selfCorrelated: true }, { unrelated: true }],
     );
+    assert.equal(connection.mainSession.state, "ready");
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("an unknown response correlation closes the session", async () => {
+  const connection = await directConnection();
+  try {
+    await connection.workerSession.send(
+      "session.reconcile",
+      { forged: true },
+      { correlationId: "message-00000000-0000-4000-8000-000000000000" },
+    );
+    assert.equal(connection.mainSession.state, "closed");
+    assert.equal(connection.mainSession.diagnostic?.code, "PROTOCOL_MESSAGE_INVALID");
   } finally {
     await cleanup(connection);
   }

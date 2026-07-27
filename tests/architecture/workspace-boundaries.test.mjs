@@ -758,3 +758,33 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
     },
   );
 });
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-export-only-layer-two-apis", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/runtime/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.d.ts", outputDirectory),
+        [
+          "export interface WorkflowEngine {}",
+          "declare class InternalScheduler {}",
+          "export { InternalScheduler as BusinessDomainScheduler };",
+          "export interface RuntimeKernel {}",
+        ].join("\n"),
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/runtime -> [forbidden public export BusinessDomainScheduler]",
+        "@tegojs/runtime -> [forbidden public export WorkflowEngine]",
+      ]);
+    },
+  );
+});

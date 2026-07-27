@@ -79,6 +79,21 @@ test("Node Worker listener rejects blank and oversized credentials before bindin
   }
 });
 
+test("single-main rejects PostgreSQL shared storage composition", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-node-single-main-postgres-"));
+  try {
+    await assert.rejects(
+      createNodeRuntimeHost({
+        ...options(directory),
+        postgresUrl: "postgresql://unused.invalid/tego",
+      }),
+      /single-main.*PostgreSQL|PostgreSQL.*single-main/iu,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a readiness failure after Worker bind rolls the listener back", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-node-listener-rollback-"));
   const endpoint = join(directory, "control.sock");

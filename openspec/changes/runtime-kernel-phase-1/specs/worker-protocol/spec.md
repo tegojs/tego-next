@@ -42,7 +42,7 @@ The Worker SHALL register labels, resources, executors, and prepared artifacts a
 - **THEN** the Main marks it unavailable and stops assigning new tasks
 
 ### Requirement: Reconnect reconciliation
-The protocol SHALL reconcile running attempts, buffered terminal results, and Worker attempt-persistence availability after a session reconnect. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch.
+The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and Main-authoritative active component bindings after a session reconnect. Active bindings SHALL be validated and materialized on a replacement Worker runtime before Main accepts assignments. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active.
 
 #### Scenario: Result completes while disconnected
 - **WHEN** a task using `finish-and-buffer` completes after its session disconnects
@@ -55,6 +55,14 @@ The protocol SHALL reconcile running attempts, buffered terminal results, and Wo
 #### Scenario: Recovered Worker runtime reconnects
 - **WHEN** a higher-epoch Worker reconciliation explicitly reports attempt persistence available
 - **THEN** Main may clear the prior persistence latch and advertise the remote executor as available
+
+#### Scenario: Replacement Worker restores exact active component bindings
+- **WHEN** a replacement Worker runtime reconnects while Main retains exact active component bindings for that Worker
+- **THEN** reconciliation validates and materializes those bindings before Main accepts assignments for them
+
+#### Scenario: Draining component replay cannot become active
+- **WHEN** a higher-epoch session encounters a retained draining activation or Main retries that same activation
+- **THEN** the Worker rejects the replay and Main does not publish the component as active
 
 ### Requirement: Orphan policy
 The runtime SHALL apply `cancel`, `finish-and-buffer`, or `finish-and-persist` when a Worker loses its Main session.

@@ -31,6 +31,51 @@ const pluginId = parsePluginId("org.example.fault");
 const componentId = parseComponentId("fault-service");
 const digest = parseArtifactDigest(`sha256:${"1".repeat(64)}`);
 
+async function runWithCleanup(run, cleanups) {
+  let result;
+  let primaryError;
+  try {
+    result = await run();
+  } catch (error) {
+    primaryError = error;
+  }
+  const cleanupErrors = [];
+  for (const cleanup of cleanups) {
+    try {
+      await cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  const errors = [...(primaryError === undefined ? [] : [primaryError]), ...cleanupErrors];
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Runtime fault test and cleanup completed with failures");
+  }
+  return result;
+}
+
+test("fault harness preserves primary and teardown failures", async () => {
+  await assert.rejects(
+    runWithCleanup(async () => {
+      throw new Error("primary failure");
+    }, [
+      async () => {
+        throw new Error("close failure");
+      },
+      async () => {},
+    ]),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.deepEqual(
+        error.errors.map((candidate) => candidate.message),
+        ["primary failure", "close failure"],
+      );
+      return true;
+    },
+  );
+});
+
 function manifest() {
   return {
     schemaVersion: "1.0",
@@ -337,11 +382,7 @@ async function withRestartableFaultStateStores(t, run) {
     const clock = new FakeClock(new Date(0));
     const store = new MemoryStateStore({ clock });
     await store.open();
-    try {
-      await run(store, clock, async () => store);
-    } finally {
-      await store.close();
-    }
+    await runWithCleanup(() => run(store, clock, async () => store), [() => store.close()]);
   });
   await t.test("SqliteStateStore", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tego-runtime-fault-restart-"));
@@ -349,17 +390,16 @@ async function withRestartableFaultStateStores(t, run) {
     const clock = new FakeClock(new Date(0));
     let store = new SqliteStateStore({ clock, databasePath });
     await store.open();
-    try {
-      await run(store, clock, async () => {
-        await store.close();
-        store = new SqliteStateStore({ clock, databasePath });
-        await store.open();
-        return store;
-      });
-    } finally {
-      await store.close().catch(() => undefined);
-      await rm(directory, { recursive: true, force: true });
-    }
+    await runWithCleanup(
+      () =>
+        run(store, clock, async () => {
+          await store.close();
+          store = new SqliteStateStore({ clock, databasePath });
+          await store.open();
+          return store;
+        }),
+      [() => store.close(), () => rm(directory, { recursive: true, force: true })],
+    );
   });
 }
 
@@ -668,7 +708,7 @@ test("@spec:worker-protocol/durable-worker-attempts/restart-terminal-replay-faul
   let secondRemote;
   let firstSession;
   let secondSession;
-  try {
+  await runWithCleanup(async () => {
     await state.open();
     firstRemote = new RemoteExecutor({
       id: "fault-remote",
@@ -722,14 +762,14 @@ test("@spec:worker-protocol/durable-worker-attempts/restart-terminal-replay-faul
     );
     assert.equal(terminal.length, 1);
     assert.deepEqual(terminal[0].result, result);
-  } finally {
-    await secondRemote?.close();
-    await firstRemote?.close();
-    secondSession?.close();
-    firstSession?.close();
-    await state.close().catch(() => undefined);
-    await rm(directory, { recursive: true, force: true });
-  }
+  }, [
+    async () => secondRemote?.close(),
+    async () => firstRemote?.close(),
+    async () => secondSession?.close(),
+    async () => firstSession?.close(),
+    () => state.close(),
+    () => rm(directory, { recursive: true, force: true }),
+  ]);
 });
 
 test("@spec:worker-protocol/durable-worker-attempts/duplicate-terminal-result-fault", async () => {

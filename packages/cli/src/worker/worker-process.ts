@@ -672,11 +672,22 @@ export async function runWorkerProcess(
       });
       await waitForAbort(options.signal);
     } else {
-      const url = new URL(command.url);
+      const urls = [
+        new URL(command.url),
+        ...(command.fallbackUrls ?? []).map((candidate) => new URL(candidate)),
+      ];
+      if (urls.length > 16) {
+        throw new RangeError("Worker connect URL count cannot exceed 16");
+      }
+      if (new Set(urls.map((candidate) => candidate.href)).size !== urls.length) {
+        throw new TypeError("Worker connect URLs must be unique");
+      }
+      let urlIndex = 0;
       let retryAttempt = 0;
       let readinessEmitted = false;
       for (;;) {
         if (hasAborted(options.signal)) break;
+        const url = urls[urlIndex % urls.length] as URL;
         let retryableAttachRace = false;
         try {
           session = await connectWorker({
@@ -711,11 +722,13 @@ export async function runWorkerProcess(
           await session.close();
           session = undefined;
           if (outcome === "aborted") break;
+          urlIndex = (urlIndex + 1) % urls.length;
         } catch (error) {
           await session?.close().catch(() => undefined);
           session = undefined;
           if (hasAborted(options.signal)) break;
           if (!retryableAttachRace && !isRetryableNetworkError(error)) throw error;
+          urlIndex = (urlIndex + 1) % urls.length;
         }
         if (!(await waitForReconnect(drivers, reconnectDelay(retryAttempt), options.signal))) {
           break;

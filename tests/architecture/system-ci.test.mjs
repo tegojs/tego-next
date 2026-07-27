@@ -276,6 +276,42 @@ test("CI workflow validation rejects every disabled, soft-fail, misplaced, no-op
   }
 });
 
+test("CI workflow validation requires automatic pull-request and main push triggers", async () => {
+  const workflow = await readFile(workflowPath, "utf8");
+  const { validateReleasePreflight } = await import(
+    new URL(`../../scripts/verify-release.mjs?trigger-mutations=${Date.now()}`, import.meta.url)
+  );
+  const base = {
+    gitStatus: "",
+    nodeVersion: "v26.5.0",
+    npmVersion: "11.13.0",
+    postgresUrl: "postgresql://localhost/tego",
+  };
+  const triggerBlock = [
+    "on:",
+    "  pull_request:",
+    "    branches: [main]",
+    "  push:",
+    "    branches: [main]",
+    "  workflow_dispatch:",
+  ].join("\n");
+  const mutations = [
+    workflow.replace(triggerBlock, "on:\n  workflow_dispatch:"),
+    workflow.replace("    branches: [main]", "    branches: [release]", 1),
+    workflow.replace("  push:\n    branches: [main]\n", ""),
+    workflow.replace("  pull_request:\n    branches: [main]\n", ""),
+  ];
+
+  for (const mutation of mutations) {
+    assert.notEqual(mutation, workflow);
+    const diagnostics = validateReleasePreflight({ ...base, workflow: mutation });
+    assert.equal(
+      diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+      true,
+    );
+  }
+});
+
 test("CI workflow validation requires the deterministic package step after build", async () => {
   const workflow = await readFile(workflowPath, "utf8");
   const { validateReleasePreflight } = await import(
@@ -485,6 +521,10 @@ test("CI reporter times out and terminates a child before writing final metadata
         directory,
         "--timeout-ms",
         "200",
+        "--ready-pattern",
+        "child-pid:",
+        "--startup-timeout-ms",
+        "2000",
         "--",
         process.execPath,
         "-e",
@@ -553,6 +593,10 @@ test("CI reporter reaps a timed-out child and grandchild before final metadata",
         directory,
         "--timeout-ms",
         "200",
+        "--ready-pattern",
+        "spawned-grandchild-pid:",
+        "--startup-timeout-ms",
+        "2000",
         "--",
         process.execPath,
         "--input-type=commonjs",
@@ -734,6 +778,35 @@ test("managed runner never targets a closed Windows leader without stable tree o
   assert.equal(metadata.exitCode, 125);
   assert.equal(metadata.processTreeTerminated, false);
   assert.match(metadata.error, /stable Windows process-tree ownership.*closed PID/iu);
+});
+
+test("managed runner converts POSIX signaling permission failures into fail-closed metadata", async () => {
+  const { runManagedProcessTree } = await import(
+    new URL(`../../scripts/run-ci-test.mjs?posix-eperm=${Date.now()}`, import.meta.url)
+  );
+  const originalKill = process.kill;
+  process.kill = () => {
+    const denied = new Error("operation not permitted");
+    denied.code = "EPERM";
+    throw denied;
+  };
+  try {
+    const metadata = await runManagedProcessTree({
+      name: "posix-eperm",
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      timeoutMs: 1_000,
+      platform: "linux",
+    });
+
+    assert.equal(metadata.timedOut, false);
+    assert.equal(metadata.childExitCode, 0);
+    assert.equal(metadata.exitCode, 125);
+    assert.equal(metadata.processTreeTerminated, false);
+    assert.match(metadata.error, /process tree did not terminate/iu);
+  } finally {
+    process.kill = originalKill;
+  }
 });
 
 test("release verification bounds stages and reports deterministic process metadata", async () => {

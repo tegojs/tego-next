@@ -7,6 +7,10 @@ The kernel SHALL bootstrap from explicit mode, identity, and runtime-driver conf
 - **WHEN** a caller bootstraps a valid `single-main` runtime with local drivers
 - **THEN** the runtime reaches `running` and exposes its identity, mode, driver health, and readiness
 
+#### Scenario: Reject shared drivers in single-Main
+- **WHEN** a caller bootstraps `single-main` with distributed coordination, shared state, shared artifacts, or a PostgreSQL composition
+- **THEN** bootstrap fails with a structured configuration error before any driver opens
+
 #### Scenario: Reject missing distributed coordination
 - **WHEN** a caller bootstraps `multi-main` without an external coordination provider
 - **THEN** bootstrap fails with a structured configuration error before application recovery begins

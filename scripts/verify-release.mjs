@@ -262,6 +262,17 @@ export function validateWorkflowContract(workflow) {
   const quality = jobs.get("quality");
   const integration = jobs.get("integration");
   const system = jobs.get("system-e2e");
+  if (
+    !sameValue(document.on, {
+      pull_request: { branches: ["main"] },
+      push: { branches: ["main"] },
+      workflow_dispatch: null,
+    })
+  ) {
+    errors.push(
+      "workflow triggers must be exactly pull_request main, push main, and workflow_dispatch",
+    );
+  }
   if (!sameValue(document.permissions, { contents: "read" })) {
     errors.push("workflow permissions must be exactly contents: read");
   }

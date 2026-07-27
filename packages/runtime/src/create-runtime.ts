@@ -553,7 +553,44 @@ class TegoRuntime implements Runtime {
   }
 
   #assertCoordinationScope(): void {
-    if (this.#configuration.mode !== "multi-main") return;
+    if (this.#configuration.mode === "single-main") {
+      const mismatches = [
+        {
+          actual: this.#drivers.coordination.scope,
+          expected: "local",
+          code: "BOOTSTRAP_COORDINATION_NOT_LOCAL",
+          label: "coordination",
+        },
+        {
+          actual: this.#drivers.state.scope,
+          expected: "local",
+          code: "BOOTSTRAP_STATE_NOT_LOCAL",
+          label: "state",
+        },
+        {
+          actual: this.#drivers.artifacts.scope,
+          expected: "local",
+          code: "BOOTSTRAP_ARTIFACTS_NOT_LOCAL",
+          label: "artifact",
+        },
+      ] as const;
+      const mismatch = mismatches.find((candidate) => candidate.actual !== candidate.expected);
+      if (mismatch !== undefined) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: mismatch.code,
+            message: `single-main mode requires local ${mismatch.label} storage`,
+            source: { kind: "runtime", id: this.#configuration.runtimeId },
+            details: {
+              mode: this.#configuration.mode,
+              [`${mismatch.label}Scope`]: mismatch.actual,
+            },
+            observedAt: this.#drivers.clock.now().toISOString(),
+          }),
+        );
+      }
+      return;
+    }
     if (this.#drivers.coordination.scope !== "distributed") {
       throw new DiagnosticError(
         runtimeDiagnostic({

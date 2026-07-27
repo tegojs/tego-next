@@ -186,6 +186,9 @@ async function digestFile(path: string): Promise<ReturnType<typeof parseArtifact
 export async function createNodeRuntimeHost(
   options: CreateNodeRuntimeHostOptions,
 ): Promise<NodeRuntimeHost> {
+  if (options.mode === "single-main" && options.postgresUrl !== undefined) {
+    throw new TypeError("single-main mode does not support PostgreSQL shared storage");
+  }
   if (
     options.worker !== undefined &&
     (options.worker.credential.trim().length === 0 ||
@@ -640,6 +643,7 @@ export async function createNodeRuntimeHost(
       };
     });
   capabilityRouter = new CapabilityRouter({
+    state: drivers.state,
     resolve: (consumer, call) => loadCapabilityRoute(consumer, call.identity),
     revalidate: async (route) =>
       (await loadCapabilityRoute(route.consumer, route.provision.identity)).routeRevision ===

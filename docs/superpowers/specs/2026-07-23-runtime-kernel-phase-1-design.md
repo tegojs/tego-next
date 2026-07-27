@@ -544,7 +544,13 @@ memory/disk buffers for `finish-and-buffer`. Reconnect reports:
 - acknowledged but not started attempts;
 - terminal results awaiting Main acknowledgement;
 - prepared artifact digests;
+- Main-authoritative exact active component bindings that a replacement Worker
+  validates and materializes before assignment admission;
 - whether the Worker attempt-state persistence boundary is currently available.
+
+A retained `draining` activation is never promoted by replay. Reconciliation
+fails closed until teardown is retried or a later durable lifecycle decision
+creates a new activation.
 
 The Main never creates a replacement attempt until the current attempt is
 resolved or retry policy explicitly advances to a new attempt ID.
