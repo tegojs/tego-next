@@ -1,25 +1,25 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  type ArtifactDigest,
+  type Clock,
   DiagnosticError,
+  type ExecutorKind,
+  type FencingEpoch,
+  type JsonObject,
+  type JsonValue,
   parseArtifactDigest,
   parseFencingEpoch,
   parseMessageId,
   parseSequence,
   parseSessionId,
   parseWorkerId,
-  runtimeDiagnostic,
-  serializeWireValue,
-  type ArtifactDigest,
-  type Clock,
-  type ExecutorKind,
-  type FencingEpoch,
-  type JsonObject,
-  type JsonValue,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type SessionId,
+  serializeWireValue,
+  type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-  type WorkerId,
 } from "@tegojs/contracts";
 import {
   createAuthenticationNonce,
@@ -44,7 +44,7 @@ export interface WorkerRegistration extends JsonObject {
 
 export interface WorkerSessionMessage {
   readonly messageId: string;
-  readonly correlationId?: string;
+  readonly correlationId: string;
   readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
@@ -72,6 +72,7 @@ const RESERVED_SESSION_MESSAGE_TYPES = new Set([
   "session.ready",
   "worker.register",
 ]);
+const RETRYABLE_ENDPOINT_CLOSE_REASONS = new Set(["COORDINATION_NOT_LEADER"]);
 
 interface WebSocketTransport {
   readonly readyState: number;
@@ -99,6 +100,11 @@ interface PendingRequest {
   readonly resolve: (message: WorkerSessionMessage) => void;
   readonly reject: (error: unknown) => void;
   readonly timeout: AbortController;
+}
+
+interface RetainedReplay {
+  readonly messageId: string;
+  readonly fingerprint: string;
 }
 
 export interface WorkerSessionOptions {
@@ -146,6 +152,25 @@ function deferred<T>(): Deferred<T> {
     },
     settled: () => isSettled,
   };
+}
+
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  const object = value as JsonObject;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key] as JsonValue)}`)
+    .join(",")}}`;
+}
+
+function replayFingerprint(envelope: WorkerControlEnvelope): string {
+  return createHash("sha256")
+    .update("tego.worker-envelope-replay/1.0\0")
+    .update(canonicalJson(envelope))
+    .digest("hex");
 }
 
 function diagnosticError(
@@ -341,6 +366,28 @@ function closeCode(diagnostic: RuntimeDiagnostic): number {
   return diagnostic.code.startsWith("PROTOCOL_") ? 1008 : 1011;
 }
 
+function isRetryableEndpointClose(arguments_: readonly unknown[]): boolean {
+  const event = arguments_[0];
+  const code =
+    typeof event === "number"
+      ? event
+      : typeof event === "object" &&
+          event !== null &&
+          "code" in event &&
+          typeof event.code === "number"
+        ? event.code
+        : undefined;
+  const rawReason =
+    typeof event === "object" && event !== null && "reason" in event ? event.reason : arguments_[1];
+  const reason =
+    typeof rawReason === "string"
+      ? rawReason
+      : rawReason instanceof Uint8Array
+        ? new TextDecoder().decode(rawReason)
+        : undefined;
+  return code === 1011 && reason !== undefined && RETRYABLE_ENDPOINT_CLOSE_REASONS.has(reason);
+}
+
 export class WorkerSession {
   readonly ready: Promise<void>;
   readonly #readyDeferred = deferred<void>();
@@ -365,10 +412,12 @@ export class WorkerSession {
   readonly #listeners = new Set<(message: WorkerSessionMessage) => void>();
   readonly #stateListeners = new Set<(state: WorkerSessionState) => void>();
   readonly #pendingMessages: WorkerSessionMessage[] = [];
-  readonly #receivedIds = new Set<string>();
-  readonly #receivedIdOrder: string[] = [];
+  readonly #receivedFingerprints = new Map<string, string>();
+  readonly #receivedReplayOrder: RetainedReplay[] = [];
   readonly #pendingBinary = new Map<string, PendingBinary>();
   readonly #pendingRequests = new Map<string, PendingRequest>();
+  readonly #issuedRequestIds = new Set<string>();
+  readonly #issuedRequestOrder: string[] = [];
   #state: WorkerSessionState = "authenticating";
   #available = false;
   #acceptingAssignments = false;
@@ -397,8 +446,8 @@ export class WorkerSession {
   readonly #messageListener: SocketListener = (...arguments_) => {
     this.#receive(arguments_);
   };
-  readonly #closeListener: SocketListener = () => {
-    this.#transportClosed();
+  readonly #closeListener: SocketListener = (...arguments_) => {
+    this.#transportClosed(isRetryableEndpointClose(arguments_));
   };
   readonly #errorListener: SocketListener = () => {
     this.#fail(diagnosticError("WORKER_TRANSPORT_ERROR", "Worker WebSocket transport failed"));
@@ -561,6 +610,7 @@ export class WorkerSession {
       reject: response.reject,
       timeout,
     });
+    this.#retainIssuedRequest(messageId);
     const timeoutMs = positiveDuration(options.timeoutMs, this.#requestTimeoutMs, "timeoutMs");
     void this.#clock
       .sleep(timeoutMs, timeout.signal)
@@ -568,6 +618,7 @@ export class WorkerSession {
         const pending = this.#pendingRequests.get(messageId);
         if (pending === undefined) return;
         this.#pendingRequests.delete(messageId);
+        this.#pruneIssuedRequests();
         pending.reject(
           diagnosticError(
             "WORKER_REQUEST_TIMEOUT",
@@ -580,6 +631,7 @@ export class WorkerSession {
       this.#sendEnvelope(type, payload, options, messageId);
     } catch (error) {
       this.#pendingRequests.delete(messageId);
+      this.#issuedRequestIds.delete(messageId);
       timeout.abort();
       response.reject(error);
       throw error;
@@ -642,22 +694,33 @@ export class WorkerSession {
       }
     } catch (error) {
       this.#fail(
-        error instanceof DiagnosticError
+        error instanceof DiagnosticError && error.diagnostic.code !== "WORKER_ENVELOPE_INVALID"
           ? error
-          : diagnosticError("PROTOCOL_FRAME_INVALID", "Worker frame could not be processed"),
+          : diagnosticError(
+              error instanceof DiagnosticError
+                ? "PROTOCOL_MESSAGE_INVALID"
+                : "PROTOCOL_FRAME_INVALID",
+              error instanceof DiagnosticError
+                ? "Worker control message is invalid"
+                : "Worker frame could not be processed",
+            ),
       );
     }
   }
 
   #receiveControl(envelope: WorkerControlEnvelope): void {
     const sequence = BigInt(parseSequence(envelope.sequence));
+    const fingerprint = replayFingerprint(envelope);
+    const retainedFingerprint = this.#receivedFingerprints.get(envelope.messageId);
     if (sequence < this.#expectedSequence) {
-      if (this.#receivedIds.has(envelope.messageId)) {
+      if (retainedFingerprint === fingerprint) {
         return;
       }
       throw diagnosticError(
         "PROTOCOL_SEQUENCE_REPLAY",
-        "Worker message sequence was replayed with a different identity",
+        retainedFingerprint === undefined
+          ? "Worker message sequence was replayed with a different identity"
+          : "Worker message replay did not match its retained canonical content",
       );
     }
     if (sequence > this.#expectedSequence) {
@@ -669,11 +732,16 @@ export class WorkerSession {
         "Worker message sequence is not contiguous",
       );
     }
-    this.#expectedSequence += 1n;
-    if (this.#receivedIds.has(envelope.messageId)) {
-      return;
+    if (retainedFingerprint !== undefined) {
+      throw diagnosticError(
+        "PROTOCOL_SEQUENCE_REPLAY",
+        retainedFingerprint === fingerprint
+          ? "Worker message identity was replayed at a different sequence"
+          : "Worker message replay did not match its retained canonical content",
+      );
     }
-    this.#retainMessageId(envelope.messageId);
+    this.#expectedSequence += 1n;
+    this.#retainReplay({ messageId: envelope.messageId, fingerprint });
 
     if (
       this.#state === "ready" &&
@@ -798,20 +866,27 @@ export class WorkerSession {
     }
     const message: WorkerSessionMessage = {
       messageId: envelope.messageId,
-      ...(envelope.correlationId === undefined ? {} : { correlationId: envelope.correlationId }),
+      correlationId: envelope.correlationId,
       type: envelope.type,
       payload: envelope.payload,
       ...(binary === undefined ? {} : { binary }),
     };
-    const request =
-      envelope.correlationId === undefined
-        ? undefined
-        : this.#pendingRequests.get(envelope.correlationId);
-    if (request !== undefined) {
-      this.#pendingRequests.delete(envelope.correlationId as string);
-      request.timeout.abort();
-      request.resolve(message);
-      return;
+    if (envelope.correlationId !== envelope.messageId) {
+      const request = this.#pendingRequests.get(envelope.correlationId);
+      if (request !== undefined) {
+        this.#pendingRequests.delete(envelope.correlationId);
+        this.#pruneIssuedRequests();
+        request.timeout.abort();
+        request.resolve(message);
+        return;
+      }
+      if (this.#issuedRequestIds.has(envelope.correlationId)) {
+        return;
+      }
+      throw diagnosticError(
+        "PROTOCOL_MESSAGE_INVALID",
+        "Worker response correlation does not identify an issued request",
+      );
     }
     if (this.#listeners.size === 0 || this.#flushingPendingMessages) {
       const bytes = this.#applicationMessageBytes(message);
@@ -844,7 +919,7 @@ export class WorkerSession {
       Buffer.byteLength(
         JSON.stringify({
           messageId: message.messageId,
-          ...(message.correlationId === undefined ? {} : { correlationId: message.correlationId }),
+          correlationId: message.correlationId,
           type: message.type,
           payload: message.payload,
         }),
@@ -1160,9 +1235,7 @@ export class WorkerSession {
       messageId,
       sessionId: this.#sessionId,
       sequence: parseSequence(this.#nextSequence.toString()),
-      ...(options.correlationId === undefined
-        ? {}
-        : { correlationId: parseMessageId(options.correlationId) }),
+      correlationId: parseMessageId(options.correlationId ?? messageId),
       type,
       sentAt: this.#clock.now().toISOString(),
       payload: serializeWireValue(payload),
@@ -1199,14 +1272,35 @@ export class WorkerSession {
     return messageId;
   }
 
-  #retainMessageId(messageId: string): void {
-    this.#receivedIds.add(messageId);
-    this.#receivedIdOrder.push(messageId);
-    while (this.#receivedIdOrder.length > this.#codec.limits.replayRetention) {
-      const removed = this.#receivedIdOrder.shift();
+  #retainReplay(replay: RetainedReplay): void {
+    this.#receivedFingerprints.set(replay.messageId, replay.fingerprint);
+    this.#receivedReplayOrder.push(replay);
+    while (this.#receivedReplayOrder.length > this.#codec.limits.replayRetention) {
+      const removed = this.#receivedReplayOrder.shift();
       if (removed !== undefined) {
-        this.#receivedIds.delete(removed);
+        this.#receivedFingerprints.delete(removed.messageId);
       }
+    }
+  }
+
+  #retainIssuedRequest(messageId: string): void {
+    this.#issuedRequestIds.add(messageId);
+    this.#issuedRequestOrder.push(messageId);
+    this.#pruneIssuedRequests();
+  }
+
+  #pruneIssuedRequests(): void {
+    const retention = this.#codec.limits.replayRetention + this.#codec.limits.maxInflightMessages;
+    while (this.#issuedRequestIds.size > retention) {
+      const removed = this.#issuedRequestOrder.shift();
+      if (removed === undefined) {
+        return;
+      }
+      if (this.#pendingRequests.has(removed)) {
+        this.#issuedRequestOrder.push(removed);
+        continue;
+      }
+      this.#issuedRequestIds.delete(removed);
     }
   }
 
@@ -1227,7 +1321,7 @@ export class WorkerSession {
     this.#detach();
   }
 
-  #transportClosed(): void {
+  #transportClosed(endpointUnavailable: boolean): void {
     if (this.#state === "closed" || this.#state === "unavailable") {
       this.#detach();
       return;
@@ -1236,9 +1330,15 @@ export class WorkerSession {
     this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
-    const error = diagnosticError("WORKER_SESSION_CLOSED", "Worker WebSocket session closed", {
-      category: "transport-closed",
-    });
+    const error = diagnosticError(
+      endpointUnavailable ? "WORKER_ENDPOINT_UNAVAILABLE" : "WORKER_SESSION_CLOSED",
+      endpointUnavailable
+        ? "Worker endpoint is not accepting authoritative registrations"
+        : "Worker WebSocket session closed",
+      {
+        category: endpointUnavailable ? "endpoint-unavailable" : "transport-closed",
+      },
+    );
     this.#diagnostic = error.diagnostic;
     this.#abort.abort(error);
     this.#handshakeAbort.abort();
@@ -1253,6 +1353,8 @@ export class WorkerSession {
       request.reject(error);
     }
     this.#pendingRequests.clear();
+    this.#issuedRequestIds.clear();
+    this.#issuedRequestOrder.length = 0;
     this.#pendingBinary.clear();
     this.#pendingBinaryBytes = 0;
   }

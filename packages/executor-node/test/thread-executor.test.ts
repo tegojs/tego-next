@@ -1,37 +1,43 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { Worker, type Transferable } from "node:worker_threads";
+import { type Transferable, Worker } from "node:worker_threads";
 import {
+  type CapabilityDefinition,
+  type ComponentCapabilityBoundary,
+  createExecutionBinding,
   diagnosticCode,
+  type ExecutionRequest,
+  type Executor,
+  type JsonValue,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
+  parseCapabilityName,
   parseComponentId,
   parseComponentInstanceId,
   parseGeneration,
   parsePluginId,
   parsePluginManifest,
   parseTaskId,
-  type Executor,
-  type ExecutionRequest,
-  type JsonValue,
+  parseWorkerId,
 } from "@tegojs/contracts";
 import {
+  type ExecutorConformanceFixture,
   eventually,
   executorConformance,
   FakeClock,
-  type ExecutorConformanceFixture,
 } from "@tegojs/testkit";
 import {
   THREAD_EXECUTOR_MAX_MESSAGE_BYTES,
   ThreadExecutor,
-  threadExecutionRequest,
   type ThreadExecutorOptions,
   type ThreadWorker,
   type ThreadWorkerFactory,
+  threadExecutionRequest,
 } from "../src/index.js";
 
 const digest = parseArtifactDigest(`sha256:${"b".repeat(64)}`);
@@ -352,6 +358,14 @@ export default {
       return new Promise(() => {});
     }
     if (input.mode === "secret") return context.secrets.get("api");
+    if (input.mode === "capability") {
+      return context.capabilities.call({
+        name: "org.example.route",
+        protocolVersion: "1.0.0",
+        method: "echo",
+        input: { marker: input.marker }
+      });
+    }
     if (input.mode === "forge-rpc") {
       const { parentPort } = await import("node:worker_threads");
       parentPort.postMessage({
@@ -429,6 +443,19 @@ export default {
   },
   async run(_context, input) {
     return input.value;
+  }
+};
+`;
+
+const remoteRuntimeComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async run(context) {
+    return {
+      executor: context.runtime.executor,
+      runtimeId: context.runtime.runtimeId
+    };
   }
 };
 `;
@@ -535,18 +562,28 @@ async function loadThreadComponentSessionFactory(): Promise<CreateThreadComponen
 }
 
 function request(input: JsonValue, suffix: string): ExecutionRequest {
-  return {
-    taskId: parseTaskId(`thread-task-${suffix}`),
-    attemptId: parseAttemptId(`thread-attempt-${suffix}`),
-    target: {
-      instanceId: parseComponentInstanceId("app.org.example.thread.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest: digest,
-      executor: { id: "thread-local", type: "thread" },
-    },
+  const target = {
+    instanceId: parseComponentInstanceId("app.org.example.thread.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: digest,
+    executor: { id: "thread-local", type: "thread" as const },
+  };
+  const identity = {
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.thread"),
     componentId: parseComponentId("echo"),
+    target,
+  };
+  return {
+    taskId: parseTaskId(`thread-task-${suffix}`),
+    attemptId: parseAttemptId(`thread-attempt-${suffix}`),
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [{ kind: "executor", executors: ["thread"] }],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
     input,
     deadline: new Date(clock.now().getTime() + 60_000).toISOString(),
     orphanPolicy: "cancel",
@@ -578,6 +615,158 @@ async function options(
     ...overrides,
   };
 }
+
+test("remote thread attempts resolve one exact capability boundary without cross-target leakage", async () => {
+  const factory = new TrackingWorkerFactory();
+  const fixture = await artifact();
+  const capabilityDefinitions = [
+    {
+      identity: {
+        name: parseCapabilityName("org.example.route"),
+        protocolVersion: "1.0.0",
+      },
+      methods: ["echo"],
+      requestSchema: true,
+      responseSchema: true,
+    },
+  ] satisfies readonly CapabilityDefinition[];
+  const permissionGrants = [
+    { kind: "executor", executors: ["remote"] },
+    {
+      kind: "capability",
+      capabilities: [{ name: "org.example.route", methods: ["echo"] }],
+    },
+  ] as const;
+  const manifest = parsePluginManifest({
+    ...fixture.manifest,
+    permissions: permissionGrants,
+  });
+  const resolutions: string[] = [];
+  const invocations: string[] = [];
+  const scopedOptions = {
+    ...(await options(factory)),
+    remoteWorkerIsolation: true,
+    resolveComponent: async (execution: ExecutionRequest) => ({
+      target: {
+        ...execution.target,
+        executor: { id: "thread-local", type: "thread" as const },
+      },
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
+      configuration: {},
+      permissionGrants,
+      capabilityDefinitions,
+    }),
+    resolveCapabilityBoundary(execution: ExecutionRequest): ComponentCapabilityBoundary {
+      const marker = `${execution.target.instanceId}:${execution.binding.fingerprint}`;
+      resolutions.push(marker);
+      return {
+        register: () => ({ ok: true, diagnostics: [] }),
+        request: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+        async invoke(invocation) {
+          invocations.push(`${marker}:${invocation.invocationId}`);
+          return { marker, invocationId: invocation.invocationId };
+        },
+        response: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+        clear() {},
+      };
+    },
+  } as ThreadExecutorOptions & {
+    readonly resolveCapabilityBoundary: (request: ExecutionRequest) => ComponentCapabilityBoundary;
+  };
+  const executor = new ThreadExecutor(scopedOptions);
+  const remoteRequest = (suffix: string): ExecutionRequest => {
+    const target = {
+      instanceId: parseComponentInstanceId(`app.org.example.thread.echo.${suffix}`),
+      deploymentGeneration: parseGeneration("1"),
+      artifactDigest: digest,
+      executor: {
+        id: "remote-worker",
+        type: "remote" as const,
+        workerId: parseWorkerId("worker-a"),
+      },
+    };
+    const identity = {
+      applicationId: parseApplicationId("app"),
+      pluginId: parsePluginId("org.example.thread"),
+      componentId: parseComponentId("echo"),
+      target,
+    };
+    return {
+      taskId: parseTaskId(`thread-task-route-${suffix}`),
+      attemptId: parseAttemptId(`thread-attempt-route-${suffix}`),
+      ...identity,
+      binding: createExecutionBinding(identity, {
+        configuration: { route: suffix },
+        permissionGrants,
+        capabilityDefinitions,
+        capabilityBindings: [],
+      }),
+      input: { mode: "capability", marker: suffix },
+      deadline: new Date(clock.now().getTime() + 60_000).toISOString(),
+      orphanPolicy: "cancel",
+    };
+  };
+  const first = remoteRequest("first");
+  const second = remoteRequest("second");
+
+  try {
+    const [firstResult, secondResult] = await Promise.all([
+      (await executor.submit(first)).result,
+      (await executor.submit(second)).result,
+    ]);
+    for (const [execution, result] of [
+      [first, firstResult],
+      [second, secondResult],
+    ] as const) {
+      const marker = `${execution.target.instanceId}:${execution.binding.fingerprint}`;
+      const expectedInvocationId = `cap.${createHash("sha256")
+        .update(`${execution.taskId.length}:${execution.taskId}${execution.attemptId}:1`)
+        .digest("hex")}`;
+      assert.equal(result.status, "succeeded");
+      assert.deepEqual(result.output, { marker, invocationId: expectedInvocationId });
+      assert.equal(
+        invocations.filter((entry) => entry === `${marker}:${expectedInvocationId}`).length,
+        1,
+      );
+    }
+    assert.deepEqual(
+      [...resolutions].sort(),
+      [
+        `${first.target.instanceId}:${first.binding.fingerprint}`,
+        `${second.target.instanceId}:${second.binding.fingerprint}`,
+      ].sort(),
+    );
+  } finally {
+    await executor.drain({});
+  }
+});
+
+test("thread executor rejects fixed and per-execution capability boundaries together", async () => {
+  const base = await options(new TrackingWorkerFactory());
+  const boundary: ComponentCapabilityBoundary = {
+    register: () => ({ ok: true, diagnostics: [] }),
+    request: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+    invoke: async () => null,
+    response: (_identity, input) => ({ allowed: true, diagnostics: [], value: input }),
+    clear() {},
+  };
+
+  assert.throws(
+    () =>
+      new ThreadExecutor({
+        ...base,
+        capabilityBoundary: boundary,
+        resolveCapabilityBoundary: () => boundary,
+      } as ThreadExecutorOptions & {
+        readonly resolveCapabilityBoundary: () => ComponentCapabilityBoundary;
+      }),
+    /capability boundar/u,
+  );
+});
 
 let conformanceFactory: TrackingWorkerFactory | undefined;
 
@@ -1535,16 +1724,19 @@ test("thread component session owns one Worker across same-target attempts and r
     assert.equal(factory.created, 1);
     assert.equal(factory.active, 1);
     assert.equal((await (await session.submit(first)).result).status, "succeeded");
+    const mismatchedTarget = {
+      ...second.target,
+      deploymentGeneration: parseGeneration("2"),
+    };
+    const persistedFingerprint = second.binding.fingerprint;
     await assert.rejects(
       session.submit({
         ...second,
-        target: {
-          ...second.target,
-          deploymentGeneration: parseGeneration("2"),
-        },
+        target: mismatchedTarget,
       }),
-      (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      (error: unknown) => diagnosticCode(error) === "PROTOCOL_EXECUTION_BINDING_INVALID",
     );
+    assert.equal(second.binding.fingerprint, persistedFingerprint);
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
     const canonicalFirst = request(
       { mode: "echo", value: { alpha: 1, nested: { left: true, right: false } } },
@@ -1569,6 +1761,70 @@ test("thread component session owns one Worker across same-target attempts and r
 
   await eventually(() => assert.equal(factory.active, 0));
   assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.drain", "lifecycle.stop"]);
+});
+
+test("thread component session materializes an exact remote target through local isolation", async () => {
+  const local = request({ mode: "runtime" }, "session-remote-target");
+  const remoteTarget = {
+    ...local.target,
+    executor: {
+      id: "remote-worker",
+      type: "remote" as const,
+      workerId: parseWorkerId("worker-a"),
+    },
+  };
+  const identity = {
+    applicationId: local.applicationId,
+    pluginId: local.pluginId,
+    componentId: local.componentId,
+    target: remoteTarget,
+  };
+  const permissionGrants = [{ kind: "executor", executors: ["remote"] }] as const;
+  const execution = {
+    ...local,
+    target: remoteTarget,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants,
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
+  };
+  const fixture = await artifact({ source: remoteRuntimeComponentSource });
+  const manifest = parsePluginManifest({ ...fixture.manifest, permissions: permissionGrants });
+  const factory = new TrackingWorkerFactory();
+  const executorOptions = await options(factory, {
+    remoteWorkerIsolation: true,
+  });
+  const createSession = await loadThreadComponentSessionFactory();
+  const session = await createSession({
+    target: execution.target,
+    identity: execution,
+    component: {
+      target: local.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
+      configuration: {},
+      permissionGrants,
+      capabilityDefinitions: [],
+    },
+    executorOptions,
+  });
+
+  try {
+    assert.deepEqual(session.target, remoteTarget);
+    assert.deepEqual((await (await session.submit(execution)).result).output, {
+      executor: "remote",
+      runtimeId: "runtime",
+    });
+    assert.equal(factory.active, 1);
+  } finally {
+    await session.close();
+  }
+  await eventually(() => assert.equal(factory.active, 0));
 });
 
 test("thread component session refuses unhealthy activation before accepting a run", async () => {

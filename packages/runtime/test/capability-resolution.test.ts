@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DiagnosticError,
+  type PluginDeploymentIdentity,
   parseApplicationId,
   parseCapabilityName,
   parsePluginId,
-  type PluginDeploymentIdentity,
+  parseRuntimeDiagnostic,
 } from "@tegojs/contracts";
 import {
+  type CapabilityResolutionDeployment,
+  parseActivation,
+  type ProviderLossDecision,
   isValidVersion,
   isValidVersionRange,
   resolveCapabilities,
   satisfiesVersionRange,
-  type CapabilityResolutionDeployment,
-} from "../src/index.js";
+  strongestProviderLoss,
+} from "@tegojs/runtime";
 
 const applicationId = parseApplicationId("application-01");
 
@@ -26,6 +31,7 @@ function deployment(
 ): CapabilityResolutionDeployment {
   return {
     identity: identity(pluginId),
+    activated: true,
     ready: true,
     provides: [],
     requires: [],
@@ -36,6 +42,65 @@ function deployment(
 
 const echoName = parseCapabilityName("org.example.echo");
 const auditName = parseCapabilityName("org.example.audit");
+
+function permutations<T>(values: readonly T[]): readonly (readonly T[])[] {
+  if (values.length < 2) return [values];
+  return values.flatMap((value, index) =>
+    permutations(values.filter((_, candidate) => candidate !== index)).map((rest) => [
+      value,
+      ...rest,
+    ]),
+  );
+}
+
+function providerLossDecision(action: ProviderLossDecision["action"]): ProviderLossDecision {
+  return {
+    action,
+    capability: echoName,
+    consumer: identity("consumer"),
+    provider: identity(`provider-${action}`),
+  };
+}
+
+test("provider loss precedence is explicit and independent of action order", () => {
+  for (const actions of permutations(["degrade", "suspend", "fail"] as const)) {
+    assert.equal(
+      strongestProviderLoss(actions.map(providerLossDecision)),
+      "fail",
+      actions.join(","),
+    );
+  }
+
+  for (const actions of permutations(["degrade", "suspend"] as const)) {
+    assert.equal(
+      strongestProviderLoss(actions.map(providerLossDecision)),
+      "suspend",
+      actions.join(","),
+    );
+  }
+  assert.equal(strongestProviderLoss([]), undefined);
+});
+
+test("invalid activations expose a stable public diagnostic with canonical bounds", () => {
+  for (const value of [-1, "01", "18446744073709551616", "not-an-activation"] as const) {
+    assert.throws(
+      () => parseActivation(value),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ACTIVATION_INVALID");
+        assert.equal(error.diagnostic.message, "Activation is invalid");
+        assert.deepEqual(error.diagnostic.details, {
+          canonicalFormat: "unsigned decimal string",
+          minimum: "0",
+          maximum: "18446744073709551615",
+        });
+        assert.equal(error.diagnostic.cause, undefined);
+        assert.deepEqual(parseRuntimeDiagnostic(error.diagnostic), error.diagnostic);
+        return true;
+      },
+    );
+  }
+});
 
 test("@spec:capability-resolution/deterministic-provider-selection/one-compatible-provider", () => {
   const result = resolveCapabilities({
@@ -125,6 +190,86 @@ test("explicit bindings take precedence and never fall back", async (context) =>
       assert.equal(result.diagnostics[0]?.code, code);
     });
   }
+});
+
+test("persisted automatic binding remains authoritative across provider availability changes", async (context) => {
+  const consumer = deployment("consumer", {
+    requires: [
+      {
+        name: echoName,
+        protocolRange: "^1.0.0",
+        lossPolicy: "suspend",
+      },
+    ],
+  });
+  const providerA = deployment("provider-a", {
+    provides: [{ name: echoName, protocolVersion: "1.1.0" }],
+  });
+  const providerB = deployment("provider-b", {
+    provides: [{ name: echoName, protocolVersion: "1.2.0" }],
+  });
+  const previousBindings = [
+    {
+      consumer: identity("consumer"),
+      capability: echoName,
+      provider: identity("provider-a"),
+    },
+  ];
+
+  await context.test("keeps the observed provider when another provider becomes ready", () => {
+    const result = resolveCapabilities({
+      deployments: [consumer, providerA, providerB],
+      previousBindings,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.diagnostics, []);
+    assert.deepEqual(result.bindings?.[0]?.provider?.deployment, identity("provider-a"));
+  });
+
+  await context.test("reports loss against the observed provider without substitution", () => {
+    const result = resolveCapabilities({
+      deployments: [consumer, { ...providerA, ready: false }, providerB],
+      previousBindings,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.diagnostics, []);
+    assert.deepEqual(result.bindings, [
+      {
+        consumer: identity("consumer"),
+        requirement: {
+          name: echoName,
+          protocolRange: "^1.0.0",
+          lossPolicy: "suspend",
+          optional: false,
+        },
+        provider: null,
+      },
+    ]);
+    assert.deepEqual(result.providerLossActions, [
+      {
+        action: "suspend",
+        capability: echoName,
+        consumer: identity("consumer"),
+        provider: identity("provider-a"),
+      },
+    ]);
+  });
+
+  await context.test("still gives an explicit desired binding precedence", () => {
+    const result = resolveCapabilities({
+      deployments: [
+        { ...consumer, bindings: { [echoName]: identity("provider-b") } },
+        providerA,
+        providerB,
+      ],
+      previousBindings,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.bindings?.[0]?.provider?.deployment, identity("provider-b"));
+  });
 });
 
 test("binding lookup ignores prototypes and rejects unsafe own properties without invoking getters", () => {
@@ -583,6 +728,7 @@ test("a consumer that was not ready does not receive provider loss actions", () 
   const result = resolveCapabilities({
     deployments: [
       deployment("consumer", {
+        activated: false,
         ready: false,
         requires: [{ name: echoName, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
       }),
@@ -601,4 +747,48 @@ test("a consumer that was not ready does not receive provider loss actions", () 
   });
 
   assert.deepEqual(result.providerLossActions, []);
+});
+
+test("sequential provider loss uses activation history after the consumer is no longer ready", () => {
+  const activatedConsumer = {
+    ...deployment("consumer", {
+      ready: false,
+      requires: [{ name: echoName, protocolRange: "^1.0.0", lossPolicy: "fail" }],
+    }),
+    activated: true,
+  };
+  const neverActivatedConsumer = { ...activatedConsumer, activated: false };
+  const unavailableProvider = deployment("provider", {
+    ready: false,
+    provides: [{ name: echoName, protocolVersion: "1.0.0" }],
+  });
+  const previousBindings = [
+    {
+      consumer: identity("consumer"),
+      capability: echoName,
+      provider: identity("provider"),
+    },
+  ];
+
+  assert.deepEqual(
+    resolveCapabilities({
+      deployments: [activatedConsumer, unavailableProvider],
+      previousBindings,
+    }).providerLossActions,
+    [
+      {
+        action: "fail",
+        capability: echoName,
+        consumer: identity("consumer"),
+        provider: identity("provider"),
+      },
+    ],
+  );
+  assert.deepEqual(
+    resolveCapabilities({
+      deployments: [neverActivatedConsumer, unavailableProvider],
+      previousBindings,
+    }).providerLossActions,
+    [],
+  );
 });

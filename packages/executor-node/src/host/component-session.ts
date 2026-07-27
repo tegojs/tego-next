@@ -2,6 +2,7 @@ import {
   type AttemptId,
   type AttemptStatus,
   type Clock,
+  type ComponentCapabilityInvocation,
   DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
@@ -28,6 +29,7 @@ export interface ComponentSessionRunResult {
 export interface ComponentSessionTransport {
   readonly executor: ExecutionResult["executor"];
   run(request: ExecutionRequest): Promise<ComponentSessionRunResult>;
+  invokeCapability?(invocation: ComponentCapabilityInvocation): Promise<JsonValue>;
   cancel(taskId: TaskId, attemptId: AttemptId, reason: "cancelled" | "timed-out"): Promise<void>;
   health(): Promise<{
     readonly status: ExecutorHealth["status"];
@@ -159,6 +161,7 @@ export class ComponentSandboxSession implements Executor {
   readonly #shutdownGraceMs: number;
   readonly #attempts = new Map<string, SessionAttempt>();
   readonly #queue: SessionAttempt[] = [];
+  readonly #activeCapabilities = new Set<Promise<void>>();
   #active = 0;
   #accepting = true;
   #drainPromise: Promise<void> | undefined;
@@ -271,6 +274,47 @@ export class ComponentSandboxSession implements Executor {
     this.#armDeadline(entry);
     this.#schedule();
     return entry.handle;
+  }
+
+  invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+    if (!this.#accepting) {
+      return Promise.reject(
+        new DiagnosticError(
+          diagnostic(
+            "EXECUTOR_DRAINING",
+            "Component session is draining and refuses new capability invocations",
+            this.type,
+            this.#clock.now(),
+          ),
+        ),
+      );
+    }
+    const invoke = this.#transport.invokeCapability;
+    if (invoke === undefined) {
+      return Promise.reject(
+        new DiagnosticError(
+          diagnostic(
+            "EXECUTOR_COMPONENT_HOOK_MISSING",
+            "Component session transport cannot invoke provider capabilities",
+            this.type,
+            this.#clock.now(),
+          ),
+        ),
+      );
+    }
+    let result: Promise<JsonValue>;
+    try {
+      result = invoke.call(this.#transport, invocation);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const active = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#activeCapabilities.add(active);
+    void active.then(() => this.#activeCapabilities.delete(active));
+    return result;
   }
 
   async observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {
@@ -483,9 +527,10 @@ export class ComponentSandboxSession implements Executor {
 
   async #converge(deadline: string | undefined): Promise<void> {
     const entries = [...this.#attempts.values()];
-    const completed = Promise.all(entries.map((entry) => entry.completed.promise)).then(
-      () => undefined,
-    );
+    const completed = Promise.all([
+      ...entries.map((entry) => entry.completed.promise),
+      ...this.#activeCapabilities,
+    ]).then(() => undefined);
     if (deadline === undefined) {
       await completed;
       return;

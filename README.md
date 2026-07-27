@@ -16,6 +16,13 @@ first layer of the planned three-layer architecture.
 
 Only the runtime-kernel layer is implemented here.
 
+## Documentation
+
+- [Runtime kernel architecture](docs/architecture/runtime-kernel.md)
+- [Phase-one threat model](docs/security/threat-model.md)
+- [Deployment topologies](docs/operations/deployment-topologies.md)
+- [Contributing and plugin authoring](docs/guides/contributing-and-plugins.md)
+
 ## Implemented capabilities
 
 - Plugin manifests, artifacts, packaging, signing, and lifecycle
@@ -47,7 +54,8 @@ The runnable example is in `examples/echo-plugin`.
 
 - Node.js 26.5.0
 - npm 11.13.0
-- Docker or a local PostgreSQL 16 server for PostgreSQL integration tests
+- Docker or a local PostgreSQL 16 server only for PostgreSQL integration and
+  multi-Main tests
 
 ## Development
 
@@ -72,6 +80,34 @@ npm run format:check
 npm run lint
 ```
 
+Run all local-capable checks:
+
+```sh
+npm run verify
+```
+
+This command does not require PostgreSQL. It runs the quality, build,
+typechecking, unit and architecture gates, root/local integration tests, and
+the single-Main real-process flow. PostgreSQL integration and multi-Main
+takeover remain release and CI gates.
+
+Release verification is intentionally stricter. From a clean working tree,
+using exactly Node.js 26.5.0 and npm 11.13.0, provide a PostgreSQL 16 URL:
+
+```sh
+TEGO_POSTGRES_URL=postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test \
+  npm run verify:release
+```
+
+The command performs a clean lockfile install, quality checks, build and
+typechecking, unit and architecture tests, SQLite and PostgreSQL integration
+tests, reproducible echo-plugin packaging, single-Main smoke, multi-Main
+takeover, and strict OpenSpec validation. `npm run verify:release -- --preflight`
+checks the toolchain, clean tree, PostgreSQL URL, and CI contract without
+running the gates. Both release verification and CI invoke the exact pinned
+`@fission-ai/openspec@1.4.1` package through `npm run openspec:validate`; no
+global OpenSpec installation is required.
+
 ## PostgreSQL integration tests
 
 Start the disposable PostgreSQL service:
@@ -92,6 +128,18 @@ Stop and delete the disposable database:
 ```sh
 docker compose down -v
 ```
+
+GitHub Actions is the authoritative phase-one acceptance environment. Its
+`quality`, `integration`, and `system-e2e` gates use PostgreSQL 16.14 and retain
+integration and process diagnostics as workflow artifacts even when a test
+fails. The PostgreSQL integration artifact contains
+`integration-result.json` and `integration-process.log`; the system artifact
+contains the corresponding `single-main-*` and `multi-main-*` result and
+process-log files, plus diagnostics emitted beneath `TEGO_TEST_ARTIFACTS_DIR`.
+Missing expected evidence fails artifact upload. Single-Main uses local
+drivers; multi-Main requires PostgreSQL coordination and persistence. This
+verification does not claim production readiness: production release remains
+gated on Node.js 26 reaching LTS.
 
 ## Plugin development
 

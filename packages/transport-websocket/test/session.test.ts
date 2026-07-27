@@ -34,6 +34,7 @@ import {
   type WorkerEpochAllocator,
   WorkerRuntime,
   type WorkerSession,
+  type WorkerSessionMessage,
 } from "../src/index.js";
 import { executionRequest, flush, TestLocalExecutor } from "./remote-test-support.js";
 
@@ -73,6 +74,7 @@ const ENVELOPE: WorkerControlEnvelope = {
   messageId: parseMessageId("message-1"),
   sessionId: parseSessionId("session-1"),
   sequence: parseSequence("0"),
+  correlationId: parseMessageId("message-1"),
   type: "heartbeat",
   sentAt: new Date(0).toISOString(),
   payload: {},
@@ -330,6 +332,31 @@ test("codec accepts only exact JSON data fields and decimal sequence values", ()
       JSON.stringify({
         ...ENVELOPE,
         unexpected: true,
+      }),
+    ),
+  );
+});
+
+test("codec round-trips capability and component lifecycle messages but rejects unknown types", () => {
+  const codec = createWorkerCodec();
+  for (const type of [
+    "capability.invoke",
+    "component.activate",
+    "component.activated",
+    "component.drain",
+    "component.stop",
+  ] as const) {
+    const envelope = {
+      ...ENVELOPE,
+      type,
+    } as unknown as WorkerControlEnvelope;
+    assert.deepEqual(codec.decodeControl(codec.encodeControl(envelope)), envelope);
+  }
+  assert.throws(() =>
+    codec.decodeControl(
+      JSON.stringify({
+        ...ENVELOPE,
+        type: "component.unknown",
       }),
     ),
   );
@@ -799,6 +826,133 @@ test("request correlation is installed before a synchronous transport can respon
   }
 });
 
+test("self-correlated one-way and late responses cannot resolve a pending request", async () => {
+  const connection = await directConnection();
+  try {
+    await connection.mainSession.send("session.reconcile", { oneWay: true });
+    const oneWay = JSON.parse(connection.mainSocket.sent[0] as string) as {
+      messageId: string;
+      correlationId?: string;
+    };
+    assert.equal(oneWay.correlationId, oneWay.messageId);
+
+    connection.mainSocket.holdControlType = "session.reconcile";
+    const received: WorkerSessionMessage[] = [];
+    connection.mainSession.onMessage((message) => received.push(message));
+    const pending = connection.mainSession.request("session.reconcile", { request: true });
+    const request = JSON.parse(connection.mainSocket.held[0] as string) as {
+      messageId: string;
+      correlationId?: string;
+    };
+    assert.equal(request.correlationId, request.messageId);
+
+    connection.workerSocket.automaticDelivery = false;
+    await connection.workerSession.send("task.cancel", { selfCorrelated: true });
+    const selfCorrelated = JSON.parse(connection.workerSocket.sent[0] as string) as Record<
+      string,
+      JsonValue
+    >;
+    selfCorrelated.messageId = request.messageId;
+    selfCorrelated.correlationId = request.messageId;
+    connection.mainSocket.inject(JSON.stringify(selfCorrelated));
+    let pendingSettled = false;
+    void pending.then(() => {
+      pendingSettled = true;
+    });
+    await flush();
+    assert.deepEqual(
+      received.map((message) => message.payload),
+      [{ selfCorrelated: true }],
+    );
+    assert.equal(pendingSettled, false);
+
+    connection.workerSocket.automaticDelivery = true;
+    await connection.workerSession.send("session.reconcile", { unrelated: true });
+    assert.deepEqual(
+      received.map((message) => message.payload),
+      [{ selfCorrelated: true }, { unrelated: true }],
+    );
+
+    await connection.workerSession.send(
+      "session.reconcile",
+      { response: true },
+      { correlationId: request.messageId },
+    );
+    assert.deepEqual((await pending).payload, { response: true });
+
+    await connection.workerSession.send(
+      "session.reconcile",
+      { late: true },
+      { correlationId: request.messageId },
+    );
+    assert.deepEqual(
+      received.map((message) => message.payload),
+      [{ selfCorrelated: true }, { unrelated: true }],
+    );
+    assert.equal(connection.mainSession.state, "ready");
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("an unknown response correlation closes the session", async () => {
+  const connection = await directConnection();
+  try {
+    await connection.workerSession.send(
+      "session.reconcile",
+      { forged: true },
+      { correlationId: "message-00000000-0000-4000-8000-000000000000" },
+    );
+    assert.equal(connection.mainSession.state, "closed");
+    assert.equal(connection.mainSession.diagnostic?.code, "PROTOCOL_MESSAGE_INVALID");
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("response correlates to the triggering request messageId", async () => {
+  const connection = await directConnection();
+  try {
+    connection.workerSession.onMessage((message) => {
+      void connection.workerSession.send(
+        "session.reconcile",
+        { accepted: true },
+        { correlationId: message.messageId },
+      );
+    });
+    await connection.mainSession.request("session.reconcile", { running: [] });
+    const request = JSON.parse(connection.mainSocket.sent[0] as string) as {
+      messageId: string;
+    };
+    const response = JSON.parse(connection.workerSocket.sent[0] as string) as {
+      correlationId?: string;
+    };
+    assert.equal(response.correlationId, request.messageId);
+  } finally {
+    await cleanup(connection);
+  }
+});
+
+test("missing correlation closes the session as PROTOCOL_MESSAGE_INVALID", async () => {
+  for (const correlationId of [undefined, "invalid correlation"]) {
+    const connection = await directConnection();
+    connection.mainSocket.automaticDelivery = false;
+    await connection.mainSession.send("session.reconcile", { running: [] });
+    const envelope = JSON.parse(connection.mainSocket.sent[0] as string) as Record<
+      string,
+      JsonValue
+    >;
+    if (correlationId === undefined) {
+      delete envelope.correlationId;
+    } else {
+      envelope.correlationId = correlationId;
+    }
+    connection.workerSocket.inject(JSON.stringify(envelope));
+    assert.equal(connection.workerSession.diagnostic?.code, "PROTOCOL_MESSAGE_INVALID");
+    await cleanup(connection);
+  }
+});
+
 test("application requests expire when the peer never sends a correlated response", async () => {
   const connection = await directConnection({ requestTimeoutMs: 100 });
   try {
@@ -847,7 +1001,7 @@ test("a consumer listener failure cannot terminate the authenticated session", a
   }
 });
 
-test("an identical raw replay is deduplicated and a conflicting replay closes the session", async () => {
+test("a canonical replay is deduplicated and same-ID equivocation closes the session", async () => {
   const connection = await directConnection();
   try {
     const received: JsonValue[] = [];
@@ -855,11 +1009,14 @@ test("an identical raw replay is deduplicated and a conflicting replay closes th
     await connection.mainSession.send("session.reconcile", { once: true });
     const original = connection.mainSocket.sent[0];
     assert.equal(typeof original, "string");
-    connection.workerSocket.inject(original as string);
+    const reordered = Object.fromEntries(
+      Object.entries(JSON.parse(original as string) as Record<string, JsonValue>).reverse(),
+    );
+    connection.workerSocket.inject(JSON.stringify(reordered));
     assert.deepEqual(received, [{ once: true }]);
 
     const conflict = JSON.parse(original as string) as Record<string, JsonValue>;
-    conflict.messageId = "message-conflict";
+    conflict.payload = { once: false };
     connection.workerSocket.inject(JSON.stringify(conflict));
     assert.equal(connection.workerSession.state, "closed");
     assert.equal(connection.workerSession.diagnostic?.code, "PROTOCOL_SEQUENCE_REPLAY");
@@ -1151,6 +1308,7 @@ test("a peer hello arriving first cannot move authenticate before the local hell
       messageId: parseMessageId("peer-hello"),
       sessionId: parseSessionId("peer-session"),
       sequence: parseSequence("0"),
+      correlationId: parseMessageId("peer-hello"),
       type: "hello",
       sentAt: clock.now().toISOString(),
       payload: {

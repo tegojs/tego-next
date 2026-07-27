@@ -21,6 +21,13 @@ The runtime SHALL compute a SHA-256 digest over the final artifact and SHALL sto
 - **WHEN** two artifacts have the same plugin ID and version but different bytes
 - **THEN** they receive different digests and the second cannot overwrite the first installation
 
+### Requirement: Immutable artifact ingress
+A multi-Main node MAY admit content-addressed immutable artifact bytes through its trusted local endpoint without fenced semantic-write authority. Admitted bytes MAY consume shared artifact storage but SHALL NOT by themselves create or change installation, deployment, operation, or task state.
+
+#### Scenario: Follower admits artifact bytes only
+- **WHEN** a follower receives a valid plugin artifact from a trusted local client
+- **THEN** it may add the immutable content-addressed bytes to shared artifact storage without creating installation, deployment, operation, or task state
+
 ### Requirement: Reproducible plugin package
 The CLI SHALL build a deterministic `.tego` archive from validated JavaScript ESM output and declared metadata.
 

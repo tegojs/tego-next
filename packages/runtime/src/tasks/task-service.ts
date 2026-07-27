@@ -4,6 +4,7 @@ import {
   type Clock,
   DiagnosticError,
   diagnosticCode,
+  type ExecutionBinding,
   type ExecutionHandle,
   type ExecutionExecutor,
   type ExecutionResult,
@@ -40,6 +41,7 @@ export interface TaskIdentity {
 
 export interface TaskExecutorSelection {
   readonly target: TaskExecutionTarget;
+  readonly binding: ExecutionBinding;
   readonly executor: Executor;
 }
 
@@ -54,6 +56,8 @@ export interface TaskServiceOptions {
     request: RunTaskRequest,
     target?: TaskExecutionTarget,
     signal?: AbortSignal,
+    binding?: ExecutionBinding,
+    identity?: TaskIdentity,
   ) => TaskExecutorSelection | Promise<TaskExecutorSelection>;
   readonly createIdentity?: (request: RunTaskRequest) => TaskIdentity;
 }
@@ -201,6 +205,8 @@ export class TaskService implements RuntimeTaskLifecycle {
     }
     this.#authority = authority === undefined ? undefined : structuredClone(authority);
     if (authority === undefined) return;
+    await this.recover();
+    this.#assertAuthority(authority);
     const pending = [...this.#records.values()]
       .map((entry) => entry.record)
       .filter((record) => record.state !== "terminal");
@@ -241,11 +247,17 @@ export class TaskService implements RuntimeTaskLifecycle {
       authority,
       proposed.taskId,
       undefined,
+      undefined,
+      proposed.attemptId,
     );
     this.#validateSelection(selected, proposed.taskId);
     this.#assertAuthority(authority);
     const admitted = await this.#admit(request, fingerprint, proposed, selected, authority);
-    if (admitted.target !== undefined && sameTarget(admitted.target, selected.target)) {
+    if (
+      admitted.target !== undefined &&
+      admitted.binding?.fingerprint === selected.binding.fingerprint &&
+      sameTarget(admitted.target, selected.target)
+    ) {
       this.#executors.set(admitted.taskId, { executor: selected.executor, authority });
     }
     const existingDispatch = this.#dispatches.get(admitted.taskId);
@@ -394,6 +406,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       request,
       state: "accepted",
       target: selection.target,
+      binding: selection.binding,
       createdAt,
       updatedAt: createdAt,
       authority,
@@ -475,6 +488,10 @@ export class TaskService implements RuntimeTaskLifecycle {
     if (target === undefined) {
       throw this.#invalidResult(record.taskId, "Task execution target is missing");
     }
+    const binding = record.binding;
+    if (binding === undefined) {
+      throw this.#invalidResult(record.taskId, "Task execution binding is missing");
+    }
     this.#assertAuthority(authority);
     const registration = { executor, authority };
     this.#executors.set(record.taskId, registration);
@@ -485,6 +502,7 @@ export class TaskService implements RuntimeTaskLifecycle {
       pluginId: record.request.pluginId,
       componentId: record.request.componentId,
       target,
+      binding,
       input: record.request.input,
       deadline: record.request.deadline,
       orphanPolicy: record.request.orphanPolicy,
@@ -599,6 +617,15 @@ export class TaskService implements RuntimeTaskLifecycle {
     record: TaskRecord,
     authority: RuntimeAuthority = this.#requireAuthority(),
   ): Promise<void> {
+    if (record.binding === undefined) {
+      await this.#settleUncertain(
+        record,
+        this.#invalidResult(record.taskId, "Task execution binding is missing"),
+        authority,
+        true,
+      );
+      return;
+    }
     if (record.target === undefined) {
       await this.#settleUncertain(
         record,
@@ -744,6 +771,9 @@ export class TaskService implements RuntimeTaskLifecycle {
     if (target === undefined) {
       throw this.#invalidResult(record.taskId, "Task execution target is missing");
     }
+    if (record.binding === undefined) {
+      throw this.#invalidResult(record.taskId, "Task execution binding is missing");
+    }
     const registration = this.#executors.get(record.taskId);
     const retained = registration?.executor;
     if (
@@ -759,11 +789,16 @@ export class TaskService implements RuntimeTaskLifecycle {
       authority,
       record.taskId,
       target,
+      record.binding,
+      record.attemptId,
     );
     this.#validateSelection(resolved, record.taskId);
     const mismatchedFields = targetMismatchedFields(target, resolved.target);
     if (mismatchedFields.length > 0) {
       throw this.#targetMismatch(record.taskId, mismatchedFields);
+    }
+    if (resolved.binding.fingerprint !== record.binding.fingerprint) {
+      throw this.#targetMismatch(record.taskId, ["binding.fingerprint"]);
     }
     return resolved.executor;
   }
@@ -773,11 +808,21 @@ export class TaskService implements RuntimeTaskLifecycle {
     authority: RuntimeAuthority,
     taskId: TaskId,
     target: TaskExecutionTarget | undefined,
+    binding?: ExecutionBinding,
+    attemptId?: AttemptId,
   ): Promise<TaskExecutorSelection> {
     const controller = new AbortController();
     this.#observationControllers.add(controller);
     const selection = Promise.resolve()
-      .then(() => this.#selectExecutor(request, target, controller.signal))
+      .then(() =>
+        this.#selectExecutor(
+          request,
+          target,
+          controller.signal,
+          binding,
+          attemptId === undefined ? undefined : { taskId, attemptId },
+        ),
+      )
       .then(
         (value) => ({ kind: "selected" as const, value }),
         (error: unknown) => ({ kind: "failed" as const, error }),
@@ -888,7 +933,8 @@ export class TaskService implements RuntimeTaskLifecycle {
     const specificDiagnostic =
       _error instanceof DiagnosticError &&
       (_error.diagnostic.code === "EXECUTOR_TARGET_MISMATCH" ||
-        _error.diagnostic.code === "EXECUTOR_TARGET_UNAVAILABLE")
+        _error.diagnostic.code === "EXECUTOR_TARGET_UNAVAILABLE" ||
+        _error.diagnostic.code === "EXECUTOR_RESULT_INVALID")
         ? { ..._error.diagnostic, retryable: false, observedAt: timestamp }
         : undefined;
     const indeterminate = parseTaskRecord({

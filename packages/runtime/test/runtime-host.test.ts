@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import * as contracts from "@tegojs/contracts";
 import {
   type ArtifactDigest,
   type ArtifactStore,
@@ -13,14 +14,18 @@ import {
   type HostedProcess,
   type JsonValue,
   type LeadershipHandle,
+  parseArtifactDigest,
   type ProcessHost,
   type ProcessSpawnRequest,
   parseApplicationId,
   parseFencingEpoch,
+  parseGeneration,
   parseNodeId,
-  type parseRevision,
+  parsePluginId,
+  parseRevision,
   parseRuntimeId,
   parseTaskId,
+  type PluginDeployment,
   type RunTaskRequest,
   type RuntimeAuthority,
   type RuntimeConfiguration,
@@ -66,6 +71,16 @@ class EmptyState implements StateStore {
   scope: "local" | "shared" = "shared";
   readonly log: string[];
   healthGate: Promise<void> = Promise.resolve();
+  readonly records = new Map<
+    string,
+    {
+      readonly key: StateKey<JsonValue>;
+      readonly value: JsonValue;
+      readonly revision: ReturnType<typeof parseRevision>;
+    }
+  >();
+  transactionReadCount = 0;
+  #nextRevision = 1n;
 
   constructor(log: string[]) {
     this.log = log;
@@ -75,19 +90,58 @@ class EmptyState implements StateStore {
     this.log.push("state.open");
   }
 
-  transact<T extends JsonValue>(
+  async transact<T extends JsonValue>(
     _options: StateTransactionOptions,
-    _work: (transaction: StateTransaction) => Promise<T>,
+    work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
-    return Promise.reject(new Error("not used"));
+    this.transactionReadCount += 1;
+    const snapshot = new Map(this.records);
+    return work({
+      get: async <V extends JsonValue>(key: StateKey<V>) => {
+        const record = snapshot.get(this.#recordKey(key));
+        return record === undefined
+          ? undefined
+          : {
+              value: structuredClone(record.value) as V,
+              revision: record.revision,
+            };
+      },
+      scan: <V extends JsonValue>(query: StateQuery<V>) =>
+        this.#scanRecords(snapshot, query) as AsyncIterable<ScannedState<V>>,
+      put: () => Promise.reject(new Error("test transaction is read-only")),
+      delete: () => Promise.reject(new Error("test transaction is read-only")),
+      appendOperation: () => Promise.reject(new Error("not used")),
+      enqueueOutbox: () => Promise.reject(new Error("not used")),
+    });
   }
 
-  read<T extends JsonValue>(_key: StateKey<T>): Promise<Versioned<T> | undefined> {
-    return Promise.resolve(undefined);
+  read<T extends JsonValue>(key: StateKey<T>): Promise<Versioned<T> | undefined> {
+    const record = this.records.get(this.#recordKey(key));
+    return Promise.resolve(
+      record === undefined
+        ? undefined
+        : {
+            value: structuredClone(record.value) as T,
+            revision: record.revision,
+          },
+    );
   }
 
-  scan<T extends JsonValue>(_query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
-    return emptyAsyncIterable();
+  scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {
+    return this.#scanRecords(this.records, query);
+  }
+
+  set(collection: string, id: string, value: JsonValue): void {
+    const key = { namespace: "tego", collection, id };
+    this.records.set(this.#recordKey(key), {
+      key,
+      value: structuredClone(value),
+      revision: parseRevision((this.#nextRevision++).toString()),
+    });
+  }
+
+  delete(collection: string, id: string): void {
+    this.records.delete(this.#recordKey({ namespace: "tego", collection, id }));
   }
 
   scanOperations(): AsyncIterable<never> {
@@ -122,6 +176,46 @@ class EmptyState implements StateStore {
 
   async close(): Promise<void> {
     this.log.push("state.close");
+  }
+
+  #recordKey(key: Pick<StateKey<JsonValue>, "namespace" | "collection" | "id">): string {
+    return `${key.namespace}\u0000${key.collection}\u0000${key.id}`;
+  }
+
+  #scanRecords<T extends JsonValue>(
+    records: ReadonlyMap<
+      string,
+      {
+        readonly key: StateKey<JsonValue>;
+        readonly value: JsonValue;
+        readonly revision: ReturnType<typeof parseRevision>;
+      }
+    >,
+    query: StateQuery<T>,
+  ): AsyncIterable<ScannedState<T>> {
+    const matching = [...records.values()]
+      .filter(
+        (record) =>
+          record.key.namespace === query.namespace &&
+          record.key.collection === query.collection &&
+          (query.idPrefix === undefined || record.key.id.startsWith(query.idPrefix)) &&
+          (query.afterId === undefined || record.key.id > query.afterId),
+      )
+      .sort((left, right) =>
+        left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
+      );
+    const page = query.limit === undefined ? matching : matching.slice(0, query.limit);
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const record of page) {
+          yield {
+            key: record.key as StateKey<T>,
+            value: structuredClone(record.value) as T,
+            revision: record.revision,
+          };
+        }
+      },
+    };
   }
 }
 
@@ -413,6 +507,15 @@ class ControlledServices implements RuntimeHostServices {
     this.workers = new ControlledWorkers(log);
   }
 
+  readonly authorityAdmission = {
+    open: (authority: RuntimeAuthority): void => {
+      this.log.push(`capabilities.authority:${authority.epoch}`);
+    },
+    close: (authority: RuntimeAuthority): void => {
+      this.log.push(`capabilities.authority:none:${authority.epoch}`);
+    },
+  };
+
   createReconciler = (
     authority: RuntimeAuthority,
     context: {
@@ -454,6 +557,7 @@ function configuration(mode: RuntimeConfiguration["mode"]): RuntimeConfiguration
 function fixture(
   mode: RuntimeConfiguration["mode"] = "multi-main",
   runtimeClock: Clock = clock,
+  sharedState?: EmptyState,
 ): {
   readonly configuration: RuntimeConfiguration;
   readonly coordination: ControlledCoordination;
@@ -464,7 +568,7 @@ function fixture(
 } {
   const log: string[] = [];
   const coordination = new ControlledCoordination(log);
-  const state = new EmptyState(log);
+  const state = sharedState ?? new EmptyState(log);
   const artifacts = new EmptyArtifacts(log);
   if (mode === "single-main") {
     coordination.scope = "local";
@@ -488,6 +592,227 @@ function fixture(
     state,
   };
 }
+
+const liveStatusDeployment = {
+  applicationId: parseApplicationId("application-01"),
+  pluginId: parsePluginId("plugin-01"),
+  version: "1.0.0",
+  artifactDigest: parseArtifactDigest(
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  ),
+  generation: parseGeneration("1"),
+  state: "active",
+  essential: true,
+  configuration: {},
+  permissionGrants: [],
+  capabilityBindings: {},
+} satisfies PluginDeployment;
+
+function liveStatusObservation(
+  status: "blocked" | "degraded" | "disabled" | "failed" | "ready" | "reconciling" | "suspended",
+  overrides: Readonly<Record<string, JsonValue>> = {},
+): JsonValue {
+  return {
+    applicationId: liveStatusDeployment.applicationId,
+    pluginId: liveStatusDeployment.pluginId,
+    generation: liveStatusDeployment.generation,
+    status,
+    diagnostics:
+      status === "failed"
+        ? [
+            runtimeDiagnostic({
+              code: "LIFECYCLE_START_FAILED",
+              message: "component failed",
+              source: { kind: "deployment", id: "application-01/plugin-01" },
+              observedAt: now.toISOString(),
+            }),
+          ]
+        : [],
+    updatedAt: now.toISOString(),
+    ...overrides,
+  };
+}
+
+function seedLiveDeployment(
+  state: EmptyState,
+  observation?: JsonValue,
+  deployment: PluginDeployment = liveStatusDeployment,
+): void {
+  state.set("installations", deployment.artifactDigest, {
+    pluginId: deployment.pluginId,
+    digest: deployment.artifactDigest,
+  });
+  state.set("deployments", `${deployment.applicationId}/${deployment.pluginId}`, deployment);
+  if (observation !== undefined) {
+    state.set(
+      "deployment-observations",
+      `${deployment.applicationId}/${deployment.pluginId}`,
+      observation,
+    );
+  }
+}
+
+test("typed deployment observation parser enforces exact canonical public fields", () => {
+  const parseObservation = (
+    contracts as unknown as {
+      readonly parsePluginDeploymentObservation: (input: unknown) => unknown;
+    }
+  ).parsePluginDeploymentObservation;
+  assert.equal(typeof parseObservation, "function");
+
+  for (const status of [
+    "blocked",
+    "degraded",
+    "disabled",
+    "failed",
+    "ready",
+    "reconciling",
+    "suspended",
+  ] as const) {
+    const valid = liveStatusObservation(status);
+    assert.deepEqual(parseObservation(valid), valid);
+  }
+  for (const invalid of [
+    liveStatusObservation("ready", { extra: true }),
+    liveStatusObservation("ready", { generation: "01" }),
+    liveStatusObservation("ready", { status: "converging" }),
+    liveStatusObservation("ready", {
+      diagnostics: [
+        {
+          ...runtimeDiagnostic({
+            code: "DEPLOYMENT_BLOCKED",
+            message: "blocked",
+            source: { kind: "deployment" },
+            observedAt: now.toISOString(),
+          }),
+          extra: true,
+        },
+      ],
+    }),
+    liveStatusObservation("ready", { updatedAt: "2026-07-24T08:00:00+08:00" }),
+  ]) {
+    assert.throws(() => parseObservation(invalid));
+  }
+});
+
+test("live runtime status reads empty durable state and deploy-after-start without recreation", async () => {
+  const value = fixture();
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+
+  const empty = await runtime.status();
+  assert.deepEqual(
+    { deployments: empty.counts.deployments, installations: empty.counts.installations },
+    { deployments: 0, installations: 0 },
+  );
+  assert.equal(empty.readiness, true);
+
+  seedLiveDeployment(value.state);
+  const reconciling = await runtime.status();
+  assert.deepEqual(
+    {
+      deployments: reconciling.counts.deployments,
+      installations: reconciling.counts.installations,
+    },
+    { deployments: 1, installations: 1 },
+  );
+  assert.equal(reconciling.readiness, false);
+
+  value.state.set(
+    "deployment-observations",
+    "application-01/plugin-01",
+    liveStatusObservation("ready", { generation: "0" }),
+  );
+  assert.equal((await runtime.status()).readiness, false);
+
+  value.state.set("deployments", "application-01/plugin-01", {
+    ...liveStatusDeployment,
+    state: "disabled",
+  });
+  value.state.delete("deployment-observations", "application-01/plugin-01");
+  assert.equal((await runtime.status()).readiness, true);
+  assert.ok(value.state.transactionReadCount >= 2);
+  await runtime.stop();
+});
+
+test("live runtime status follows provider degradation and recovery without recreation", async () => {
+  const value = fixture();
+  seedLiveDeployment(value.state, liveStatusObservation("ready"));
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+  assert.equal((await runtime.status()).readiness, true);
+
+  value.state.set(
+    "deployment-observations",
+    "application-01/plugin-01",
+    liveStatusObservation("degraded"),
+  );
+  assert.equal((await runtime.status()).readiness, false);
+
+  value.state.set(
+    "deployment-observations",
+    "application-01/plugin-01",
+    liveStatusObservation("ready"),
+  );
+  assert.equal((await runtime.status()).readiness, true);
+  await runtime.stop();
+});
+
+test("live runtime status reports essential deployment failure from durable observation", async () => {
+  const value = fixture();
+  seedLiveDeployment(value.state, liveStatusObservation("ready"));
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+  assert.equal((await runtime.status()).readiness, true);
+
+  value.state.set(
+    "deployment-observations",
+    "application-01/plugin-01",
+    liveStatusObservation("failed"),
+  );
+  assert.equal((await runtime.status()).readiness, false);
+  await runtime.stop();
+});
+
+test("live runtime status is identical on a follower reading shared durable state", async () => {
+  const value = fixture();
+  seedLiveDeployment(value.state, liveStatusObservation("ready"));
+  const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
+  await runtime.start();
+
+  const status = await runtime.status();
+  assert.equal(status.authority, undefined);
+  assert.equal(status.counts.deployments, 1);
+  assert.equal(status.counts.installations, 1);
+  assert.equal(status.readiness, true);
+  await runtime.stop();
+});
+
+test("live runtime status remains durable and live after restart-after-ready", async () => {
+  const first = fixture();
+  seedLiveDeployment(first.state, liveStatusObservation("ready"));
+  const original = createRuntimeHost(first.configuration, first.drivers, first.services);
+  await original.start();
+  assert.equal((await original.status()).readiness, true);
+  await original.stop();
+
+  const restartedValue = fixture("multi-main", clock, first.state);
+  const restarted = createRuntimeHost(
+    restartedValue.configuration,
+    restartedValue.drivers,
+    restartedValue.services,
+  );
+  await restarted.start();
+  assert.equal((await restarted.status()).readiness, true);
+
+  first.state.set(
+    "deployment-observations",
+    "application-01/plugin-01",
+    liveStatusObservation("suspended"),
+  );
+  assert.equal((await restarted.status()).readiness, false);
+  await restarted.stop();
+});
 
 test("@spec:coordination-provider/fenced-leadership/follower-remains-operable", async () => {
   const value = fixture();
@@ -571,11 +896,15 @@ test("leadership loss closes mutation admission before task authority and reconc
   assert.equal(value.services.reconcilerCurrentAuthorities[0]?.(), undefined);
   assert.equal((await runtime.status()).acceptingOperations, false);
   assert.equal((await runtime.status()).authority, undefined);
+  assert.notEqual(value.log.indexOf("capabilities.authority:none:7"), -1);
+  assert.ok(
+    value.log.indexOf("capabilities.authority:none:7") < value.log.indexOf("tasks.authority:none"),
+  );
   assert.ok(value.log.indexOf("tasks.authority:none") < value.log.indexOf("reconciler.stop:7"));
   assert.ok(
     value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
   );
-  assert.ok(value.log.indexOf("workers.authority:none") < value.log.indexOf("reconciler.stop:7"));
+  assert.ok(value.log.indexOf("reconciler.stop:7") < value.log.indexOf("workers.authority:none"));
 
   await eventually(() =>
     assert.equal(value.log.filter((entry) => entry === "coordination.campaign").length, 2),
@@ -584,10 +913,11 @@ test("leadership loss closes mutation admission before task authority and reconc
   await eventually(async () => assert.equal((await runtime.status()).authority?.epoch, "8"));
   assert.equal(value.services.reconcilerAuthorities.at(-1)?.epoch, "8");
   assert.equal(value.services.activeReconcilers, 1);
+  assert.ok(value.log.indexOf("tasks.authority:8") < value.log.indexOf("capabilities.authority:8"));
   await runtime.stop();
 });
 
-test("stop is idempotent and closes admission, leader services, tasks, workers, then drivers", async () => {
+test("stop is idempotent and retains Worker lifecycle transport until reconciliation closes", async () => {
   const value = fixture();
   const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
   await runtime.start();
@@ -599,10 +929,11 @@ test("stop is idempotent and closes admission, leader services, tasks, workers, 
   assert.equal(first, second);
   await first;
 
-  assert.deepEqual(value.log.slice(-11), [
+  assert.deepEqual(value.log.slice(-12), [
+    "capabilities.authority:none:11",
     "tasks.authority:none",
-    "workers.authority:none",
     "reconciler.stop:11",
+    "workers.authority:none",
     "coordination.release:11",
     "tasks.close",
     "workers.close",
@@ -638,6 +969,7 @@ test("single-main start waits for authority and initial reconciliation", async (
   assert.ok(value.log.indexOf("tasks.recover") < value.log.indexOf("workers.authority:1"));
   assert.ok(value.log.indexOf("workers.authority:1") < value.log.indexOf("reconciler.start:1"));
   assert.ok(value.log.indexOf("reconciler.start:1") < value.log.indexOf("tasks.authority:1"));
+  assert.ok(value.log.indexOf("tasks.authority:1") < value.log.indexOf("capabilities.authority:1"));
   await runtime.stop();
 });
 
@@ -650,6 +982,11 @@ test("background reconciliation failure closes authority and stops the runtime",
   assert.equal(value.services.reconcilerCurrentAuthorities[0]?.()?.epoch, "1");
   value.services.reconcilerBackgroundErrors[0]?.(new Error("background reconcile failed"));
   assert.equal(value.services.reconcilerCurrentAuthorities[0]?.(), undefined);
+  assert.equal(
+    value.log.includes("capabilities.authority:none:1"),
+    true,
+    "background failure must synchronously fence capability admission",
+  );
   await eventually(async () => {
     const status = await runtime.status();
     assert.equal(status.lifecycle, "stopped");
@@ -722,7 +1059,13 @@ test("stop retries retained reconciler cleanup, closes every service, and aggreg
   assert.equal(value.services.activeReconcilers, 0);
   assert.equal((await runtime.status()).lifecycle, "failed");
   assert.equal((await runtime.status()).acceptingOperations, false);
-  assert.equal(value.log.filter((entry) => entry === "reconciler.stop:14").length, 2);
+  const reconcilerStops = value.log
+    .map((entry, index) => (entry === "reconciler.stop:14" ? index : -1))
+    .filter((index) => index !== -1);
+  assert.equal(reconcilerStops.length, 2);
+  const workerRevoke = value.log.indexOf("workers.authority:none");
+  assert.ok(workerRevoke > (reconcilerStops[0] ?? -1));
+  assert.ok(workerRevoke < (reconcilerStops[1] ?? Number.POSITIVE_INFINITY));
   for (const entry of [
     "coordination.release:14",
     "tasks.close",
@@ -812,6 +1155,6 @@ test("task authority activation failure rolls back workers before stopping recon
   assert.ok(
     value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
   );
-  assert.ok(value.log.indexOf("workers.authority:none") < value.log.indexOf("reconciler.stop:17"));
+  assert.ok(value.log.indexOf("reconciler.stop:17") < value.log.indexOf("workers.authority:none"));
   await runtime.stop();
 });

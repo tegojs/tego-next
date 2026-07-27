@@ -591,3 +591,24 @@ test("createPostgresDrivers creates one shared driver namespace", async () => {
   assert.equal(drivers.coordination.scope, "distributed");
   assert.equal(drivers.artifacts.scope, "shared");
 });
+
+test("PostgreSQL cluster time is canonical UTC and independent of the process clock", async () => {
+  const { createPostgresDrivers } = await import("../src/index.js");
+  const drivers = createPostgresDrivers({
+    connectionString,
+    namespace: namespace("cluster_time"),
+  });
+  const realDateNow = Date.now;
+  await drivers.state.open();
+  try {
+    const earliestDatabaseTime = realDateNow() - 5_000;
+    Date.now = () => Date.UTC(2100, 0, 1);
+    const now = await drivers.clusterTime.now();
+    assert.equal(new Date(now).toISOString(), now);
+    assert.ok(Date.parse(now) >= earliestDatabaseTime);
+    assert.ok(Date.parse(now) <= realDateNow() + 5_000);
+  } finally {
+    Date.now = realDateNow;
+    await drivers.state.close();
+  }
+});

@@ -4,8 +4,10 @@ import {
   parseArtifactDigest,
   parseAttemptId,
   parseComponentId,
+  parseComponentInstanceId,
   parseFencingEpoch,
   parseExecutorId,
+  parseGeneration,
   parseOperationId,
   parsePluginId,
   parseTaskId,
@@ -13,18 +15,23 @@ import {
   type ArtifactDigest,
   type AttemptId,
   type ComponentId,
+  type Generation,
   type OperationId,
   type PluginId,
   type TaskId,
 } from "./identity.js";
 import {
+  createExecutionBinding,
   parseExecutionRequest,
+  assertExecutionBindingMatches,
   parseExecutionResult,
   parsePermissionSet,
   parsePluginDeployment,
+  parsePluginDeploymentObservation,
   parseRuntimeDiagnostic,
 } from "./schema.js";
 import {
+  type ExecutionBinding,
   type ExecutionResult,
   type OrphanPolicy,
   parseTaskExecutionTarget,
@@ -71,7 +78,25 @@ export interface RunTaskRequest extends JsonObject {
 export interface PluginDeploymentStatus extends JsonObject {
   readonly identity: PluginDeploymentIdentity;
   readonly desired?: PluginDeployment;
-  readonly observation?: JsonValue;
+  readonly observation?: PluginDeploymentObservation;
+}
+
+export type PluginDeploymentObservationStatus =
+  | "blocked"
+  | "degraded"
+  | "disabled"
+  | "failed"
+  | "ready"
+  | "reconciling"
+  | "suspended";
+
+export interface PluginDeploymentObservation extends JsonObject {
+  readonly applicationId: ApplicationId;
+  readonly pluginId: PluginId;
+  readonly generation: Generation;
+  readonly status: PluginDeploymentObservationStatus;
+  readonly diagnostics: readonly RuntimeDiagnostic[];
+  readonly updatedAt: string;
 }
 
 export type TaskRecordState = "accepted" | "running" | "terminal";
@@ -97,6 +122,7 @@ export interface TaskRecord extends JsonObject {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly target?: TaskExecutionTarget;
+  readonly binding?: ExecutionBinding;
   readonly executor?: TaskExecutorReference;
   readonly authority?: {
     readonly resource: string;
@@ -154,18 +180,29 @@ function exactKeys(
 
 function cloneStrictJson<T extends JsonValue>(value: T): T {
   try {
+    const identity = {
+      target: {
+        instanceId: parseComponentInstanceId("validation-instance"),
+        deploymentGeneration: parseGeneration("0"),
+        artifactDigest: parseArtifactDigest(
+          "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        executor: { id: "validation-executor", type: "thread" as const },
+      },
+      applicationId: parseApplicationId("validation-application"),
+      pluginId: parsePluginId("validation-plugin"),
+      componentId: parseComponentId("validation-component"),
+    };
     const parsed = parseExecutionRequest({
       taskId: "validation-task",
       attemptId: "validation-attempt",
-      target: {
-        instanceId: "validation-instance",
-        deploymentGeneration: "0",
-        artifactDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        executor: { id: "validation-executor", type: "thread" },
-      },
-      applicationId: "validation-application",
-      pluginId: "validation-plugin",
-      componentId: "validation-component",
+      ...identity,
+      binding: createExecutionBinding(identity, {
+        configuration: null,
+        permissionGrants: [],
+        capabilityDefinitions: [],
+        capabilityBindings: [],
+      }),
       input: value,
       deadline: "2026-01-01T00:00:00.000Z",
       orphanPolicy: "cancel",
@@ -310,7 +347,7 @@ export function parsePluginDeploymentStatus(input: unknown): PluginDeploymentSta
       : { desired: structuredClone(parsePluginDeployment(value.desired)) }),
     ...(value.observation === undefined
       ? {}
-      : { observation: cloneStrictJson(value.observation as JsonValue) }),
+      : { observation: structuredClone(parsePluginDeploymentObservation(value.observation)) }),
   };
 }
 
@@ -319,7 +356,7 @@ export function parseTaskRecord(input: unknown): TaskRecord {
   exactKeys(
     value,
     ["taskId", "attemptId", "request", "state", "createdAt", "updatedAt"],
-    ["target", "executor", "authority", "cancellation", "diagnostic", "result"],
+    ["target", "binding", "executor", "authority", "cancellation", "diagnostic", "result"],
   );
   if (value.state !== "accepted" && value.state !== "running" && value.state !== "terminal") {
     throw operationError("Task state is invalid");
@@ -338,7 +375,26 @@ export function parseTaskRecord(input: unknown): TaskRecord {
             type: entry.type as TaskExecutorReference["type"],
           };
         })();
+  const request = parseRunTaskRequest(value.request);
   const target = value.target === undefined ? undefined : parseTaskExecutionTarget(value.target);
+  const binding =
+    value.binding === undefined
+      ? undefined
+      : target === undefined
+        ? (() => {
+            throw operationError("Task execution binding requires an immutable target");
+          })()
+        : structuredClone(
+            assertExecutionBindingMatches(
+              {
+                applicationId: request.applicationId,
+                pluginId: request.pluginId,
+                componentId: request.componentId,
+                target,
+              },
+              value.binding,
+            ),
+          );
   if (
     target !== undefined &&
     executor !== undefined &&
@@ -407,11 +463,12 @@ export function parseTaskRecord(input: unknown): TaskRecord {
   const parsed: TaskRecord = {
     taskId,
     attemptId,
-    request: parseRunTaskRequest(value.request),
+    request,
     state: value.state as TaskRecordState,
     createdAt,
     updatedAt,
     ...(target === undefined ? {} : { target }),
+    ...(binding === undefined ? {} : { binding }),
     ...(executor === undefined ? {} : { executor }),
     ...(authority === undefined ? {} : { authority }),
     ...(cancellation === undefined ? {} : { cancellation }),

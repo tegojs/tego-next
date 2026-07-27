@@ -199,6 +199,34 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
     });
   });
 
+  for (const [name, importLine] of [
+    [
+      "accepts pathToFileURL among multiple named imports",
+      'import { fileURLToPath, pathToFileURL } from "node:url";',
+    ],
+    [
+      "accepts pathToFileURL before another named import",
+      'import { pathToFileURL, fileURLToPath } from "node:url";',
+    ],
+    [
+      "accepts multiline spacing around named imports",
+      ["import {", "  fileURLToPath,", "  pathToFileURL,", '} from "node:url";'].join("\n"),
+    ],
+  ]) {
+    await t.test(name, async () => {
+      await withWorkspace(workspaces, async (root) => {
+        const loaderDirectory = new URL("packages/executor-node/dist/src/host/", root);
+        await mkdir(loaderDirectory, { recursive: true });
+        await writeFile(
+          new URL("component-loader.js", loaderDirectory),
+          directLoader.replace('import { pathToFileURL } from "node:url";', importLine),
+        );
+
+        assert.deepEqual(await checkWorkspaceBoundaries(root), []);
+      });
+    });
+  }
+
   for (const [name, source] of [
     [
       "rejects a second computed import in the same loader",
@@ -726,6 +754,36 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
         "@tegojs/contracts -> @tegojs/testkit",
+      ]);
+    },
+  );
+});
+
+test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-export-only-layer-two-apis", async () => {
+  await withWorkspace(
+    {
+      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/runtime": {
+        name: "@tegojs/runtime",
+        dependencies: { "@tegojs/contracts": "0.0.0" },
+      },
+    },
+    async (root) => {
+      const outputDirectory = new URL("packages/runtime/dist/src/", root);
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(
+        new URL("index.d.ts", outputDirectory),
+        [
+          "export interface WorkflowEngine {}",
+          "declare class InternalScheduler {}",
+          "export { InternalScheduler as BusinessDomainScheduler };",
+          "export interface RuntimeKernel {}",
+        ].join("\n"),
+      );
+
+      assert.deepEqual(await checkWorkspaceBoundaries(root), [
+        "@tegojs/runtime -> [forbidden public export BusinessDomainScheduler]",
+        "@tegojs/runtime -> [forbidden public export WorkflowEngine]",
       ]);
     },
   );

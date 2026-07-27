@@ -1,5 +1,5 @@
-import type { JsonObject, JsonValue } from "@tegojs/contracts";
-import { snapshotComponentJson, type ComponentContext } from "./context.js";
+import type { ComponentCapabilityInvocation, JsonObject, JsonValue } from "@tegojs/contracts";
+import { type ComponentContext, snapshotComponentJson } from "./context.js";
 
 export const COMPONENT_DEFINITION_PROTOCOL = "tego.component/1.0" as const;
 
@@ -10,14 +10,27 @@ export interface PluginComponentDefinition {
   readonly start?: (context: ComponentContext) => Promise<void> | void;
   readonly health?: (context: ComponentContext) => Promise<JsonValue> | JsonValue;
   readonly run?: (context: ComponentContext, input: JsonValue) => Promise<JsonValue> | JsonValue;
+  readonly invokeCapability?: (
+    context: ComponentContext,
+    request: ComponentCapabilityInvocation,
+  ) => Promise<JsonValue> | JsonValue;
   readonly drain?: (context: ComponentContext) => Promise<void> | void;
   readonly stop?: (context: ComponentContext) => Promise<void> | void;
 }
 
 export type PluginComponentDefinitionInput = Omit<PluginComponentDefinition, "protocol">;
 
-const FIELDS = new Set(["drain", "health", "kind", "metadata", "run", "start", "stop"]);
-const HOOKS = ["drain", "health", "run", "start", "stop"] as const;
+const FIELDS = new Set([
+  "drain",
+  "health",
+  "invokeCapability",
+  "kind",
+  "metadata",
+  "run",
+  "start",
+  "stop",
+]);
+const HOOKS = ["drain", "health", "invokeCapability", "run", "start", "stop"] as const;
 
 export function defineComponent(input: PluginComponentDefinitionInput): PluginComponentDefinition {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -48,6 +61,9 @@ export function defineComponent(input: PluginComponentDefinitionInput): PluginCo
       throw new TypeError(`Component definition ${hook} must be a function`);
     }
   }
+  if (kind === "service" && values.get("invokeCapability") !== undefined) {
+    throw new TypeError("Capability provider hooks are supported only by task components");
+  }
   const metadataValue = values.get("metadata");
   let metadata: JsonObject | undefined;
   if (metadataValue !== undefined) {
@@ -64,6 +80,9 @@ export function defineComponent(input: PluginComponentDefinitionInput): PluginCo
     ...(values.get("start") === undefined ? {} : { start: values.get("start") }),
     ...(values.get("health") === undefined ? {} : { health: values.get("health") }),
     ...(values.get("run") === undefined ? {} : { run: values.get("run") }),
+    ...(values.get("invokeCapability") === undefined
+      ? {}
+      : { invokeCapability: values.get("invokeCapability") }),
     ...(values.get("drain") === undefined ? {} : { drain: values.get("drain") }),
     ...(values.get("stop") === undefined ? {} : { stop: values.get("stop") }),
   }) as PluginComponentDefinition;

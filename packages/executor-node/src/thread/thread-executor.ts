@@ -1,24 +1,18 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MessageChannel, Worker, type MessagePort, type Transferable } from "node:worker_threads";
+import { MessageChannel, type MessagePort, type Transferable, Worker } from "node:worker_threads";
 import {
-  compileSchemaValidator,
-  DiagnosticError,
-  parseArtifactDigest,
-  parseCapabilityName,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parsePluginManifest,
-  parseTaskExecutionTarget,
-  runtimeDiagnostic,
   type ArtifactDigest,
   type AttemptId,
   type AttemptStatus,
   type CapabilityDefinition,
   type Clock,
   type ComponentCapabilityBoundary,
+  type ComponentCapabilityInvocation,
   type ComponentPermissionBoundary,
+  compileSchemaValidator,
+  DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -29,26 +23,34 @@ import {
   type JsonValue,
   type Permission,
   type PluginManifest,
+  parseArtifactDigest,
+  parseCapabilityName,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parseOperationId,
+  parsePluginManifest,
+  parseTaskExecutionTarget,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type SecretProvider,
-  type TaskId,
   type TaskExecutionTarget,
+  type TaskId,
 } from "@tegojs/contracts";
 import {
   COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
   ComponentSandboxSession,
-  raceComponentSessionOperation,
   type ComponentSessionRunResult,
   type ComponentSessionTransport,
+  raceComponentSessionOperation,
   taskExecutionTargetsEqual,
 } from "../host/component-session.js";
 import {
   COMPONENT_HOST_PROTOCOL,
-  cloneComponentHostValue,
-  parseComponentHostResult,
   type ComponentHostCommand,
   type ComponentHostResult,
+  cloneComponentHostValue,
   type PrepareComponentHostCommand,
+  parseComponentHostResult,
 } from "../host/protocol.js";
 
 export const THREAD_EXECUTOR_MAX_MESSAGE_BYTES = 1024 * 1024;
@@ -125,7 +127,11 @@ export interface ThreadExecutorOptions {
   readonly workerEntrypoint?: string;
   readonly workerFactory?: ThreadWorkerFactory;
   readonly permissionBoundary?: ComponentPermissionBoundary;
+  readonly remoteWorkerIsolation?: boolean;
   readonly capabilityBoundary?: ComponentCapabilityBoundary;
+  readonly resolveCapabilityBoundary?: (
+    request: ExecutionRequest,
+  ) => ComponentCapabilityBoundary | Promise<ComponentCapabilityBoundary>;
   readonly secretProvider?: SecretProvider;
   readonly logger?: ThreadExecutorLogger;
   readonly events?: {
@@ -403,6 +409,7 @@ class ThreadChannel {
   readonly #port: MessagePort;
   readonly #options: ThreadExecutorOptions;
   readonly #component: ResolvedThreadComponent;
+  readonly #capabilityBoundary: ComponentCapabilityBoundary | undefined;
   readonly #inboundBudget: ThreadInboundBudget;
   readonly #capabilityValidators = new Map<
     string,
@@ -465,9 +472,11 @@ class ThreadChannel {
     options: ThreadExecutorOptions,
     component: ResolvedThreadComponent,
     inboundBudget: ThreadInboundBudget,
+    capabilityBoundary: ComponentCapabilityBoundary | undefined = options.capabilityBoundary,
   ) {
     this.#options = options;
     this.#component = component;
+    this.#capabilityBoundary = capabilityBoundary;
     this.#inboundBudget = inboundBudget;
     for (const definition of component.capabilityDefinitions) {
       this.#capabilityValidators.set(this.#capabilityKey(definition.identity), {
@@ -631,7 +640,12 @@ class ThreadChannel {
         }
         value = await this.#options.secretProvider.get(payload.name);
       } else if (message.type === "capability") {
-        const payload = this.#exactPayload(message.payload, ["identity", "method", "input"]);
+        const payload = this.#exactPayload(message.payload, [
+          "invocationId",
+          "identity",
+          "method",
+          "input",
+        ]);
         const identity = this.#exactPayload(payload.identity, ["name", "protocolVersion"]);
         const name = parseCapabilityName(identity.name);
         if (typeof identity.protocolVersion !== "string" || identity.protocolVersion.length === 0) {
@@ -645,11 +659,12 @@ class ThreadChannel {
         const validators = this.#capabilityValidators.get(this.#capabilityKey(capabilityIdentity));
         if (validators === undefined) throw new Error("Capability RPC is not registered");
         const input = validators.request.parse(payload.input);
-        if (this.#options.capabilityBoundary === undefined) {
+        if (this.#capabilityBoundary === undefined) {
           throw new Error("Capability boundary is unavailable");
         }
         value = validators.response.parse(
-          await this.#options.capabilityBoundary.invoke({
+          await this.#capabilityBoundary.invoke({
+            invocationId: parseOperationId(payload.invocationId),
             identity: capabilityIdentity,
             method: payload.method,
             input,
@@ -757,6 +772,14 @@ export class ThreadExecutor implements Executor {
   constructor(options: ThreadExecutorOptions) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(options.id)) {
       throw new TypeError("Thread executor identity is invalid");
+    }
+    if (
+      options.capabilityBoundary !== undefined &&
+      options.resolveCapabilityBoundary !== undefined
+    ) {
+      throw new TypeError(
+        "Thread executor capability boundary must be fixed or per-execution, not both",
+      );
     }
     const maxConcurrency = options.maxConcurrency ?? 1;
     const maxQueue = options.maxQueue ?? THREAD_EXECUTOR_MAX_QUEUE;
@@ -992,6 +1015,10 @@ export class ThreadExecutor implements Executor {
         return;
       }
       const component = resolution.value;
+      const capabilityBoundary =
+        this.#options.resolveCapabilityBoundary === undefined
+          ? this.#options.capabilityBoundary
+          : await this.#options.resolveCapabilityBoundary(entry.request);
       if (entry.forced !== undefined || this.#fatalDiagnostic !== undefined) {
         candidate =
           entry.forced ??
@@ -1017,7 +1044,13 @@ export class ThreadExecutor implements Executor {
         candidate = this.#cancelledResult(entry, entry.cancellation);
         return;
       }
-      channel = new ThreadChannel(lease, this.#options, component, this.#inboundBudget);
+      channel = new ThreadChannel(
+        lease,
+        this.#options,
+        component,
+        this.#inboundBudget,
+        capabilityBoundary,
+      );
       entry.channel = channel;
       const bootstrap = await channel.request({
         kind: "bootstrap",
@@ -1174,8 +1207,14 @@ export class ThreadExecutor implements Executor {
     const target = parseTaskExecutionTarget(resolved.target);
     const artifactDigest = parseArtifactDigest(resolved.artifactDigest);
     const manifest = parsePluginManifest(resolved.manifest);
+    const workerRemoteTarget =
+      this.#options.remoteWorkerIsolation === true &&
+      request.target.executor.type === "remote" &&
+      target.instanceId === request.target.instanceId &&
+      target.deploymentGeneration === request.target.deploymentGeneration &&
+      target.artifactDigest === request.target.artifactDigest;
     if (
-      !taskExecutionTargetsEqual(target, request.target) ||
+      (!taskExecutionTargetsEqual(target, request.target) && !workerRemoteTarget) ||
       target.executor.type !== "thread" ||
       target.executor.id !== this.id ||
       target.artifactDigest !== artifactDigest
@@ -1221,12 +1260,17 @@ export class ThreadExecutor implements Executor {
         this.#clock.now(),
       );
     }
+    const authoritativeExecutor =
+      this.#options.remoteWorkerIsolation === true && request.target.executor.type === "remote"
+        ? "remote"
+        : "thread";
     const threadGranted = resolved.permissionGrants.some(
-      (permission) => permission.kind === "executor" && permission.executors.includes("thread"),
+      (permission) =>
+        permission.kind === "executor" && permission.executors.includes(authoritativeExecutor),
     );
     const executorDecision = this.#options.permissionBoundary?.authorize(
       resolved.permissionGrants,
-      { kind: "executor", executor: "thread" },
+      { kind: "executor", executor: authoritativeExecutor },
     );
     if (!threadGranted || executorDecision?.allowed === false) {
       throw executorError(
@@ -1747,7 +1791,12 @@ export async function createThreadComponentSession(
   const { executorOptions: options, identity } = input;
   const clock = options.clock ?? systemClock;
   const target = parseTaskExecutionTarget(input.target);
-  if (target.executor.type !== "thread" || target.executor.id !== options.id) {
+  const remoteIsolation =
+    options.remoteWorkerIsolation === true && target.executor.type === "remote";
+  if (
+    !remoteIsolation &&
+    (target.executor.type !== "thread" || target.executor.id !== options.id)
+  ) {
     throw executorError(
       "EXECUTOR_REQUEST_TARGET_MISMATCH",
       "Thread session target does not match the selected executor",
@@ -1756,6 +1805,13 @@ export async function createThreadComponentSession(
   }
   const artifactDigest = parseArtifactDigest(input.component.artifactDigest);
   const resolvedTarget = parseTaskExecutionTarget(input.component.target);
+  const isolatedRemoteTarget =
+    remoteIsolation &&
+    resolvedTarget.executor.type === "thread" &&
+    resolvedTarget.executor.id === options.id &&
+    resolvedTarget.instanceId === target.instanceId &&
+    resolvedTarget.deploymentGeneration === target.deploymentGeneration &&
+    resolvedTarget.artifactDigest === target.artifactDigest;
   const manifest = parsePluginManifest(input.component.manifest);
   const definition = manifest.components.find(
     (candidate) => candidate.componentId === identity.componentId,
@@ -1773,7 +1829,7 @@ export async function createThreadComponentSession(
     );
   }
   if (
-    !taskExecutionTargetsEqual(resolvedTarget, target) ||
+    (!taskExecutionTargetsEqual(resolvedTarget, target) && !isolatedRemoteTarget) ||
     artifactDigest !== target.artifactDigest
   ) {
     throw executorError(
@@ -1800,12 +1856,14 @@ export async function createThreadComponentSession(
       clock.now(),
     );
   }
+  const authoritativeExecutor = remoteIsolation ? "remote" : "thread";
   const threadGranted = input.component.permissionGrants.some(
-    (permission) => permission.kind === "executor" && permission.executors.includes("thread"),
+    (permission) =>
+      permission.kind === "executor" && permission.executors.includes(authoritativeExecutor),
   );
   const executorDecision = options.permissionBoundary?.authorize(input.component.permissionGrants, {
     kind: "executor",
-    executor: "thread",
+    executor: authoritativeExecutor,
   });
   if (!threadGranted || executorDecision?.allowed === false) {
     throw executorError(
@@ -2016,7 +2074,7 @@ export async function createThreadComponentSession(
         configuration: component.configuration,
         permissionGrants: component.permissionGrants,
         capabilityDefinitions: component.capabilityDefinitions,
-        runtime: { executor: "thread", mode: "single-main" },
+        runtime: { executor: remoteIsolation ? "remote" : "thread", mode: "single-main" },
       },
     };
     await hostCommand(prepare);
@@ -2057,6 +2115,23 @@ export async function createThreadComponentSession(
           payload: { artifactDigest, execution: request },
         });
         return parseSessionRunResult(result, clock);
+      },
+      async invokeCapability(invocation: ComponentCapabilityInvocation): Promise<JsonValue> {
+        const result = await hostCommand({
+          protocol: COMPONENT_HOST_PROTOCOL,
+          commandId: `session-capability-${++commandSequence}-${invocation.invocationId}`,
+          deadline: controlDeadline(),
+          type: "invokeCapability",
+          payload: { artifactDigest, invocation },
+        });
+        if (result.value === undefined) {
+          throw executorError(
+            "EXECUTOR_COMPONENT_HOST_FAILED",
+            "Capability provider returned no wire value",
+            clock.now(),
+          );
+        }
+        return result.value;
       },
       async cancel(taskId, attemptId, reason): Promise<void> {
         await hostCommand({

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdtemp, readFile, rm } from "node:fs/promises";
-import { createConnection, type Socket } from "node:net";
+import { access, chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -215,6 +215,27 @@ async function readResponse(socket: Socket, timeoutMs = 1_000): Promise<ControlR
   });
 }
 
+function runtimeStopFrame(requestId: string): string {
+  return `${JSON.stringify({
+    protocolVersion: "1.0",
+    requestId,
+    operation: "runtime.stop",
+    input: {},
+  })}\n`;
+}
+
+async function readUntilClosed(socket: Socket): Promise<string> {
+  return await new Promise((resolve) => {
+    let response = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+    });
+    socket.once("error", () => undefined);
+    socket.once("close", () => resolve(response));
+  });
+}
+
 async function sendFragmented(endpoint: string, data: string): Promise<ControlResponse> {
   const socket = await connect(endpoint);
   const response = readResponse(socket);
@@ -332,6 +353,62 @@ test("@spec:runtime-operations/local-runtime-operations/path-ingress-stays-outsi
       assert.equal(response.ok, true);
       assert.deepEqual(ingested, [artifactPath]);
       assert.deepEqual(installed, [expectedDigest]);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("artifact ingress occurs exactly once before follower installation is fenced", async () => {
+  await withEndpoint(async (endpoint, directory) => {
+    const artifactPath = join(directory, "plugin.tego");
+    const expectedDigest = `sha256:${"b".repeat(64)}` as ArtifactDigest;
+    const calls: string[] = [];
+    const semanticState = {
+      installations: [],
+      deployments: [],
+      instances: [],
+      operations: [],
+      tasks: [],
+    };
+    const semanticStateBefore = JSON.stringify(semanticState);
+    const operations = fakeOperations();
+    const server = await startControlServer({
+      endpoint,
+      artifactIngress: {
+        putPath: async (path: string) => {
+          calls.push(`putPath:${path}`);
+          return expectedDigest;
+        },
+      },
+      operations: {
+        ...operations,
+        operations: {
+          ...operations.operations,
+          installPlugin: async (request: InstallPluginRequest) => {
+            calls.push(`installPlugin:${request.digest}`);
+            throw new DiagnosticError(
+              runtimeDiagnostic({
+                code: "COORDINATION_NOT_LEADER",
+                message: "Operation requires the current leader",
+                source: { kind: "coordination" },
+              }),
+            );
+          },
+        },
+      },
+    });
+    try {
+      const response = await requestControl({
+        endpoint,
+        operation: "plugin.install-path",
+        input: { artifactPath },
+        timeoutMs: 1_000,
+      });
+      assert.equal(response.ok, false);
+      assert.equal(response.diagnostic?.code, "COORDINATION_NOT_LEADER");
+      assert.deepEqual(calls, [`putPath:${artifactPath}`, `installPlugin:${expectedDigest}`]);
+      assert.equal(JSON.stringify(semanticState), semanticStateBefore);
     } finally {
       await server.close();
     }
@@ -600,6 +677,341 @@ test("@spec:runtime-operations/local-runtime-operations/permission-init-rolls-ba
       await unexpected?.close();
     }
     await assert.rejects(connect(endpoint));
+  });
+});
+
+test("permission initialization pauses accepted Unix sockets until owner-private 0600 verification", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket permission initialization does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
+    let stopCalls = 0;
+    const operations = fakeOperations();
+    const startup = startControlServer({
+      endpoint,
+      operations: {
+        ...operations,
+        stop: async () => {
+          stopCalls += 1;
+        },
+      },
+      setEndpointPermissions: async (path) => {
+        permissionEntered.resolve();
+        await permissionRelease.promise;
+        await chmod(path, 0o600);
+      },
+    });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const response = readResponse(socket);
+    socket.end(runtimeStopFrame("permission-window"));
+
+    const responseSettledBeforePermission = await settlesBeforeDeadline(response);
+    const stopCallsBeforePermission = stopCalls;
+    permissionRelease.resolve();
+    const server = await startup;
+    try {
+      assert.equal((await response).ok, true);
+      assert.equal(stopCalls, 1);
+    } finally {
+      await server.close();
+    }
+    assert.equal(responseSettledBeforePermission, false);
+    assert.equal(stopCallsBeforePermission, 0);
+  });
+});
+
+test("permission initialization rejects a no-op hook and closes its queued socket", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket permission initialization does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async () => {
+        permissionEntered.resolve();
+        await permissionRelease.promise;
+      },
+    });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const closed = readUntilClosed(socket);
+    socket.end(runtimeStopFrame("permission-no-op"));
+    permissionRelease.resolve();
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    const response = await closed;
+    if (outcome.ok) await outcome.server.close();
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
+    assert.equal(response, "");
+    await assert.rejects(connect(endpoint));
+  });
+});
+
+test("permission initialization rejects a non-socket path and closes its queued socket", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket permission initialization does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        permissionEntered.resolve();
+        await permissionRelease.promise;
+        await unlink(path);
+        await writeFile(path, "not a socket", { mode: 0o600 });
+      },
+    });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const closed = readUntilClosed(socket);
+    socket.end(runtimeStopFrame("permission-non-socket"));
+    permissionRelease.resolve();
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    const response = await closed;
+    if (outcome.ok) await outcome.server.close();
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
+    assert.equal(response, "");
+    await assert.rejects(connect(endpoint));
+  });
+});
+
+test("permission initialization rejects a same-owner 0600 replacement socket", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket identity verification does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    let replacement: Server | undefined;
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        await chmod(path, 0o600);
+        permissionEntered.resolve();
+        await permissionRelease.promise;
+        await unlink(path);
+        replacement = createServer();
+        await new Promise<void>((resolve, reject) => {
+          replacement?.once("error", reject);
+          replacement?.listen(path, resolve);
+        });
+        await chmod(path, 0o600);
+      },
+    });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const closed = readUntilClosed(socket);
+    socket.end(runtimeStopFrame("permission-replacement"));
+    permissionRelease.resolve();
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    const response = await closed;
+    if (outcome.ok) await outcome.server.close();
+    await new Promise<void>((resolve, reject) => {
+      if (replacement === undefined || !replacement.listening) {
+        resolve();
+        return;
+      }
+      replacement.close((error) => (error === undefined ? resolve() : reject(error)));
+    });
+
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
+    assert.equal(response, "");
+  });
+});
+
+test("permission initialization rejects a parent directory made public by its hook", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix directory permissions do not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint, directory) => {
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        await chmod(path, 0o600);
+        await chmod(directory, 0o777);
+      },
+    });
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    if (outcome.ok) await outcome.server.close();
+    await chmod(directory, 0o700);
+
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE");
+    }
+  });
+});
+
+test("permission initialization rejects a symlink endpoint", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket identity verification does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint, directory) => {
+    const target = join(directory, "replacement.sock");
+    const replacement = createServer();
+    await new Promise<void>((resolve, reject) => {
+      replacement.once("error", reject);
+      replacement.listen(target, resolve);
+    });
+    await chmod(target, 0o600);
+    try {
+      const startup = startControlServer({
+        endpoint,
+        operations: fakeOperations(),
+        setEndpointPermissions: async (path) => {
+          await chmod(path, 0o600);
+          await unlink(path);
+          await symlink(target, path);
+        },
+      });
+      const outcome = await startup.then(
+        (server) => ({ ok: true as const, server }),
+        (error: unknown) => ({ error, ok: false as const }),
+      );
+      if (outcome.ok) await outcome.server.close();
+
+      assert.equal(outcome.ok, false);
+      if (!outcome.ok) {
+        assert.ok(outcome.error instanceof DiagnosticError);
+        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        replacement.close((error) => (error === undefined ? resolve() : reject(error)));
+      });
+    }
+  });
+});
+
+test("permission initialization rejects a mode other than 0600 and closes its queued socket", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket permission initialization does not apply to named pipes");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        permissionEntered.resolve();
+        await permissionRelease.promise;
+        await chmod(path, 0o640);
+      },
+    });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const closed = readUntilClosed(socket);
+    socket.end(runtimeStopFrame("permission-mode"));
+    permissionRelease.resolve();
+
+    const outcome = await startup.then(
+      (server) => ({ ok: true as const, server }),
+      (error: unknown) => ({ error, ok: false as const }),
+    );
+    const response = await closed;
+    if (outcome.ok) await outcome.server.close();
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.ok(outcome.error instanceof DiagnosticError);
+      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    }
+    assert.equal(response, "");
+    await assert.rejects(connect(endpoint));
+  });
+});
+
+test("permission initialization rejects the wrong owner and closes its queued socket", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix socket permission initialization does not apply to named pipes");
+    return;
+  }
+  const originalGetuid = process.getuid;
+  if (originalGetuid === undefined) {
+    context.skip("Unix owner verification requires getuid");
+    return;
+  }
+  await withEndpoint(async (endpoint) => {
+    const permissionEntered = Promise.withResolvers<void>();
+    const permissionRelease = Promise.withResolvers<void>();
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      setEndpointPermissions: async (path) => {
+        permissionEntered.resolve();
+        await permissionRelease.promise;
+        await chmod(path, 0o600);
+        process.getuid = () => originalGetuid() + 1;
+      },
+    });
+    await permissionEntered.promise;
+    const socket = await connect(endpoint);
+    const closed = readUntilClosed(socket);
+    socket.end(runtimeStopFrame("permission-owner"));
+    permissionRelease.resolve();
+    try {
+      const outcome = await startup.then(
+        (server) => ({ ok: true as const, server }),
+        (error: unknown) => ({ error, ok: false as const }),
+      );
+      const response = await closed;
+      if (outcome.ok) await outcome.server.close();
+      assert.equal(outcome.ok, false);
+      if (!outcome.ok) {
+        assert.ok(outcome.error instanceof DiagnosticError);
+        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_PARENT_NOT_PRIVATE");
+      }
+      assert.equal(response, "");
+      await assert.rejects(connect(endpoint));
+    } finally {
+      process.getuid = originalGetuid;
+    }
   });
 });
 

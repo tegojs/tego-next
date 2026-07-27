@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  createExecutionBinding,
+  type JsonValue,
+  type PluginManifest,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
+  parseCapabilityName,
   parseComponentId,
   parseComponentInstanceId,
   parseGeneration,
@@ -14,18 +18,16 @@ import {
   parsePluginManifest,
   parseRuntimeId,
   parseTaskId,
-  type JsonValue,
-  type PluginManifest,
   type SecretProvider,
 } from "@tegojs/contracts";
 import {
-  cloneComponentHostValue,
   ComponentHost,
-  parseComponentHostCommand,
   type ComponentHostCommand,
   type ComponentHostOptions,
   type ComponentHostResult,
+  cloneComponentHostValue,
   type PrepareComponentHostCommand,
+  parseComponentHostCommand,
 } from "../src/index.js";
 
 const digest = parseArtifactDigest(`sha256:${"a".repeat(64)}`);
@@ -36,6 +38,12 @@ const componentTarget = {
   deploymentGeneration: parseGeneration("1"),
   artifactDigest: digest,
   executor: { id: "component-host", type: "process" },
+} as const;
+const componentExecutionIdentity = {
+  applicationId: parseApplicationId("app-01"),
+  pluginId: parsePluginId("org.example.component"),
+  componentId: parseComponentId("component"),
+  target: componentTarget,
 } as const;
 
 interface ArtifactFixture {
@@ -51,6 +59,7 @@ async function artifactFixture(
     readonly entrypoint?: string;
     readonly isolated?: boolean;
     readonly permissions?: PluginManifest["permissions"];
+    readonly provides?: PluginManifest["capabilities"]["provides"];
   } = {},
 ): Promise<ArtifactFixture> {
   const directory = await mkdtemp(
@@ -79,7 +88,7 @@ async function artifactFixture(
       },
     ],
     permissions: options.permissions ?? [],
-    capabilities: { provides: [], requires: [] },
+    capabilities: { provides: options.provides ?? [], requires: [] },
   });
   return { directory: await realpath(directory), manifest };
 }
@@ -110,6 +119,15 @@ function prepareCommand(
       ...overrides,
     },
   };
+}
+
+function executionBinding(fixture: ArtifactFixture) {
+  return createExecutionBinding(componentExecutionIdentity, {
+    configuration: { greeting: "hello" },
+    permissionGrants: fixture.manifest.permissions,
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
 }
 
 function command(
@@ -272,6 +290,7 @@ async function attachmentLimitResult(
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -319,6 +338,51 @@ test("host command protocol is versioned, strict, JSON-safe, and bounded", () =>
   assert.equal(calls, 0);
 });
 
+test("provider capability invocation commands preserve the exact bounded wire contract", () => {
+  const invocation = {
+    protocol: "1.0",
+    commandId: "invoke-capability-01",
+    deadline: futureDeadline,
+    type: "invokeCapability",
+    payload: {
+      artifactDigest: digest,
+      invocation: {
+        invocationId: "operation-01",
+        identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+        method: "echo",
+        input: { message: "hello" },
+      },
+    },
+  };
+
+  assert.deepEqual(parseComponentHostCommand(invocation), invocation);
+  assert.throws(
+    () =>
+      parseComponentHostCommand({
+        ...invocation,
+        payload: {
+          ...invocation.payload,
+          invocation: { ...invocation.payload.invocation, invocationId: "" },
+        },
+      }),
+    /invocation|OperationId/u,
+  );
+  assert.throws(
+    () =>
+      parseComponentHostCommand({
+        ...invocation,
+        payload: {
+          ...invocation.payload,
+          invocation: {
+            ...invocation.payload.invocation,
+            input: "x".repeat(1024 * 1024 + 1),
+          },
+        },
+      }),
+    /bounded|limit|size/u,
+  );
+});
+
 test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sdk", async (t) => {
   const fixture = await artifactFixture(
     t,
@@ -353,6 +417,7 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sd
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -942,6 +1007,7 @@ test("failed stop cleanup is terminal and repeats its canonical result without r
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1062,6 +1128,7 @@ test("a plugin-created AsyncResource cannot self-await an active transition", as
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1116,6 +1183,7 @@ test("drain closes run intake synchronously before its hook settles", async (t) 
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1156,6 +1224,7 @@ test("non-cooperative runs respect hard capacity while cancel and drain remain a
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
+          binding: executionBinding(fixture),
           input: index,
           deadline: futureDeadline,
           orphanPolicy: "cancel",
@@ -1267,6 +1336,7 @@ test("duplicate task attempts compare full execution fingerprints and completed 
     applicationId: parseApplicationId("app-01"),
     pluginId: parsePluginId("org.example.component"),
     componentId: parseComponentId("component"),
+    binding: executionBinding(fixture),
     input: { version: 1 },
     deadline: futureDeadline,
     orphanPolicy: "cancel",
@@ -1363,6 +1433,7 @@ test("deadline acceptance and chunked timers use the same injected clock", async
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
+          binding: executionBinding(fixture),
           input: null,
           deadline,
           orphanPolicy: "cancel",
@@ -1468,6 +1539,18 @@ test("capability calls are forced through permission, request, invoke, and respo
     }),
   );
   await host.handle(command("start", "start-01", { artifactDigest: digest }));
+  const executionIdentity = {
+    applicationId: parseApplicationId("app-01"),
+    pluginId: parsePluginId("org.example.component"),
+    componentId: parseComponentId("component"),
+    target: componentTarget,
+  };
+  const binding = createExecutionBinding(executionIdentity, {
+    configuration: { greeting: "hello" },
+    permissionGrants: fixture.manifest.permissions,
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
 
   const invalidRequest = await host.handle(
     command("run", "run-invalid-request", {
@@ -1475,10 +1558,8 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-invalid"),
         attemptId: parseAttemptId("attempt-invalid"),
-        target: componentTarget,
-        applicationId: parseApplicationId("app-01"),
-        pluginId: parsePluginId("org.example.component"),
-        componentId: parseComponentId("component"),
+        ...executionIdentity,
+        binding,
         input: { message: 7 },
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1486,6 +1567,11 @@ test("capability calls are forced through permission, request, invoke, and respo
     }),
   );
   assert.equal(invalidRequest.ok, false);
+  assert.equal(
+    invalidRequest.diagnostics[0]?.code,
+    "CAPABILITY_REQUEST_INVALID",
+    JSON.stringify(invalidRequest.diagnostics),
+  );
   assert.deepEqual(order, ["permission:capability", "request"]);
 
   order.length = 0;
@@ -1496,10 +1582,8 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-response"),
         attemptId: parseAttemptId("attempt-response"),
-        target: componentTarget,
-        applicationId: parseApplicationId("app-01"),
-        pluginId: parsePluginId("org.example.component"),
-        componentId: parseComponentId("component"),
+        ...executionIdentity,
+        binding,
         input: { message: "hello" },
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1509,6 +1593,316 @@ test("capability calls are forced through permission, request, invoke, and respo
   assert.equal(invalidResponse.ok, false);
   assert.deepEqual(order, ["permission:capability", "request", "invoke", "response"]);
   assert.equal(invalidResponse.diagnostics[0]?.code, "CAPABILITY_RESPONSE_INVALID");
+});
+
+test("provider capability commands invoke only the task provider hook", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => { throw new Error("run must not handle provider calls"); },
+        invokeCapability: async (_context, request) => ({
+          invocationId: request.invocationId,
+          method: request.method,
+          input: request.input
+        })
+      });
+    `,
+    {
+      provides: [
+        {
+          name: parseCapabilityName("org.example.echo"),
+          protocolVersion: "1.0.0",
+          componentId: parseComponentId("component"),
+          methods: ["echo"],
+          requestSchema: true,
+          responseSchema: true,
+        },
+      ],
+    },
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "provider-import", { artifactDigest: digest }));
+  await host.handle(command("start", "provider-start", { artifactDigest: digest }));
+
+  const result = await host.handle(
+    command("invokeCapability" as never, "provider-invoke", {
+      artifactDigest: digest,
+      invocation: {
+        invocationId: "operation-provider-01",
+        identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+        method: "echo",
+        input: { message: "hello" },
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, {
+    invocationId: "operation-provider-01",
+    method: "echo",
+    input: { message: "hello" },
+  });
+});
+
+test("declared task capability providers fail import when the provider hook is missing", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => null
+      });
+    `,
+    {
+      provides: [
+        {
+          name: parseCapabilityName("org.example.echo"),
+          protocolVersion: "1.0.0",
+          componentId: parseComponentId("component"),
+          methods: ["echo"],
+          requestSchema: true,
+          responseSchema: true,
+        },
+      ],
+    },
+  );
+  const host = new ComponentHost(allowedOptions(fixture));
+  await host.handle(prepareCommand(fixture));
+
+  const result = await host.handle(
+    command("import", "provider-missing-hook-import", { artifactDigest: digest }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "EXECUTOR_COMPONENT_DEFINITION_INVALID");
+  assert.match(result.diagnostics[0]?.message ?? "", /invokeCapability|provider hook/iu);
+});
+
+test("secret values cannot cross the capability request boundary or diagnostic surface", async (t) => {
+  const secret = "raw-capability-secret";
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async (context) => {
+          const secret = await context.secrets.get("API_TOKEN");
+          return context.capabilities.call({
+            name: "org.example.echo",
+            protocolVersion: "1.0.0",
+            method: "echo",
+            input: { secret }
+          });
+        }
+      });
+    `,
+    {
+      permissions: [
+        { kind: "secret", names: ["API_TOKEN"] },
+        {
+          kind: "capability",
+          capabilities: [{ name: "org.example.echo", methods: ["echo"] }],
+        },
+      ],
+    },
+  );
+  let invoked = false;
+  const host = new ComponentHost(
+    allowedOptions(fixture, {
+      secretProvider: {
+        developmentOnly: true,
+        open: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: "2026-07-23T00:00:00.000Z",
+        }),
+        close: async () => {},
+        get: async () => secret,
+      },
+      permissionBoundary: {
+        validateGrant: (_requested, granted) => ({
+          allowed: true,
+          diagnostics: [],
+          granted,
+        }),
+        authorize: () => ({ allowed: true, diagnostics: [] }),
+      },
+      capabilityBoundary: {
+        register: () => ({ ok: true, diagnostics: [] }),
+        request: (_identity: unknown, input: JsonValue) => ({
+          allowed: true,
+          diagnostics: [],
+          value: input,
+        }),
+        invoke: async () => {
+          invoked = true;
+          return null;
+        },
+        response: (_identity: unknown, input: JsonValue) => ({
+          allowed: true,
+          diagnostics: [],
+          value: input,
+        }),
+        clear() {},
+      },
+    }),
+  );
+  const prepared = await host.handle(prepareCommand(fixture));
+  assert.equal(prepared.ok, true, JSON.stringify(prepared.diagnostics));
+  const imported = await host.handle(
+    command("import", "secret-capability-import", { artifactDigest: digest }),
+  );
+  assert.equal(imported.ok, true, JSON.stringify(imported.diagnostics));
+  const started = await host.handle(
+    command("start", "secret-capability-start", { artifactDigest: digest }),
+  );
+  assert.equal(started.ok, true, JSON.stringify(started.diagnostics));
+  const executionIdentity = {
+    applicationId: parseApplicationId("app-01"),
+    pluginId: parsePluginId("org.example.component"),
+    componentId: parseComponentId("component"),
+    target: componentTarget,
+  };
+
+  const result = await host.handle(
+    command("run", "secret-capability-run", {
+      artifactDigest: digest,
+      execution: {
+        taskId: parseTaskId("task-secret-capability"),
+        attemptId: parseAttemptId("attempt-secret-capability"),
+        ...executionIdentity,
+        binding: createExecutionBinding(executionIdentity, {
+          configuration: { greeting: "hello" },
+          permissionGrants: fixture.manifest.permissions,
+          capabilityDefinitions: [],
+          capabilityBindings: [],
+        }),
+        input: null,
+        deadline: futureDeadline,
+        orphanPolicy: "cancel",
+      },
+    }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.diagnostics[0]?.code,
+    "PERMISSION_SECRET_EXFILTRATION_BLOCKED",
+    JSON.stringify(result.diagnostics),
+  );
+  assert.equal(invoked, false);
+  assert.doesNotMatch(JSON.stringify(result), /raw-capability-secret/u);
+});
+
+test("provider capability responses reject secret exfiltration before wire redaction", async (t) => {
+  const secret = "raw-provider-capability-secret";
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => null,
+        invokeCapability: async (context) => ({
+          value: await context.secrets.get("API_TOKEN")
+        })
+      });
+    `,
+    {
+      permissions: [{ kind: "secret", names: ["API_TOKEN"] }],
+      provides: [
+        {
+          name: parseCapabilityName("org.example.echo"),
+          protocolVersion: "1.0.0",
+          componentId: parseComponentId("component"),
+          methods: ["echo"],
+          requestSchema: true,
+          responseSchema: true,
+        },
+      ],
+    },
+  );
+  const host = new ComponentHost(
+    allowedOptions(fixture, {
+      secretProvider: {
+        developmentOnly: true,
+        open: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: "2026-07-23T00:00:00.000Z",
+        }),
+        close: async () => {},
+        get: async () => secret,
+      },
+      permissionBoundary: {
+        validateGrant: (_requested, granted) => ({
+          allowed: true,
+          diagnostics: [],
+          granted,
+        }),
+        authorize: () => ({ allowed: true, diagnostics: [] }),
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "provider-secret-import", { artifactDigest: digest }));
+  await host.handle(command("start", "provider-secret-start", { artifactDigest: digest }));
+
+  const result = await host.handle(
+    command("invokeCapability" as never, "provider-secret-invoke", {
+      artifactDigest: digest,
+      invocation: {
+        invocationId: "operation-provider-secret",
+        identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+        method: "echo",
+        input: null,
+      },
+    }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.diagnostics[0]?.code,
+    "PERMISSION_SECRET_EXFILTRATION_BLOCKED",
+    JSON.stringify(result.diagnostics),
+  );
+  assert.doesNotMatch(JSON.stringify(result), /raw-provider-capability-secret/u);
+});
+
+test("service components explicitly reject provider capability hooks", async (t) => {
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default {
+        protocol: "tego.component/1.0",
+        kind: "service",
+        invokeCapability: async () => null
+      };
+    `,
+    { componentId: "component" },
+  );
+  const component = fixture.manifest.components[0];
+  if (component === undefined) throw new Error("Service fixture component is missing");
+  const serviceManifest = {
+    ...fixture.manifest,
+    components: [{ ...component, kind: "service" as const }],
+  } satisfies PluginManifest;
+  const host = new ComponentHost(allowedOptions({ ...fixture, manifest: serviceManifest }));
+  await host.handle(prepareCommand({ ...fixture, manifest: serviceManifest }));
+  const result = await host.handle(
+    command("import", "service-provider-import", { artifactDigest: digest }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0]?.code, "EXECUTOR_COMPONENT_DEFINITION_INVALID");
+  assert.match(result.diagnostics[0]?.message ?? "", /task|unsupported/u);
 });
 
 test("duplicate task attempts execute once and cooperative cancellation reaches the hook", async (t) => {
@@ -1557,6 +1951,7 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
       applicationId: parseApplicationId("app-01"),
       pluginId: parsePluginId("org.example.component"),
       componentId: parseComponentId("component"),
+      binding: executionBinding(fixture),
       input: null,
       deadline: futureDeadline,
       orphanPolicy: "cancel",
@@ -1620,6 +2015,7 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
+          binding: executionBinding(fixture),
           input: null,
           deadline,
           orphanPolicy: "cancel",
@@ -1716,6 +2112,7 @@ test("secret access requires manifest request and deployment grant and never lea
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",

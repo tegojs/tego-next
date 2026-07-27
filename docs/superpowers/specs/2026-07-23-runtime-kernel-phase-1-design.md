@@ -520,12 +520,18 @@ interface WorkerEnvelope<T> {
   messageId: MessageId;
   sessionId: SessionId;
   sequence: Sequence;
-  correlationId?: MessageId;
+  correlationId: MessageId;
   type: WorkerMessageType;
   sentAt: string;
   payload: T;
 }
 ```
+
+Every envelope carries a correlation identity. One-way messages and requests
+self-correlate by setting `correlationId` to their own `messageId`; responses
+set it to the exact triggering request `messageId`. A missing or invalid
+correlation is a protocol error and never downgrades to an uncorrelated
+message.
 
 Control messages are JSON. Artifact chunks and large task payloads use binary
 frames correlated by message ID. Limits exist for message size, inflight
@@ -538,7 +544,25 @@ memory/disk buffers for `finish-and-buffer`. Reconnect reports:
 - acknowledged but not started attempts;
 - terminal results awaiting Main acknowledgement;
 - prepared artifact digests;
+- Main-retained exact active and draining component bindings that a replacement
+  Worker validates and materializes with the same admission state;
+- Worker-retained exact component bindings and lifecycle states, from which a
+  replacement Main may create a non-transferable draining teardown candidate
+  but never create or replay Main activation authority;
 - whether the Worker attempt-state persistence boundary is currently available.
+
+A retained `draining` activation is never promoted by replay. Reconciliation
+materializes it as non-accepting on a replacement Worker and lets a replacement
+Main recover a teardown candidate. That candidate is never sent to another
+Worker and accepts stop only with the matching Main-derived durable target and
+binding fingerprint. Each peer validates the complete activation inventory
+before committing state or invoking materialization. Only successful stop, or a
+later durable lifecycle decision after stop, permits a new active activation.
+
+A Worker with multiple bounded Main URLs rotates past an authenticated follower
+that rejects registration as non-authoritative. The peer exposes only a generic
+retryable endpoint-unavailable diagnostic; credential and authentication
+failures remain terminal.
 
 The Main never creates a replacement attempt until the current attempt is
 resolved or retry policy explicitly advances to a new attempt ID.
@@ -602,8 +626,8 @@ interface RuntimeDiagnostic {
 }
 ```
 
-Codes are stable and grouped by bootstrap, artifact, deployment, capability,
-permission, lifecycle, executor, Worker, coordination, state, and protocol.
+Codes are stable and grouped by activation, bootstrap, artifact, deployment,
+capability, permission, lifecycle, executor, Worker, coordination, state, and protocol.
 Stack traces are diagnostic attachments and never the only error identity.
 
 ## 18. Testing Architecture

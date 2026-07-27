@@ -3,9 +3,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
+import { registerTestCleanup, useTempWorkspace } from "../support/temp-workspace.mjs";
 
 function registerCleanup(t, child) {
-  t.after(async () => {
+  registerTestCleanup(t, async () => {
     await child.stop({ timeoutMs: 2_000 });
     await child.assertClean();
   });
@@ -36,6 +37,22 @@ function nextEventLoopTurn(signal) {
       resolve();
     });
     signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function settleTestPromiseWithin(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("ASSERT_CLEAN_TIMEOUT")), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
 }
 
@@ -103,17 +120,22 @@ function registerExpectedDiagnosticCleanup(t, child, expected, finishResources =
 
 test("@spec:runtime-operations/ci-authoritative-system-acceptance/actionable-system-test-failure", async (t) => {
   const artifacts = await createRunArtifacts("managed-process");
+  const workspace = await useTempWorkspace(t, "managed-process");
   const child = await spawnManagedProcess({
     artifacts,
     command: process.execPath,
     args: [
       "--eval",
       [
+        "require('node:fs').writeFileSync(",
+        "require('node:path').join(process.env.TEGO_TEST_WORKSPACE, 'child.txt'),",
+        "'created\\n');",
         "process.once('SIGTERM', () => process.exit(0));",
         "console.log(JSON.stringify({ type: 'ready', pid: process.pid }));",
         "setInterval(() => {}, 1_000);",
       ].join(" "),
     ],
+    env: { TEGO_TEST_WORKSPACE: workspace.directory },
     name: "ready-child",
   });
   registerCleanup(t, child);
@@ -121,6 +143,7 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/actionable-sys
   assert.equal(ready.pid, child.pid);
   await child.stop({ timeoutMs: 2_000 });
   await child.assertClean();
+  assert.equal(await readFile(workspace.path("child.txt"), "utf8"), "created\n");
   assert.match(await readFile(artifacts.stdout("ready-child"), "utf8"), /"type":"ready"/u);
 });
 
@@ -162,6 +185,103 @@ test("registered cleanup stops a child after a readiness failure", async (t) => 
     );
   });
   assert.equal(isProcessAlive(pid), false);
+});
+
+test("registered cleanup stops a child before removing its workspace", async (t) => {
+  let workspace;
+  await t.test("readiness failure while child owns workspace", async (t) => {
+    const artifacts = await createRunArtifacts("ordered-cleanup");
+    workspace = await useTempWorkspace(t, "ordered-cleanup");
+    const child = await spawnManagedProcess({
+      artifacts,
+      command: process.execPath,
+      args: [
+        "--eval",
+        [
+          "const fs = require('node:fs');",
+          "const path = require('node:path');",
+          "process.stdin.on('end', () => {",
+          "fs.writeFileSync(path.join(process.env.TEGO_TEST_WORKSPACE, 'stopped.txt'), 'stopped\\n');",
+          "});",
+          "process.stdin.resume();",
+        ].join(" "),
+      ],
+      env: { TEGO_TEST_WORKSPACE: workspace.directory },
+      name: "workspace-owner",
+    });
+    registerCleanup(t, child);
+    await assert.rejects(
+      child.ready(() => true, { timeoutMs: 20 }),
+      /PROCESS_READY_TIMEOUT/u,
+    );
+  });
+  await workspace.assertRemoved();
+});
+
+test("managed process reports spawn failure without waiting for exit", async (t) => {
+  const artifacts = await createRunArtifacts("spawn-failure");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: workspacePathForMissingExecutable(artifacts.directory),
+    args: [],
+    name: "missing-child",
+  });
+  registerExpectedDiagnosticCleanup(t, child, /PROCESS_SPAWN_ERROR/u);
+  await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_SPAWN_ERROR/u);
+});
+
+test("managed process reports a live child without waiting for exit", async (t) => {
+  const artifacts = await createRunArtifacts("live-child");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: ["--eval", "console.log(JSON.stringify({ type: 'ready' })); process.stdin.resume();"],
+    name: "live-child",
+  });
+  registerCleanup(t, child);
+  await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
+  await assert.rejects(settleTestPromiseWithin(child.assertClean(), 200), /PROCESS_STILL_RUNNING/u);
+  await assert.rejects(
+    settleTestPromiseWithin(child.assertClean({ timeoutMs: 20 }), 200),
+    /PROCESS_STILL_RUNNING/u,
+  );
+});
+
+test("managed process can wait boundedly for an externally killed child to exit", async (t) => {
+  const artifacts = await createRunArtifacts("externally-killed-child");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: ["--eval", "console.log(JSON.stringify({ type: 'ready' })); process.stdin.resume();"],
+    name: "externally-killed-child",
+  });
+  registerCleanup(t, child);
+  await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
+  process.kill(child.pid, "SIGKILL");
+  await child.assertClean({ timeoutMs: 2_000 });
+});
+
+test("managed process gives stdin EOF a bounded graceful stop phase", async (t) => {
+  const artifacts = await createRunArtifacts("stdin-eof-stop");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: [
+      "--eval",
+      [
+        "process.stdin.once('end', () => process.exit(0));",
+        "process.stdin.resume();",
+        "console.log(JSON.stringify({ type: 'ready' }));",
+      ].join(" "),
+    ],
+    name: "stdin-child",
+  });
+  registerCleanup(t, child);
+  await child.ready((event) => event.type === "ready", { timeoutMs: 2_000 });
+  await child.stop({ timeoutMs: 2_000 });
+  await child.assertClean();
+  const cleanup = JSON.parse(await readFile(artifacts.cleanup("stdin-child"), "utf8"));
+  assert.deepEqual(cleanup.actions, ["stdin:end"]);
 });
 
 test("managed process bounds stalled stream finalization", async (t) => {
@@ -212,6 +332,10 @@ test("managed process bounds stalled stream finalization", async (t) => {
   process.kill(grandchildPid, "SIGTERM");
   await waitForPidDeath(grandchildPid, { timeoutMs: 2_000 });
 });
+
+function workspacePathForMissingExecutable(directory) {
+  return `${directory}/executable-that-does-not-exist`;
+}
 
 test("managed process surfaces readiness listener processing errors", async (t) => {
   const artifacts = await createRunArtifacts("event-processing-error");

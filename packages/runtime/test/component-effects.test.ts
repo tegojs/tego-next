@@ -74,6 +74,7 @@ const deployment: PluginDeployment = {
 function effect(kind: ReconcileEffectKind): ReconcileEffect {
   return {
     kind,
+    activation: "1",
     operationId: parseOperationId(`${kind}-operation`),
     messageId: parseMessageId(`${kind}-message`),
     instanceId,
@@ -88,6 +89,7 @@ function effect(kind: ReconcileEffectKind): ReconcileEffect {
 
 function readyInstance(overrides: Partial<ComponentInstance> = {}): ComponentInstance {
   return {
+    activation: "1",
     applicationId,
     artifactDigest,
     componentId,
@@ -163,6 +165,14 @@ function harness(
     resolveDeployment: async () => validatedDeployment,
     authority: () => authority,
     host: {
+      prepare: async (_binding, persisted) =>
+        persisted ?? {
+          configuration: null,
+          permissionGrants: [],
+          capabilityDefinitions: [],
+          capabilityBindings: [],
+          fingerprint: "1".repeat(64),
+        },
       start: async (binding) => {
         assert.equal(Object.isFrozen(binding), true);
         calls.push(`start:${binding.instanceId}`);
@@ -262,6 +272,58 @@ test("restores persisted preparing sessions without starting them twice", async 
   assert.equal(cache.prepares, 1);
   assert.deepEqual(calls, []);
   await effects.close();
+});
+
+test("starting checkpoint restoration prepares the exact binding without reporting start", async () => {
+  const authority = {
+    resource: "runtime:app",
+    epoch: parseFencingEpoch("7"),
+  };
+  const { cache, calls, effects, registry } = harness({ authority });
+  const starting = { ...effect("start"), kind: "start" as const };
+  const lifecycle = effects as ComponentEffects & {
+    restoreStarting(effect: ReconcileEffect & { readonly kind: "start" }): Promise<void>;
+  };
+
+  await lifecycle.restoreStarting(starting);
+
+  const prepared = registry.require(instanceId);
+  assert.equal(prepared.state, "prepared");
+  assert.equal(prepared.acceptingTasks, false);
+  assert.equal(prepared.binding.activation, starting.activation);
+  assert.equal(prepared.binding.deployment.generation, starting.deploymentGeneration);
+  assert.equal(prepared.binding.artifact.digest, starting.artifactDigest);
+  assert.equal(prepared.binding.executor, starting.executor);
+  assert.deepEqual(prepared.binding.authority, authority);
+  assert.equal(cache.prepares, 1);
+  assert.deepEqual(calls, []);
+
+  await effects.perform(starting);
+
+  assert.equal(registry.require(instanceId).state, "active");
+  assert.deepEqual(calls, [`start:${instanceId}`]);
+  await effects.close();
+});
+
+test("termination restoration prepares held sessions without externally starting them", async () => {
+  for (const instance of [
+    readyInstance({ lifecycle: "ready" }),
+    readyInstance({ lifecycle: "draining" }),
+    readyInstance({ lifecycle: "stopping" }),
+    readyInstance({ lifecycle: "failed", retryEffect: "stop" }),
+  ]) {
+    const { calls, effects, registry } = harness();
+    const termination = effects as ComponentEffects & {
+      restoreTermination(instance: ComponentInstance): Promise<void>;
+    };
+
+    await termination.restoreTermination(instance);
+
+    assert.equal(registry.require(instanceId).state, "stopping");
+    assert.deepEqual(calls, []);
+    await effects.perform(effect("stop"));
+    assert.deepEqual(calls, [`stop:${instanceId}`]);
+  }
 });
 
 test("close fences concurrent restoration and concurrent close calls share cleanup", async () => {
@@ -427,6 +489,30 @@ test("operation identity replay is idempotent and conflicting payloads are rejec
       (error as { diagnostic: { code?: unknown } }).diagnostic.code ===
         "LIFECYCLE_OPERATION_CONFLICT",
   );
+});
+
+test("suspend activation effects reject a value that differs from the immutable binding", async () => {
+  const { effects, registry } = harness();
+  const prepare = {
+    ...effect("prepare"),
+    activation: "1",
+  } as ReconcileEffect & { readonly activation: string };
+  await effects.perform(prepare);
+
+  await assert.rejects(
+    effects.perform({
+      ...effect("start"),
+      activation: "2",
+    } as ReconcileEffect & { readonly activation: string }),
+    /activation|identity|binding/iu,
+  );
+  assert.equal(registry.require(instanceId).state, "prepared");
+  await effects.close();
+});
+
+test("component effects reject non-canonical activation at the public boundary", async () => {
+  const { effects } = harness();
+  await assert.rejects(effects.perform({ ...effect("prepare"), activation: "01" }), /activation/iu);
 });
 
 test("stale deployment identity cannot operate a newly registered instance", async () => {

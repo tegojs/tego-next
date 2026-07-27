@@ -1,40 +1,43 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
-  DiagnosticError,
-  parseArtifactDigest,
-  parsePluginManifest,
-  runtimeDiagnostic,
   type ArtifactDigest,
   type ComponentCapabilityBoundary,
   type ComponentCapabilityDiagnostic,
+  type ComponentCapabilityInvocation,
   type ComponentPermissionBoundary,
   type ComponentPermissionDiagnostic,
   type DiagnosticCode,
+  DiagnosticError,
   type JsonObject,
   type JsonValue,
   type PluginManifest,
+  parseArtifactDigest,
+  parseOperationId,
+  parsePluginManifest,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
   type SecretProvider,
 } from "@tegojs/contracts";
 import {
-  loadPreparedComponent,
-  prepareArtifactBinding,
   type LoadedComponentDefinition,
+  loadPreparedComponent,
   type PreparedArtifactBinding,
+  prepareArtifactBinding,
 } from "./component-loader.js";
 import {
-  cloneComponentHostValue,
+  type ArtifactComponentHostCommand,
   COMPONENT_HOST_ATTACHMENT_COUNT_LIMIT,
   COMPONENT_HOST_PROTOCOL,
   COMPONENT_HOST_WIRE_BYTE_LIMIT,
-  parseComponentHostCommand,
-  parseComponentHostResult,
   type ComponentHostCommand,
   type ComponentHostResult,
   type ComponentHostState,
-  type ArtifactComponentHostCommand,
+  cloneComponentHostValue,
+  type InvokeCapabilityComponentHostCommand,
   type PrepareComponentHostPayload,
+  parseComponentHostCommand,
+  parseComponentHostResult,
   type RunComponentHostCommand,
 } from "./protocol.js";
 
@@ -208,6 +211,7 @@ export class ComponentHost {
   #definition: LoadedComponentDefinition | undefined;
   #disposables: ReturnType<ComponentHost["createDisposables"]> | undefined;
   #stopOutcome: ComponentHostResult | undefined;
+  #capabilityInvocationSequence = 0;
 
   constructor(options: ComponentHostOptions) {
     this.#options = options;
@@ -387,6 +391,8 @@ export class ComponentHost {
           return await this.#health(command);
         case "run":
           return await this.#run(command, attachments ?? this.#attachments([]));
+        case "invokeCapability":
+          return await this.#invokeCapability(command);
         case "drain":
           return await this.#drain(command);
         case "stop":
@@ -480,11 +486,21 @@ export class ComponentHost {
       throw this.#lifecycleError("import", "prepared");
     }
     this.#assertDigest(command.payload.artifactDigest);
-    this.#definition = await loadPreparedComponent({
+    const definition = await loadPreparedComponent({
       prepared: this.#prepared.artifact,
       entrypoint: this.#prepared.entrypoint,
       expectedKind: this.#prepared.kind,
     });
+    const declaresCapabilityProvider = this.#prepared.manifest.capabilities.provides.some(
+      (provision) => provision.componentId === this.#prepared?.payload.componentId,
+    );
+    if (declaresCapabilityProvider && definition.invokeCapability === undefined) {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMPONENT_DEFINITION_INVALID",
+        "Declared task capability provider must define an invokeCapability hook",
+      );
+    }
+    this.#definition = definition;
     this.#state = "imported";
     return this.#success(command, { status: "imported" });
   }
@@ -600,7 +616,16 @@ export class ComponentHost {
       active.cancellation = "timed-out";
       active.controller.abort("deadline");
     });
-    const context = this.#context(active.controller.signal, "started", attachments.reader);
+    let capabilityCallSequence = 0;
+    const context = this.#context(active.controller.signal, "started", attachments.reader, () =>
+      parseOperationId(
+        `cap.${createHash("sha256")
+          .update(
+            `${execution.taskId.length}:${execution.taskId}${execution.attemptId}:${++capabilityCallSequence}`,
+          )
+          .digest("hex")}`,
+      ),
+    );
     const hook = Promise.resolve()
       .then(() => this.#definition?.run?.(context, execution.input))
       .then(
@@ -628,6 +653,73 @@ export class ComponentHost {
       status: "succeeded",
       output: this.#wireOutput(outcome.value),
     };
+  }
+
+  async #invokeCapability(
+    command: InvokeCapabilityComponentHostCommand,
+  ): Promise<ComponentHostResult> {
+    this.#assertDigest(command.payload.artifactDigest);
+    if (!this.#acceptingRuns || this.#state !== "started") {
+      throw this.#lifecycleError("invokeCapability", "started with open run intake");
+    }
+    const prepared = this.#prepared;
+    if (prepared === undefined) throw this.#lifecycleError("invokeCapability", "prepared");
+    const invocation = command.payload.invocation;
+    const provision = prepared.manifest.capabilities.provides.find(
+      (candidate) =>
+        candidate.componentId === prepared.payload.componentId &&
+        candidate.name === invocation.identity.name &&
+        candidate.protocolVersion === invocation.identity.protocolVersion,
+    );
+    if (provision === undefined || !provision.methods.includes(invocation.method)) {
+      throw this.#diagnosticError(
+        "CAPABILITY_PROVIDER_UNDECLARED",
+        "Capability invocation is not declared by this provider component",
+      );
+    }
+    const hook = this.#definition?.invokeCapability;
+    if (hook === undefined) {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMPONENT_HOOK_MISSING",
+        "Task capability provider does not define an invokeCapability hook",
+      );
+    }
+    const controller = new AbortController();
+    const clearDeadline = armDeadline(command.deadline, this.#clock, () =>
+      controller.abort("deadline"),
+    );
+    const request = freezeJson(
+      cloneComponentHostValue(invocation),
+    ) as ComponentCapabilityInvocation;
+    const outcome = await Promise.race([
+      Promise.resolve()
+        .then(() => hook(this.#context(controller.signal, "started"), request))
+        .then(
+          (value) => ({ kind: "value" as const, value }),
+          (error: unknown) => ({ kind: "error" as const, error }),
+        ),
+      new Promise<{ readonly kind: "deadline" }>((resolve) => {
+        controller.signal.addEventListener("abort", () => resolve({ kind: "deadline" }), {
+          once: true,
+        });
+      }),
+    ]);
+    clearDeadline();
+    if (outcome.kind === "deadline") {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMMAND_DEADLINE_EXCEEDED",
+        "Component invokeCapability hook exceeded its deadline",
+      );
+    }
+    if (outcome.kind === "error") throw outcome.error;
+    const output = cloneComponentHostValue(outcome.value);
+    if (this.#containsSecret(output)) {
+      throw this.#diagnosticError(
+        "PERMISSION_SECRET_EXFILTRATION_BLOCKED",
+        "Secret values cannot be returned through capability calls",
+      );
+    }
+    return this.#success(command, this.#wireOutput(outcome.value));
   }
 
   async #drain(command: ArtifactComponentHostCommand): Promise<ComponentHostResult> {
@@ -733,6 +825,8 @@ export class ComponentHost {
     signal: AbortSignal,
     lifecycle: ComponentHostState,
     attachments: RunAttachmentLease["reader"] = this.#attachments([]).reader,
+    nextCapabilityInvocationId: () => ReturnType<typeof parseOperationId> = () =>
+      parseOperationId(`cap.host.${++this.#capabilityInvocationSequence}`),
   ): object {
     const prepared = this.#prepared;
     const disposables = this.#disposables;
@@ -771,7 +865,7 @@ export class ComponentHost {
         },
       }),
       capabilities: Object.freeze({
-        call: (request: unknown) => this.#capabilityCall(request),
+        call: (request: unknown) => this.#capabilityCall(request, nextCapabilityInvocationId()),
       }),
       lifecycle: Object.freeze({ state: lifecycle }),
       runtime: Object.freeze({
@@ -881,7 +975,10 @@ export class ComponentHost {
     };
   }
 
-  async #capabilityCall(input: unknown): Promise<JsonValue> {
+  async #capabilityCall(
+    input: unknown,
+    invocationId: ReturnType<typeof parseOperationId>,
+  ): Promise<JsonValue> {
     const requestValue = cloneComponentHostValue(input);
     if (typeof requestValue !== "object" || requestValue === null || Array.isArray(requestValue)) {
       throw this.#diagnosticError(
@@ -924,6 +1021,7 @@ export class ComponentHost {
     }
     const response = cloneComponentHostValue(
       await this.#options.capabilityBoundary.invoke({
+        invocationId,
         identity,
         method: request.method,
         input: requestDecision.value,

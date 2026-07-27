@@ -1,12 +1,13 @@
 import {
   DiagnosticError,
-  parseTaskExecutionTarget,
-  runtimeDiagnostic,
   type Executor,
   type JsonValue,
+  parseTaskExecutionTarget,
   type RunTaskRequest,
+  runtimeDiagnostic,
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
+import type { ComponentInstanceIdentity } from "@tegojs/runtime";
 
 export interface LocalComponentSessionRegistration {
   readonly applicationId: RunTaskRequest["applicationId"];
@@ -15,6 +16,8 @@ export interface LocalComponentSessionRegistration {
   readonly target: TaskExecutionTarget;
   readonly executor: Executor;
   readonly drainLifecycle: Executor["drain"];
+  readonly capabilityConsumer?: ComponentInstanceIdentity;
+  readonly releaseBoundaries?: () => void;
 }
 
 interface RegisteredLocalComponentSession extends LocalComponentSessionRegistration {
@@ -106,13 +109,27 @@ export class LocalComponentSessionRegistry {
     request: RunTaskRequest,
     isComponentAccepting: (target: TaskExecutionTarget) => boolean = () => true,
   ): LocalComponentSessionRegistration {
+    return this.resolveComponent(
+      request.applicationId,
+      request.pluginId,
+      request.componentId,
+      isComponentAccepting,
+    );
+  }
+
+  resolveComponent(
+    applicationId: RunTaskRequest["applicationId"],
+    pluginId: RunTaskRequest["pluginId"],
+    componentId: RunTaskRequest["componentId"],
+    isComponentAccepting: (target: TaskExecutionTarget) => boolean = () => true,
+  ): LocalComponentSessionRegistration {
     const candidates = [...this.#sessions.values()].filter(
       (candidate) =>
         candidate.accepting &&
         isComponentAccepting(candidate.target) &&
-        candidate.applicationId === request.applicationId &&
-        candidate.pluginId === request.pluginId &&
-        candidate.componentId === request.componentId,
+        candidate.applicationId === applicationId &&
+        candidate.pluginId === pluginId &&
+        candidate.componentId === componentId,
     );
     if (candidates.length === 0) {
       throw registryError(
@@ -120,9 +137,9 @@ export class LocalComponentSessionRegistry {
         "No active accepting local component session matches the task",
         this.#runtimeId,
         {
-          applicationId: request.applicationId,
-          pluginId: request.pluginId,
-          componentId: request.componentId,
+          applicationId,
+          pluginId,
+          componentId,
         },
       );
     }
@@ -132,9 +149,9 @@ export class LocalComponentSessionRegistry {
         "Local component session selection is ambiguous",
         this.#runtimeId,
         {
-          applicationId: request.applicationId,
-          pluginId: request.pluginId,
-          componentId: request.componentId,
+          applicationId,
+          pluginId,
+          componentId,
           candidateTargets: candidates.map((candidate) =>
             localComponentSessionTargetKey(candidate.target),
           ),
@@ -157,7 +174,13 @@ export class LocalComponentSessionRegistry {
     for (const session of sessions) session.accepting = false;
     this.#closePromise = (async () => {
       const results = await Promise.allSettled(
-        sessions.map(async (session) => session.executor.close()),
+        sessions.map(async (session) => {
+          try {
+            await session.executor.close();
+          } finally {
+            session.releaseBoundaries?.();
+          }
+        }),
       );
       this.#sessions.clear();
       const errors = results
@@ -193,6 +216,12 @@ export class LocalComponentSessionRegistry {
       target: deepFreeze(structuredClone(session.target)),
       executor: session.executor,
       drainLifecycle: session.drainLifecycle,
+      ...(session.capabilityConsumer === undefined
+        ? {}
+        : { capabilityConsumer: deepFreeze(structuredClone(session.capabilityConsumer)) }),
+      ...(session.releaseBoundaries === undefined
+        ? {}
+        : { releaseBoundaries: session.releaseBoundaries }),
     });
   }
 }

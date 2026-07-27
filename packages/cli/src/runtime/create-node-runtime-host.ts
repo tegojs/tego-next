@@ -3,31 +3,50 @@ import { createReadStream } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  assertExecutionBindingMatches,
+  type CapabilityBinding,
+  type CapabilityDefinition,
+  type ClusterTime,
+  type ComponentCapabilityInvocation,
+  createExecutionBinding,
   DiagnosticError,
+  type ExecutionBinding,
+  type JsonObject,
+  type JsonValue,
   parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseNodeId,
   parsePermissionSet,
   parsePluginDeployment,
   parsePluginInstallation,
   parseRuntimeId,
   parseWorkerId,
+  type RunTaskRequest,
   type Runtime,
   type RuntimeAuthority,
   type RuntimeConfiguration,
   type RuntimeDrivers,
   runtimeDiagnostic,
+  type StateTransaction,
+  type TaskExecutionTarget,
 } from "@tegojs/contracts";
 import { createLocalDrivers } from "@tegojs/drivers-local";
 import { createPostgresDrivers } from "@tegojs/drivers-postgres";
 import {
   ArtifactService,
+  type CapabilityInvocationAuthority,
+  type CapabilityRoute,
+  CapabilityRouter,
   ComponentEffects,
+  type ComponentInstanceIdentity,
   type ComponentLifecycleHost,
   ComponentRegistry,
+  canonicalJsonBytes,
   createRuntimeHost,
   type PlacementWorker,
   PreparedArtifactCache,
+  parseActivation,
   Reconciler,
   TaskService,
 } from "@tegojs/runtime";
@@ -73,6 +92,59 @@ export interface NodeRuntimeHost {
   readonly runtime: Runtime;
   readonly artifactIngress: LocalArtifactIngress;
   startWorkerListener(): Promise<string | undefined>;
+}
+
+export interface AuthorityCapabilityAdmission {
+  open(authority: RuntimeAuthority): void;
+  close(authority: RuntimeAuthority): void;
+  invoke<T>(operation: (authority: CapabilityInvocationAuthority) => Promise<T>): Promise<T>;
+}
+
+export function createAuthorityCapabilityAdmission(
+  unavailableError: () => Error = () => new Error("Capability invocation authority is unavailable"),
+): AuthorityCapabilityAdmission {
+  interface AuthorityLease {
+    readonly authority: RuntimeAuthority;
+    readonly token: CapabilityInvocationAuthority;
+    readonly state: { active: boolean };
+  }
+  let lease: AuthorityLease | undefined;
+  const sameAuthority = (
+    left: RuntimeAuthority | undefined,
+    right: RuntimeAuthority | undefined,
+  ): boolean =>
+    left?.resource === right?.resource &&
+    left?.epoch === right?.epoch &&
+    (left !== undefined) === (right !== undefined);
+
+  return {
+    open: (nextAuthority) => {
+      if (sameAuthority(lease?.authority, nextAuthority)) return;
+      if (lease !== undefined) lease.state.active = false;
+      const state = { active: true };
+      const token = Object.freeze({
+        assertActive: () => {
+          if (!state.active || lease?.token !== token) throw unavailableError();
+        },
+      });
+      lease = {
+        authority: structuredClone(nextAuthority),
+        token,
+        state,
+      };
+    },
+    close: (closedAuthority) => {
+      const closed = lease;
+      if (!sameAuthority(closed?.authority, closedAuthority) || closed === undefined) return;
+      closed.state.active = false;
+      lease = undefined;
+    },
+    invoke: async (operation) => {
+      const admitted = lease;
+      if (admitted === undefined) throw unavailableError();
+      return operation(admitted.token);
+    },
+  };
 }
 
 interface OwnedWorkerListener {
@@ -134,6 +206,9 @@ async function digestFile(path: string): Promise<ReturnType<typeof parseArtifact
 export async function createNodeRuntimeHost(
   options: CreateNodeRuntimeHostOptions,
 ): Promise<NodeRuntimeHost> {
+  if (options.mode === "single-main" && options.postgresUrl !== undefined) {
+    throw new TypeError("single-main mode does not support PostgreSQL shared storage");
+  }
   if (
     options.worker !== undefined &&
     (options.worker.credential.trim().length === 0 ||
@@ -144,6 +219,7 @@ export async function createNodeRuntimeHost(
   await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
   const local = await createLocalDrivers({ dataDirectory: options.dataDirectory });
   let drivers: RuntimeDrivers = local;
+  let clusterTime: ClusterTime | undefined;
   if (options.postgresUrl !== undefined) {
     const postgres = createPostgresDrivers({
       connectionString: options.postgresUrl,
@@ -155,6 +231,7 @@ export async function createNodeRuntimeHost(
       coordination: postgres.coordination,
       state: postgres.state,
     };
+    if (options.mode === "multi-main") clusterTime = postgres.clusterTime;
   }
 
   const configuration: RuntimeConfiguration = {
@@ -187,6 +264,18 @@ export async function createNodeRuntimeHost(
   });
   const componentRegistry = new ComponentRegistry();
   const sessionRegistry = new LocalComponentSessionRegistry(options.runtimeId);
+  let capabilityRouter: CapabilityRouter | undefined;
+  const capabilityAdmission = createAuthorityCapabilityAdmission(
+    () =>
+      new DiagnosticError(
+        runtimeDiagnostic({
+          code: "COORDINATION_FENCE_REJECTED",
+          message: "Capability invocation authority is unavailable",
+          source: { kind: "runtime", id: configuration.runtimeId },
+          observedAt: drivers.clock.now().toISOString(),
+        }),
+      ),
+  );
   const componentHost = new LocalComponentSessionHost({
     nodeId: options.nodeId,
     runtimeId: options.runtimeId,
@@ -194,6 +283,25 @@ export async function createNodeRuntimeHost(
     processHost: drivers.processHost,
     secretProvider: drivers.secrets,
     registry: sessionRegistry,
+    resolveExecutionBinding: (binding, target) =>
+      drivers.state.transact({}, async (transaction) =>
+        resolveExecutionBinding(
+          transaction,
+          {
+            applicationId: binding.deployment.applicationId,
+            pluginId: binding.deployment.pluginId,
+            componentId: binding.component.componentId,
+          },
+          target,
+        ),
+      ),
+    invokeCapability: (consumer, invocation) => {
+      return capabilityAdmission.invoke((authority) => {
+        const router = capabilityRouter;
+        if (router === undefined) throw new Error("Capability router is unavailable");
+        return router.invoke(consumer, invocation, authority);
+      });
+    },
   });
   const configuredWorkerId =
     options.worker === undefined ? undefined : parseWorkerId(options.worker.workerId);
@@ -201,9 +309,25 @@ export async function createNodeRuntimeHost(
   const remoteComponentHost = new RemoteComponentSessionHost({
     registry: sessionRegistry,
     resolveExecutor: (workerId) => (workerId === configuredWorkerId ? remoteExecutor : undefined),
+    resolveExecutionBinding: (binding, target) =>
+      drivers.state.transact({}, async (transaction) =>
+        resolveExecutionBinding(
+          transaction,
+          {
+            applicationId: binding.deployment.applicationId,
+            pluginId: binding.deployment.pluginId,
+            componentId: binding.component.componentId,
+          },
+          target,
+        ),
+      ),
     runtimeId: options.runtimeId,
   });
   const lifecycleHost: ComponentLifecycleHost = {
+    prepare: (binding, persisted) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.prepare(binding, persisted)
+        : componentHost.prepare(binding, persisted),
     start: (binding) =>
       binding.executor === "remote"
         ? remoteComponentHost.start(binding)
@@ -212,15 +336,389 @@ export async function createNodeRuntimeHost(
       binding.executor === "remote"
         ? remoteComponentHost.drain(binding)
         : componentHost.drain(binding),
+    restoreTermination: (binding, checkpoint) =>
+      binding.executor === "remote"
+        ? remoteComponentHost.restoreTermination(binding, checkpoint)
+        : componentHost.restoreTermination(binding, checkpoint),
     stop: (binding) =>
       binding.executor === "remote"
         ? remoteComponentHost.stop(binding)
         : componentHost.stop(binding),
   };
+  const resolveExecutionBinding = async (
+    transaction: StateTransaction,
+    request: Pick<RunTaskRequest, "applicationId" | "componentId" | "pluginId">,
+    target: TaskExecutionTarget,
+    options: { readonly allowInactiveDeployment?: boolean } = {},
+  ): Promise<ExecutionBinding> => {
+    const durableDeployment = await transaction.get({
+      namespace: "tego",
+      collection: "deployments",
+      id: `${request.applicationId}/${request.pluginId}`,
+    });
+    if (durableDeployment === undefined) {
+      throw new Error("Task deployment is unavailable while building its execution binding");
+    }
+    const deployment = parsePluginDeployment(durableDeployment.value);
+    if (
+      deployment.applicationId !== request.applicationId ||
+      deployment.pluginId !== request.pluginId ||
+      (deployment.state !== "active" && options.allowInactiveDeployment !== true) ||
+      deployment.generation !== target.deploymentGeneration ||
+      deployment.artifactDigest !== target.artifactDigest
+    ) {
+      throw new Error("Task deployment does not match its immutable execution target");
+    }
+    const durableInstallation = await transaction.get({
+      namespace: "tego",
+      collection: "installations",
+      id: `${deployment.pluginId}@${deployment.version}@${deployment.artifactDigest}`,
+    });
+    if (durableInstallation === undefined) {
+      throw new Error("Task installation is unavailable while building its execution binding");
+    }
+    const installation = parsePluginInstallation(durableInstallation.value);
+    const component = installation.manifest.components.find(
+      (candidate) => candidate.componentId === request.componentId,
+    );
+    if (
+      installation.pluginId !== deployment.pluginId ||
+      installation.version !== deployment.version ||
+      installation.digest !== deployment.artifactDigest ||
+      component === undefined ||
+      !component.executors.includes(target.executor.type)
+    ) {
+      throw new Error("Task component does not match its immutable execution target");
+    }
+    const durableInstance = await transaction.get({
+      namespace: "tego",
+      collection: "component-instances",
+      id: target.instanceId,
+    });
+    const instance =
+      durableInstance?.value !== null &&
+      typeof durableInstance?.value === "object" &&
+      !Array.isArray(durableInstance.value)
+        ? (durableInstance.value as JsonObject)
+        : undefined;
+    if (
+      instance === undefined ||
+      instance.applicationId !== request.applicationId ||
+      instance.pluginId !== request.pluginId ||
+      instance.componentId !== request.componentId ||
+      instance.deploymentGeneration !== target.deploymentGeneration ||
+      instance.artifactDigest !== target.artifactDigest ||
+      instance.instanceId !== target.instanceId
+    ) {
+      throw new Error("Task component instance does not match its immutable execution target");
+    }
+
+    const capabilityBindings: CapabilityBinding[] = [];
+    const capabilityDefinitions: CapabilityDefinition[] = [];
+    for await (const record of transaction.scan({
+      namespace: "tego",
+      collection: "capability-bindings",
+      idPrefix: `${request.applicationId}/${request.pluginId}/`,
+    })) {
+      const value =
+        record.value !== null && typeof record.value === "object" && !Array.isArray(record.value)
+          ? (record.value as JsonObject)
+          : undefined;
+      const consumer =
+        value?.consumer !== null &&
+        typeof value?.consumer === "object" &&
+        !Array.isArray(value.consumer)
+          ? (value.consumer as JsonObject)
+          : undefined;
+      const provider =
+        value?.provider !== null &&
+        typeof value?.provider === "object" &&
+        !Array.isArray(value.provider)
+          ? (value.provider as JsonObject)
+          : undefined;
+      if (
+        consumer?.applicationId !== request.applicationId ||
+        consumer.pluginId !== request.pluginId ||
+        value?.deploymentGeneration !== deployment.generation ||
+        typeof value.capability !== "string" ||
+        typeof provider?.applicationId !== "string" ||
+        typeof provider.pluginId !== "string"
+      ) {
+        continue;
+      }
+      const providerDeploymentRecord = await transaction.get({
+        namespace: "tego",
+        collection: "deployments",
+        id: `${provider.applicationId}/${provider.pluginId}`,
+      });
+      if (providerDeploymentRecord === undefined) {
+        throw new Error("Capability provider deployment is unavailable");
+      }
+      const providerDeployment = parsePluginDeployment(providerDeploymentRecord.value);
+      const providerInstallationRecord = await transaction.get({
+        namespace: "tego",
+        collection: "installations",
+        id: `${providerDeployment.pluginId}@${providerDeployment.version}@${providerDeployment.artifactDigest}`,
+      });
+      if (providerInstallationRecord === undefined) {
+        throw new Error("Capability provider installation is unavailable");
+      }
+      const providerInstallation = parsePluginInstallation(providerInstallationRecord.value);
+      const provision = providerInstallation.manifest.capabilities.provides.find(
+        (candidate) => candidate.name === value.capability,
+      );
+      if (provision === undefined) {
+        throw new Error("Capability provider no longer provides the durable binding");
+      }
+      capabilityBindings.push({
+        capability: {
+          name: parseCapabilityName(provision.name),
+          protocolVersion: provision.protocolVersion,
+        },
+        providerDeployment: {
+          applicationId: providerDeployment.applicationId,
+          pluginId: providerDeployment.pluginId,
+        },
+      });
+      capabilityDefinitions.push({
+        identity: {
+          name: parseCapabilityName(provision.name),
+          protocolVersion: provision.protocolVersion,
+        },
+        methods: provision.methods,
+        requestSchema: provision.requestSchema,
+        responseSchema: provision.responseSchema,
+      });
+    }
+    return createExecutionBinding(
+      {
+        applicationId: request.applicationId,
+        pluginId: request.pluginId,
+        componentId: request.componentId,
+        target,
+      },
+      {
+        configuration: deployment.configuration,
+        permissionGrants: deployment.permissionGrants,
+        capabilityDefinitions,
+        capabilityBindings,
+      },
+    );
+  };
+  const loadCapabilityRoute = async (
+    consumer: ComponentInstanceIdentity,
+    identity: ComponentCapabilityInvocation["identity"],
+  ): Promise<CapabilityRoute> =>
+    drivers.state.transact({}, async (transaction) => {
+      const consumerInstanceRecord = await transaction.get({
+        namespace: "tego",
+        collection: "component-instances",
+        id: consumer.target.instanceId,
+      });
+      const consumerInstance =
+        consumerInstanceRecord?.value !== null &&
+        typeof consumerInstanceRecord?.value === "object" &&
+        !Array.isArray(consumerInstanceRecord.value)
+          ? (consumerInstanceRecord.value as JsonObject)
+          : undefined;
+      if (
+        consumerInstance === undefined ||
+        consumerInstance.applicationId !== consumer.applicationId ||
+        consumerInstance.pluginId !== consumer.pluginId ||
+        consumerInstance.componentId !== consumer.componentId ||
+        consumerInstance.deploymentGeneration !== consumer.target.deploymentGeneration ||
+        consumerInstance.artifactDigest !== consumer.target.artifactDigest ||
+        consumerInstance.lifecycle !== "ready" ||
+        parseActivation(
+          Object.hasOwn(consumerInstance, "activation") ? consumerInstance.activation : "1",
+        ) !== consumer.activation
+      ) {
+        throw new Error("Capability consumer is not the exact durable ready activation");
+      }
+      const consumerBinding = await resolveExecutionBinding(transaction, consumer, consumer.target);
+      if (consumerBinding.fingerprint !== consumer.bindingFingerprint) {
+        throw new Error("Capability consumer immutable binding changed");
+      }
+      const binding = consumerBinding.capabilityBindings.find(
+        (candidate) =>
+          candidate.capability.name === identity.name &&
+          candidate.capability.protocolVersion === identity.protocolVersion,
+      );
+      if (binding === undefined) throw new Error("Capability has no durable consumer binding");
+      const providerDeploymentRecord = await transaction.get({
+        namespace: "tego",
+        collection: "deployments",
+        id: `${binding.providerDeployment.applicationId}/${binding.providerDeployment.pluginId}`,
+      });
+      if (providerDeploymentRecord === undefined) {
+        throw new Error("Capability provider deployment is unavailable");
+      }
+      const providerDeployment = parsePluginDeployment(providerDeploymentRecord.value);
+      if (
+        providerDeployment.applicationId !== binding.providerDeployment.applicationId ||
+        providerDeployment.pluginId !== binding.providerDeployment.pluginId ||
+        providerDeployment.state !== "active"
+      ) {
+        throw new Error("Capability provider deployment is not active");
+      }
+      const providerInstallationRecord = await transaction.get({
+        namespace: "tego",
+        collection: "installations",
+        id: `${providerDeployment.pluginId}@${providerDeployment.version}@${providerDeployment.artifactDigest}`,
+      });
+      if (providerInstallationRecord === undefined) {
+        throw new Error("Capability provider installation is unavailable");
+      }
+      const providerInstallation = parsePluginInstallation(providerInstallationRecord.value);
+      const provision = providerInstallation.manifest.capabilities.provides.find(
+        (candidate) =>
+          candidate.name === identity.name &&
+          candidate.protocolVersion === identity.protocolVersion,
+      );
+      if (provision === undefined) {
+        throw new Error("Capability provider provision no longer matches the durable binding");
+      }
+      const providerComponent = providerInstallation.manifest.components.find(
+        (candidate) => candidate.componentId === provision.componentId,
+      );
+      if (providerComponent?.kind !== "task") {
+        throw new Error("Capability provider component must be a task");
+      }
+      const providerSession = sessionRegistry.resolveComponent(
+        providerDeployment.applicationId,
+        providerDeployment.pluginId,
+        providerComponent.componentId,
+        (target) =>
+          componentRegistry.get(target.instanceId)?.state === "active" &&
+          componentRegistry.get(target.instanceId)?.acceptingTasks === true,
+      );
+      const providerInstanceRecord = await transaction.get({
+        namespace: "tego",
+        collection: "component-instances",
+        id: providerSession.target.instanceId,
+      });
+      const providerInstance =
+        providerInstanceRecord?.value !== null &&
+        typeof providerInstanceRecord?.value === "object" &&
+        !Array.isArray(providerInstanceRecord.value)
+          ? (providerInstanceRecord.value as JsonObject)
+          : undefined;
+      const providerActivation =
+        providerInstance === undefined
+          ? undefined
+          : parseActivation(
+              Object.hasOwn(providerInstance, "activation") ? providerInstance.activation : "1",
+            );
+      if (
+        providerInstance === undefined ||
+        providerInstance.applicationId !== providerDeployment.applicationId ||
+        providerInstance.pluginId !== providerDeployment.pluginId ||
+        providerInstance.componentId !== providerComponent.componentId ||
+        providerInstance.deploymentGeneration !== providerDeployment.generation ||
+        providerInstance.artifactDigest !== providerDeployment.artifactDigest ||
+        providerInstance.lifecycle !== "ready" ||
+        providerActivation === undefined
+      ) {
+        throw new Error("Capability provider is not an exact durable ready activation");
+      }
+      const providerBinding = await resolveExecutionBinding(
+        transaction,
+        {
+          applicationId: providerDeployment.applicationId,
+          pluginId: providerDeployment.pluginId,
+          componentId: providerComponent.componentId,
+        },
+        providerSession.target,
+      );
+      const routeRevision = createHash("sha256")
+        .update(
+          canonicalJsonBytes({
+            consumer,
+            consumerBindingFingerprint: consumerBinding.fingerprint,
+            binding,
+            providerTarget: providerSession.target,
+            providerActivation,
+            providerBindingFingerprint: providerBinding.fingerprint,
+            consumerInstanceRevision: consumerInstanceRecord?.revision ?? "",
+            providerInstanceRevision: providerInstanceRecord?.revision ?? "",
+            providerDeploymentGeneration: providerDeployment.generation,
+          }),
+        )
+        .digest("hex");
+      return {
+        consumer,
+        consumerBindingFingerprint: consumerBinding.fingerprint,
+        permissionGrants: consumerBinding.permissionGrants,
+        binding,
+        provision: {
+          identity: {
+            name: parseCapabilityName(provision.name),
+            protocolVersion: provision.protocolVersion,
+          },
+          componentId: provision.componentId,
+          methods: provision.methods,
+          requestSchema: provision.requestSchema,
+          responseSchema: provision.responseSchema,
+        },
+        provider: {
+          applicationId: providerDeployment.applicationId,
+          pluginId: providerDeployment.pluginId,
+          componentId: providerComponent.componentId,
+          target: providerSession.target,
+          activation: providerActivation,
+          bindingFingerprint: providerBinding.fingerprint,
+        },
+        routeRevision,
+      };
+    });
+  capabilityRouter = new CapabilityRouter({
+    state: drivers.state,
+    resolve: (consumer, call) => loadCapabilityRoute(consumer, call.identity),
+    revalidate: async (route) =>
+      (await loadCapabilityRoute(route.consumer, route.provision.identity)).routeRevision ===
+      route.routeRevision,
+    dispatch: async (route, invocation) => {
+      const provider = sessionRegistry.resolveExact(route.provider.target).executor as {
+        invokeCapability?: (request: ComponentCapabilityInvocation) => Promise<JsonValue>;
+      };
+      if (typeof provider.invokeCapability !== "function") {
+        throw new Error("Capability provider executor cannot invoke provider hooks");
+      }
+      return provider.invokeCapability(invocation);
+    },
+  });
   const tasks = new TaskService({
     state: drivers.state,
     clock: drivers.clock,
-    selectExecutor: (request, target) => {
+    selectExecutor: async (request, target, _signal, persistedBinding, identity) => {
+      if (
+        target !== undefined &&
+        target.executor.type === "remote" &&
+        persistedBinding !== undefined &&
+        sessionRegistry.findExact(target) === undefined
+      ) {
+        if (identity === undefined) {
+          throw new TypeError("Remote task recovery requires an exact durable task identity");
+        }
+        const binding = assertExecutionBindingMatches(
+          {
+            applicationId: request.applicationId,
+            pluginId: request.pluginId,
+            componentId: request.componentId,
+            target,
+          },
+          persistedBinding,
+        );
+        return {
+          target,
+          binding,
+          executor: remoteComponentHost.resolveTaskRecoveryExecutor(
+            target,
+            binding.fingerprint,
+            identity,
+          ),
+        };
+      }
       const selection =
         target === undefined
           ? sessionRegistry.resolveFresh(
@@ -230,8 +728,23 @@ export async function createNodeRuntimeHost(
                 componentRegistry.get(candidate.instanceId)?.acceptingTasks === true,
             )
           : sessionRegistry.resolveExact(target);
+      const binding =
+        persistedBinding === undefined
+          ? await drivers.state.transact({}, async (transaction) =>
+              resolveExecutionBinding(transaction, request, selection.target),
+            )
+          : assertExecutionBindingMatches(
+              {
+                applicationId: request.applicationId,
+                pluginId: request.pluginId,
+                componentId: request.componentId,
+                target: selection.target,
+              },
+              persistedBinding,
+            );
       return {
         target: selection.target,
+        binding,
         executor: selection.executor,
       };
     },
@@ -240,6 +753,15 @@ export async function createNodeRuntimeHost(
   let requestedWorkerAuthority: RuntimeAuthority | undefined;
   let authorityGeneration = 0;
   let allocatedWorkerAuthorityGeneration: number | undefined;
+  const workerRegistrationAuthorityError = (message: string): DiagnosticError =>
+    new DiagnosticError(
+      runtimeDiagnostic({
+        code: "COORDINATION_NOT_LEADER",
+        message,
+        source: { kind: "runtime", id: configuration.runtimeId },
+        observedAt: drivers.clock.now().toISOString(),
+      }),
+    );
   const mainEndpoint =
     options.worker === undefined
       ? undefined
@@ -251,7 +773,9 @@ export async function createNodeRuntimeHost(
               const authority = activeWorkerAuthority;
               const generation = authorityGeneration;
               if (authority === undefined || !sameAuthority(authority, requestedWorkerAuthority)) {
-                throw new Error("Only the authoritative Main can register a Worker session");
+                throw workerRegistrationAuthorityError(
+                  "Only the authoritative Main can register a Worker session",
+                );
               }
               const epoch = await new StateWorkerEpochAllocator({
                 state: drivers.state,
@@ -262,7 +786,9 @@ export async function createNodeRuntimeHost(
                 !sameAuthority(authority, activeWorkerAuthority) ||
                 !sameAuthority(authority, requestedWorkerAuthority)
               ) {
-                throw new Error("Main authority changed during Worker session registration");
+                throw workerRegistrationAuthorityError(
+                  "Main authority changed during Worker session registration",
+                );
               }
               allocatedWorkerAuthorityGeneration = generation;
               return epoch;
@@ -274,7 +800,9 @@ export async function createNodeRuntimeHost(
               allocatedWorkerAuthorityGeneration !== authorityGeneration ||
               !sameAuthority(activeWorkerAuthority, requestedWorkerAuthority)
             ) {
-              throw new Error("Main authority changed before Worker session publication");
+              throw workerRegistrationAuthorityError(
+                "Main authority changed before Worker session publication",
+              );
             }
             allocatedWorkerAuthorityGeneration = undefined;
           },
@@ -434,6 +962,21 @@ export async function createNodeRuntimeHost(
           workerId: configuredWorkerId,
           fencing: requested,
         }),
+        routeCapability: (request) => {
+          return capabilityAdmission.invoke((authority) => {
+            const registration = sessionRegistry.resolveExact(request.target);
+            const consumer = registration.capabilityConsumer;
+            if (
+              consumer === undefined ||
+              consumer.bindingFingerprint !== request.bindingFingerprint
+            ) {
+              throw new Error("Remote capability consumer binding is not the exact active session");
+            }
+            const router = capabilityRouter;
+            if (router === undefined) throw new Error("Capability router is unavailable");
+            return router.invoke(consumer, request.invocation, authority);
+          });
+        },
       });
       activeWorkerAuthority = requested;
     });
@@ -478,6 +1021,7 @@ export async function createNodeRuntimeHost(
     },
   };
   const runtime = createRuntimeHost(configuration, drivers, {
+    authorityAdmission: capabilityAdmission,
     artifactService,
     tasks,
     workers,
@@ -487,6 +1031,7 @@ export async function createNodeRuntimeHost(
         artifactGate: localArtifactGate,
         authority,
         clock: drivers.clock,
+        ...(clusterTime === undefined ? {} : { clusterTime }),
         effects: new ComponentEffects({
           artifacts: preparedArtifacts,
           registry: componentRegistry,
@@ -506,33 +1051,77 @@ export async function createNodeRuntimeHost(
             const deployment = parsePluginDeployment(durableDeployment.value);
             if (
               deployment.applicationId !== effect.applicationId ||
-              deployment.pluginId !== effect.pluginId ||
-              deployment.generation !== effect.deploymentGeneration ||
-              deployment.artifactDigest !== effect.artifactDigest
+              deployment.pluginId !== effect.pluginId
             ) {
               return undefined;
             }
-            const durableInstallation = await drivers.state.read({
+            const durableInstance = await drivers.state.read({
+              namespace: "tego",
+              collection: "component-instances",
+              id: effect.instanceId,
+            });
+            const instance: Record<string, unknown> | undefined =
+              durableInstance?.value !== null &&
+              typeof durableInstance?.value === "object" &&
+              !Array.isArray(durableInstance.value)
+                ? (durableInstance.value as Record<string, unknown>)
+                : undefined;
+            if (
+              instance === undefined ||
+              instance.instanceId !== effect.instanceId ||
+              parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1") !==
+                effect.activation ||
+              instance.deploymentGeneration !== effect.deploymentGeneration
+            ) {
+              return undefined;
+            }
+            let installation: ReturnType<typeof parsePluginInstallation> | undefined;
+            for await (const record of drivers.state.scan({
               namespace: "tego",
               collection: "installations",
-              id: `${deployment.pluginId}@${deployment.version}@${deployment.artifactDigest}`,
-            });
-            if (durableInstallation === undefined) return undefined;
-            const installation = parsePluginInstallation(durableInstallation.value);
+            })) {
+              const candidate = parsePluginInstallation(record.value);
+              if (
+                candidate.pluginId === effect.pluginId &&
+                candidate.digest === effect.artifactDigest
+              ) {
+                installation = candidate;
+                break;
+              }
+            }
+            if (installation === undefined) return undefined;
             const artifact = await localArtifactGate.validate({
               digest: effect.artifactDigest,
             });
             if (
-              installation.pluginId !== deployment.pluginId ||
-              installation.version !== deployment.version ||
-              installation.digest !== deployment.artifactDigest ||
+              installation.pluginId !== effect.pluginId ||
+              installation.digest !== effect.artifactDigest ||
               artifact.digest !== installation.digest ||
               !canonicalJsonEqual(artifact.manifest, installation.manifest)
             ) {
               return undefined;
             }
+            const historical =
+              deployment.generation === effect.deploymentGeneration &&
+              deployment.artifactDigest === effect.artifactDigest
+                ? deployment
+                : effect.executionBinding === undefined
+                  ? undefined
+                  : {
+                      applicationId: effect.applicationId,
+                      pluginId: effect.pluginId,
+                      version: installation.version,
+                      artifactDigest: effect.artifactDigest,
+                      generation: effect.deploymentGeneration,
+                      state: "disabled" as const,
+                      essential: deployment.essential,
+                      configuration: effect.executionBinding.configuration,
+                      permissionGrants: effect.executionBinding.permissionGrants,
+                      capabilityBindings: {},
+                    };
+            if (historical === undefined) return undefined;
             return {
-              deployment,
+              deployment: historical,
               artifact,
             };
           },
@@ -544,6 +1133,20 @@ export async function createNodeRuntimeHost(
       return activeReconciler;
     },
   });
+  let runtimeStarted = false;
+  const ownedRuntime: Runtime = {
+    operations: runtime.operations,
+    events: runtime.events,
+    start: async () => {
+      await runtime.start();
+      runtimeStarted = true;
+    },
+    status: () => runtime.status(),
+    stop: async (stopOptions) => {
+      runtimeStarted = false;
+      await runtime.stop(stopOptions);
+    },
+  };
   const artifactIngress: LocalArtifactIngress = {
     putPath: async (artifactPath) => {
       const resolved = await realpath(artifactPath);
@@ -564,6 +1167,9 @@ export async function createNodeRuntimeHost(
   };
   const startWorkerListener = async (): Promise<string | undefined> => {
     if (listenerOwner === undefined) return undefined;
+    if (!runtimeStarted) {
+      throw new Error("Runtime must be running before the Worker listener binds");
+    }
     const status = await runtime.status();
     if (status.lifecycle !== "running") {
       throw new Error("Runtime must be running before the Worker listener binds");
@@ -571,7 +1177,7 @@ export async function createNodeRuntimeHost(
     return listenerOwner.start();
   };
   return {
-    runtime,
+    runtime: ownedRuntime,
     artifactIngress,
     startWorkerListener,
   };

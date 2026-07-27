@@ -1,6 +1,10 @@
 import {
   type Clock,
   DiagnosticError,
+  type JsonValue,
+  type PluginDeployment,
+  type PluginDeploymentObservation,
+  parsePluginDeployment,
   parseRuntimeConfiguration,
   parseRuntimeEvent,
   parseRuntimeStatus,
@@ -11,16 +15,24 @@ import {
   type RuntimeEvent,
   type RuntimeLifecycleState,
   type RuntimeStatus,
+  type ScannedState,
+  type StateStore,
+  type StateTransaction,
   runtimeDiagnostic,
   type StopOptions,
   serializeCause,
 } from "@tegojs/contracts";
+import { decodePersistedPluginDeploymentObservation } from "./deployment-observation.js";
 import { DriverSupervisor } from "./driver-supervisor.js";
 import { LeadershipController } from "./leadership-controller.js";
 import { isRuntimeReady } from "./readiness.js";
 import type { Reconciler } from "./reconcile/reconciler.js";
 import { type RuntimeRecoverySnapshot, recoverRuntimeState } from "./recovery.js";
-import type { RuntimeHostServices } from "./runtime-host.js";
+import type {
+  RuntimeHostServices,
+  RuntimeObservedStatus,
+  RuntimeObservedStatusReader,
+} from "./runtime-host.js";
 import { RuntimeOperationController } from "./runtime-operations.js";
 import { transitionRuntimeState } from "./runtime-state.js";
 
@@ -48,6 +60,132 @@ export async function wakeReconcilerForAuthority(
     );
   }
   await reconciler.wake();
+}
+
+const observedStatusPageSize = 100;
+
+async function scanObservedStatusCollection<T extends JsonValue>(
+  transaction: StateTransaction,
+  collection: "deployment-observations" | "deployments" | "installations",
+): Promise<readonly ScannedState<T>[]> {
+  const records: ScannedState<T>[] = [];
+  let afterId: string | undefined;
+  while (true) {
+    const page: ScannedState<T>[] = [];
+    for await (const record of transaction.scan<T>({
+      namespace: "tego",
+      collection,
+      ...(afterId === undefined ? {} : { afterId }),
+      limit: observedStatusPageSize,
+    })) {
+      page.push(record);
+    }
+    records.push(...page);
+    if (page.length < observedStatusPageSize) return records;
+    afterId = page.at(-1)?.key.id;
+    if (afterId === undefined) return records;
+  }
+}
+
+function compareDeploymentRecords(
+  left: ScannedState<PluginDeployment>,
+  right: ScannedState<PluginDeployment>,
+): number {
+  const leftGeneration = BigInt(left.value.generation);
+  const rightGeneration = BigInt(right.value.generation);
+  if (leftGeneration !== rightGeneration) {
+    return leftGeneration < rightGeneration ? -1 : 1;
+  }
+  const canonicalId = `${left.value.applicationId}/${left.value.pluginId}`;
+  const leftCanonical = left.key.id === canonicalId;
+  const rightCanonical = right.key.id === canonicalId;
+  if (leftCanonical !== rightCanonical) return leftCanonical ? 1 : -1;
+  return left.key.id < right.key.id ? 1 : left.key.id > right.key.id ? -1 : 0;
+}
+
+function currentDeploymentRecords(
+  records: readonly ScannedState<PluginDeployment>[],
+  applicationId: RuntimeConfiguration["applicationId"],
+): readonly ScannedState<PluginDeployment>[] {
+  const current = new Map<string, ScannedState<PluginDeployment>>();
+  for (const record of records) {
+    const deployment = parsePluginDeployment(record.value);
+    if (deployment.applicationId !== applicationId) continue;
+    const parsed = { ...record, value: deployment };
+    const identity = `${deployment.applicationId}/${deployment.pluginId}`;
+    const previous = current.get(identity);
+    if (previous === undefined || compareDeploymentRecords(previous, parsed) < 0) {
+      current.set(identity, parsed);
+    }
+  }
+  return [...current.values()];
+}
+
+class DurableRuntimeObservedStatusReader implements RuntimeObservedStatusReader {
+  readonly #applicationId: RuntimeConfiguration["applicationId"];
+  readonly #state: StateStore;
+
+  constructor(state: StateStore, applicationId: RuntimeConfiguration["applicationId"]) {
+    this.#state = state;
+    this.#applicationId = applicationId;
+  }
+
+  read(): Promise<RuntimeObservedStatus> {
+    return this.#state.transact({}, async (transaction) => {
+      const installations = await scanObservedStatusCollection<JsonValue>(
+        transaction,
+        "installations",
+      );
+      const deployments = currentDeploymentRecords(
+        await scanObservedStatusCollection<PluginDeployment>(transaction, "deployments"),
+        this.#applicationId,
+      );
+      const observations = await scanObservedStatusCollection<PluginDeploymentObservation>(
+        transaction,
+        "deployment-observations",
+      );
+      const observationByDeployment = new Map<string, ScannedState<PluginDeploymentObservation>>();
+      for (const record of observations) {
+        const decoded = decodePersistedPluginDeploymentObservation(record.value).observation;
+        if (decoded.applicationId !== this.#applicationId) continue;
+        const identity = `${decoded.applicationId}/${decoded.pluginId}`;
+        const deployment = deployments.find(
+          (candidate) =>
+            `${candidate.value.applicationId}/${candidate.value.pluginId}` === identity,
+        );
+        if (deployment === undefined || decoded.generation !== deployment.value.generation) {
+          continue;
+        }
+        const parsed = { ...record, value: decoded };
+        const previous = observationByDeployment.get(identity);
+        const canonicalId = identity;
+        const parsedCanonical = parsed.key.id === canonicalId;
+        const previousCanonical = previous?.key.id === canonicalId;
+        if (
+          previous === undefined ||
+          (parsedCanonical && !previousCanonical) ||
+          (parsedCanonical === previousCanonical && parsed.key.id < previous.key.id)
+        ) {
+          observationByDeployment.set(identity, parsed);
+        }
+      }
+      return {
+        deploymentCount: deployments.length,
+        installationCount: installations.length,
+        deploymentReadiness: deployments.map(({ value: deployment }) => {
+          const observation = observationByDeployment.get(
+            `${deployment.applicationId}/${deployment.pluginId}`,
+          )?.value;
+          return {
+            essential: deployment.essential,
+            ready:
+              deployment.state === "disabled" ||
+              (observation?.generation === deployment.generation && observation.status === "ready"),
+          };
+        }),
+      };
+    });
+  }
 }
 
 class RuntimeEventIterator implements AsyncIterable<RuntimeEvent>, AsyncIterator<RuntimeEvent> {
@@ -126,6 +264,16 @@ class RuntimeEventStream implements AsyncIterable<RuntimeEvent> {
   }
 }
 
+type TerminalObservedStatus =
+  | {
+      readonly kind: "failure";
+      readonly error: unknown;
+    }
+  | {
+      readonly kind: "status";
+      readonly status: RuntimeObservedStatus;
+    };
+
 class TegoRuntime implements Runtime {
   readonly operations: RuntimeOperationController;
   readonly events: AsyncIterable<RuntimeEvent>;
@@ -134,6 +282,7 @@ class TegoRuntime implements Runtime {
   readonly #services: RuntimeHostServices | undefined;
   readonly #supervisor: DriverSupervisor;
   readonly #eventStream = new RuntimeEventStream();
+  readonly #observedStatus: RuntimeObservedStatusReader;
   #lifecycle: RuntimeLifecycleState = "created";
   #recovery: RuntimeRecoverySnapshot = {
     installationCount: 0,
@@ -151,7 +300,10 @@ class TegoRuntime implements Runtime {
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
   #stopRequested = false;
+  #workerAuthorityActive = false;
   #servicesClosed = false;
+  #driversOpened = false;
+  #terminalObservedStatus: TerminalObservedStatus | undefined;
 
   constructor(
     configuration: RuntimeConfiguration,
@@ -161,6 +313,10 @@ class TegoRuntime implements Runtime {
     this.#configuration = parseRuntimeConfiguration(configuration);
     this.#drivers = drivers;
     this.#services = services;
+    this.#observedStatus = new DurableRuntimeObservedStatusReader(
+      drivers.state,
+      this.#configuration.applicationId,
+    );
     this.#supervisor = new DriverSupervisor(drivers);
     this.operations = new RuntimeOperationController({
       clock: drivers.clock,
@@ -209,6 +365,7 @@ class TegoRuntime implements Runtime {
       this.#assertCoordinationScope();
       this.#setLifecycle("opening");
       await this.#supervisor.open();
+      this.#driversOpened = true;
       if (this.#stopRequested) return;
 
       this.#setLifecycle("recovering");
@@ -251,8 +408,14 @@ class TegoRuntime implements Runtime {
       this.operations.close();
       await this.#leadershipController?.stop().catch(() => undefined);
       await this.#stopReconciler().catch(() => undefined);
+      if (this.#driversOpened) {
+        await this.#captureTerminalObservedStatus();
+      } else {
+        this.#captureRecoveredObservedStatus();
+      }
       await this.#closeServices();
       await this.#supervisor.close();
+      this.#driversOpened = false;
       if (
         this.#lifecycle !== "failed" &&
         this.#lifecycle !== "stopped" &&
@@ -278,10 +441,14 @@ class TegoRuntime implements Runtime {
     if (this.#lifecycle !== "stopping") this.#setLifecycle("stopping");
     try {
       await this.#stopReconciler();
+      await this.#revokeWorkerAuthority();
     } catch (error) {
       errors.push(error);
     }
+    const observedStatusFailure = await this.#captureTerminalObservedStatus();
+    if (observedStatusFailure !== undefined) errors.push(observedStatusFailure);
     errors.push(...(await this.#closeServices()), ...(await this.#supervisor.close()));
+    this.#driversOpened = false;
     this.#setLifecycle(errors.length === 0 ? "stopped" : "failed");
     this.#eventStream.close();
     if (errors.length > 0) {
@@ -303,6 +470,7 @@ class TegoRuntime implements Runtime {
     if (this.#lifecycle === "running") {
       this.#driverHealth = await this.#supervisor.health(this.#drivers.clock.now().toISOString());
     }
+    const observed = await this.#readObservedStatus();
     const driverHealth = this.#driverHealth.map(({ health }) => health);
     const status = {
       identity: {
@@ -316,13 +484,16 @@ class TegoRuntime implements Runtime {
       readiness: isRuntimeReady({
         lifecycle: this.#lifecycle,
         drivers: driverHealth,
-        deployments: this.#recovery.deploymentReadiness,
+        deployments: observed.deploymentReadiness.map((deployment) => ({
+          desired: true,
+          ...deployment,
+        })),
       }),
       acceptingOperations: this.operations.accepting,
       drivers: this.#driverHealth,
       counts: {
-        deployments: this.#recovery.deploymentCount,
-        installations: this.#recovery.installationCount,
+        deployments: observed.deploymentCount,
+        installations: observed.installationCount,
         recoverableOperations: this.#recovery.operations.length,
         tasks: this.#services?.tasks.count() ?? this.#recovery.taskCount,
         workers: this.#services?.workers.count() ?? 0,
@@ -339,8 +510,87 @@ class TegoRuntime implements Runtime {
     return structuredClone(parseRuntimeStatus(status));
   }
 
+  async #captureTerminalObservedStatus(): Promise<unknown | undefined> {
+    if (this.#terminalObservedStatus !== undefined) return undefined;
+    try {
+      this.#terminalObservedStatus = {
+        kind: "status",
+        status: await this.#observedStatus.read(),
+      };
+      return undefined;
+    } catch (error) {
+      this.#terminalObservedStatus = {
+        kind: "failure",
+        error,
+      };
+      return error;
+    }
+  }
+
+  #captureRecoveredObservedStatus(): void {
+    if (this.#terminalObservedStatus !== undefined) return;
+    this.#terminalObservedStatus = {
+      kind: "status",
+      status: {
+        deploymentCount: this.#recovery.deploymentCount,
+        installationCount: this.#recovery.installationCount,
+        deploymentReadiness: this.#recovery.deploymentReadiness.map(({ essential, ready }) => ({
+          essential,
+          ready,
+        })),
+      },
+    };
+  }
+
+  #readObservedStatus(): Promise<RuntimeObservedStatus> {
+    if (this.#terminalObservedStatus?.kind === "failure") {
+      return Promise.reject(this.#terminalObservedStatus.error);
+    }
+    if (this.#terminalObservedStatus?.kind === "status") {
+      return Promise.resolve(this.#terminalObservedStatus.status);
+    }
+    return this.#observedStatus.read();
+  }
+
   #assertCoordinationScope(): void {
-    if (this.#configuration.mode !== "multi-main") return;
+    if (this.#configuration.mode === "single-main") {
+      const mismatches = [
+        {
+          actual: this.#drivers.coordination.scope,
+          expected: "local",
+          code: "BOOTSTRAP_COORDINATION_NOT_LOCAL",
+          label: "coordination",
+        },
+        {
+          actual: this.#drivers.state.scope,
+          expected: "local",
+          code: "BOOTSTRAP_STATE_NOT_LOCAL",
+          label: "state",
+        },
+        {
+          actual: this.#drivers.artifacts.scope,
+          expected: "local",
+          code: "BOOTSTRAP_ARTIFACTS_NOT_LOCAL",
+          label: "artifact",
+        },
+      ] as const;
+      const mismatch = mismatches.find((candidate) => candidate.actual !== candidate.expected);
+      if (mismatch !== undefined) {
+        throw new DiagnosticError(
+          runtimeDiagnostic({
+            code: mismatch.code,
+            message: `single-main mode requires local ${mismatch.label} storage`,
+            source: { kind: "runtime", id: this.#configuration.runtimeId },
+            details: {
+              mode: this.#configuration.mode,
+              [`${mismatch.label}Scope`]: mismatch.actual,
+            },
+            observedAt: this.#drivers.clock.now().toISOString(),
+          }),
+        );
+      }
+      return;
+    }
     if (this.#drivers.coordination.scope !== "distributed") {
       throw new DiagnosticError(
         runtimeDiagnostic({
@@ -396,6 +646,7 @@ class TegoRuntime implements Runtime {
     }
 
     this.#reconcilerCurrentAuthority = structuredClone(authority);
+    this.#workerAuthorityActive = true;
     await this.#services.workers.setAuthority(authority);
     let reconciler!: Reconciler;
     reconciler = this.#services.createReconciler(authority, {
@@ -410,6 +661,7 @@ class TegoRuntime implements Runtime {
     await reconciler.start();
     await this.#services.tasks.setAuthority(authority);
     this.#leadership = structuredClone(authority);
+    this.#services.authorityAdmission.open(authority);
     if (this.#lifecycle === "running" && !this.#stopRequested) {
       this.operations.openMutations();
     }
@@ -430,17 +682,22 @@ class TegoRuntime implements Runtime {
 
     const errors: unknown[] = [];
     try {
+      this.#services.authorityAdmission.close(authority);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
       await this.#services.tasks.setAuthority(undefined);
     } catch (error) {
       errors.push(error);
     }
     try {
-      await this.#services.workers.setAuthority(undefined);
+      await this.#stopReconciler();
     } catch (error) {
       errors.push(error);
     }
     try {
-      await this.#stopReconciler();
+      await this.#revokeWorkerAuthority();
     } catch (error) {
       errors.push(error);
     }
@@ -468,6 +725,12 @@ class TegoRuntime implements Runtime {
     }
   }
 
+  async #revokeWorkerAuthority(): Promise<void> {
+    if (this.#services === undefined || !this.#workerAuthorityActive) return;
+    await this.#services.workers.setAuthority(undefined);
+    this.#workerAuthorityActive = false;
+  }
+
   #handleReconcilerBackgroundFailure(
     reconciler: Reconciler,
     authority: RuntimeAuthority,
@@ -483,6 +746,11 @@ class TegoRuntime implements Runtime {
     this.operations.closeMutations();
     this.#leadership = undefined;
     this.#reconcilerCurrentAuthority = undefined;
+    try {
+      this.#services?.authorityAdmission.close(authority);
+    } catch {
+      // The authoritative stop path retries and reports cleanup failures.
+    }
     const diagnostic = runtimeDiagnostic({
       code: "LIFECYCLE_RECONCILE_BACKGROUND_FAILED",
       message: "Leader-owned background reconciliation failed",

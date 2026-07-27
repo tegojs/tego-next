@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { JsonValue } from "@tegojs/contracts";
 import {
+  type ComponentContext,
   createComponentContext,
   createDisposableStack,
   defineComponent,
-  type ComponentContext,
 } from "../src/index.js";
 
 test("defineComponent snapshots and deeply freezes a functional definition", () => {
@@ -29,6 +29,30 @@ test("defineComponent snapshots and deeply freezes a functional definition", () 
   assert.throws(() => {
     (definition.metadata?.nested as { label: string }).label = "changed";
   }, TypeError);
+});
+
+test("defineComponent accepts a task capability provider hook", async () => {
+  const invokeCapability = async (_context: ComponentContext, request: JsonValue) => request;
+  const definition = defineComponent({
+    kind: "task",
+    invokeCapability,
+  } as never);
+
+  assert.equal(
+    (definition as unknown as { readonly invokeCapability?: unknown }).invokeCapability,
+    invokeCapability,
+  );
+});
+
+test("defineComponent explicitly rejects capability provider hooks on services", () => {
+  assert.throws(
+    () =>
+      defineComponent({
+        kind: "service",
+        invokeCapability: async () => null,
+      } as never),
+    /task components/u,
+  );
 });
 
 test("defineComponent rejects class instances and accessor-backed definitions without invoking them", () => {

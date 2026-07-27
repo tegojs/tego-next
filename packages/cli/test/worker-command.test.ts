@@ -7,14 +7,20 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import {
   type ArtifactDigest,
+  createExecutionBinding,
+  DiagnosticError,
   type ExecutionRequest,
   type JsonValue,
+  parseApplicationId,
   parseArtifactDigest,
+  parseCapabilityName,
   parseComponentInstanceId,
   parseFencingEpoch,
   parseGeneration,
+  parsePluginId,
   parsePluginManifest,
   parseWorkerId,
+  runtimeDiagnostic,
   type StateFencing,
   type StateTransaction,
   type StateTransactionOptions,
@@ -28,6 +34,7 @@ import {
   MemoryRemoteAttemptStore,
   MemoryWorkerEpochAllocator,
   type RemoteAttemptRecord,
+  type RemoteComponentActivation,
   RemoteExecutor,
   requestFingerprint,
   systemWorkerClock,
@@ -272,7 +279,7 @@ function preparedArtifact(
           executors,
         },
       ],
-      permissions: [{ kind: "executor", executors }],
+      permissions: [{ kind: "executor", executors: [...executors, "remote"] }],
       capabilities: { provides: [], requires: [] },
     }),
   };
@@ -289,31 +296,136 @@ function assignment(
     workerId: parseWorkerId("worker-01"),
   },
 ): ExecutionRequest {
-  return {
-    taskId: "task-artifact-selection" as ExecutionRequest["taskId"],
-    attemptId: "attempt-artifact-selection" as ExecutionRequest["attemptId"],
-    target: {
-      instanceId: parseComponentInstanceId("application-artifact-selection.plugin.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest:
-        remote.artifactDigest ??
-        parseArtifactDigest(
-          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
-      executor: {
-        id: remote.id,
-        type: "remote",
-        workerId: remote.workerId,
-      },
+  const target = {
+    instanceId: parseComponentInstanceId("application-artifact-selection.plugin.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest:
+      remote.artifactDigest ??
+      parseArtifactDigest(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+    executor: {
+      id: remote.id,
+      type: "remote" as const,
+      workerId: remote.workerId,
     },
+  };
+  const identity = {
     applicationId: "application-artifact-selection" as ExecutionRequest["applicationId"],
     pluginId: pluginId as ExecutionRequest["pluginId"],
     componentId: "echo" as ExecutionRequest["componentId"],
+    target,
+  };
+  return {
+    taskId: "task-artifact-selection" as ExecutionRequest["taskId"],
+    attemptId: "attempt-artifact-selection" as ExecutionRequest["attemptId"],
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [
+        {
+          kind: "executor",
+          executors: ["remote"],
+        },
+      ],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
     input: null,
     deadline: new Date(Date.now() + 60_000).toISOString(),
     orphanPolicy: "cancel",
   };
 }
+
+function activation(request: ExecutionRequest): RemoteComponentActivation {
+  return {
+    identity: {
+      applicationId: request.applicationId,
+      pluginId: request.pluginId,
+      componentId: request.componentId,
+    },
+    target: request.target,
+    configuration: request.binding.configuration,
+    permissionGrants: request.binding.permissionGrants,
+    capabilityDefinitions: request.binding.capabilityDefinitions,
+    capabilityBindings: request.binding.capabilityBindings,
+    bindingFingerprint: request.binding.fingerprint,
+  };
+}
+
+test("execution binding parity forwards nested configuration, grants, and capabilities verbatim", () => {
+  const selection = createPreparedArtifactSelection(
+    [preparedArtifact("org.example.exact", "a")],
+    "worker-runtime",
+  );
+  const base = assignment("org.example.exact");
+  const request = {
+    ...base,
+    binding: createExecutionBinding(base, {
+      configuration: {
+        nested: {
+          retries: 3,
+          values: ["one", { enabled: true }],
+        },
+      },
+      permissionGrants: [
+        { kind: "executor", executors: ["process", "remote", "thread"] },
+        { kind: "secret", names: ["api-token"] },
+      ],
+      capabilityDefinitions: [
+        {
+          identity: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
+          methods: ["query"],
+          requestSchema: { type: "object" },
+          responseSchema: { type: "object" },
+        },
+      ],
+      capabilityBindings: [
+        {
+          capability: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
+          providerDeployment: {
+            applicationId: parseApplicationId("application-artifact-selection"),
+            pluginId: parsePluginId("records-provider"),
+          },
+        },
+      ],
+    }),
+  };
+  const component = selection.resolveComponent(request);
+
+  assert.deepEqual(
+    component.configuration,
+    (request as ExecutionRequest & { readonly binding: { readonly configuration: JsonValue } })
+      .binding.configuration,
+  );
+  assert.deepEqual(
+    component.permissionGrants,
+    (
+      request as ExecutionRequest & {
+        readonly binding: { readonly permissionGrants: readonly JsonValue[] };
+      }
+    ).binding.permissionGrants,
+  );
+  assert.deepEqual(
+    component.capabilityDefinitions,
+    (
+      request as ExecutionRequest & {
+        readonly binding: { readonly capabilityDefinitions: readonly JsonValue[] };
+      }
+    ).binding.capabilityDefinitions,
+  );
+  const generationMismatch = {
+    ...structuredClone(request),
+    target: {
+      ...request.target,
+      deploymentGeneration: parseGeneration("2"),
+    },
+  } as ExecutionRequest;
+  assert.equal(
+    selection.validateAssignment(generationMismatch)?.code,
+    "PROTOCOL_EXECUTION_BINDING_INVALID",
+  );
+});
 
 test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-plugin", () => {
   const exact = createPreparedArtifactSelection(
@@ -323,9 +435,10 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
   const exactRequest = assignment("org.example.exact");
   assert.equal(exact.validateAssignment(exactRequest), undefined);
   assert.equal(exact.resolveComponent(exactRequest).artifactDigest, `sha256:${"a".repeat(64)}`);
-  assert.deepEqual(exact.resolveComponent(exactRequest).permissionGrants, [
-    { kind: "executor", executors: ["thread"] },
-  ]);
+  assert.deepEqual(
+    exact.resolveComponent(exactRequest).permissionGrants,
+    exactRequest.binding.permissionGrants,
+  );
   const processOnly = createPreparedArtifactSelection(
     [preparedArtifact("org.example.process-only", "c", ["process"])],
     "worker-runtime",
@@ -336,9 +449,10 @@ test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-p
     workerId: parseWorkerId("worker-01"),
   });
   assert.equal(processOnly.selectExecutorKind(processRequest), "process");
-  assert.deepEqual(processOnly.resolveComponent(processRequest).permissionGrants, [
-    { kind: "executor", executors: ["process"] },
-  ]);
+  assert.deepEqual(
+    processOnly.resolveComponent(processRequest).permissionGrants,
+    processRequest.binding.permissionGrants,
+  );
 
   const missing = exact.validateAssignment(assignment("org.example.missing"));
   assert.equal(missing?.code, "EXECUTOR_REMOTE_ARTIFACT_UNPREPARED");
@@ -486,6 +600,10 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
     const reopened = await store.load(request.taskId, request.attemptId);
     assert.equal(reopened?.revision, "1");
     assert.equal(reopened?.fingerprint, initial.fingerprint);
+    assert.deepEqual(await store.recover(workerId, 2), {
+      highestEpoch: "1",
+      records: [reopened],
+    });
 
     const unknown = {
       ...(reopened ?? initial),
@@ -505,9 +623,166 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
       (await store.list(workerId)).map((record: RemoteAttemptRecord) => record.revision),
       ["2"],
     );
+    assert.deepEqual(
+      (await store.recover(workerId, 2)).records.map((record) => record.revision),
+      ["2"],
+    );
+    const completedAt = new Date(3).toISOString();
+    const terminal = await store.commit(
+      {
+        ...unknown,
+        state: "terminal",
+        updatedAt: completedAt,
+        revision: "2",
+        result: {
+          taskId: request.taskId,
+          attemptId: request.attemptId,
+          status: "succeeded",
+          executor: { kind: "remote", workerId },
+          startedAt: completedAt,
+          completedAt,
+        },
+      },
+      { expectedRevision: "2", expectedEpoch: "1" },
+    );
+    assert.equal(terminal?.revision, "3");
+    if (terminal === undefined) throw new Error("terminal attempt was not committed");
+    const { result: _terminalResult, ...terminalWithoutResult } = terminal;
+    const expired = await store.commit(
+      {
+        ...terminalWithoutResult,
+        state: "expired",
+        updatedAt: new Date(4).toISOString(),
+        acknowledgedAt: new Date(4).toISOString(),
+      },
+      { expectedRevision: "3", expectedEpoch: "1" },
+    );
+    assert.equal(expired?.revision, "4");
+    await state.close();
+    state = new SqliteStateStore({ databasePath });
+    await state.open();
+    store = new StateRemoteAttemptStore({ state, workerId });
+    assert.deepEqual(await store.load(request.taskId, request.attemptId), expired);
+    assert.deepEqual(await store.recover(workerId, 2), {
+      highestEpoch: "1",
+      records: [],
+    });
   } finally {
     await state.close().catch(() => undefined);
     await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("StateRemoteAttemptStore rejects revision overflow without mutating recovery state", async () => {
+  const state = new MemoryStateStore();
+  const workerId = parseWorkerId("worker-attempt-revision-overflow");
+  const request = assignment("org.example.revision-overflow", {
+    id: "remote-revision-overflow",
+    workerId,
+  });
+  const maximumRevision = "18446744073709551615";
+  const initial = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "assigned" as const,
+    epoch: "1",
+    updatedAt: new Date(0).toISOString(),
+    revision: maximumRevision,
+  };
+  await state.open();
+  try {
+    const store = new StateRemoteAttemptStore({ state, workerId });
+    await store.save(initial);
+
+    await assert.rejects(
+      store.commit(
+        {
+          ...initial,
+          state: "unknown",
+          updatedAt: new Date(1).toISOString(),
+        },
+        { expectedRevision: maximumRevision, expectedEpoch: "1" },
+      ),
+      /revision|unsigned|64|range|exhaust/iu,
+    );
+
+    assert.deepEqual(await store.load(request.taskId, request.attemptId), initial);
+    assert.deepEqual(await store.recover(workerId, 2), {
+      highestEpoch: "1",
+      records: [initial],
+    });
+  } finally {
+    await state.close();
+  }
+});
+
+test("StateRemoteAttemptStore recovery keeps tombstones out of its bounded active index", async () => {
+  const state = new MemoryStateStore();
+  const workerId = parseWorkerId("worker-attempt-recovery-index");
+  await state.open();
+  try {
+    let store = new StateRemoteAttemptStore({ state, workerId });
+    for (let index = 0; index < 513; index += 1) {
+      const request = {
+        ...assignment("org.example.expired", {
+          id: "remote-recovery-index",
+          workerId,
+        }),
+        taskId: `task-expired-${index}` as ExecutionRequest["taskId"],
+        attemptId: `attempt-expired-${index}` as ExecutionRequest["attemptId"],
+      };
+      const completedAt = new Date(index).toISOString();
+      await store.save({
+        workerId,
+        request,
+        fingerprint: requestFingerprint(request),
+        state: "expired",
+        epoch: "7",
+        updatedAt: completedAt,
+        revision: "1",
+        result: {
+          taskId: request.taskId,
+          attemptId: request.attemptId,
+          status: "succeeded",
+          executor: { kind: "remote", workerId },
+          startedAt: completedAt,
+          completedAt,
+        },
+      });
+    }
+    for (let index = 0; index < 2; index += 1) {
+      const request = {
+        ...assignment("org.example.active", {
+          id: "remote-recovery-index",
+          workerId,
+        }),
+        taskId: `task-active-${index}` as ExecutionRequest["taskId"],
+        attemptId: `attempt-active-${index}` as ExecutionRequest["attemptId"],
+      };
+      await store.save({
+        workerId,
+        request,
+        fingerprint: requestFingerprint(request),
+        state: "assigned",
+        epoch: "9",
+        updatedAt: new Date(1_000 + index).toISOString(),
+        revision: "1",
+      });
+    }
+
+    store = new StateRemoteAttemptStore({ state, workerId });
+    const recovered = await store.recover(workerId, 3);
+
+    assert.equal((await store.list(workerId)).length, 515);
+    assert.equal(recovered.highestEpoch, "9");
+    assert.equal(recovered.records.length, 2);
+    assert.equal(
+      recovered.records.every((record) => record.state !== "expired"),
+      true,
+    );
+  } finally {
+    await state.close();
   }
 });
 
@@ -558,10 +833,11 @@ test("@spec:worker-protocol/durable-worker-attempts/fences-every-mutation-when-c
       await store.delete(request.taskId, request.attemptId);
       await store.load(request.taskId, request.attemptId);
       await store.list(workerId);
+      await store.recover(workerId, 2);
 
       assert.deepEqual(
         state.transactionOptions,
-        Array.from({ length: 3 }, () =>
+        Array.from({ length: 4 }, () =>
           configuredFencing === undefined ? {} : { fencing: configuredFencing },
         ),
       );
@@ -586,9 +862,20 @@ async function putRawAttempt(
   value: RemoteAttemptRecord,
 ): Promise<void> {
   await state.transact({}, async (transaction) => {
-    await transaction.put(attemptStateKey(keyRecord), value, {
+    const key = attemptStateKey(keyRecord);
+    await transaction.put(key, value, {
       expectedRevision: "absent",
     });
+    if (value.state !== "expired") {
+      await transaction.put(
+        {
+          ...key,
+          collection: "worker-active-attempts",
+        },
+        value,
+        { expectedRevision: "absent" },
+      );
+    }
     return null;
   });
 }
@@ -646,6 +933,11 @@ test("@spec:worker-protocol/durable-worker-attempts/rejects-corrupt-sqlite-recor
       );
       await assert.rejects(
         store.list(workerId),
+        /attempt|epoch|fingerprint|worker|identity|invalid/iu,
+        fixture.name,
+      );
+      await assert.rejects(
+        store.recover(workerId, 2),
         /attempt|epoch|fingerprint|worker|identity|invalid/iu,
         fixture.name,
       );
@@ -749,7 +1041,7 @@ async function createWorkerArtifact(
           executors,
         },
       ],
-      permissions: [{ kind: "executor", executors }],
+      permissions: [{ kind: "executor", executors: [...executors, "remote"] }],
       capabilities: { provides: [], requires: [] },
     }),
   );
@@ -816,7 +1108,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
     await remote.attach(session);
     assert.deepEqual(main.registration(workerId)?.preparedArtifacts, [digest]);
 
-    const request = {
+    const request: ExecutionRequest = {
       ...assignment("org.example.worker-echo", {
         artifactDigest: parseArtifactDigest(digest),
         id: remote.id,
@@ -825,6 +1117,7 @@ test("@spec:worker-protocol/independent-worker-command/listen-prepares-advertise
       input: { usable: true },
       deadline: new Date(Date.now() + 60_000).toISOString(),
     };
+    await remote.activateComponent(activation(request));
     const result = await beforeDeadline(
       (await remote.submit(request)).result,
       "prepared Worker echo result",
@@ -887,18 +1180,18 @@ test("@spec:worker-protocol/independent-worker-command/process-only-artifact-exe
     session = await connectMain({ endpoint: main, url: new URL(readiness.url) });
     await session.ready;
     await remote.attach(session);
+    const request = {
+      ...assignment(pluginId, {
+        artifactDigest: parseArtifactDigest(digest),
+        id: remote.id,
+        workerId,
+      }),
+      input: { processOnly: true },
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await remote.activateComponent(activation(request));
     const result = await beforeDeadline(
-      (
-        await remote.submit({
-          ...assignment(pluginId, {
-            artifactDigest: parseArtifactDigest(digest),
-            id: remote.id,
-            workerId,
-          }),
-          input: { processOnly: true },
-          deadline: new Date(Date.now() + 60_000).toISOString(),
-        })
-      ).result,
+      (await remote.submit(request)).result,
       "process-only Worker result",
     );
 
@@ -1029,6 +1322,89 @@ test("@spec:worker-protocol/independent-worker-command/connect-retries-initial-n
     if (disruptor.listening) await closeServer(disruptor);
     await Promise.allSettled([listener?.close(), main.close()]);
     await beforeDeadline(running, "initial retry Worker cleanup");
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-rotates-from-follower-to-leader", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-follower-"));
+  const workerId = parseWorkerId("worker-connect-follower");
+  const credential = "follower-rotation-secret";
+  const follower = createMainEndpoint({
+    credential,
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+    assertRegistrationPublishable: () => {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "COORDINATION_NOT_LEADER",
+          message: "Worker registration requires the authoritative Main",
+          source: { kind: "runtime", id: "follower" },
+        }),
+      );
+    },
+  });
+  const leader = createMainEndpoint({
+    credential,
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const followerListener = await listenForMain({
+    endpoint: follower,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const leaderListener = await listenForMain({
+    endpoint: leader,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const parsed = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    followerListener.url.href,
+    "--credential",
+    credential,
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+  ]) as WorkerStartCommand;
+  if (parsed.direction !== "connect") throw new Error("test command must connect");
+  const command: WorkerStartCommand = {
+    ...parsed,
+    fallbackUrls: [leaderListener.url.href],
+  };
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness) => ready.resolve(readiness),
+  });
+
+  try {
+    const readiness = await beforeDeadline(
+      Promise.race([
+        ready.promise,
+        running.then(() => {
+          throw new Error("Worker exited before connecting to the leader");
+        }),
+      ]),
+      "Worker follower-to-leader rotation",
+    );
+    assert.equal(readiness.url, leaderListener.url.href);
+    assert.equal(follower.current(workerId), undefined);
+    assert.equal(leader.current(workerId)?.available, true);
+  } finally {
+    controller.abort();
+    await Promise.allSettled([
+      followerListener.close(),
+      leaderListener.close(),
+      follower.close(),
+      leader.close(),
+    ]);
+    await running.catch(() => undefined);
     await cleanupDirectory(directory);
   }
 });
@@ -1195,7 +1571,7 @@ test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered
     firstSession.onStateChange((state) => {
       if (state === "closed") firstSessionClosed.resolve();
     });
-    const handle = await remote.submit({
+    const request: ExecutionRequest = {
       ...assignment("org.example.worker-echo", {
         artifactDigest: parseArtifactDigest(digest),
         id: remote.id,
@@ -1204,7 +1580,9 @@ test("@spec:worker-protocol/independent-worker-command/connect-recovers-buffered
       input: { delayMs: 200, recovered: true },
       deadline: new Date(Date.now() + 60_000).toISOString(),
       orphanPolicy: "finish-and-buffer",
-    });
+    };
+    await remote.activateComponent(activation(request));
+    const handle = await remote.submit(request);
     let terminalResults = 0;
     void handle.result.then(() => {
       terminalResults += 1;

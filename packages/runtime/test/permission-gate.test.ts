@@ -260,6 +260,7 @@ test("capability request and response payload gates return structured diagnostic
       name: parseCapabilityName("org.example.echo"),
       protocolVersion: "1.0.0",
     },
+    methods: ["echo"],
     requestSchema: {
       type: "object",
       additionalProperties: false,
@@ -306,6 +307,7 @@ test("payload gates reject accessors and exotic prototypes without invoking user
       name: parseCapabilityName("org.example.echo"),
       protocolVersion: "1.0.0",
     },
+    methods: ["echo"],
     requestSchema: true,
     responseSchema: true,
   } satisfies CapabilityDefinition;
@@ -345,6 +347,7 @@ test("capability schema registration reuses canonical $id schemas and rejects co
       name: parseCapabilityName("org.example.registered"),
       protocolVersion: "1.0.0",
     },
+    methods: ["echo"],
     requestSchema: {
       $id: "urn:tego:test:registered-request",
       type: "object",

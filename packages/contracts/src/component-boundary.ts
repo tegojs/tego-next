@@ -1,4 +1,5 @@
 import type { CapabilityDefinition } from "./capability.js";
+import type { OperationId } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { Permission } from "./permission.js";
 
@@ -54,6 +55,7 @@ export interface ComponentCapabilityIdentity extends JsonObject {
 }
 
 export interface ComponentCapabilityInvocation extends JsonObject {
+  readonly invocationId: OperationId | string;
   readonly identity: ComponentCapabilityIdentity;
   readonly method: string;
   readonly input: JsonValue;

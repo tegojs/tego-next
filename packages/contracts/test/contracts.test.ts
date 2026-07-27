@@ -5,18 +5,19 @@ import {
   type CapabilityBinding,
   type CapabilityDefinition,
   type CapabilityIdentity,
+  createExecutionBinding,
   DiagnosticError,
-  diagnosticCode,
   type DriverHealth,
+  diagnosticCode,
   type ExecutionRequest,
   type ExecutionResult,
   type JsonSchema,
   type JsonValue,
   type Leadership,
+  type Permission,
   type PluginDeployment,
   type PluginInstallation,
   type PluginManifest,
-  type Permission,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
@@ -26,12 +27,12 @@ import {
   parseCapabilityName,
   parseComponentId,
   parseComponentInstanceId,
+  parseDriverHealth,
   parseExecutionRequest,
   parseExecutionResult,
   parseExecutorId,
-  parseGeneration,
-  parseDriverHealth,
   parseFencingEpoch,
+  parseGeneration,
   parseLeadership,
   parseMessageId,
   parseNodeId,
@@ -47,9 +48,9 @@ import {
   parseSchema,
   parseSequence,
   parseSessionId,
+  parseTaskExecutionTarget,
   parseTaskId,
   parseTaskRecord,
-  parseTaskExecutionTarget,
   parseWorkerEnvelope,
   type RuntimeConfiguration,
   type RuntimeDiagnostic,
@@ -96,20 +97,32 @@ const validManifest = {
   },
 } satisfies PluginManifest;
 
-const validExecutionRequest = {
-  taskId: parseTaskId("task-01"),
-  attemptId: parseAttemptId("attempt-01"),
-  target: {
-    instanceId: parseComponentInstanceId("detector.org.example.echo.echo.1"),
-    deploymentGeneration: parseGeneration("1"),
-    artifactDigest: parseArtifactDigest(
-      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-    ),
-    executor: { id: "executor-01", type: "process" },
-  },
+const validExecutionTarget = {
+  instanceId: parseComponentInstanceId("detector.org.example.echo.echo.1"),
+  deploymentGeneration: parseGeneration("1"),
+  artifactDigest: parseArtifactDigest(
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  ),
+  executor: { id: "executor-01", type: "process" },
+} as const;
+
+const validExecutionIdentity = {
   applicationId: parseApplicationId("detector"),
   pluginId: parsePluginId("org.example.echo"),
   componentId: parseComponentId("echo"),
+  target: validExecutionTarget,
+} as const;
+
+const validExecutionRequest = {
+  taskId: parseTaskId("task-01"),
+  attemptId: parseAttemptId("attempt-01"),
+  ...validExecutionIdentity,
+  binding: createExecutionBinding(validExecutionIdentity, {
+    configuration: { nested: { enabled: true } },
+    permissionGrants: validManifest.permissions,
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  }),
   input: { message: "hello" },
   deadline: "2026-07-23T12:00:00.000Z",
   orphanPolicy: "finish-and-buffer",
@@ -120,6 +133,7 @@ const validWorkerEnvelope = {
   messageId: parseMessageId("message-01"),
   sessionId: parseSessionId("session-01"),
   sequence: parseSequence("1"),
+  correlationId: parseMessageId("message-01"),
   type: "task.assign",
   sentAt: "2026-07-23T11:59:00.000Z",
   payload: validExecutionRequest,
@@ -220,6 +234,7 @@ const validCapabilityIdentity = {
 
 const validCapabilityDefinition = {
   identity: validCapabilityIdentity,
+  methods: ["echo"],
   requestSchema: {
     type: "object",
     additionalProperties: false,
@@ -233,6 +248,15 @@ const validCapabilityDefinition = {
     properties: { echo: { type: "string" } },
   },
 } satisfies CapabilityDefinition;
+
+const validCapabilityProvision = {
+  name: validCapabilityIdentity.name,
+  protocolVersion: validCapabilityIdentity.protocolVersion,
+  componentId: parseComponentId("echo"),
+  methods: ["echo", "inspect"],
+  requestSchema: validCapabilityDefinition.requestSchema,
+  responseSchema: validCapabilityDefinition.responseSchema,
+} as const;
 
 const validCapabilityBinding = {
   capability: validCapabilityIdentity,
@@ -372,11 +396,124 @@ test("plugin permission contracts are structured and empty arrays remain valid",
   }
 });
 
+test("plugin capability provisions carry a canonical method set, schemas, and a task provider", () => {
+  const manifest = {
+    ...validManifest,
+    capabilities: {
+      provides: [validCapabilityProvision],
+      requires: [],
+    },
+  };
+
+  assert.deepEqual(parsePluginManifest(manifest), manifest);
+  for (const provides of [
+    [{ ...validCapabilityProvision, methods: [] }],
+    [{ ...validCapabilityProvision, methods: ["echo", "echo"] }],
+    [{ ...validCapabilityProvision, methods: ["inspect", "echo"] }],
+    [
+      validCapabilityProvision,
+      { ...validCapabilityProvision, componentId: parseComponentId("other") },
+    ],
+  ]) {
+    assert.throws(
+      () =>
+        parsePluginManifest({
+          ...validManifest,
+          capabilities: { provides, requires: [] },
+        }),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+    );
+  }
+});
+
+test("plugin capability provisions reject undeclared and non-task provider components", () => {
+  assert.throws(
+    () =>
+      parsePluginManifest({
+        ...validManifest,
+        capabilities: {
+          provides: [{ ...validCapabilityProvision, componentId: parseComponentId("undeclared") }],
+          requires: [],
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
+  assert.throws(
+    () =>
+      parsePluginManifest({
+        ...validManifest,
+        components: [{ ...validManifest.components[0], kind: "service" }],
+        capabilities: {
+          provides: [validCapabilityProvision],
+          requires: [],
+        },
+      }),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_MANIFEST_INVALID",
+  );
+});
+
+test("capability definitions require canonical non-empty unique methods", () => {
+  assert.deepEqual(parseCapabilityDefinition(validCapabilityDefinition), validCapabilityDefinition);
+  for (const methods of [[], ["echo", "echo"], ["inspect", "echo"]]) {
+    assert.throws(
+      () => parseCapabilityDefinition({ ...validCapabilityDefinition, methods }),
+      (error: unknown) => diagnosticCode(error) === "CAPABILITY_DEFINITION_INVALID",
+    );
+  }
+});
+
 test("execution request validation preserves JsonValue payloads", () => {
   assert.deepEqual(parseExecutionRequest(validExecutionRequest), validExecutionRequest);
   assert.throws(
     () => parseExecutionRequest({ ...validExecutionRequest, input: undefined }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_INVALID",
+  );
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        bindingTarget: validExecutionRequest.target,
+      }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_INVALID",
+  );
+});
+
+test("execution binding canonicalization is deterministic and target-bound", () => {
+  const content = {
+    configuration: { secret: "never-log-this", nested: { enabled: true } },
+    permissionGrants: [
+      { kind: "secret" as const, names: ["zeta", "alpha"] },
+      { kind: "executor" as const, executors: ["thread" as const, "process" as const] },
+    ],
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  };
+  const reordered = createExecutionBinding(validExecutionIdentity, {
+    ...content,
+    permissionGrants: [
+      { kind: "executor", executors: ["process", "thread"] },
+      { kind: "secret", names: ["alpha", "zeta"] },
+    ],
+  });
+  const canonical = createExecutionBinding(validExecutionIdentity, content);
+  assert.deepEqual(reordered, canonical);
+
+  const nextTarget = {
+    ...validExecutionTarget,
+    deploymentGeneration: parseGeneration("2"),
+  };
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        target: nextTarget,
+        binding: canonical,
+      }),
+    (error: unknown) => {
+      assert.equal(diagnosticCode(error), "PROTOCOL_EXECUTION_BINDING_INVALID");
+      assert.doesNotMatch(JSON.stringify(error), /never-log-this/u);
+      return true;
+    },
   );
 });
 
@@ -422,15 +559,20 @@ test("task execution targets share one strict persisted and wire contract", () =
 
 test("executor identifiers use one bounded wire-safe parser", () => {
   const executorId = "node-01:thread/worker:process";
+  const target = {
+    ...validExecutionRequest.target,
+    executor: { ...validExecutionRequest.target.executor, id: executorId },
+  };
 
   assert.equal(parseExecutorId(executorId), executorId);
   assert.equal(
     parseExecutionRequest({
       ...validExecutionRequest,
-      target: {
-        ...validExecutionRequest.target,
-        executor: { ...validExecutionRequest.target.executor, id: executorId },
-      },
+      target,
+      binding: createExecutionBinding(
+        { ...validExecutionIdentity, target },
+        validExecutionRequest.binding,
+      ),
     }).target.executor.id,
     executorId,
   );
@@ -563,6 +705,21 @@ test("worker envelopes preserve decimal sequence values and payloads", () => {
       return true;
     },
   );
+});
+
+test("worker envelope correlation is mandatory and preserves uint64 sequences", () => {
+  const { correlationId: _correlationId, ...withoutCorrelation } = validWorkerEnvelope;
+  assert.throws(
+    () => parseWorkerEnvelope(withoutCorrelation),
+    (error: unknown) => diagnosticCode(error) === "WORKER_ENVELOPE_INVALID",
+  );
+
+  const maximumSequenceEnvelope = {
+    ...validWorkerEnvelope,
+    sequence: parseSequence("18446744073709551615"),
+    correlationId: parseMessageId("correlation-maximum-sequence"),
+  };
+  assert.deepEqual(parseWorkerEnvelope(maximumSequenceEnvelope), maximumSequenceEnvelope);
 });
 
 test("the public Worker envelope owns handshake and binary wire metadata", () => {

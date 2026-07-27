@@ -39,22 +39,38 @@ export {
 export {
   ComponentRegistry,
   type ComponentBinding,
+  type ComponentBindingPreparation,
   type ComponentBindingState,
   type RegisteredComponent,
 } from "./components/component-registry.js";
 export {
   resolveCapabilities,
   type CapabilityResolutionDeployment,
+  type CapabilityResolutionProvision,
   type CapabilityResolutionDiagnostic,
   type CapabilityResolutionDiagnosticCode,
   type CapabilityResolutionInput,
   type NormalizedCapabilityRequirement,
   type PreviousCapabilityBinding,
+  type PersistedProviderLoss,
+  type ProviderLossAction,
   type ProviderLossDecision,
+  type ProviderRecoveryBindingPrerequisite,
   type ResolutionResult,
   type ResolvedCapabilityBinding,
   type ResolvedCapabilityProvider,
+  strongestProviderLoss,
 } from "./capabilities/resolver.js";
+export {
+  CapabilityRouter,
+  type CapabilityInvocationAuthority,
+  type CapabilityProviderRoute,
+  type CapabilityProvisionRoute,
+  type CapabilityRoute,
+  type CapabilityRouterOptions,
+  type ComponentInstanceIdentity,
+  type RoutedCapabilityInvocation,
+} from "./capabilities/router.js";
 export {
   isValidVersion,
   isValidVersionRange,
@@ -67,8 +83,11 @@ export {
 } from "./leadership-controller.js";
 export {
   createRuntimeHost,
+  type RuntimeAuthorityAdmission,
   type RuntimeHost,
   type RuntimeHostServices,
+  type RuntimeObservedStatus,
+  type RuntimeObservedStatusReader,
 } from "./runtime-host.js";
 export {
   RuntimeOperationController,
@@ -120,7 +139,10 @@ export {
   type ComponentTransitionInput,
 } from "./reconcile/component-lifecycle.js";
 export {
+  parseActivation,
   planReconcile,
+  reconcileEffectIdentities,
+  type Activation,
   type ArtifactDeploymentGate,
   type ComponentInstance,
   type ReconcileEffect,

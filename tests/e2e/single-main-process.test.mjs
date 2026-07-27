@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmod,
   cp,
@@ -17,8 +18,12 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { parseRuntimeSnapshotResponse } from "@tegojs/contracts";
+import { Pool } from "pg";
+import { requestControl } from "../../packages/cli/dist/src/control/client.js";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
+import { collectSemanticSnapshot, settleWithCleanup } from "../support/single-main-process.mjs";
 
 const executeFile = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -33,12 +38,12 @@ const workerResources = {
   storageBytes: 256 * 1024 * 1024,
 };
 
-async function runCli(arguments_) {
+async function runCli(arguments_, timeout = processDeadlineMs) {
   const { stdout, stderr } = await executeFile(process.execPath, [cliBinary, ...arguments_], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 1024 * 1024,
-    timeout: processDeadlineMs,
+    timeout,
   });
   assert.equal(stderr, "");
   return JSON.parse(stdout);
@@ -120,14 +125,24 @@ globals[marker] = (typeof globals[marker] === "number" ? globals[marker] : 0) + 
 
 export default defineComponent({
   kind: "task",
-  async run(_context, input) {
+  async run(context, input) {
     const requestedDelay =
       typeof input === "object" && input !== null && "delayMs" in input
         ? Reflect.get(input, "delayMs")
         : undefined;
     if (typeof requestedDelay === "number" && Number.isFinite(requestedDelay)) {
-      const delayMs = Math.max(0, Math.min(requestedDelay, 10_000));
+      const delayMs = Math.max(0, Math.min(requestedDelay, 30_000));
       await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      Reflect.get(input, "inspectExecutionBinding") === true
+    ) {
+      return {
+        configuration: context.config.get(),
+        input,
+      };
     }
     return input;
   },
@@ -175,6 +190,8 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
     input.digest,
     "--permissions",
     JSON.stringify(permissions),
+    "--configuration",
+    JSON.stringify(input.configuration ?? {}),
     "--endpoint",
     endpoint,
     "--json",
@@ -185,10 +202,12 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
     endpoint,
     operationId: `system-${executor}`,
     value: input.value,
+    expectedOutput: input.expectedOutput,
   });
 }
 
-async function runTask({ endpoint, operationId, value }) {
+async function runTask({ endpoint, expectedOutput: expectedOutputInput, operationId, value }) {
+  const expectedOutput = expectedOutputInput ?? value;
   const accepted = await startTask({ endpoint, operationId, value });
   let completed;
   try {
@@ -221,8 +240,12 @@ async function runTask({ endpoint, operationId, value }) {
     endpoint,
     "--json",
   ]);
-  assert.equal(completed.result.status, "succeeded");
-  assert.deepEqual(completed.result.output, value);
+  assert.equal(
+    completed.result.status,
+    "succeeded",
+    `task did not succeed: ${JSON.stringify(completed)}`,
+  );
+  assert.deepEqual(completed.result.output, expectedOutput);
   assert.deepEqual(status, completed);
   return completed;
 }
@@ -245,8 +268,24 @@ async function startTask({ endpoint, operationId, orphanPolicy = "cancel", value
   ]);
 }
 
-async function runtimeSnapshot(endpoint) {
-  return runCli(["runtime", "snapshot", "--endpoint", endpoint, "--json"]);
+async function runtimeSnapshot(endpoint, input = {}) {
+  const requestId = randomUUID();
+  const response = await requestControl({
+    endpoint,
+    input,
+    operation: "runtime.snapshot",
+    requestId,
+    timeoutMs: processDeadlineMs,
+  });
+  assert.equal(response.requestId, requestId);
+  if (!response.ok) {
+    throw new Error(`RUNTIME_SNAPSHOT_FAILED:${JSON.stringify(response.diagnostic)}`);
+  }
+  return parseRuntimeSnapshotResponse(response.result);
+}
+
+async function semanticSnapshotItems(endpoint) {
+  return collectSemanticSnapshot((input) => runtimeSnapshot(endpoint, input));
 }
 
 async function runtimeStatus(endpoint) {
@@ -285,6 +324,7 @@ async function runSystemFlow(runIndex) {
   let worker;
   let restartedMain;
   let workerUrl;
+  let operationError;
   try {
     await mkdir(dirname(endpoint), { mode: 0o700, recursive: true });
     const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
@@ -348,18 +388,41 @@ async function runSystemFlow(runIndex) {
       "--json",
     ]);
     const tasks = [];
+    const executionBindingConfiguration = {
+      nested: {
+        retries: 3,
+        values: ["one", { enabled: true }],
+      },
+    };
     for (const [index, executor] of ["thread", "process", "remote"].entries()) {
+      const value = {
+        executor,
+        inspectExecutionBinding: true,
+        runIndex,
+        value: index + 1,
+      };
       tasks.push(
         await deployAndRun({
           endpoint,
           executor,
           generation: String(index + 1),
           input: {
+            configuration: executionBindingConfiguration,
             digest: installation.digest,
-            value: { executor, runIndex, value: index + 1 },
+            expectedOutput: {
+              configuration: executionBindingConfiguration,
+              input: value,
+            },
+            value,
           },
         }),
       );
+    }
+    for (const task of tasks) {
+      assert.deepEqual(task.binding.configuration, executionBindingConfiguration);
+      assert.equal(task.binding.permissionGrants.length > 0, true);
+      assert.deepEqual(task.binding.capabilityDefinitions, []);
+      assert.deepEqual(task.binding.capabilityBindings, []);
     }
     const beforeRestart = await runtimeSnapshot(endpoint);
     const beforeInstallation = onlySnapshotValue(beforeRestart.installations, "installations");
@@ -392,7 +455,7 @@ async function runSystemFlow(runIndex) {
     assert.equal(interruptedRemote.state, "running");
 
     process.kill(main.pid, "SIGKILL");
-    await main.assertClean();
+    await main.assertClean({ timeoutMs: processDeadlineMs });
     main = undefined;
     await assertPortClosed(workerUrl);
     const workerPort = Number(new URL(workerUrl).port);
@@ -494,39 +557,50 @@ async function runSystemFlow(runIndex) {
     });
 
     return { directory, endpoint: restartedEndpoint, workerUrl };
+  } catch (error) {
+    operationError = error;
   } finally {
-    try {
-      await stopProcess(worker);
-      if (restartedMain !== undefined) {
-        await runCli(["runtime", "stop", "--endpoint", restartedEndpoint, "--json"]).catch(
-          () => undefined,
-        );
-        await stopProcess(restartedMain);
-      }
-      if (main !== undefined) {
-        await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]).catch(() => undefined);
-        await stopProcess(main);
-      }
-      await rm(endpoint, { force: true });
-      assert.equal(await exists(endpoint), false);
-      assert.equal(await exists(restartedEndpoint), false);
-      if (workerUrl !== undefined) await assertPortClosed(workerUrl);
-      for (const name of ["main", "worker", "main-restart"]) {
-        const cleanupPath = artifacts.cleanup(name);
-        if (!(await exists(cleanupPath))) continue;
-        const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
-        assert.deepEqual(cleanup.streamErrors ?? [], []);
-        assert.deepEqual(cleanup.processingErrors ?? [], []);
-      }
-    } finally {
-      await removeTreeWithReadOnlyDirectories(directory);
-      await rm(pluginWorkspace, { force: true, recursive: true });
-      await artifacts.dispose();
-    }
+    await settleWithCleanup(async () => {
+      if (operationError !== undefined) throw operationError;
+    }, [
+      async () => {
+        if (restartedMain !== undefined) {
+          await runCli(["runtime", "stop", "--endpoint", restartedEndpoint, "--json"]);
+        }
+      },
+      async () => stopProcess(restartedMain),
+      async () => stopProcess(worker),
+      async () => {
+        if (main !== undefined) {
+          await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]);
+        }
+      },
+      async () => stopProcess(main),
+      async () => rm(endpoint, { force: true }),
+      async () => {
+        assert.equal(await exists(endpoint), false);
+        assert.equal(await exists(restartedEndpoint), false);
+      },
+      async () => {
+        if (workerUrl !== undefined) await assertPortClosed(workerUrl);
+      },
+      async () => {
+        for (const name of ["main", "worker", "main-restart"]) {
+          const cleanupPath = artifacts.cleanup(name);
+          if (!(await exists(cleanupPath))) continue;
+          const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
+          assert.deepEqual(cleanup.streamErrors ?? [], []);
+          assert.deepEqual(cleanup.processingErrors ?? [], []);
+        }
+      },
+      async () => removeTreeWithReadOnlyDirectories(directory),
+      async () => rm(pluginWorkspace, { force: true, recursive: true }),
+      async () => artifacts.dispose(),
+    ]);
   }
 }
 
-test("@spec:runtime-operations/ci-authoritative-system-acceptance/real-single-main-process-flow", async () => {
+test("@spec:runtime-operations/ci-authoritative-system-acceptance/real-single-main-process-flow execution binding parity", async () => {
   const first = await runSystemFlow(1);
   const second = await runSystemFlow(2);
   assert.notEqual(first.directory, second.directory);
@@ -566,8 +640,7 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
   ];
   const mains = [];
   let worker;
-  let restartedWorker;
-  let killedLeader;
+  let operationError;
   try {
     const pluginDirectory = await prepareEchoPlugin(pluginWorkspace);
     await runCli(["plugin", "pack", pluginDirectory, "--output", artifactPath, "--json"]);
@@ -636,6 +709,7 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
           prepare: [artifactPath],
           resources: workerResources,
           url: leader.candidate.workerUrl,
+          fallbackUrls: [follower.candidate.workerUrl],
           workerId,
         }),
       },
@@ -662,92 +736,246 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       leader.candidate.configuration.endpoint,
       "--json",
     ]);
-    const beforeFailover = await deployAndRun({
+    const deployment = await runCli([
+      "plugin",
+      "deploy",
+      "org.example.echo",
+      "--digest",
+      installation.digest,
+      "--permissions",
+      JSON.stringify([
+        { kind: "executor", executors: ["remote"] },
+        { kind: "worker", labels: {}, resources: workerResources },
+      ]),
+      "--configuration",
+      "{}",
+      "--endpoint",
+      leader.candidate.configuration.endpoint,
+      "--json",
+    ]);
+    assert.equal(deployment.generation, "1");
+    await waitForDeployment(leader.candidate.configuration.endpoint, "1");
+    const followerSemanticBefore = JSON.stringify(
+      await semanticSnapshotItems(follower.candidate.configuration.endpoint),
+    );
+    const leaderSemanticBefore = JSON.stringify(
+      await semanticSnapshotItems(leader.candidate.configuration.endpoint),
+    );
+    assert.equal(followerSemanticBefore, leaderSemanticBefore);
+    await assert.rejects(
+      runCli([
+        "plugin",
+        "install",
+        artifactPath,
+        "--endpoint",
+        follower.candidate.configuration.endpoint,
+        "--json",
+      ]),
+      (error) => {
+        assert.equal(JSON.parse(error.stderr).diagnostic.code, "COORDINATION_NOT_LEADER");
+        return true;
+      },
+    );
+    const followerSemanticAfter = JSON.stringify(
+      await semanticSnapshotItems(follower.candidate.configuration.endpoint),
+    );
+    const leaderSemanticAfter = JSON.stringify(
+      await semanticSnapshotItems(leader.candidate.configuration.endpoint),
+    );
+    assert.equal(followerSemanticAfter, followerSemanticBefore);
+    assert.equal(leaderSemanticAfter, leaderSemanticBefore);
+    assert.equal(followerSemanticAfter, leaderSemanticAfter);
+
+    const activeTask = await startTask({
       endpoint: leader.candidate.configuration.endpoint,
-      executor: "remote",
-      generation: "1",
-      input: {
-        digest: installation.digest,
-        value: { executor: "remote", phase: "before-leader-failover", uniqueRun },
+      operationId: `system-remote-authority-transfer-${uniqueRun}`,
+      orphanPolicy: "finish-and-buffer",
+      value: {
+        delayMs: 10_000,
+        executor: "remote",
+        phase: "across-leader-failover",
+        uniqueRun,
       },
     });
+    await eventually(async () => {
+      const snapshot = await runtimeSnapshot(leader.candidate.configuration.endpoint);
+      const record = snapshot.tasks.items
+        .map((item) => item.value)
+        .find((candidate) => candidate.taskId === activeTask.taskId);
+      return record?.state === "running" ? record : undefined;
+    }, "remote task is running before authority transfer");
+    let replacementOutcome;
+    const replacementDeployment = runCli([
+      "plugin",
+      "deploy",
+      "org.example.echo",
+      "--digest",
+      installation.digest,
+      "--permissions",
+      JSON.stringify([
+        { kind: "executor", executors: ["remote"] },
+        { kind: "worker", labels: {}, resources: workerResources },
+      ]),
+      "--configuration",
+      "{}",
+      "--essential",
+      "--endpoint",
+      leader.candidate.configuration.endpoint,
+      "--json",
+    ]).then(
+      (value) => (replacementOutcome = { value }),
+      (error) => (replacementOutcome = { error }),
+    );
+    let latestReplacementInstances = [];
+    const statePool = new Pool({ connectionString: postgresUrl, max: 1 });
+    try {
+      await eventually(async () => {
+        if (replacementOutcome !== undefined && "error" in replacementOutcome) {
+          throw replacementOutcome.error;
+        }
+        const result = await statePool.query(
+          `SELECT collection_name, value_json
+             FROM tego_records
+            WHERE driver_namespace = $1
+              AND namespace = 'tego'
+              AND collection_name IN ('component-instances', 'deployments')`,
+          [runtimeId],
+        );
+        latestReplacementInstances = result.rows
+          .filter((row) => row.collection_name === "component-instances")
+          .map((row) => row.value_json);
+        const desiredReplacement = result.rows
+          .filter((row) => row.collection_name === "deployments")
+          .map((row) => row.value_json)
+          .find((deployment) => deployment.generation === "2");
+        const retainedRunning = latestReplacementInstances.find(
+          (instance) =>
+            instance.deploymentGeneration === "1" &&
+            instance.executor === "remote" &&
+            instance.lifecycle === "ready",
+        );
+        return desiredReplacement === undefined || retainedRunning === undefined
+          ? undefined
+          : { desiredReplacement, retainedRunning };
+      }, "replacement desired state is durable before authority transfer");
+    } catch (error) {
+      throw new Error(
+        `${String(error)} replacement=${JSON.stringify(replacementOutcome)} instances=${JSON.stringify(latestReplacementInstances)}`,
+      );
+    } finally {
+      await statePool.end();
+    }
 
-    killedLeader = leader.candidate.handle;
-    process.kill(killedLeader.pid, "SIGKILL");
-    await killedLeader.assertClean();
     const oldEpoch = BigInt(leader.status.authority.epoch);
+    const pool = new Pool({ connectionString: postgresUrl, max: 1 });
+    try {
+      const terminated = await pool.query(
+        `SELECT pg_terminate_backend(activity.pid) AS terminated
+           FROM pg_locks AS locks
+           JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+          WHERE locks.locktype = 'advisory'
+            AND locks.granted = TRUE
+            AND activity.application_name = $1`,
+        [`tego:${runtimeId}:coordination`],
+      );
+      assert.equal(terminated.rowCount, 1);
+      assert.equal(terminated.rows[0]?.terminated, true);
+    } finally {
+      await pool.end();
+    }
     const promoted = await eventually(async () => {
       const status = await runtimeStatus(follower.candidate.configuration.endpoint);
       return status.authority !== undefined && BigInt(status.authority.epoch) > oldEpoch
         ? status
         : undefined;
     }, "PostgreSQL follower promotion with a newer authority epoch");
-
-    await stopProcess(worker);
-    worker = undefined;
-    restartedWorker = await spawnManagedProcess({
-      artifacts,
-      command: process.execPath,
-      args: [workerFixture],
-      env: {
-        TEGO_TEST_WORKER_COMMAND: JSON.stringify({
-          kind: "worker.start",
-          credential,
-          dataDirectory: join(directory, "worker"),
-          direction: "connect",
-          json: true,
-          labels: {},
-          prepare: [artifactPath],
-          resources: workerResources,
-          url: follower.candidate.workerUrl,
-          workerId,
-        }),
+    await eventually(async () => {
+      const status = await runtimeStatus(leader.candidate.configuration.endpoint);
+      return status.authority === undefined ? status : undefined;
+    }, "former PostgreSQL leader remains alive and loses authority");
+    await assert.rejects(
+      runCli([
+        "plugin",
+        "install",
+        artifactPath,
+        "--endpoint",
+        leader.candidate.configuration.endpoint,
+        "--json",
+      ]),
+      (error) => {
+        assert.equal(JSON.parse(error.stderr).diagnostic.code, "COORDINATION_NOT_LEADER");
+        return true;
       },
-      name: "worker-follower",
-    });
-    await restartedWorker.ready((event) => event.type === "worker.ready", {
-      timeoutMs: processDeadlineMs,
-    });
+    );
     await eventually(async () => {
       const status = await runtimeStatus(follower.candidate.configuration.endpoint);
       return status.counts.workers === 1 && status.authority?.epoch === promoted.authority.epoch
         ? status
         : undefined;
     }, "Worker placement moves to the promoted PostgreSQL Main");
-    await waitForDeployment(follower.candidate.configuration.endpoint, "1");
-
-    const afterFailover = await runTask({
-      endpoint: follower.candidate.configuration.endpoint,
-      operationId: `system-remote-after-leader-failover-${uniqueRun}`,
-      value: { executor: "remote", phase: "after-leader-failover", uniqueRun },
+    const replacementResult = await replacementDeployment;
+    if ("value" in replacementResult) {
+      assert.equal(replacementResult.value.generation, "2");
+    }
+    await waitForDeployment(follower.candidate.configuration.endpoint, "2");
+    const completed = await runCli(
+      [
+        "task",
+        "wait",
+        activeTask.taskId,
+        "--timeout-ms",
+        String(processDeadlineMs * 3),
+        "--endpoint",
+        follower.candidate.configuration.endpoint,
+        "--json",
+      ],
+      processDeadlineMs * 3,
+    );
+    assert.equal(completed.result.status, "succeeded");
+    assert.deepEqual(completed.result.output, {
+      delayMs: 10_000,
+      executor: "remote",
+      phase: "across-leader-failover",
+      uniqueRun,
     });
     const snapshot = await runtimeSnapshot(follower.candidate.configuration.endpoint);
     const taskRecords = snapshot.tasks.items.map((item) => item.value);
-    assert.equal(taskRecords.length, 2);
-    assert.equal(new Set(taskRecords.map((task) => task.taskId)).size, 2);
-    assert.deepEqual(
-      new Set(taskRecords.map((task) => task.taskId)),
-      new Set([beforeFailover.taskId, afterFailover.taskId]),
+    assert.equal(taskRecords.length, 1);
+    assert.equal(taskRecords[0]?.taskId, activeTask.taskId);
+    assert.equal(taskRecords[0]?.attemptId, activeTask.attemptId);
+    assert.equal(taskRecords[0]?.state, "terminal");
+    assert.equal(taskRecords[0]?.result.status, "succeeded");
+    const componentInstances = snapshot.instances.items.map((item) => item.value);
+    assert.equal(
+      componentInstances.some(
+        (instance) => instance.deploymentGeneration === "1" && instance.lifecycle === "stopped",
+      ),
+      true,
     );
-    for (const task of taskRecords) {
-      assert.equal(task.state, "terminal");
-      assert.equal(task.result.status, "succeeded");
-    }
+    assert.equal(
+      componentInstances.some(
+        (instance) => instance.deploymentGeneration === "2" && instance.lifecycle === "ready",
+      ),
+      true,
+    );
+  } catch (error) {
+    operationError = error;
   } finally {
-    await stopProcess(restartedWorker).catch(() => undefined);
-    await stopProcess(worker).catch(() => undefined);
-    for (const main of mains) {
-      if (main.handle === killedLeader) continue;
-      await runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]).catch(
-        () => undefined,
-      );
-      await stopProcess(main.handle).catch(() => undefined);
-    }
-    for (const configuration of mainConfigurations) {
-      await rm(configuration.endpoint, { force: true });
-    }
-    await removeTreeWithReadOnlyDirectories(directory);
-    await rm(pluginWorkspace, { force: true, recursive: true });
-    await artifacts.dispose();
+    await settleWithCleanup(async () => {
+      if (operationError !== undefined) throw operationError;
+    }, [
+      ...mains.flatMap((main) => [
+        async () =>
+          runCli(["runtime", "stop", "--endpoint", main.configuration.endpoint, "--json"]),
+        async () => stopProcess(main.handle),
+      ]),
+      async () => stopProcess(worker),
+      ...mainConfigurations.map(
+        (configuration) => async () => rm(configuration.endpoint, { force: true }),
+      ),
+      async () => removeTreeWithReadOnlyDirectories(directory),
+      async () => rm(pluginWorkspace, { force: true, recursive: true }),
+      async () => artifacts.dispose(),
+    ]);
   }
 });

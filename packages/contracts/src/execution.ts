@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import type { CapabilityBinding, CapabilityDefinition } from "./capability.js";
 import { DiagnosticError, runtimeDiagnostic, type RuntimeDiagnostic } from "./diagnostic.js";
 import {
   parseArtifactDigest,
@@ -16,6 +18,7 @@ import {
   type WorkerId,
 } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
+import type { Permission } from "./permission.js";
 import type { DriverHealth } from "./state.js";
 
 export type OrphanPolicy = "cancel" | "finish-and-buffer" | "finish-and-persist";
@@ -35,6 +38,50 @@ export interface TaskExecutionTarget extends JsonObject {
         readonly type: "process" | "thread";
         readonly workerId?: never;
       };
+}
+
+export interface ExecutionBindingContent extends JsonObject {
+  readonly configuration: JsonValue;
+  readonly permissionGrants: readonly Permission[];
+  readonly capabilityDefinitions: readonly CapabilityDefinition[];
+  readonly capabilityBindings: readonly CapabilityBinding[];
+}
+
+export interface ExecutionBinding extends ExecutionBindingContent {
+  readonly fingerprint: string;
+}
+
+export interface ExecutionBindingIdentity extends JsonObject {
+  readonly applicationId: ApplicationId;
+  readonly pluginId: PluginId;
+  readonly componentId: ComponentId;
+  readonly target: TaskExecutionTarget;
+}
+
+function canonical(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonical(item)).join(",")}]`;
+  const object = value as JsonObject;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonical(object[key] as JsonValue)}`)
+    .join(",")}}`;
+}
+
+export function executionBindingFingerprint(
+  identity: ExecutionBindingIdentity,
+  binding: ExecutionBindingContent,
+): string {
+  return createHash("sha256")
+    .update(
+      canonical({
+        domain: "tego.execution-binding/1.0",
+        identity,
+        binding,
+      }),
+      "utf8",
+    )
+    .digest("hex");
 }
 
 function targetError(message: string): DiagnosticError {
@@ -113,6 +160,7 @@ export interface ExecutionRequest extends JsonObject {
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
   readonly componentId: ComponentId;
+  readonly binding: ExecutionBinding;
   readonly input: JsonValue;
   readonly deadline: string;
   readonly orphanPolicy: OrphanPolicy;

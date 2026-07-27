@@ -1,24 +1,31 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   DiagnosticError,
-  runtimeDiagnostic,
   type ExecutorKind,
+  type ExecutionBinding,
   type JsonValue,
   type PluginComponent,
   type PluginDeployment,
   type RuntimeAuthority,
+  runtimeDiagnostic,
   type WorkerId,
 } from "@tegojs/contracts";
 import type { PreparedArtifact } from "../artifacts/prepared-artifact-cache.js";
-import type { ReconcileEffect } from "../reconcile/plan.js";
+import { type Activation, parseActivation, type ReconcileEffect } from "../reconcile/plan.js";
 
-export interface ComponentBinding {
+export interface ComponentBindingPreparation {
   readonly instanceId: string;
+  readonly activation: Activation;
   readonly executor: ExecutorKind;
   readonly workerId?: WorkerId;
   readonly artifact: PreparedArtifact;
   readonly deployment: PluginDeployment;
   readonly component: PluginComponent;
   readonly authority?: RuntimeAuthority;
+}
+
+export interface ComponentBinding extends ComponentBindingPreparation {
+  readonly executionBinding: ExecutionBinding;
 }
 
 export type ComponentBindingState = "active" | "draining" | "prepared" | "stopping";
@@ -39,6 +46,7 @@ function lifecycleError(code: `LIFECYCLE_${string}`, message: string, effect: Re
       source: { kind: "plugin", id: `${effect.pluginId}/${effect.componentId}` },
       details: {
         artifactDigest: effect.artifactDigest,
+        activation: effect.activation,
         deploymentGeneration: effect.deploymentGeneration,
         instanceId: effect.instanceId,
         operationId: effect.operationId,
@@ -97,6 +105,8 @@ export class ComponentRegistry {
     binding: ComponentBinding,
     authority?: RuntimeAuthority,
   ): RegisteredComponent {
+    parseActivation(effect.activation);
+    parseActivation(binding.activation);
     this.#assertBinding(effect, binding, authority);
     const existing = this.#entries.get(effect.instanceId);
     if (existing !== undefined) {
@@ -116,11 +126,13 @@ export class ComponentRegistry {
     }
     const stableBinding = deepFreeze({
       instanceId: binding.instanceId,
+      activation: binding.activation,
       executor: binding.executor,
       ...(binding.workerId === undefined ? {} : { workerId: binding.workerId }),
       artifact: binding.artifact,
       deployment: cloneFrozen(binding.deployment),
       component: cloneFrozen(binding.component),
+      executionBinding: cloneFrozen(binding.executionBinding),
       ...(authority === undefined ? {} : { authority: cloneFrozen(authority) }),
     });
     const entry = Object.freeze({
@@ -269,15 +281,21 @@ export class ComponentRegistry {
 
   #matchesIdentity(effect: ReconcileEffect, entry: RegisteredComponent): boolean {
     const { binding } = entry;
+    const effectActivation = parseActivation(effect.activation);
+    const bindingActivation = parseActivation(binding.activation);
     return (
       binding.instanceId === effect.instanceId &&
+      bindingActivation === effectActivation &&
       binding.artifact.digest === effect.artifactDigest &&
       binding.deployment.applicationId === effect.applicationId &&
       binding.deployment.pluginId === effect.pluginId &&
       binding.deployment.generation === effect.deploymentGeneration &&
       binding.executor === effect.executor &&
       binding.workerId === effect.workerId &&
-      binding.component.componentId === effect.componentId
+      binding.component.componentId === effect.componentId &&
+      (effect.executionBinding === undefined ||
+        (binding.executionBinding.fingerprint === effect.executionBinding.fingerprint &&
+          isDeepStrictEqual(binding.executionBinding, effect.executionBinding)))
     );
   }
 
@@ -291,6 +309,7 @@ export class ComponentRegistry {
     );
     if (
       binding.instanceId !== effect.instanceId ||
+      binding.activation !== effect.activation ||
       binding.executor !== effect.executor ||
       binding.workerId !== effect.workerId ||
       binding.artifact.digest !== effect.artifactDigest ||

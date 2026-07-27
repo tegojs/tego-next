@@ -1,12 +1,14 @@
 import type {
   ApplicationId,
   ArtifactDigest,
+  CapabilityName,
   ComponentId,
   Generation,
   PluginId,
 } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
 import type { Permission } from "./permission.js";
+import type { JsonSchema } from "./schema.js";
 
 export type PluginModuleFormat = "esm";
 export type ComponentKind = "service" | "task";
@@ -20,8 +22,12 @@ export interface PluginComponent extends JsonObject {
 }
 
 export interface PluginCapabilityProvision extends JsonObject {
-  readonly name: string;
+  readonly name: CapabilityName;
   readonly protocolVersion: string;
+  readonly componentId: ComponentId;
+  readonly methods: readonly string[];
+  readonly requestSchema: JsonSchema;
+  readonly responseSchema: JsonSchema;
 }
 
 export interface PluginCapabilityRequirement extends JsonObject {

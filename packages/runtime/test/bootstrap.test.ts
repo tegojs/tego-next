@@ -93,9 +93,16 @@ class ControlledStateStore implements StateStore {
 
   async transact<T extends JsonValue>(
     _options: StateTransactionOptions,
-    _work: (transaction: StateTransaction) => Promise<T>,
+    work: (transaction: StateTransaction) => Promise<T>,
   ): Promise<T> {
-    throw new Error("not used");
+    return work({
+      get: (key) => this.read(key),
+      scan: (query) => this.scan(query),
+      put: () => Promise.reject(new Error("bootstrap transaction is read-only")),
+      delete: () => Promise.reject(new Error("bootstrap transaction is read-only")),
+      appendOperation: () => Promise.reject(new Error("not used")),
+      enqueueOutbox: () => Promise.reject(new Error("not used")),
+    });
   }
 
   async read<T extends JsonValue>(_key: StateKey<T>): Promise<Versioned<T> | undefined> {
@@ -411,7 +418,7 @@ test("@spec:runtime-bootstrap/independent-kernel-lifecycle/empty-runtime-lifecyc
   await runtime.stop();
   assert.equal(coordination.releaseCount, 1);
   assert.equal((await runtime.status()).lifecycle, "stopped");
-  assert.deepEqual(log.slice(-5), [
+  assert.deepEqual(log.filter((entry) => entry.endsWith(".close")).slice(-5), [
     "secrets.close",
     "processHost.close",
     "artifacts.close",
@@ -493,6 +500,28 @@ test("multi-main accepts structurally distributed and shared drivers", async () 
   await runtime.start();
   assert.equal((await runtime.status()).lifecycle, "running");
   await runtime.stop();
+});
+
+test("single-main rejects distributed or shared drivers before opening them", async () => {
+  for (const mismatch of ["artifacts", "coordination", "state"] as const) {
+    const { artifacts, coordination, drivers, log, state } = controlledDrivers();
+    if (mismatch === "coordination") coordination.scope = "distributed";
+    if (mismatch === "state") state.scope = "shared";
+    if (mismatch === "artifacts") artifacts.scope = "shared";
+    const runtime = createRuntime(configuration, drivers);
+
+    await assert.rejects(
+      runtime.start(),
+      (error: unknown) =>
+        diagnosticCode(error) ===
+        {
+          artifacts: "BOOTSTRAP_ARTIFACTS_NOT_LOCAL",
+          coordination: "BOOTSTRAP_COORDINATION_NOT_LOCAL",
+          state: "BOOTSTRAP_STATE_NOT_LOCAL",
+        }[mismatch],
+    );
+    assert.deepEqual(log, []);
+  }
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/recovery-precedes-operations-and-authority", async () => {
@@ -633,7 +662,7 @@ test("runtime rejects leadership for a different campaign resource before runnin
   assert.equal(status.lifecycle, "failed");
   assert.equal(status.acceptingOperations, false);
   assert.ok(log.indexOf("state.health") < log.indexOf("coordination.campaign"));
-  assert.deepEqual(log.slice(-5), [
+  assert.deepEqual(log.filter((entry) => entry.endsWith(".close")).slice(-5), [
     "secrets.close",
     "processHost.close",
     "artifacts.close",

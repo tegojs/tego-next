@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
-  parseArtifactDigest,
-  parseWorkerId,
   type ArtifactDigest,
   type Clock,
   type ExecutorKind,
   type FencingEpoch,
   type JsonObject,
   type JsonValue,
+  parseArtifactDigest,
+  parseWorkerId,
   type RuntimeDiagnostic,
   type SessionId,
+  type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-  type WorkerId,
 } from "@tegojs/contracts";
 import { FakeClock } from "./fake-clock.js";
 
@@ -138,10 +138,15 @@ export interface WorkerRegistrationInput {
 
 export interface WorkerSessionMessage {
   readonly messageId: string;
-  readonly correlationId?: string;
+  readonly correlationId: string;
   readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
+}
+
+export interface WorkerSessionRequestOptions {
+  readonly binary?: Uint8Array;
+  readonly timeoutMs?: number;
 }
 
 export interface WorkerSessionLike {
@@ -160,6 +165,11 @@ export interface WorkerSessionLike {
       readonly binary?: Uint8Array;
     },
   ): Promise<string>;
+  request(
+    type: WorkerMessageType,
+    payload: JsonValue,
+    options?: WorkerSessionRequestOptions,
+  ): Promise<WorkerSessionMessage>;
   onMessage(listener: (message: WorkerSessionMessage) => void): () => void;
   close(): Promise<void>;
 }
@@ -451,17 +461,46 @@ export function workerSessionConformance(
           worker,
           "worker-initiated",
         );
-        const received: WorkerSessionMessage[] = [];
-        const unsubscribe = workerSession.onMessage((message) => received.push(message));
+        const workerReceived: WorkerSessionMessage[] = [];
+        const mainReceived: WorkerSessionMessage[] = [];
+        const unsubscribeWorker = workerSession.onMessage((message) =>
+          workerReceived.push(message),
+        );
+        const unsubscribeMain = mainSession.onMessage((message) => mainReceived.push(message));
         const messageId = await mainSession.send("session.reconcile", { running: [] });
-        await mainSession.send("session.reconcile", { running: [] }, { correlationId: messageId });
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(received.length, 2);
-        assert.equal(received[1]?.correlationId, messageId);
+        assert.equal(workerReceived.length, 1);
+        const request = workerReceived[0];
+        assert.ok(request);
+        assert.equal(request.messageId, messageId);
+        assert.equal(request.correlationId, request.messageId);
+
+        const unsubscribeResponder = workerSession.onMessage((message) => {
+          if (
+            typeof message.payload === "object" &&
+            message.payload !== null &&
+            !Array.isArray(message.payload) &&
+            (message.payload as JsonObject).request === true
+          ) {
+            void workerSession.send(
+              "session.reconcile",
+              { response: true },
+              { correlationId: message.messageId },
+            );
+          }
+        });
+        const response = await mainSession.request("session.reconcile", { request: true });
+        const correlatedRequest = workerReceived.at(-1);
+        assert.ok(correlatedRequest);
+        assert.equal(correlatedRequest.correlationId, correlatedRequest.messageId);
+        assert.equal(response.correlationId, correlatedRequest.messageId);
+        assert.deepEqual(response.payload, { response: true });
+        assert.equal(mainReceived.length, 0);
+
         const original = mainSocket.lastControlFrame();
         workerSocket.inject(original);
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(received.length, 2);
+        assert.equal(workerReceived.length, 2);
 
         const conflict = JSON.parse(original) as Record<string, JsonValue>;
         conflict.messageId = "conformance-conflict";
@@ -469,7 +508,9 @@ export function workerSessionConformance(
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(workerSession.state, "closed");
         assert.equal(workerSession.diagnostic?.code, "PROTOCOL_SEQUENCE_REPLAY");
-        unsubscribe();
+        unsubscribeResponder();
+        unsubscribeWorker();
+        unsubscribeMain();
       } finally {
         await Promise.all([main.close(), worker.close()]);
       }

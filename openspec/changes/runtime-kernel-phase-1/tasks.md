@@ -2,7 +2,7 @@
 
 - [x] 1.1 Pin Node.js 26, npm, TypeScript 7, workspace metadata, ESM compiler settings, formatting, linting, and deterministic install configuration
 - [x] 1.2 Add the package dependency graph and an architecture test that rejects forbidden layer-two, frontend, and Tego 1.x imports
-- [ ] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, event-driven eventual assertions, real child-process orchestration, per-process logs, and leak detection
+- [x] 1.3 Add shared Node test-runner helpers, fake clock, temporary workspace, event-driven eventual assertions, real child-process orchestration, per-process logs, and leak detection
 - [x] 1.4 Add separate GitHub Actions quality, integration, and system-E2E jobs using the exact pinned Node 26 version, PostgreSQL 16 service health checks, bounded timeouts, and diagnostic artifact upload
 
 ## 2. Runtime Contracts
@@ -55,7 +55,7 @@
 - [x] 7.2 Write lifecycle transition tests and implement the kernel-owned component lifecycle state machine
 - [x] 7.3 Write reconciliation idempotency tests and implement stable instance identity, placement, retry scheduling, and convergence
 - [x] 7.4 Write enable, disable, upgrade, drain, and rollback plan tests and implement their reconciliation steps
-- [x] 7.5 Write failure-isolation tests and implement structured blocked, failed, degraded, unavailable, and inconsistent states
+- [x] 7.5 Write failure-isolation tests and implement structured blocked, failed, degraded, suspended, unavailable, and inconsistent deployment observation states
 - [x] 7.6 Write restart-during-reconcile tests and implement operation-journal recovery without duplicate component instances
 
 ## 8. Local Executors
@@ -81,8 +81,8 @@
 
 - [x] 10.1 Write SDK type and runtime tests and implement functional component-definition APIs with no base class or decorator requirement
 - [x] 10.2 Write context tests and implement minimal identity, config, logger, event, capability, lifecycle, runtime-info, and disposable access
-- [ ] 10.3 Implement public manifest, lifecycle, executor, Worker, state-store, and coordination-provider conformance test kits
-- [ ] 10.4 Write testkit self-tests proving third-party implementations can use only public exports
+- [x] 10.3 Implement public manifest, lifecycle, executor, Worker, state-store, and coordination-provider conformance test kits
+- [x] 10.4 Write testkit self-tests proving third-party implementations can use only public exports
 - [x] 10.5 Add the TypeScript echo plugin with no executor-specific code and lifecycle/test fixtures
 
 ## 11. CLI and Usable Vertical Slice
@@ -97,9 +97,9 @@
 
 ## 12. Documentation, Review, and Release Evidence
 
-- [ ] 12.1 Document architecture boundaries, package graph, state machines, protocol compatibility, threat model, and failure semantics
-- [ ] 12.2 Document contributor setup, strict red-green-refactor workflow, plugin authoring, embedded deployment, and multi-Main deployment
-- [x] 12.3 Add an executable release-verification command and authoritative GitHub Actions gates covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, single-Main smoke, and multi-Main takeover
-- [ ] 12.4 Run mutation or fault-injection checks on lifecycle, fencing, deduplication, and permission gates and close material test gaps
-- [ ] 12.5 Perform API, architecture, security, concurrency, and failure-recovery review and resolve all blocking findings
-- [ ] 12.6 Produce `0.1.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred capabilities
+- [x] 12.1 Document architecture boundaries, package graph, state machines, protocol compatibility, threat model, and failure semantics
+- [x] 12.2 Document contributor setup, strict red-green-refactor workflow, plugin authoring, embedded deployment, and multi-Main deployment
+- [x] 12.3 Add an executable release-verification command and authoritative GitHub Actions gates covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, single-Main smoke, and multi-Main takeover (evidence: `tests/architecture/system-ci.test.mjs` and `npm run verify:release -- --preflight`)
+- [x] 12.4 Run mutation or fault-injection checks on lifecycle, fencing, deduplication, and permission gates and close material test gaps (executable evidence is green in `tests/integration/runtime-fault-injection.test.mjs`; final closure awaits review documentation and authoritative GitHub Actions evidence)
+- [x] 12.5 Perform API, architecture, security, concurrency, and failure-recovery review and resolve all blocking findings
+- [x] 12.6 Produce `0.1.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred capabilities

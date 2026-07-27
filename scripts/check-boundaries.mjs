@@ -17,11 +17,46 @@ const FIRST_LAYER_FORBIDDEN_FRAGMENTS = [
   "tego/",
   "frontend",
   "http",
+  "authentication",
   "acl",
   "cache",
+  "database",
+  "scheduler",
   "workflow",
   "datasource",
+  "business-domain",
+  "domain-api",
+  "rest-api",
 ];
+
+const FIRST_LAYER_FORBIDDEN_EXPORT_FRAGMENTS = [
+  "accesscontrol",
+  "authentication",
+  "authenticator",
+  "businessdomain",
+  "cacheservice",
+  "databaseresource",
+  "datasource",
+  "domainservice",
+  "frontend",
+  "httpcontroller",
+  "httproute",
+  "httprouter",
+  "httpserver",
+  "scheduler",
+  "workflow",
+];
+
+const FIRST_LAYER_ALLOWED_EXPORTS = new Map([
+  [
+    "@tegojs/transport-websocket",
+    new Set([
+      "createAuthenticationNonce",
+      "createAuthenticationProof",
+      "verifyAuthenticationProof",
+    ]),
+  ],
+]);
 
 function npmAliasTarget(version) {
   if (typeof version !== "string") {
@@ -99,6 +134,65 @@ async function emittedJavaScriptFiles(directory) {
   );
 
   return files.flat();
+}
+
+async function emittedDeclarationFiles(directory) {
+  let entries;
+
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const files = await Promise.all(
+    entries.map(async (entry) => {
+      const entryUrl = new URL(entry.name, directory);
+      if (entry.isDirectory()) {
+        return emittedDeclarationFiles(new URL(`${entry.name}/`, directory));
+      }
+      return entry.isFile() && entry.name.endsWith(".d.ts") ? [entryUrl] : [];
+    }),
+  );
+
+  return files.flat();
+}
+
+function exportedDeclarationNames(source) {
+  const withoutComments = source
+    .replaceAll(/\/\*[\s\S]*?\*\//gu, "")
+    .replaceAll(/\/\/[^\r\n]*/gu, "");
+  const names = new Set();
+  const declarations =
+    /\bexport\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:class|const|enum|function|interface|let|namespace|type|var)\s+([A-Za-z_$][\w$]*)/gu;
+  for (const match of withoutComments.matchAll(declarations)) {
+    names.add(match[1]);
+  }
+  const lists = /\bexport\s+(?:type\s+)?\{([^}]*)\}/gu;
+  for (const match of withoutComments.matchAll(lists)) {
+    for (const entry of match[1].split(",")) {
+      const normalized = entry.trim().replace(/^type\s+/u, "");
+      if (normalized.length === 0) continue;
+      const parts = normalized.split(/\s+as\s+/u);
+      const exported = parts.at(-1)?.trim();
+      if (/^[A-Za-z_$][\w$]*$/u.test(exported ?? "")) {
+        names.add(exported);
+      }
+    }
+  }
+  return names;
+}
+
+function forbiddenPublicExports(workspace, source) {
+  const allowed = FIRST_LAYER_ALLOWED_EXPORTS.get(workspace.manifest.name);
+  return [...exportedDeclarationNames(source)].filter((name) => {
+    if (allowed?.has(name)) return false;
+    const normalized = name.toLowerCase();
+    return FIRST_LAYER_FORBIDDEN_EXPORT_FRAGMENTS.some((fragment) => normalized.includes(fragment));
+  });
 }
 
 function canStartRegularExpression(tokens) {
@@ -359,18 +453,35 @@ function analyzeImports(source) {
       continue;
     }
 
-    if (
-      token.value === "import" &&
-      next?.value === "{" &&
-      tokens[index + 2]?.type === "identifier" &&
-      tokens[index + 2]?.value === "pathToFileURL" &&
-      tokens[index + 3]?.value === "}" &&
-      tokens[index + 4]?.value === "from" &&
-      tokens[index + 5]?.type === "string" &&
-      !tokens[index + 5].escaped &&
-      tokens[index + 5].value === "node:url"
-    ) {
-      hasPathToFileUrlImport = true;
+    if (token.value === "import" && next?.value === "{") {
+      const close = tokens.findIndex(
+        (candidate, candidateIndex) => candidateIndex > index + 1 && candidate.value === "}",
+      );
+      if (
+        close !== -1 &&
+        tokens[close + 1]?.value === "from" &&
+        tokens[close + 2]?.type === "string" &&
+        !tokens[close + 2].escaped &&
+        tokens[close + 2].value === "node:url"
+      ) {
+        const bindings = [];
+        let binding = [];
+        for (const candidate of tokens.slice(index + 2, close)) {
+          if (candidate.value === ",") {
+            if (binding.length > 0) bindings.push(binding);
+            binding = [];
+          } else {
+            binding.push(candidate);
+          }
+        }
+        if (binding.length > 0) bindings.push(binding);
+        hasPathToFileUrlImport = bindings.some(
+          (candidate) =>
+            candidate.length === 1 &&
+            candidate[0].type === "identifier" &&
+            candidate[0].value === "pathToFileURL",
+        );
+      }
     }
 
     if (token.value === "import" && next?.value === "(") {
@@ -633,6 +744,15 @@ export async function checkWorkspaceBoundaries(root) {
             importingFile: file,
             kind: "import",
           });
+        }
+      }
+    }
+    if (workspace.kind === "first-layer") {
+      const declarations = await emittedDeclarationFiles(new URL("dist/", workspace.directory));
+      for (const file of declarations) {
+        const source = await readFile(file, "utf8");
+        for (const name of forbiddenPublicExports(workspace, source)) {
+          violations.add(`${workspace.manifest.name} -> [forbidden public export ${name}]`);
         }
       }
     }

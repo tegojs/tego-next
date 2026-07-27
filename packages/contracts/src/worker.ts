@@ -6,6 +6,11 @@ export type WorkerMessageType =
   | "artifact.prepare"
   | "artifact.prepared"
   | "authenticate"
+  | "capability.invoke"
+  | "component.activate"
+  | "component.activated"
+  | "component.drain"
+  | "component.stop"
   | "heartbeat"
   | "hello"
   | "session.ready"
@@ -21,7 +26,7 @@ export interface WorkerEnvelope<T extends JsonValue = JsonValue> extends JsonObj
   readonly messageId: MessageId;
   readonly sessionId: SessionId;
   readonly sequence: Sequence;
-  readonly correlationId?: MessageId;
+  readonly correlationId: MessageId;
   readonly type: WorkerMessageType;
   readonly sentAt: string;
   readonly payload: T;

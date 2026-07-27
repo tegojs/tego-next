@@ -1,18 +1,32 @@
 import { createHash } from "node:crypto";
 import {
+  type ApplicationId,
+  assertExecutionBindingMatches,
+  type CapabilityBinding,
+  type CapabilityDefinition,
+  type ComponentCapabilityInvocation,
+  type ComponentId,
   DiagnosticError,
-  parseExecutionRequest,
-  parseExecutionResult,
-  parseSequence,
-  runtimeDiagnostic,
-  serializeWireValue,
   type ExecutionRequest,
   type ExecutionResult,
   type JsonObject,
   type JsonValue,
+  type Permission,
+  type PluginId,
+  parseApplicationId,
+  parseComponentId,
+  parseExecutionRequest,
+  parseExecutionResult,
+  parsePluginId,
+  parseSequence,
+  parseTaskExecutionTarget,
+  parseWorkerId,
   type RuntimeDiagnostic,
-  type WorkerMessageType,
+  runtimeDiagnostic,
+  serializeWireValue,
+  type TaskExecutionTarget,
   type WorkerId,
+  type WorkerMessageType,
 } from "@tegojs/contracts";
 
 export const REMOTE_ASSIGN = "task.assign";
@@ -23,10 +37,15 @@ export const REMOTE_INVENTORY = "session.reconcile";
 export const REMOTE_INVENTORY_RESULT = REMOTE_INVENTORY;
 export const REMOTE_RESULT = "task.result";
 export const REMOTE_RESULT_ACK = REMOTE_ACK;
+export const REMOTE_CAPABILITY_INVOKE = "capability.invoke";
+export const REMOTE_COMPONENT_ACTIVATE = "component.activate";
+export const REMOTE_COMPONENT_ACTIVATED = "component.activated";
+export const REMOTE_COMPONENT_DRAIN = "component.drain";
+export const REMOTE_COMPONENT_STOP = "component.stop";
 
 export interface RemoteSessionMessage {
   readonly messageId: string;
-  readonly correlationId?: string;
+  readonly correlationId: string;
   readonly type: WorkerMessageType;
   readonly payload: JsonValue;
   readonly binary?: Uint8Array;
@@ -58,6 +77,50 @@ export interface RemoteAttemptIdentity extends JsonObject {
   readonly attemptId: ExecutionRequest["attemptId"];
 }
 
+export interface RemoteCapabilityInvocation extends JsonObject {
+  readonly invocationId: string;
+  readonly bindingFingerprint: string;
+  readonly target: TaskExecutionTarget;
+  readonly invocation: ComponentCapabilityInvocation;
+}
+
+export interface RemoteCapabilityInvocationResponse extends JsonObject {
+  readonly invocationId: string;
+  readonly fingerprint: string;
+  readonly ok: boolean;
+  readonly value?: JsonValue;
+  readonly error?: {
+    readonly code: `CAPABILITY_${string}` | `PROTOCOL_${string}`;
+    readonly message: string;
+  };
+}
+
+export interface RemoteComponentActivationIdentity extends JsonObject {
+  readonly applicationId: ApplicationId;
+  readonly pluginId: PluginId;
+  readonly componentId: ComponentId;
+}
+
+export interface RemoteComponentActivation extends JsonObject {
+  readonly identity: RemoteComponentActivationIdentity;
+  readonly target: TaskExecutionTarget;
+  readonly configuration: JsonValue;
+  readonly permissionGrants: readonly Permission[];
+  readonly capabilityDefinitions: readonly CapabilityDefinition[];
+  readonly capabilityBindings: readonly CapabilityBinding[];
+  readonly bindingFingerprint: string;
+}
+
+export interface RemoteComponentLifecycleResponse extends JsonObject {
+  readonly ok: boolean;
+  readonly target: TaskExecutionTarget;
+  readonly bindingFingerprint?: string;
+  readonly error?: {
+    readonly code: `LIFECYCLE_${string}` | `PROTOCOL_${string}`;
+    readonly message: string;
+  };
+}
+
 export type RemoteAttemptState =
   | "acknowledged"
   | "assigned"
@@ -84,6 +147,11 @@ export interface RemoteAttemptCommitCondition {
   readonly expectedEpoch?: string;
 }
 
+export interface RemoteAttemptRecovery {
+  readonly highestEpoch: string;
+  readonly records: readonly RemoteAttemptRecord[];
+}
+
 export interface RemoteAttemptStore {
   save(record: RemoteAttemptRecord): Promise<void>;
   commit(
@@ -99,6 +167,21 @@ export interface RemoteAttemptStore {
     attemptId: ExecutionRequest["attemptId"],
   ): Promise<RemoteAttemptRecord | undefined>;
   list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]>;
+  recover(workerId: WorkerId, limit: number): Promise<RemoteAttemptRecovery>;
+}
+
+export interface RemoteAttemptRecordExpectation {
+  readonly workerId: WorkerId;
+  readonly executorId?: string;
+  readonly taskId?: ExecutionRequest["taskId"];
+  readonly attemptId?: ExecutionRequest["attemptId"];
+  readonly fingerprint?: string;
+}
+
+export interface ParsedRemoteAttemptRecord {
+  readonly record: RemoteAttemptRecord;
+  readonly request: ExecutionRequest;
+  readonly result?: ExecutionResult;
 }
 
 export interface MemoryRemoteAttemptStoreOptions {
@@ -119,6 +202,8 @@ export function isRemoteAttemptRevisionError(error: unknown): error is RemoteAtt
 }
 
 export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
+  readonly #activeRecords = new Map<string, RemoteAttemptRecord>();
+  readonly #highestEpochs = new Map<WorkerId, bigint>();
   readonly #records = new Map<string, RemoteAttemptRecord>();
   readonly #onSave: ((record: RemoteAttemptRecord) => void) | undefined;
 
@@ -132,7 +217,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       ...record,
       revision: parseAttemptRevision(record.revision),
     }) as unknown as RemoteAttemptRecord;
-    this.#records.set(key, snapshot);
+    this.#storeSnapshot(key, snapshot);
     this.#onSave?.(snapshot);
   }
 
@@ -160,7 +245,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       ...record,
       revision: incrementRevision(currentRevision ?? "0"),
     }) as unknown as RemoteAttemptRecord;
-    this.#records.set(key, snapshot);
+    this.#storeSnapshot(key, snapshot);
     this.#onSave?.(snapshot);
     return cloneJson(snapshot) as unknown as RemoteAttemptRecord;
   }
@@ -177,13 +262,43 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     taskId: ExecutionRequest["taskId"],
     attemptId: ExecutionRequest["attemptId"],
   ): Promise<void> {
-    this.#records.delete(attemptKey(taskId, attemptId));
+    const key = attemptKey(taskId, attemptId);
+    this.#records.delete(key);
+    this.#activeRecords.delete(key);
   }
 
   async list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]> {
     return [...this.#records.values()]
       .filter((record) => record.workerId === workerId)
       .map((record) => cloneJson(record) as unknown as RemoteAttemptRecord);
+  }
+
+  async recover(workerId: WorkerId, limit: number): Promise<RemoteAttemptRecovery> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new RangeError("Remote attempt recovery limit must be a positive safe integer");
+    }
+    const records: RemoteAttemptRecord[] = [];
+    for (const record of this.#activeRecords.values()) {
+      if (record.workerId !== workerId) continue;
+      if (records.length >= limit) break;
+      records.push(cloneJson(record) as unknown as RemoteAttemptRecord);
+    }
+    return {
+      highestEpoch: (this.#highestEpochs.get(workerId) ?? 0n).toString(),
+      records,
+    };
+  }
+
+  #storeSnapshot(key: string, snapshot: RemoteAttemptRecord): void {
+    this.#records.set(key, snapshot);
+    if (snapshot.state === "expired") {
+      this.#activeRecords.delete(key);
+    } else {
+      this.#activeRecords.set(key, snapshot);
+    }
+    const epoch = BigInt(parseAttemptRevision(snapshot.epoch));
+    const highestEpoch = this.#highestEpochs.get(snapshot.workerId) ?? 0n;
+    if (epoch > highestEpoch) this.#highestEpochs.set(snapshot.workerId, epoch);
   }
 }
 
@@ -213,6 +328,125 @@ export function parseAttemptRevision(revision: unknown): string {
     );
   }
   return parsed;
+}
+
+function canonicalTimestamp(value: unknown, name: string): string {
+  if (
+    typeof value !== "string" ||
+    Number.isNaN(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  ) {
+    throw new TypeError(`${name} must be a canonical ISO timestamp`);
+  }
+  return value;
+}
+
+export function parseRemoteAttemptRecord(
+  value: unknown,
+  expectation: RemoteAttemptRecordExpectation,
+): ParsedRemoteAttemptRecord {
+  const object = asUnknownObject(value, "Remote attempt record");
+  const allowedKeys = new Set([
+    "acknowledgedAt",
+    "cancellation",
+    "epoch",
+    "fingerprint",
+    "request",
+    "result",
+    "revision",
+    "state",
+    "updatedAt",
+    "workerId",
+  ]);
+  if (Object.keys(object).some((key) => !allowedKeys.has(key))) {
+    throw new TypeError("Remote attempt record has unknown fields");
+  }
+  const workerId = parseWorkerId(object.workerId);
+  const request = parseRemoteRequest(object.request);
+  const fingerprint = sha256Fingerprint(object.fingerprint);
+  const state = object.state;
+  if (
+    state !== "acknowledged" &&
+    state !== "assigned" &&
+    state !== "expired" &&
+    state !== "running" &&
+    state !== "terminal" &&
+    state !== "unknown"
+  ) {
+    throw new TypeError("Remote attempt record state is invalid");
+  }
+  const epoch = parseAttemptRevision(object.epoch);
+  const revision = parseAttemptRevision(object.revision);
+  const updatedAt = canonicalTimestamp(object.updatedAt, "Remote attempt updatedAt");
+  const cancellation = object.cancellation;
+  if (cancellation !== undefined && cancellation !== "cancelled" && cancellation !== "timed-out") {
+    throw new TypeError("Remote attempt cancellation is invalid");
+  }
+  const acknowledgedAt =
+    object.acknowledgedAt === undefined
+      ? undefined
+      : canonicalTimestamp(object.acknowledgedAt, "Remote attempt acknowledgedAt");
+  if (acknowledgedAt !== undefined && state !== "terminal" && state !== "expired") {
+    throw new TypeError("Only terminal or expired remote attempts can be acknowledged");
+  }
+  if (acknowledgedAt !== undefined && Date.parse(acknowledgedAt) > Date.parse(updatedAt)) {
+    throw new TypeError("Remote attempt acknowledgement cannot be newer than its update");
+  }
+  const result = object.result === undefined ? undefined : parseExecutionResult(object.result);
+  if (state === "terminal" && result === undefined) {
+    throw new TypeError("Terminal remote attempt record requires a result");
+  }
+  if (state !== "terminal" && state !== "expired" && result !== undefined) {
+    throw new TypeError("Non-terminal remote attempt record cannot contain a result");
+  }
+  if (
+    workerId !== expectation.workerId ||
+    request.target.executor.type !== "remote" ||
+    request.target.executor.workerId !== expectation.workerId ||
+    (expectation.executorId !== undefined &&
+      request.target.executor.id !== expectation.executorId) ||
+    (expectation.taskId !== undefined && request.taskId !== expectation.taskId) ||
+    (expectation.attemptId !== undefined && request.attemptId !== expectation.attemptId) ||
+    (expectation.fingerprint !== undefined && fingerprint !== expectation.fingerprint)
+  ) {
+    throw new TypeError("Remote attempt record does not match its expected owner and identity");
+  }
+  if (requestFingerprint(request) !== fingerprint) {
+    throw new TypeError("Remote attempt record fingerprint does not match its request");
+  }
+  if (
+    result !== undefined &&
+    (result.taskId !== request.taskId ||
+      result.attemptId !== request.attemptId ||
+      result.executor.kind !== "remote" ||
+      result.executor.workerId !== expectation.workerId)
+  ) {
+    throw new TypeError("Remote attempt result does not match its request and Worker identity");
+  }
+  if (result !== undefined) {
+    canonicalTimestamp(result.startedAt, "Remote attempt result startedAt");
+    canonicalTimestamp(result.completedAt, "Remote attempt result completedAt");
+    if (Date.parse(result.startedAt) > Date.parse(result.completedAt)) {
+      throw new TypeError("Remote attempt result timestamps are inconsistent");
+    }
+  }
+  const record: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint,
+    state,
+    epoch,
+    updatedAt,
+    revision,
+    ...(result === undefined ? {} : { result }),
+    ...(cancellation === undefined ? {} : { cancellation }),
+    ...(acknowledgedAt === undefined ? {} : { acknowledgedAt }),
+  };
+  return {
+    record,
+    request,
+    ...(result === undefined ? {} : { result }),
+  };
 }
 
 export interface RemoteResultStore {
@@ -291,6 +525,175 @@ export function requestFingerprint(request: ExecutionRequest): string {
 
 export function jsonFingerprint(value: JsonValue): string {
   return createHash("sha256").update(canonical(value)).digest("hex");
+}
+
+export function capabilityInvocationFingerprint(request: RemoteCapabilityInvocation): string {
+  return jsonFingerprint({
+    bindingFingerprint: request.bindingFingerprint,
+    target: request.target,
+    invocation: request.invocation,
+  });
+}
+
+export function parseRemoteCapabilityInvocation(value: unknown): RemoteCapabilityInvocation {
+  const object = asUnknownObject(value, "Remote capability invocation");
+  const invocationId = boundedIdentity(object.invocationId, "Capability invocation id");
+  const bindingFingerprint = sha256Fingerprint(object.bindingFingerprint);
+  const target = parseTaskExecutionTarget(object.target);
+  const invocationObject = asUnknownObject(object.invocation, "Capability invocation");
+  const nestedInvocationId = boundedIdentity(
+    invocationObject.invocationId,
+    "Nested capability invocation id",
+  );
+  if (nestedInvocationId !== invocationId) {
+    throw new TypeError("Capability invocation identities must match");
+  }
+  const identity = asUnknownObject(invocationObject.identity, "Capability identity");
+  const name = boundedIdentity(identity.name, "Capability name");
+  const protocolVersion = boundedIdentity(identity.protocolVersion, "Capability protocol version");
+  const method = boundedIdentity(invocationObject.method, "Capability method");
+  const input = serializeWireValue(invocationObject.input);
+  return {
+    invocationId,
+    bindingFingerprint,
+    target,
+    invocation: {
+      invocationId,
+      identity: { name, protocolVersion },
+      method,
+      input,
+    },
+  };
+}
+
+export function parseRemoteCapabilityResponse(value: unknown): RemoteCapabilityInvocationResponse {
+  const object = asUnknownObject(value, "Remote capability response");
+  const invocationId = boundedIdentity(object.invocationId, "Capability invocation id");
+  const fingerprint = sha256Fingerprint(object.fingerprint);
+  if (typeof object.ok !== "boolean") {
+    throw new TypeError("Remote capability response ok must be a boolean");
+  }
+  if (object.ok) {
+    if (object.error !== undefined) {
+      throw new TypeError("Successful remote capability response must not include an error");
+    }
+    return {
+      invocationId,
+      fingerprint,
+      ok: true,
+      value: serializeWireValue(object.value),
+    };
+  }
+  const error = asUnknownObject(object.error, "Remote capability response error");
+  const code = boundedIdentity(error.code, "Remote capability error code");
+  if (!/^(?:CAPABILITY|PROTOCOL)_[A-Z0-9_]+$/u.test(code)) {
+    throw new TypeError("Remote capability response error code is invalid");
+  }
+  return {
+    invocationId,
+    fingerprint,
+    ok: false,
+    error: {
+      code: code as `CAPABILITY_${string}` | `PROTOCOL_${string}`,
+      message: boundedText(error.message, "Remote capability error message"),
+    },
+  };
+}
+
+export function parseRemoteComponentActivation(value: unknown): RemoteComponentActivation {
+  const object = asUnknownObject(value, "Remote component activation");
+  const identityObject = asUnknownObject(object.identity, "Remote component activation identity");
+  const identity = {
+    applicationId: parseApplicationId(identityObject.applicationId),
+    pluginId: parsePluginId(identityObject.pluginId),
+    componentId: parseComponentId(identityObject.componentId),
+  };
+  const target = parseTaskExecutionTarget(object.target);
+  const binding = assertExecutionBindingMatches(
+    { ...identity, target },
+    {
+      configuration: object.configuration,
+      permissionGrants: object.permissionGrants,
+      capabilityDefinitions: object.capabilityDefinitions,
+      capabilityBindings: object.capabilityBindings,
+      fingerprint: object.bindingFingerprint,
+    },
+  );
+  return {
+    identity,
+    target,
+    configuration: binding.configuration,
+    permissionGrants: binding.permissionGrants,
+    capabilityDefinitions: binding.capabilityDefinitions,
+    capabilityBindings: binding.capabilityBindings,
+    bindingFingerprint: binding.fingerprint,
+  };
+}
+
+export function parseRemoteComponentLifecycleResponse(
+  value: unknown,
+): RemoteComponentLifecycleResponse {
+  const object = asUnknownObject(value, "Remote component lifecycle response");
+  if (typeof object.ok !== "boolean") {
+    throw new TypeError("Remote component lifecycle response ok must be a boolean");
+  }
+  const target = parseTaskExecutionTarget(object.target);
+  const bindingFingerprint =
+    object.bindingFingerprint === undefined
+      ? undefined
+      : sha256Fingerprint(object.bindingFingerprint);
+  if (object.ok) {
+    if (object.error !== undefined) {
+      throw new TypeError("Successful component lifecycle response must not include an error");
+    }
+    return {
+      ok: true,
+      target,
+      ...(bindingFingerprint === undefined ? {} : { bindingFingerprint }),
+    };
+  }
+  const error = asUnknownObject(object.error, "Remote component lifecycle error");
+  const code = boundedIdentity(error.code, "Remote component lifecycle error code");
+  if (!/^(?:LIFECYCLE|PROTOCOL)_[A-Z0-9_]+$/u.test(code)) {
+    throw new TypeError("Remote component lifecycle response error code is invalid");
+  }
+  return {
+    ok: false,
+    target,
+    ...(bindingFingerprint === undefined ? {} : { bindingFingerprint }),
+    error: {
+      code: code as `LIFECYCLE_${string}` | `PROTOCOL_${string}`,
+      message: boundedText(error.message, "Remote component lifecycle error message"),
+    },
+  };
+}
+
+function asUnknownObject(value: unknown, name: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${name} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function boundedIdentity(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    throw new TypeError(`${name} must be a non-empty bounded string`);
+  }
+  return value;
+}
+
+function boundedText(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096) {
+    throw new TypeError(`${name} must be a non-empty bounded string`);
+  }
+  return value;
+}
+
+function sha256Fingerprint(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new TypeError("Remote capability fingerprint must be a SHA-256 hex digest");
+  }
+  return value;
 }
 
 export function parseRemoteRequest(value: unknown): ExecutionRequest {

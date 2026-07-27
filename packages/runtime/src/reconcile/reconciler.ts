@@ -1,31 +1,42 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   type ApplicationId,
   type ArtifactDigest,
+  type CapabilityName,
   type Clock,
+  type ClusterTime,
   DiagnosticError,
   diagnosticCode,
   type ExecutorKind,
+  type ExecutionBinding,
+  type Generation,
   type JsonObject,
   type OperationId,
   type OutboxClaim,
   type PluginDeployment,
+  type PluginDeploymentIdentity,
+  type PluginDeploymentObservation,
   type PluginInstallation,
   parseApplicationId,
   parseArtifactDigest,
   parseCapabilityName,
   parseComponentId,
   parseGeneration,
+  parseExecutionBinding,
   parseMessageId,
   parseOperationId,
   parsePluginDeployment,
   parsePluginId,
   parsePluginInstallation,
+  type Revision,
   type RuntimeAuthority,
   type RuntimeDiagnostic,
   runtimeDiagnostic,
   type StateKey,
   type StateStore,
+  type StateTransaction,
   serializeCause,
+  type Versioned,
 } from "@tegojs/contracts";
 import type {
   ArtifactService,
@@ -34,16 +45,27 @@ import type {
 } from "../artifacts/artifact-service.js";
 import {
   type CapabilityResolutionDeployment,
+  type PersistedProviderLoss,
   type PreviousCapabilityBinding,
+  type ProviderLossDecision,
+  type ProviderRecoveryBindingPrerequisite,
+  type ResolvedCapabilityBinding,
   resolveCapabilities,
+  strongestProviderLoss,
 } from "../capabilities/resolver.js";
+import { satisfiesVersionRange } from "../capabilities/version.js";
+import { decodePersistedPluginDeploymentObservation } from "../deployment-observation.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
 import type { PlacementWorker } from "./placement.js";
 import { placementIsEligible } from "./placement.js";
 import {
+  type Activation,
   type ArtifactDeploymentGate,
   type ComponentInstance,
+  legacyReconcileEffectIdentities,
+  legacyReconcileInstanceId,
+  parseActivation,
   planReconcile,
   type ReconcileEffect,
   type ReconcileEffectKind,
@@ -58,8 +80,13 @@ const defaultMaxConvergencePasses = 10_000;
 
 export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
-  perform(effect: ReconcileEffect): Promise<void>;
+  perform(
+    effect: ReconcileEffect,
+    // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+  ): Promise<void | { readonly executionBinding?: ExecutionBinding }>;
   restore?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  restoreStarting?(effect: ReconcileEffect & { readonly kind: "start" }): Promise<void>;
+  restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   isLive?(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
   close?(authority?: RuntimeAuthority): Promise<void>;
 }
@@ -68,8 +95,43 @@ export interface ReconcileArtifactGate {
   validate(request: ValidateArtifactRequest): Promise<ValidatedPluginArtifact>;
 }
 
+interface PersistedCapabilityBinding extends JsonObject {
+  readonly consumer: PluginDeploymentIdentity;
+  readonly capability: CapabilityName;
+  readonly provider: PluginDeploymentIdentity;
+  readonly source: "automatic" | "explicit";
+  readonly deploymentGeneration: Generation;
+  readonly updatedAt: string;
+}
+
+interface LoadedCapabilityBinding {
+  readonly key: StateKey<PersistedCapabilityBinding>;
+  readonly value: PersistedCapabilityBinding;
+  readonly revision: Revision;
+}
+
+interface LoadedProviderLoss {
+  readonly key: StateKey<PersistedProviderLoss>;
+  readonly value: PersistedProviderLoss;
+  readonly revision: Revision;
+}
+
+interface ProviderComponentEvidence {
+  readonly key: StateKey<PersistedComponentInstance>;
+  readonly instance?: ComponentInstance;
+}
+
+interface ProviderReadinessSnapshot {
+  readonly evidence: readonly ProviderComponentEvidence[];
+  readonly ready: boolean;
+}
+
+type RecoveryEffectAuthorization = "abandoned" | "authorized" | "retry" | "superseded";
+
 interface ComponentLifecycleExecutor {
   restore(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  restoreStarting?(effect: ReconcileEffect & { readonly kind: "start" }): Promise<void>;
+  restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   isLive(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
   close(authority?: RuntimeAuthority): Promise<void>;
 }
@@ -77,7 +139,7 @@ interface ComponentLifecycleExecutor {
 function componentLifecycle(
   effects: ComponentEffectExecutor,
 ): ComponentLifecycleExecutor | undefined {
-  const { close, isLive, restore } = effects;
+  const { close, isLive, restore, restoreStarting, restoreTermination } = effects;
   if (restore === undefined && isLive === undefined && close === undefined) return undefined;
   if (restore === undefined || isLive === undefined || close === undefined) {
     throw new TypeError(
@@ -86,6 +148,10 @@ function componentLifecycle(
   }
   return {
     restore: restore.bind(effects),
+    ...(restoreStarting === undefined ? {} : { restoreStarting: restoreStarting.bind(effects) }),
+    ...(restoreTermination === undefined
+      ? {}
+      : { restoreTermination: restoreTermination.bind(effects) }),
     isLive: isLive.bind(effects),
     close: close.bind(effects),
   };
@@ -94,10 +160,17 @@ function componentLifecycle(
 function restorationOperationId(
   instance: Pick<
     ComponentInstance,
-    "applicationId" | "componentId" | "deploymentGeneration" | "pluginId"
+    | "activation"
+    | "applicationId"
+    | "componentId"
+    | "deploymentGeneration"
+    | "legacyActivation"
+    | "pluginId"
   >,
 ): OperationId {
-  const prepareOperationId = reconcileEffectIdentities(
+  const prepareOperationId = (
+    instance.legacyActivation === true ? legacyReconcileEffectIdentities : reconcileEffectIdentities
+  )(
     {
       applicationId: instance.applicationId,
       generation: instance.deploymentGeneration,
@@ -105,13 +178,48 @@ function restorationOperationId(
     },
     instance.componentId,
     "prepare",
+    ...(instance.legacyActivation === true ? [] : [instance.activation]),
   ).operationId;
   return parseOperationId(`${prepareOperationId.slice(0, -"prepare".length)}restore`);
+}
+
+function startingEffect(instance: ComponentInstance): ReconcileEffect & { readonly kind: "start" } {
+  if (instance.lifecycle !== "starting" || instance.artifactDigest === undefined) {
+    throw new TypeError("Only an exact persisted starting checkpoint can be reconstructed");
+  }
+  const identity = (
+    instance.legacyActivation === true ? legacyReconcileEffectIdentities : reconcileEffectIdentities
+  )(
+    {
+      applicationId: instance.applicationId,
+      generation: instance.deploymentGeneration,
+      pluginId: instance.pluginId,
+    },
+    instance.componentId,
+    "start",
+    ...(instance.legacyActivation === true ? [] : [instance.activation]),
+  );
+  return {
+    kind: "start",
+    activation: instance.activation,
+    ...identity,
+    applicationId: instance.applicationId,
+    pluginId: instance.pluginId,
+    componentId: instance.componentId,
+    deploymentGeneration: instance.deploymentGeneration,
+    artifactDigest: instance.artifactDigest,
+    executor: instance.executor,
+    ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
+    ...(instance.executionBinding === undefined
+      ? {}
+      : { executionBinding: instance.executionBinding }),
+  };
 }
 
 export interface ReconcilerOptions {
   readonly state: StateStore;
   readonly clock: Clock;
+  readonly clusterTime?: ClusterTime;
   readonly effects: ComponentEffectExecutor;
   readonly artifactGate: ReconcileArtifactGate | Pick<ArtifactService, "validate">;
   readonly authority?: RuntimeAuthority;
@@ -126,6 +234,8 @@ export interface ReconcilerOptions {
 
 interface PersistedComponentInstance extends JsonObject {
   readonly instanceId: string;
+  readonly activation?: Activation;
+  readonly hasStarted?: boolean;
   readonly applicationId: ApplicationId;
   readonly pluginId: ComponentInstance["pluginId"];
   readonly componentId: ComponentInstance["componentId"];
@@ -135,6 +245,7 @@ interface PersistedComponentInstance extends JsonObject {
   readonly executor: ComponentInstance["executor"];
   readonly workerId?: string;
   readonly artifactDigest?: ArtifactDigest;
+  readonly executionBinding?: ExecutionBinding;
   readonly attempt?: number;
   readonly retryAt?: string;
   readonly retryEffect?: ReconcileEffectKind;
@@ -143,29 +254,44 @@ interface PersistedComponentInstance extends JsonObject {
   readonly completedOperationIds?: readonly OperationId[];
 }
 
+function parsePersistedActivation(instance: PersistedComponentInstance): Activation {
+  return parseActivation(Object.hasOwn(instance, "activation") ? instance.activation : "1");
+}
+
+export function inferComponentHasStarted(
+  instance: Pick<ComponentInstance, "hasStarted" | "lifecycle">,
+): boolean {
+  if (instance.hasStarted === true) return true;
+  if (instance.hasStarted === false) return false;
+  return instance.lifecycle === "ready" || instance.lifecycle === "degraded";
+}
+
 interface LoadedComponentInstance {
   readonly storageId: string;
   readonly value: ComponentInstance;
+  readonly legacyActivation: boolean;
 }
 
-interface DeploymentObservation extends JsonObject {
-  readonly applicationId: PluginDeployment["applicationId"];
-  readonly pluginId: PluginDeployment["pluginId"];
-  readonly generation: PluginDeployment["generation"];
-  readonly status:
-    | "blocked"
-    | "converging"
-    | "degraded"
-    | "failed"
-    | "inconsistent"
-    | "ready"
-    | "unavailable";
-  readonly diagnostics: readonly JsonObject[];
-  readonly updatedAt: string;
+function deploymentKey(identity: PluginDeploymentIdentity): string {
+  return `${identity.applicationId}/${identity.pluginId}`;
 }
 
-function deploymentKey(deployment: PluginDeployment): string {
-  return `${deployment.applicationId}/${deployment.pluginId}`;
+function compareActivations(left: Activation, right: Activation): number {
+  const leftValue = BigInt(left);
+  const rightValue = BigInt(right);
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+function nextActivation(current: Activation): Activation {
+  return parseActivation((BigInt(parseActivation(current)) + 1n).toString());
+}
+
+function deploymentStateKey(identity: PluginDeploymentIdentity): StateKey<PluginDeployment> {
+  return {
+    namespace,
+    collection: "deployments",
+    id: deploymentKey(identity),
+  };
 }
 
 function instanceKey(instanceId: string): StateKey<PersistedComponentInstance> {
@@ -180,15 +306,25 @@ function isCanonicalInstance(record: LoadedComponentInstance): boolean {
   const instance = record.value;
   return (
     record.storageId === instance.instanceId &&
-    reconcileEffectIdentities(
-      {
-        applicationId: instance.applicationId,
-        generation: instance.deploymentGeneration,
-        pluginId: instance.pluginId,
-      },
-      instance.componentId,
-      "prepare",
-    ).instanceId === instance.instanceId
+    (record.legacyActivation
+      ? legacyReconcileInstanceId(
+          {
+            applicationId: instance.applicationId,
+            generation: instance.deploymentGeneration,
+            pluginId: instance.pluginId,
+          },
+          instance.componentId,
+        )
+      : reconcileEffectIdentities(
+          {
+            applicationId: instance.applicationId,
+            generation: instance.deploymentGeneration,
+            pluginId: instance.pluginId,
+          },
+          instance.componentId,
+          "prepare",
+          instance.activation,
+        ).instanceId) === instance.instanceId
   );
 }
 
@@ -211,13 +347,91 @@ function isInstanceContextConsistent(
   );
 }
 
-function observationKey(deployment: PluginDeployment): StateKey<DeploymentObservation> {
+function observationKey(deployment: PluginDeployment): StateKey<PluginDeploymentObservation> {
   return {
     namespace,
     collection: "deployment-observations",
     id: deploymentKey(deployment),
   };
 }
+
+function capabilityBindingKey(
+  consumer: PluginDeploymentIdentity,
+  capability: CapabilityName,
+): StateKey<PersistedCapabilityBinding> {
+  return {
+    namespace,
+    collection: "capability-bindings",
+    id: `${consumer.applicationId}/${consumer.pluginId}/${capability}`,
+  };
+}
+
+function providerLossKey(consumer: PluginDeploymentIdentity): StateKey<PersistedProviderLoss> {
+  return {
+    namespace,
+    collection: "provider-loss",
+    id: deploymentKey(consumer),
+  };
+}
+
+function parsePersistedProviderLoss(value: PersistedProviderLoss): PersistedProviderLoss {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    (value.action !== "degrade" && value.action !== "fail" && value.action !== "suspend") ||
+    !Array.isArray(value.capabilities) ||
+    !Array.isArray(value.providers) ||
+    (value.bindingPrerequisites !== undefined && !Array.isArray(value.bindingPrerequisites)) ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw new TypeError("Persisted provider loss is invalid");
+  }
+  return {
+    consumer: {
+      applicationId: parseApplicationId(value.consumer?.applicationId),
+      pluginId: parsePluginId(value.consumer?.pluginId),
+    },
+    deploymentGeneration: parseGeneration(value.deploymentGeneration),
+    action: value.action,
+    capabilities: value.capabilities.map(parseCapabilityName),
+    providers: value.providers.map((provider) => ({
+      applicationId: parseApplicationId(provider?.applicationId),
+      pluginId: parsePluginId(provider?.pluginId),
+    })),
+    ...(value.bindingPrerequisites === undefined
+      ? {}
+      : {
+          bindingPrerequisites: value.bindingPrerequisites.map((prerequisite) => {
+            const legacy = prerequisite as ProviderRecoveryBindingPrerequisite & {
+              readonly providerGeneration?: unknown;
+            };
+            if (legacy.providerGeneration !== undefined) {
+              parseGeneration(legacy.providerGeneration);
+            }
+            return {
+              capability: parseCapabilityName(prerequisite?.capability),
+              provider: {
+                applicationId: parseApplicationId(prerequisite?.provider?.applicationId),
+                pluginId: parsePluginId(prerequisite?.provider?.pluginId),
+              },
+            };
+          }),
+        }),
+    ...(value.recoveryActivations === undefined
+      ? {}
+      : {
+          recoveryActivations: Object.fromEntries(
+            Object.entries(value.recoveryActivations).map(([componentId, activation]) => [
+              parseComponentId(componentId),
+              parseActivation(activation),
+            ]),
+          ),
+        }),
+    updatedAt: value.updatedAt,
+  };
+}
+
+const capabilityBindingConflict = Symbol("capability-binding-conflict");
 
 function conflictCode(error: unknown): string | undefined {
   return (
@@ -231,7 +445,7 @@ function conflictCode(error: unknown): string | undefined {
   );
 }
 
-function observationDiagnosticsFingerprint(diagnostics: readonly JsonObject[]): string {
+function observationDiagnosticsFingerprint(diagnostics: readonly RuntimeDiagnostic[]): string {
   return JSON.stringify(
     diagnostics.map((diagnostic) => {
       const { observedAt: _observedAt, ...stable } = diagnostic;
@@ -258,6 +472,7 @@ function effectDiagnostic(
     },
     retryable: true,
     details: {
+      activation: effect.activation,
       componentId: effect.componentId,
       deploymentGeneration: effect.deploymentGeneration,
       instanceId: effect.instanceId,
@@ -284,7 +499,12 @@ function invalidMessageDiagnostic(claim: OutboxClaim, error: unknown, observedAt
   });
 }
 
-function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
+const legacyActivationProvenance = Symbol("legacy-activation-provenance");
+type ParsedReconcileEffect = ReconcileEffect & {
+  readonly [legacyActivationProvenance]: boolean;
+};
+
+function parseReconcileEffect(claim: OutboxClaim): ParsedReconcileEffect {
   const payload = claim.message.payload;
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
     throw new TypeError("Lifecycle payload must be an object");
@@ -307,8 +527,11 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
   if (value.workerId !== undefined && typeof value.workerId !== "string") {
     throw new TypeError("Lifecycle worker identity is invalid");
   }
-  const effect: ReconcileEffect = {
+  const legacyActivation = !Object.hasOwn(value, "activation");
+  const effect: ParsedReconcileEffect = {
     kind: value.kind,
+    activation: parseActivation(legacyActivation ? "1" : value.activation),
+    [legacyActivationProvenance]: legacyActivation,
     applicationId: parseApplicationId(value.applicationId),
     artifactDigest: parseArtifactDigest(value.artifactDigest),
     componentId: parseComponentId(value.componentId),
@@ -319,6 +542,9 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
     operationId: parseOperationId(value.operationId),
     pluginId: parsePluginId(value.pluginId),
     ...(value.workerId === undefined ? {} : { workerId: value.workerId }),
+    ...(value.executionBinding === undefined
+      ? {}
+      : { executionBinding: parseExecutionBinding(value.executionBinding) }),
   };
   if (
     effect.messageId !== claim.message.messageId ||
@@ -331,6 +557,7 @@ function parseReconcileEffect(claim: OutboxClaim): ReconcileEffect {
 
 export class Reconciler {
   readonly #options: ReconcilerOptions;
+  readonly #clusterTime: ClusterTime;
   readonly #owner: string;
   readonly #componentLifecycle: ComponentLifecycleExecutor | undefined;
   readonly #maxConvergencePasses: number;
@@ -341,6 +568,7 @@ export class Reconciler {
   #starting = false;
   #stopRequested = false;
   #fatalReported = false;
+  #backgroundErrorNotified = false;
   #fatalError: unknown;
   #tail: Promise<void> = Promise.resolve();
   #interrupted = false;
@@ -358,12 +586,44 @@ export class Reconciler {
 
   constructor(options: ReconcilerOptions) {
     this.#options = options;
+    this.#clusterTime = options.clusterTime ?? {
+      now: async () => options.clock.now().toISOString(),
+    };
     this.#owner = options.owner ?? "reconciler";
     this.#componentLifecycle = componentLifecycle(options.effects);
     this.#maxConvergencePasses = options.maxConvergencePasses ?? defaultMaxConvergencePasses;
     if (!Number.isSafeInteger(this.#maxConvergencePasses) || this.#maxConvergencePasses < 1) {
       throw new RangeError("maxConvergencePasses must be a positive safe integer");
     }
+  }
+
+  async #authoritativeNow(): Promise<{ readonly epochMs: number; readonly iso: string }> {
+    return this.#parseAuthoritativeTime(
+      await this.#clusterTime.now(),
+      "Cluster time must be a canonical UTC timestamp",
+    );
+  }
+
+  #parseAuthoritativeTime(
+    iso: unknown,
+    message: string,
+  ): { readonly epochMs: number; readonly iso: string } {
+    const epochMs = typeof iso === "string" ? Date.parse(iso) : Number.NaN;
+    if (!Number.isFinite(epochMs) || new Date(epochMs).toISOString() !== iso) {
+      throw new TypeError(message);
+    }
+    return { epochMs, iso };
+  }
+
+  #claimDecisionNow(
+    batchNow: { readonly epochMs: number; readonly iso: string },
+    claimedAt: string,
+  ): { readonly epochMs: number; readonly iso: string } {
+    const claimNow = this.#parseAuthoritativeTime(
+      claimedAt,
+      "Outbox claim time must be a canonical UTC timestamp",
+    );
+    return claimNow.epochMs > batchNow.epochMs ? claimNow : batchNow;
   }
 
   get kernelRunning(): boolean {
@@ -416,13 +676,14 @@ export class Reconciler {
       } catch (error) {
         this.#running = false;
         this.#cancelDeferredWake();
+        if (!this.#starting) this.#notifyBackgroundError(error);
         let failure = error;
         try {
           await this.#componentLifecycle?.close(this.#options.authority);
         } catch (closeError) {
           failure = new AggregateError([error, closeError], "Reconciler failure cleanup failed");
         }
-        if (!this.#starting) await this.#reportFatalFailure(failure);
+        if (!this.#starting) this.#reportFatalFailure(failure);
         throw failure;
       }
     });
@@ -462,17 +723,18 @@ export class Reconciler {
 
   async #reconcileUntilQuiescent(preservedWakeAt?: number): Promise<void> {
     this.#diagnosticsByDeployment.clear();
+    const decisionNow = await this.#authoritativeNow();
     this.#nextWakeAt =
-      preservedWakeAt !== undefined && preservedWakeAt > this.#options.clock.now().getTime()
+      preservedWakeAt !== undefined && preservedWakeAt > decisionNow.epochMs
         ? preservedWakeAt
         : undefined;
     for (let pass = 0; pass < this.#maxConvergencePasses; pass += 1) {
       if (!this.#running) return;
-      const pending = await this.#reconcilePass();
+      const pending = await this.#reconcilePass(decisionNow);
       if (!this.#running || this.#interrupted) return;
       if (!pending) {
-        this.#deferUntil(this.#options.clock.now().getTime() + claimLeaseMs);
-        this.#armDeferredWake();
+        this.#deferUntil(decisionNow.epochMs + claimLeaseMs);
+        await this.#armDeferredWake();
         return;
       }
     }
@@ -488,34 +750,60 @@ export class Reconciler {
     );
   }
 
-  async #reconcilePass(): Promise<boolean> {
+  async #reconcilePass(decisionNow: {
+    readonly epochMs: number;
+    readonly iso: string;
+  }): Promise<boolean> {
     if (!this.#running) return false;
     const replanCount = this.#replanCount;
-    let [deployments, installations, loadedInstances] = await Promise.all([
-      this.#loadDeployments(),
-      this.#loadInstallations(),
-      this.#loadInstances(),
-    ]);
+    let [deployments, installations, loadedInstances, capabilityBindings, providerLosses] =
+      await Promise.all([
+        this.#loadDeployments(),
+        this.#loadInstallations(),
+        this.#loadInstances(),
+        this.#loadCapabilityBindings(),
+        this.#loadProviderLosses(),
+      ]);
     if (!this.#running) return false;
-    await this.#restorePersistedComponents(deployments, installations, loadedInstances);
+    if (!(await this.#cleanupCapabilityBindings(deployments, capabilityBindings))) return true;
+    capabilityBindings = capabilityBindings.filter((record) =>
+      this.#isCurrentCapabilityBinding(record, deployments),
+    );
+    await this.#restorePersistedComponents(
+      deployments,
+      installations,
+      loadedInstances,
+      providerLosses,
+      capabilityBindings,
+      decisionNow,
+    );
     if (!this.#running) return false;
     loadedInstances = await this.#loadInstances();
-    this.#deferRetries(loadedInstances);
+    this.#deferRetries(loadedInstances, decisionNow.epochMs);
     this.#deployments = deployments;
     this.#readyDeployments.clear();
 
     const existingClaim = await this.#claimNext();
     let performedImmediateWork = existingClaim !== undefined;
     if (existingClaim !== undefined) {
-      await this.#executeClaim(existingClaim);
+      if ((await this.#executeClaim(existingClaim, decisionNow)) === capabilityBindingConflict) {
+        return true;
+      }
       if (!this.#running || this.#interrupted) return false;
-      [deployments, installations, loadedInstances] = await Promise.all([
-        this.#loadDeployments(),
-        this.#loadInstallations(),
-        this.#loadInstances(),
-      ]);
+      [deployments, installations, loadedInstances, capabilityBindings, providerLosses] =
+        await Promise.all([
+          this.#loadDeployments(),
+          this.#loadInstallations(),
+          this.#loadInstances(),
+          this.#loadCapabilityBindings(),
+          this.#loadProviderLosses(),
+        ]);
       if (!this.#running) return false;
-      this.#deferRetries(loadedInstances);
+      if (!(await this.#cleanupCapabilityBindings(deployments, capabilityBindings))) return true;
+      capabilityBindings = capabilityBindings.filter((record) =>
+        this.#isCurrentCapabilityBinding(record, deployments),
+      );
+      this.#deferRetries(loadedInstances, decisionNow.epochMs);
       this.#deployments = deployments;
     }
 
@@ -557,8 +845,10 @@ export class Reconciler {
         deployments,
         installations,
         canonicalInstances,
+        capabilityBindings,
       );
       if (!this.#running) return false;
+      if (gate === capabilityBindingConflict) return true;
       gates.set(deploymentKey(deployment), gate);
       if (!(gate instanceof DiagnosticError)) {
         for (const [index, identity] of (gate.capabilityResolution.order ?? []).entries()) {
@@ -566,6 +856,19 @@ export class Reconciler {
           if (!orderRanks.has(key)) orderRanks.set(key, index);
         }
       }
+    }
+    if (
+      await this.#reconcileProviderLosses(
+        deployments,
+        installations,
+        canonicalInstances,
+        capabilityBindings,
+        providerLosses,
+        gates,
+        decisionNow.iso,
+      )
+    ) {
+      return true;
     }
     const orderedDeployments = lexicalDeployments.sort((left, right) => {
       if (left.applicationId !== right.applicationId) {
@@ -622,12 +925,41 @@ export class Reconciler {
         await this.#recordBlocked(deployment, [gate.diagnostic]);
         continue;
       }
+      const providerLossHold = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === deployment.applicationId &&
+          loss.value.consumer.pluginId === deployment.pluginId &&
+          loss.value.deploymentGeneration === deployment.generation &&
+          (loss.value.action === "fail" || loss.value.action === "suspend"),
+      );
+      const suspension =
+        providerLossHold?.value.action === "suspend" ? providerLossHold : undefined;
+      const recoveryPrerequisitesReady =
+        suspension?.value.recoveryActivations !== undefined &&
+        this.#recoveryPrerequisitesReady(
+          suspension.value,
+          deployments,
+          installations,
+          canonicalInstances,
+          capabilityBindings,
+        );
+      const planningInstances =
+        suspension?.value.recoveryActivations !== undefined && !recoveryPrerequisitesReady
+          ? deploymentInstances.filter(
+              (instance) =>
+                suspension.value.recoveryActivations?.[instance.componentId] !==
+                instance.activation,
+            )
+          : deploymentInstances;
       const plan = planReconcile({
         deployment,
         gate,
-        instances: deploymentInstances,
-        now: this.#options.clock.now().toISOString(),
+        instances: planningInstances,
+        now: decisionNow.iso,
         supportedExecutors: this.#options.effects.supportedExecutors,
+        suspended:
+          providerLossHold?.value.action === "fail" ||
+          (suspension !== undefined && !recoveryPrerequisitesReady),
         ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
       });
       if (plan.blocked) {
@@ -651,7 +983,7 @@ export class Reconciler {
       }
       for (const step of plan.steps) {
         if (!this.#running) return false;
-        await this.#persistStep(deployment, step);
+        await this.#persistStep(deployment, step, decisionNow.iso);
       }
     }
 
@@ -659,22 +991,43 @@ export class Reconciler {
       const claim = await this.#claimNext();
       if (claim !== undefined) {
         performedImmediateWork = true;
-        await this.#executeClaim(claim);
+        if ((await this.#executeClaim(claim, decisionNow)) === capabilityBindingConflict) {
+          return true;
+        }
       }
     }
     if (!this.#running || this.#interrupted) return false;
     await this.#refreshReadiness();
     if (!this.#running) return false;
     const latestInstances = await this.#loadInstances();
-    this.#deferRetries(latestInstances);
+    this.#deferRetries(latestInstances, decisionNow.epochMs);
     const canonicalLatestInstances = latestInstances.filter((record) =>
       isInstanceContextConsistent(record, this.#deployments),
     );
-    const needsImmediateReconcile = canonicalLatestInstances.some(
-      (record) =>
+    const needsImmediateReconcile = canonicalLatestInstances.some((record) => {
+      const heldRecovery = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === record.value.applicationId &&
+          loss.value.consumer.pluginId === record.value.pluginId &&
+          loss.value.deploymentGeneration === record.value.deploymentGeneration &&
+          loss.value.action === "suspend" &&
+          loss.value.recoveryActivations?.[record.value.componentId] === record.value.activation,
+      );
+      const recoveryPrerequisitesReady =
+        heldRecovery === undefined ||
+        this.#recoveryPrerequisitesReady(
+          heldRecovery.value,
+          deployments,
+          installations,
+          canonicalLatestInstances.map((candidate) => candidate.value),
+          capabilityBindings,
+        );
+      return (
+        recoveryPrerequisitesReady &&
         !this.#isDeploymentPlanningBlocked(record.value) &&
-        this.#needsImmediateReconcile(record.value),
-    );
+        this.#needsImmediateReconcile(record.value, decisionNow.iso)
+      );
+    });
     const hasUnsettledDeployment = this.#deployments.some(
       (deployment) =>
         deployment.state === "active" &&
@@ -745,75 +1098,1211 @@ export class Reconciler {
       namespace,
       collection: "component-instances",
     })) {
+      const legacyActivation = !Object.hasOwn(record.value, "activation");
       instances.push({
         storageId: record.key.id,
-        value: { ...record.value, revision: record.revision },
+        value: {
+          ...record.value,
+          activation: parseActivation(legacyActivation ? "1" : record.value.activation),
+          ...(legacyActivation ? { legacyActivation: true } : {}),
+          revision: record.revision,
+        },
+        legacyActivation,
       });
     }
     return instances;
   }
 
+  async #loadCapabilityBindings(): Promise<readonly LoadedCapabilityBinding[]> {
+    const bindings: LoadedCapabilityBinding[] = [];
+    for await (const record of this.#options.state.scan<PersistedCapabilityBinding>({
+      namespace,
+      collection: "capability-bindings",
+    })) {
+      bindings.push({ key: record.key, value: record.value, revision: record.revision });
+    }
+    return bindings.sort((left, right) => {
+      const leftKey = left.key.id;
+      const rightKey = right.key.id;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+  }
+
+  async #loadRecoveryEvidence(transaction: StateTransaction): Promise<{
+    readonly bindings: readonly LoadedCapabilityBinding[];
+    readonly deployments: readonly PluginDeployment[];
+    readonly installations: readonly PluginInstallation[];
+    readonly instances: readonly ComponentInstance[];
+  }> {
+    const persistedDeployments: PluginDeployment[] = [];
+    for await (const record of transaction.scan<PluginDeployment>({
+      namespace,
+      collection: "deployments",
+    })) {
+      persistedDeployments.push(parsePluginDeployment(record.value));
+    }
+    const persistedInstallations: PluginInstallation[] = [];
+    for await (const record of transaction.scan<PluginInstallation>({
+      namespace,
+      collection: "installations",
+    })) {
+      persistedInstallations.push(parsePluginInstallation(record.value));
+    }
+    const instances: ComponentInstance[] = [];
+    for await (const record of transaction.scan<PersistedComponentInstance>({
+      namespace,
+      collection: "component-instances",
+    })) {
+      const legacyActivation = !Object.hasOwn(record.value, "activation");
+      instances.push({
+        ...record.value,
+        activation: parseActivation(legacyActivation ? "1" : record.value.activation),
+        ...(legacyActivation ? { legacyActivation: true } : {}),
+        revision: record.revision,
+      });
+    }
+    const bindings: LoadedCapabilityBinding[] = [];
+    for await (const record of transaction.scan<PersistedCapabilityBinding>({
+      namespace,
+      collection: "capability-bindings",
+    })) {
+      bindings.push({ key: record.key, value: record.value, revision: record.revision });
+    }
+    return {
+      bindings,
+      deployments: persistedDeployments,
+      installations: persistedInstallations,
+      instances,
+    };
+  }
+
+  async #authorizeRecoveryEffect(
+    transaction: StateTransaction,
+    effect: Pick<
+      ComponentInstance,
+      | "activation"
+      | "applicationId"
+      | "artifactDigest"
+      | "componentId"
+      | "deploymentGeneration"
+      | "instanceId"
+      | "pluginId"
+    >,
+    expectedLifecycle: PersistedComponentInstance["lifecycle"],
+    expectedRevision: Revision,
+  ): Promise<RecoveryEffectAuthorization> {
+    const currentLoss = await transaction.get(
+      providerLossKey({
+        applicationId: effect.applicationId,
+        pluginId: effect.pluginId,
+      }),
+    );
+    if (currentLoss === undefined) return "superseded";
+    const loss = parsePersistedProviderLoss(currentLoss.value as PersistedProviderLoss);
+    if (
+      loss.action !== "suspend" ||
+      loss.deploymentGeneration !== effect.deploymentGeneration ||
+      loss.recoveryActivations?.[effect.componentId] !== effect.activation
+    ) {
+      return "superseded";
+    }
+    const evidence = await this.#loadRecoveryEvidence(transaction);
+    const consumer = evidence.deployments.find(
+      (deployment) =>
+        deployment.applicationId === effect.applicationId &&
+        deployment.pluginId === effect.pluginId,
+    );
+    const consumerMatchesEffect =
+      consumer !== undefined &&
+      consumer.state === "active" &&
+      consumer.generation === effect.deploymentGeneration &&
+      consumer.artifactDigest === effect.artifactDigest;
+    const consumerInstance = evidence.instances.find(
+      (instance) =>
+        instance.instanceId === effect.instanceId &&
+        instance.activation === effect.activation &&
+        instance.applicationId === effect.applicationId &&
+        instance.pluginId === effect.pluginId &&
+        instance.componentId === effect.componentId &&
+        instance.deploymentGeneration === effect.deploymentGeneration &&
+        instance.observedGeneration === effect.deploymentGeneration &&
+        instance.artifactDigest === effect.artifactDigest,
+    );
+    if (consumerInstance?.lifecycle !== expectedLifecycle) {
+      return "superseded";
+    }
+    if (consumerInstance.revision !== expectedRevision) {
+      return "retry";
+    }
+    if (
+      consumerMatchesEffect &&
+      this.#recoveryPrerequisitesReady(
+        loss,
+        evidence.deployments,
+        evidence.installations,
+        evidence.instances,
+        evidence.bindings,
+      )
+    ) {
+      return "authorized";
+    }
+    const { recoveryActivations: _recoveryActivations, ...invalidatedLoss } = loss;
+    const {
+      attempt: _attempt,
+      diagnostic: _diagnostic,
+      retryAt: _retryAt,
+      retryEffect: _retryEffect,
+      ...stableInstance
+    } = consumerInstance;
+    void _recoveryActivations;
+    void _attempt;
+    void _diagnostic;
+    void _retryAt;
+    void _retryEffect;
+    await transaction.put(
+      providerLossKey(loss.consumer),
+      {
+        ...invalidatedLoss,
+        updatedAt: this.#options.clock.now().toISOString(),
+      },
+      { expectedRevision: currentLoss.revision },
+    );
+    await transaction.put(
+      instanceKey(effect.instanceId),
+      {
+        ...stableInstance,
+        lifecycle: "stopped",
+      },
+      { expectedRevision },
+    );
+    return "abandoned";
+  }
+
+  async #loadProviderLosses(): Promise<readonly LoadedProviderLoss[]> {
+    const losses: LoadedProviderLoss[] = [];
+    for await (const record of this.#options.state.scan<PersistedProviderLoss>({
+      namespace,
+      collection: "provider-loss",
+    })) {
+      losses.push({
+        key: record.key,
+        value: parsePersistedProviderLoss(record.value),
+        revision: record.revision,
+      });
+    }
+    return losses.sort((left, right) =>
+      left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
+    );
+  }
+
+  #isCurrentCapabilityBinding(
+    record: LoadedCapabilityBinding,
+    deployments: readonly PluginDeployment[],
+  ): boolean {
+    return deployments.some(
+      (deployment) =>
+        deployment.applicationId === record.value.consumer.applicationId &&
+        deployment.pluginId === record.value.consumer.pluginId &&
+        deployment.generation === record.value.deploymentGeneration,
+    );
+  }
+
+  async #cleanupCapabilityBindings(
+    deployments: readonly PluginDeployment[],
+    loadedBindings: readonly LoadedCapabilityBinding[],
+  ): Promise<boolean> {
+    if (this.#options.loadDeployments !== undefined) return true;
+    const staleBindings = loadedBindings.filter(
+      (record) => !this.#isCurrentCapabilityBinding(record, deployments),
+    );
+    if (staleBindings.length === 0) return true;
+    try {
+      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+        for (const record of staleBindings) {
+          const currentDeployment = await transaction.get(
+            deploymentStateKey(record.value.consumer),
+          );
+          if (
+            currentDeployment !== undefined &&
+            parsePluginDeployment(currentDeployment.value).generation ===
+              record.value.deploymentGeneration
+          ) {
+            continue;
+          }
+          await transaction.delete(record.key, { expectedRevision: record.revision });
+        }
+        return null;
+      });
+      this.#lastCommitAuthority = this.#options.authority;
+      return true;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+      return false;
+    }
+  }
+
+  #providerReadiness(
+    provider: PluginDeploymentIdentity,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly ComponentInstance[],
+  ): ProviderReadinessSnapshot {
+    const deployment = deployments.find(
+      (candidate) =>
+        candidate.applicationId === provider.applicationId &&
+        candidate.pluginId === provider.pluginId,
+    );
+    if (deployment === undefined) return { evidence: [], ready: false };
+    const installation = installations.find(
+      (candidate) =>
+        candidate.pluginId === deployment.pluginId &&
+        candidate.version === deployment.version &&
+        candidate.digest === deployment.artifactDigest,
+    );
+    if (installation === undefined) return { evidence: [], ready: false };
+    const evidence = installation.manifest.components.map((component) => {
+      const instance = instances
+        .filter(
+          (candidate) =>
+            candidate.applicationId === deployment.applicationId &&
+            candidate.pluginId === deployment.pluginId &&
+            candidate.deploymentGeneration === deployment.generation &&
+            candidate.observedGeneration === deployment.generation &&
+            candidate.artifactDigest === deployment.artifactDigest &&
+            candidate.componentId === component.componentId,
+        )
+        .sort((left, right) => compareActivations(right.activation, left.activation))[0];
+      const expectedInstanceId =
+        instance?.instanceId ??
+        reconcileEffectIdentities(
+          {
+            applicationId: deployment.applicationId,
+            generation: deployment.generation,
+            pluginId: deployment.pluginId,
+          },
+          component.componentId,
+          "prepare",
+        ).instanceId;
+      return {
+        key: instanceKey(expectedInstanceId),
+        ...(instance === undefined ? {} : { instance }),
+      };
+    });
+    return {
+      evidence,
+      ready:
+        deployment.state === "active" &&
+        evidence.every(
+          ({ instance }) =>
+            instance !== undefined &&
+            instance.applicationId === deployment.applicationId &&
+            instance.pluginId === deployment.pluginId &&
+            instance.deploymentGeneration === deployment.generation &&
+            this.#isReadyAndLive(instance),
+        ),
+    };
+  }
+
+  #bindingPrerequisites(
+    deployment: PluginDeployment,
+    gate: ArtifactDeploymentGate | DiagnosticError | undefined,
+    deployments: readonly PluginDeployment[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+    lossCapabilities: ReadonlySet<CapabilityName>,
+  ): readonly ProviderRecoveryBindingPrerequisite[] | undefined {
+    if (gate === undefined || gate instanceof DiagnosticError) return undefined;
+    const prerequisites: ProviderRecoveryBindingPrerequisite[] = [];
+    for (const requirement of gate.artifact.manifest.capabilities.requires
+      .filter(
+        (candidate) =>
+          candidate.optional !== true || lossCapabilities.has(parseCapabilityName(candidate.name)),
+      )
+      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))) {
+      const matches = capabilityBindings.filter(
+        (record) =>
+          record.value.consumer.applicationId === deployment.applicationId &&
+          record.value.consumer.pluginId === deployment.pluginId &&
+          record.value.capability === requirement.name &&
+          record.value.deploymentGeneration === deployment.generation,
+      );
+      if (matches.length !== 1) return undefined;
+      const binding = matches[0];
+      if (binding === undefined) return undefined;
+      const provider = deployments.find(
+        (candidate) =>
+          candidate.applicationId === binding.value.provider.applicationId &&
+          candidate.pluginId === binding.value.provider.pluginId,
+      );
+      if (provider === undefined) return undefined;
+      prerequisites.push({
+        capability: parseCapabilityName(requirement.name),
+        provider: binding.value.provider,
+      });
+    }
+    return prerequisites;
+  }
+
+  #recoveryBindingsAreExact(
+    loss: PersistedProviderLoss,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+  ): boolean {
+    const prerequisites = loss.bindingPrerequisites;
+    const consumerDeployment = deployments.find(
+      (deployment) =>
+        deployment.applicationId === loss.consumer.applicationId &&
+        deployment.pluginId === loss.consumer.pluginId &&
+        deployment.generation === loss.deploymentGeneration,
+    );
+    if (consumerDeployment === undefined) return false;
+    const consumerInstallation = installations.find(
+      (installation) =>
+        installation.pluginId === consumerDeployment.pluginId &&
+        installation.version === consumerDeployment.version &&
+        installation.digest === consumerDeployment.artifactDigest,
+    );
+    if (consumerInstallation === undefined) return false;
+    const lossCapabilities = new Set(loss.capabilities);
+    const requirements = consumerInstallation.manifest.capabilities.requires.filter(
+      (requirement) =>
+        requirement.optional !== true ||
+        lossCapabilities.has(parseCapabilityName(requirement.name)),
+    );
+    if (prerequisites === undefined) {
+      return (
+        requirements.length === 0 && loss.capabilities.length === 0 && loss.providers.length === 0
+      );
+    }
+    if (prerequisites.length !== requirements.length) return false;
+    const prerequisiteCapabilities = prerequisites.map(({ capability }) => capability);
+    if (new Set(prerequisiteCapabilities).size !== prerequisiteCapabilities.length) return false;
+    const expectedCapabilities = [...requirements.map(({ name }) => name)].sort();
+    if (
+      JSON.stringify([...prerequisiteCapabilities].sort()) !== JSON.stringify(expectedCapabilities)
+    ) {
+      return false;
+    }
+    const lossPrerequisites: ProviderRecoveryBindingPrerequisite[] = [];
+    for (const capability of loss.capabilities) {
+      const prerequisite = prerequisites.find((candidate) => candidate.capability === capability);
+      if (prerequisite === undefined) return false;
+      lossPrerequisites.push(prerequisite);
+    }
+    const prerequisiteProviders = [
+      ...new Map(
+        lossPrerequisites.map(({ provider }) => [deploymentKey(provider), provider] as const),
+      ).values(),
+    ].sort((left, right) =>
+      deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0,
+    );
+    const lossProviders = [...loss.providers].sort((left, right) =>
+      deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0,
+    );
+    if (JSON.stringify(lossProviders) !== JSON.stringify(prerequisiteProviders)) return false;
+    return requirements.every((requirement) => {
+      const prerequisite = prerequisites.find(
+        (candidate) => candidate.capability === requirement.name,
+      );
+      if (prerequisite === undefined) return false;
+      const matches = capabilityBindings.filter(
+        (binding) =>
+          binding.value.consumer.applicationId === loss.consumer.applicationId &&
+          binding.value.consumer.pluginId === loss.consumer.pluginId &&
+          binding.value.capability === requirement.name &&
+          binding.value.deploymentGeneration === loss.deploymentGeneration,
+      );
+      if (
+        matches.length !== 1 ||
+        matches[0]?.value.provider.applicationId !== prerequisite.provider.applicationId ||
+        matches[0]?.value.provider.pluginId !== prerequisite.provider.pluginId
+      ) {
+        return false;
+      }
+      const providerDeployment = deployments.find(
+        (deployment) =>
+          deployment.applicationId === prerequisite.provider.applicationId &&
+          deployment.pluginId === prerequisite.provider.pluginId,
+      );
+      if (providerDeployment === undefined) return false;
+      const providerInstallation = installations.find(
+        (installation) =>
+          installation.pluginId === providerDeployment.pluginId &&
+          installation.version === providerDeployment.version &&
+          installation.digest === providerDeployment.artifactDigest,
+      );
+      return (
+        providerInstallation?.manifest.capabilities.provides.some(
+          (provision) =>
+            provision.name === requirement.name &&
+            satisfiesVersionRange(provision.protocolVersion, requirement.protocolRange),
+        ) === true
+      );
+    });
+  }
+
+  #recoveryPrerequisitesReady(
+    loss: PersistedProviderLoss,
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly ComponentInstance[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+  ): boolean {
+    return (
+      this.#recoveryBindingsAreExact(loss, deployments, installations, capabilityBindings) &&
+      (loss.bindingPrerequisites ?? [])
+        .map(({ provider }) =>
+          this.#providerReadiness(provider, deployments, installations, instances),
+        )
+        .every(({ ready }) => ready)
+    );
+  }
+
+  async #cleanupOrphanProviderLosses(
+    deployments: readonly PluginDeployment[],
+    loadedLosses: readonly LoadedProviderLoss[],
+  ): Promise<boolean> {
+    const orphaned = loadedLosses.filter(
+      (record) =>
+        !deployments.some(
+          (deployment) =>
+            deployment.applicationId === record.value.consumer.applicationId &&
+            deployment.pluginId === record.value.consumer.pluginId,
+        ),
+    );
+    if (orphaned.length === 0) return false;
+    try {
+      const committed = await this.#options.state.transact(
+        this.#transactionOptions(),
+        async (transaction) => {
+          const deploymentKeys = orphaned.map((record) =>
+            deploymentStateKey(record.value.consumer),
+          );
+          for (const deploymentKey of deploymentKeys) {
+            if ((await transaction.get(deploymentKey)) !== undefined) return false;
+          }
+          for (const record of orphaned) {
+            const deploymentKey = deploymentStateKey(record.value.consumer);
+            await transaction.delete(deploymentKey, { expectedRevision: "absent" });
+            await transaction.delete(record.key, { expectedRevision: record.revision });
+          }
+          return true;
+        },
+      );
+      if (!committed) {
+        this.#replanCount += 1;
+        return true;
+      }
+      this.#lastCommitAuthority = this.#options.authority;
+      return true;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+      return true;
+    }
+  }
+
+  async #fenceProviderComponentEvidence(
+    transaction: StateTransaction,
+    snapshots: readonly ProviderReadinessSnapshot[],
+    mutationKeys: ReadonlySet<string>,
+  ): Promise<boolean> {
+    for (const { evidence } of snapshots) {
+      for (const expected of evidence) {
+        const current = await transaction.get(expected.key);
+        if (expected.instance === undefined) {
+          if (current !== undefined) return false;
+          await transaction.delete(expected.key, { expectedRevision: "absent" });
+          continue;
+        }
+        if (
+          current === undefined ||
+          current.revision !== expected.instance.revision ||
+          current.value.instanceId !== expected.instance.instanceId ||
+          parsePersistedActivation(current.value) !== expected.instance.activation ||
+          current.value.applicationId !== expected.instance.applicationId ||
+          current.value.pluginId !== expected.instance.pluginId ||
+          current.value.componentId !== expected.instance.componentId ||
+          current.value.deploymentGeneration !== expected.instance.deploymentGeneration ||
+          current.value.observedGeneration !== expected.instance.observedGeneration ||
+          current.value.artifactDigest !== expected.instance.artifactDigest ||
+          current.value.lifecycle !== expected.instance.lifecycle
+        ) {
+          return false;
+        }
+        if (!mutationKeys.has(expected.key.id)) {
+          await transaction.put(expected.key, current.value, {
+            expectedRevision: expected.instance.revision,
+          });
+        }
+      }
+    }
+    return true;
+  }
+
+  async #reconcileProviderLosses(
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly ComponentInstance[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+    loadedLosses: readonly LoadedProviderLoss[],
+    gates: ReadonlyMap<string, ArtifactDeploymentGate | DiagnosticError>,
+    now: string,
+  ): Promise<boolean> {
+    if (this.#options.loadDeployments !== undefined) return false;
+    if (await this.#cleanupOrphanProviderLosses(deployments, loadedLosses)) return true;
+    const decisionsByConsumer = new Map<string, ProviderLossDecision[]>();
+    for (const gate of gates.values()) {
+      if (gate instanceof DiagnosticError) continue;
+      for (const decision of gate.capabilityResolution.providerLossActions) {
+        const decisions = decisionsByConsumer.get(deploymentKey(decision.consumer)) ?? [];
+        decisions.push(decision);
+        decisionsByConsumer.set(deploymentKey(decision.consumer), decisions);
+      }
+    }
+    const lossByConsumer = new Map(
+      loadedLosses.map((record) => [deploymentKey(record.value.consumer), record] as const),
+    );
+    const lexicalDeployments = [...deployments].sort((left, right) =>
+      deploymentKey(left) < deploymentKey(right)
+        ? -1
+        : deploymentKey(left) > deploymentKey(right)
+          ? 1
+          : 0,
+    );
+
+    for (const deployment of lexicalDeployments) {
+      const consumer: PluginDeploymentIdentity = {
+        applicationId: deployment.applicationId,
+        pluginId: deployment.pluginId,
+      };
+      const current = lossByConsumer.get(deploymentKey(consumer));
+      const decisions = (decisionsByConsumer.get(deploymentKey(consumer)) ?? []).sort(
+        (left, right) =>
+          left.capability < right.capability
+            ? -1
+            : left.capability > right.capability
+              ? 1
+              : deploymentKey(left.provider) < deploymentKey(right.provider)
+                ? -1
+                : deploymentKey(left.provider) > deploymentKey(right.provider)
+                  ? 1
+                  : 0,
+      );
+      const observedStrongest = strongestProviderLoss(decisions);
+      const strongest = (["fail", "suspend", "degrade"] as const).find(
+        (action) => current?.value.action === action || observedStrongest === action,
+      );
+      const deploymentGate = gates.get(deploymentKey(deployment));
+      const lostCapabilities = [
+        ...new Set([
+          ...(current?.value.capabilities ?? []),
+          ...decisions.map((decision) => decision.capability),
+        ]),
+      ].sort();
+      const bindingPrerequisites =
+        observedStrongest === undefined
+          ? current?.value.bindingPrerequisites
+          : this.#bindingPrerequisites(
+              deployment,
+              deploymentGate,
+              deployments,
+              capabilityBindings,
+              new Set(lostCapabilities),
+            );
+      const desired: PersistedProviderLoss | undefined =
+        observedStrongest === undefined
+          ? current?.value
+          : {
+              consumer,
+              deploymentGeneration: deployment.generation,
+              action: strongest ?? observedStrongest,
+              capabilities: lostCapabilities,
+              providers: [
+                ...new Map(
+                  [
+                    ...(current?.value.providers ?? []),
+                    ...decisions.map((decision) => decision.provider),
+                  ]
+                    .sort((left, right) =>
+                      deploymentKey(left) < deploymentKey(right)
+                        ? -1
+                        : deploymentKey(left) > deploymentKey(right)
+                          ? 1
+                          : 0,
+                    )
+                    .map((provider) => [deploymentKey(provider), provider] as const),
+                ).values(),
+              ],
+              ...(bindingPrerequisites === undefined ? {} : { bindingPrerequisites }),
+              updatedAt: this.#options.clock.now().toISOString(),
+            };
+      if (desired === undefined) continue;
+
+      const providersToFence = [
+        ...new Map(
+          [
+            ...desired.providers,
+            ...(desired.bindingPrerequisites ?? []).map(({ provider }) => provider),
+          ].map((provider) => [deploymentKey(provider), provider] as const),
+        ).values(),
+      ];
+      const providerReadiness = providersToFence.map((provider) =>
+        this.#providerReadiness(provider, deployments, installations, instances),
+      );
+      const stale = desired.deploymentGeneration !== deployment.generation;
+      const recovered =
+        !stale &&
+        decisions.length === 0 &&
+        this.#recoveryPrerequisitesReady(
+          desired,
+          deployments,
+          installations,
+          instances,
+          capabilityBindings,
+        );
+      const deploymentInstances = instances.filter(
+        (instance) =>
+          instance.applicationId === deployment.applicationId &&
+          instance.pluginId === deployment.pluginId &&
+          instance.deploymentGeneration === deployment.generation,
+      );
+      const latestByComponent =
+        deploymentGate === undefined || deploymentGate instanceof DiagnosticError
+          ? []
+          : deploymentGate.artifact.manifest.components.map(
+              (component) =>
+                deploymentInstances
+                  .filter((instance) => instance.componentId === component.componentId)
+                  .sort((left, right) => compareActivations(right.activation, left.activation))[0],
+            );
+      const suspendStopped =
+        desired.action !== "suspend" ||
+        latestByComponent.every((instance) => instance?.lifecycle === "stopped");
+      let recoveryActivations = desired.recoveryActivations;
+      const beginRecovery =
+        desired.action === "suspend" &&
+        recovered &&
+        suspendStopped &&
+        latestByComponent.length > 0 &&
+        recoveryActivations === undefined;
+      if (beginRecovery) {
+        try {
+          recoveryActivations = Object.fromEntries(
+            latestByComponent.map((instance) => [
+              instance?.componentId ?? "",
+              nextActivation(instance?.activation ?? "0"),
+            ]),
+          );
+        } catch (error) {
+          const diagnostic = runtimeDiagnostic({
+            code: "DEPLOYMENT_ACTIVATION_EXHAUSTED",
+            message: "Component activation identity space is exhausted",
+            source: { kind: "deployment", id: deploymentKey(deployment) },
+            retryable: false,
+            details: {
+              deploymentGeneration: deployment.generation,
+              cause: serializeCause(error),
+            },
+            observedAt: this.#options.clock.now().toISOString(),
+          });
+          this.#diagnosticsByDeployment.set(deploymentKey(deployment), [diagnostic]);
+          await this.#recordBlocked(deployment, [diagnostic]);
+          continue;
+        }
+      }
+      const recoveryPlan =
+        !beginRecovery ||
+        recoveryActivations === undefined ||
+        deploymentGate === undefined ||
+        deploymentGate instanceof DiagnosticError
+          ? undefined
+          : planReconcile({
+              deployment,
+              gate: deploymentGate,
+              instances: deploymentInstances,
+              now: this.#options.clock.now().toISOString(),
+              supportedExecutors: this.#options.effects.supportedExecutors,
+              activations: recoveryActivations,
+              ...(this.#options.workers === undefined ? {} : { workers: this.#options.workers }),
+            });
+      const recoveryReady =
+        desired.action === "suspend" &&
+        recoveryActivations !== undefined &&
+        (deploymentGate === undefined || deploymentGate instanceof DiagnosticError
+          ? false
+          : deploymentGate.artifact.manifest.components.every((component) => {
+              const activation = recoveryActivations?.[component.componentId];
+              const recovery = deploymentInstances.find(
+                (instance) =>
+                  instance.componentId === component.componentId &&
+                  instance.activation === activation,
+              );
+              return recovery !== undefined && this.#isReadyAndLive(recovery);
+            }));
+      const recoveryPlanValid =
+        recoveryPlan !== undefined &&
+        !recoveryPlan.blocked &&
+        recoveryPlan.steps.length === latestByComponent.length;
+      const canRecover =
+        desired.action === "fail"
+          ? false
+          : desired.action === "suspend"
+            ? recovered &&
+              (recoveryReady ||
+                (recoveryActivations === undefined && latestByComponent.length === 0))
+            : recovered && suspendStopped;
+      const nextLifecycle =
+        canRecover && desired.action !== "suspend"
+          ? "ready"
+          : !stale && desired.action === "degrade"
+            ? "degraded"
+            : undefined;
+      const transitioningInstances =
+        nextLifecycle === undefined
+          ? []
+          : deploymentInstances.filter(
+              (instance) =>
+                (nextLifecycle === "degraded" && instance.lifecycle === "ready") ||
+                (nextLifecycle === "ready" && instance.lifecycle === "degraded"),
+            );
+      const sameRecord =
+        current !== undefined &&
+        current.value.deploymentGeneration === desired.deploymentGeneration &&
+        current.value.action === desired.action &&
+        JSON.stringify(current.value.capabilities) === JSON.stringify(desired.capabilities) &&
+        JSON.stringify(current.value.providers) === JSON.stringify(desired.providers) &&
+        JSON.stringify(current.value.bindingPrerequisites) ===
+          JSON.stringify(desired.bindingPrerequisites);
+      const recoverySteps = beginRecovery && recoveryPlanValid ? (recoveryPlan?.steps ?? []) : [];
+      const recoveryRecord =
+        beginRecovery && recoveryPlanValid && recoveryActivations !== undefined
+          ? { ...desired, recoveryActivations }
+          : desired;
+      const writeRecord =
+        !stale &&
+        ((beginRecovery && recoveryPlanValid) ||
+          (!canRecover && !sameRecord && desired.recoveryActivations === undefined));
+      const deleteRecord = current !== undefined && (canRecover || stale);
+      if (
+        !writeRecord &&
+        !deleteRecord &&
+        transitioningInstances.length === 0 &&
+        recoverySteps.length === 0
+      ) {
+        continue;
+      }
+
+      try {
+        const committed = await this.#options.state.transact(
+          this.#transactionOptions(),
+          async (transaction) => {
+            const persistedDeployment = await transaction.get(deploymentStateKey(consumer));
+            if (persistedDeployment === undefined) return false;
+            const latestDeployment = parsePluginDeployment(persistedDeployment.value);
+            if (
+              latestDeployment.generation !== deployment.generation ||
+              latestDeployment.state !== deployment.state ||
+              latestDeployment.artifactDigest !== deployment.artifactDigest
+            ) {
+              return false;
+            }
+            if (beginRecovery) {
+              const recoveryEvidence = await this.#loadRecoveryEvidence(transaction);
+              if (
+                !this.#recoveryPrerequisitesReady(
+                  desired,
+                  recoveryEvidence.deployments,
+                  recoveryEvidence.installations,
+                  recoveryEvidence.instances,
+                  recoveryEvidence.bindings,
+                )
+              ) {
+                return "recovery-not-ready";
+              }
+            }
+            if (!stale) {
+              for (const provider of providersToFence) {
+                const loadedProvider = deployments.find(
+                  (candidate) =>
+                    candidate.applicationId === provider.applicationId &&
+                    candidate.pluginId === provider.pluginId,
+                );
+                if (loadedProvider === undefined) return false;
+                const persistedProvider = await transaction.get(deploymentStateKey(provider));
+                if (persistedProvider === undefined) return false;
+                const latestProvider = parsePluginDeployment(persistedProvider.value);
+                if (
+                  latestProvider.generation !== loadedProvider.generation ||
+                  latestProvider.state !== loadedProvider.state ||
+                  latestProvider.artifactDigest !== loadedProvider.artifactDigest
+                ) {
+                  return false;
+                }
+              }
+              for (const prerequisite of desired.bindingPrerequisites ?? []) {
+                const loadedBinding = capabilityBindings.find(
+                  (record) =>
+                    record.value.consumer.applicationId === consumer.applicationId &&
+                    record.value.consumer.pluginId === consumer.pluginId &&
+                    record.value.capability === prerequisite.capability &&
+                    record.value.deploymentGeneration === deployment.generation &&
+                    prerequisite.provider.applicationId === record.value.provider.applicationId &&
+                    prerequisite.provider.pluginId === record.value.provider.pluginId,
+                );
+                if (loadedBinding === undefined) return false;
+                const persistedBinding = await transaction.get(loadedBinding.key);
+                if (
+                  persistedBinding?.revision !== loadedBinding.revision ||
+                  persistedBinding.value.deploymentGeneration !== deployment.generation ||
+                  persistedBinding.value.provider.applicationId !==
+                    loadedBinding.value.provider.applicationId ||
+                  persistedBinding.value.provider.pluginId !== loadedBinding.value.provider.pluginId
+                ) {
+                  return false;
+                }
+              }
+            }
+            const persistedInstances: Array<
+              Versioned<PersistedComponentInstance> & {
+                readonly key: StateKey<PersistedComponentInstance>;
+              }
+            > = [];
+            for (const instance of transitioningInstances) {
+              const key = instanceKey(instance.instanceId);
+              const persistedInstance = await transaction.get(key);
+              if (
+                persistedInstance === undefined ||
+                persistedInstance.revision !== instance.revision
+              ) {
+                return false;
+              }
+              persistedInstances.push({ ...persistedInstance, key });
+            }
+            for (const instance of latestByComponent) {
+              if (recoverySteps.length === 0 || instance === undefined) continue;
+              const key = instanceKey(instance.instanceId);
+              const persistedInstance = await transaction.get(key);
+              if (
+                persistedInstance === undefined ||
+                persistedInstance.revision !== instance.revision ||
+                parsePersistedActivation(persistedInstance.value) !== instance.activation ||
+                persistedInstance.value.lifecycle !== "stopped" ||
+                persistedInstance.value.deploymentGeneration !== deployment.generation
+              ) {
+                return false;
+              }
+              await transaction.put(key, persistedInstance.value, {
+                expectedRevision: instance.revision,
+              });
+            }
+            if (
+              !stale &&
+              !(await this.#fenceProviderComponentEvidence(
+                transaction,
+                providerReadiness,
+                new Set(persistedInstances.map(({ key }) => key.id)),
+              ))
+            ) {
+              return false;
+            }
+            if (writeRecord) {
+              await transaction.put(providerLossKey(consumer), recoveryRecord, {
+                expectedRevision: current?.revision ?? "absent",
+              });
+            } else if (deleteRecord && current !== undefined) {
+              await transaction.delete(current.key, { expectedRevision: current.revision });
+            }
+            for (const persistedInstance of persistedInstances) {
+              const lifecycle = transitionComponentLifecycle({
+                pluginId: persistedInstance.value.pluginId,
+                componentId: persistedInstance.value.componentId,
+                current: persistedInstance.value.lifecycle,
+                next: nextLifecycle ?? persistedInstance.value.lifecycle,
+                observedAt: this.#options.clock.now().toISOString(),
+              });
+              await transaction.put(
+                persistedInstance.key,
+                { ...persistedInstance.value, lifecycle },
+                { expectedRevision: persistedInstance.revision },
+              );
+            }
+            for (const step of recoverySteps) {
+              const key = instanceKey(step.instanceId);
+              await transaction.put(
+                key,
+                {
+                  instanceId: step.instanceId,
+                  activation: step.effect.activation,
+                  applicationId: step.effect.applicationId,
+                  pluginId: step.effect.pluginId,
+                  componentId: step.effect.componentId,
+                  deploymentGeneration: step.effect.deploymentGeneration,
+                  observedGeneration: step.effect.deploymentGeneration,
+                  lifecycle: "created",
+                  executor: step.effect.executor,
+                  artifactDigest: step.effect.artifactDigest,
+                  ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
+                },
+                { expectedRevision: "absent" },
+              );
+              await transaction.appendOperation({
+                operationId: step.operationId,
+                kind: "component.lifecycle",
+                status: "planned",
+                state: step.effect,
+                updatedAt: now,
+              });
+              await transaction.enqueueOutbox({
+                messageId: step.messageId,
+                operationId: step.operationId,
+                topic: "component.lifecycle",
+                payload: step.effect,
+                createdAt: now,
+                availableAt: now,
+              });
+            }
+            return true;
+          },
+        );
+        if (committed === "recovery-not-ready") {
+          continue;
+        }
+        if (!committed) {
+          this.#replanCount += 1;
+          return true;
+        }
+        this.#lastCommitAuthority = this.#options.authority;
+        return true;
+      } catch (error) {
+        if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+        this.#replanCount += 1;
+        return true;
+      }
+    }
+    return false;
+  }
+
   async #restorePersistedComponents(
-    loadedDeployments?: readonly PluginDeployment[],
-    loadedInstallations?: readonly PluginInstallation[],
-    loadedInstances?: readonly LoadedComponentInstance[],
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly LoadedComponentInstance[],
+    providerLosses: readonly LoadedProviderLoss[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+    decisionNow: { readonly epochMs: number; readonly iso: string },
   ): Promise<void> {
     if (this.#componentLifecycle === undefined) return;
-    const [deployments, installations, instances] = await Promise.all([
-      loadedDeployments ?? this.#loadDeployments(),
-      loadedInstallations ?? this.#loadInstallations(),
-      loadedInstances ?? this.#loadInstances(),
-    ]);
-    const now = this.#options.clock.now().toISOString();
+    const now = decisionNow.iso;
     const restorable = instances
       .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value)
       .filter(
         (instance) =>
-          (instance.lifecycle === "preparing" || instance.lifecycle === "ready") &&
+          (instance.lifecycle === "preparing" ||
+            instance.lifecycle === "starting" ||
+            instance.lifecycle === "ready" ||
+            instance.lifecycle === "degraded" ||
+            instance.lifecycle === "draining" ||
+            instance.lifecycle === "stopping" ||
+            (instance.lifecycle === "failed" &&
+              (instance.retryEffect === "drain" || instance.retryEffect === "stop"))) &&
           (instance.retryAt === undefined || instance.retryAt <= now) &&
           (instance.workerId === undefined ||
             this.#options.workers?.some((worker) => worker.workerId === instance.workerId) ===
               true) &&
           instance.artifactDigest !== undefined &&
           this.#options.effects.supportedExecutors.includes(instance.executor) &&
-          deployments.some(
+          (deployments.some(
             (deployment) =>
               deployment.state === "active" &&
               deployment.applicationId === instance.applicationId &&
               deployment.pluginId === instance.pluginId &&
               deployment.generation === instance.deploymentGeneration &&
               deployment.artifactDigest === instance.artifactDigest,
-          ),
+          ) ||
+            (instance.executionBinding !== undefined &&
+              (instance.lifecycle === "ready" ||
+                instance.lifecycle === "degraded" ||
+                instance.lifecycle === "draining" ||
+                instance.lifecycle === "stopping" ||
+                (instance.lifecycle === "failed" &&
+                  (instance.retryEffect === "drain" || instance.retryEffect === "stop"))) &&
+              deployments.some(
+                (deployment) =>
+                  deployment.applicationId === instance.applicationId &&
+                  deployment.pluginId === instance.pluginId,
+              ) &&
+              installations.some(
+                (installation) =>
+                  installation.pluginId === instance.pluginId &&
+                  installation.digest === instance.artifactDigest,
+              ))),
       )
       .sort((left, right) =>
         left.instanceId < right.instanceId ? -1 : left.instanceId > right.instanceId ? 1 : 0,
       );
     for (const instance of restorable) {
+      const currentDeployment = deployments.find(
+        (deployment) =>
+          deployment.applicationId === instance.applicationId &&
+          deployment.pluginId === instance.pluginId,
+      );
+      const requiresHistoricalTermination =
+        currentDeployment !== undefined &&
+        instance.executionBinding !== undefined &&
+        (currentDeployment.state === "disabled" ||
+          currentDeployment.generation !== instance.deploymentGeneration ||
+          currentDeployment.artifactDigest !== instance.artifactDigest);
+      if (requiresHistoricalTermination) {
+        if (this.#componentLifecycle.restoreTermination === undefined) continue;
+        try {
+          await this.#componentLifecycle.restoreTermination(instance, this.#options.authority);
+          await this.#markTerminationRestored(instance);
+          await this.#clearRestorationFailure(instance);
+        } catch (error) {
+          await this.#recordRestorationFailure(instance, error, decisionNow);
+        }
+        continue;
+      }
+      const providerLossHold = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === instance.applicationId &&
+          loss.value.consumer.pluginId === instance.pluginId &&
+          loss.value.deploymentGeneration === instance.deploymentGeneration &&
+          (loss.value.action === "fail" || loss.value.action === "suspend"),
+      );
+      const suspendedLoss =
+        providerLossHold?.value.action === "suspend" ? providerLossHold : undefined;
+      const recoveryInstance =
+        suspendedLoss?.value.recoveryActivations?.[instance.componentId] === instance.activation;
+      const recoveryPrerequisitesReady =
+        suspendedLoss !== undefined &&
+        this.#recoveryPrerequisitesReady(
+          suspendedLoss.value,
+          deployments,
+          installations,
+          instances.map((record) => record.value),
+          capabilityBindings,
+        );
+      if (suspendedLoss !== undefined && recoveryInstance) {
+        if (!recoveryPrerequisitesReady) continue;
+      } else if (providerLossHold !== undefined) {
+        if (instance.lifecycle === "preparing") continue;
+        if (this.#componentLifecycle.restoreTermination === undefined) continue;
+        try {
+          await this.#componentLifecycle.restoreTermination(instance, this.#options.authority);
+          await this.#markTerminationRestored(instance);
+          await this.#clearRestorationFailure(instance);
+        } catch (error) {
+          await this.#recordRestorationFailure(instance, error, decisionNow);
+        }
+        continue;
+      }
       if (
         instance.executor === "remote" &&
         !(await this.#isPersistedRemotePlacementEligible(instance, deployments, installations))
       ) {
         continue;
       }
+      if (instance.lifecycle === "starting") {
+        if (this.#componentLifecycle.restoreStarting === undefined) continue;
+        try {
+          await this.#componentLifecycle.restoreStarting(startingEffect(instance));
+          await this.#clearRestorationFailure(instance);
+        } catch (error) {
+          await this.#recordRestorationFailure(instance, error, decisionNow);
+        }
+        continue;
+      }
       if (
-        instance.lifecycle === "ready" &&
+        (instance.lifecycle === "ready" || instance.lifecycle === "degraded") &&
         this.#componentLifecycle.isLive(instance, this.#options.authority)
       ) {
         await this.#clearRestorationFailure(instance);
         continue;
       }
+      if (recoveryInstance) {
+        const authorization = await this.#options.state.transact(
+          this.#transactionOptions(),
+          (transaction) =>
+            this.#authorizeRecoveryEffect(
+              transaction,
+              instance,
+              instance.lifecycle,
+              instance.revision,
+            ),
+        );
+        if (authorization !== "authorized") {
+          this.#replanCount += 1;
+          if (authorization === "abandoned") {
+            this.#lastCommitAuthority = this.#options.authority;
+          }
+          continue;
+        }
+      }
       try {
         await this.#componentLifecycle.restore(instance, this.#options.authority);
         if (
-          instance.lifecycle === "ready" &&
+          (instance.lifecycle === "ready" || instance.lifecycle === "degraded") &&
           !this.#componentLifecycle.isLive(instance, this.#options.authority)
         ) {
           throw new Error("Restored component session did not become live");
         }
         await this.#clearRestorationFailure(instance);
       } catch (error) {
-        await this.#recordRestorationFailure(instance, error);
+        await this.#recordRestorationFailure(instance, error, decisionNow);
+      }
+    }
+  }
+
+  async #markTerminationRestored(instance: ComponentInstance): Promise<void> {
+    if (instance.lifecycle === "stopping") return;
+    const key = instanceKey(instance.instanceId);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.#options.state.read(key);
+      if (current === undefined || current.value.lifecycle === "stopping") return;
+      try {
+        await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
+          const draining =
+            current.value.lifecycle === "ready" || current.value.lifecycle === "degraded"
+              ? transitionComponentLifecycle({
+                  pluginId: current.value.pluginId,
+                  componentId: current.value.componentId,
+                  current: current.value.lifecycle,
+                  next: "draining",
+                  observedAt: this.#options.clock.now().toISOString(),
+                })
+              : current.value.lifecycle;
+          await transaction.put(
+            key,
+            {
+              ...current.value,
+              lifecycle: transitionComponentLifecycle({
+                pluginId: current.value.pluginId,
+                componentId: current.value.componentId,
+                current: draining,
+                next: "stopping",
+                observedAt: this.#options.clock.now().toISOString(),
+              }),
+            },
+            { expectedRevision: current.revision },
+          );
+          return null;
+        });
+        this.#lastCommitAuthority = this.#options.authority;
+        return;
+      } catch (error) {
+        if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+        this.#replanCount += 1;
       }
     }
   }
@@ -869,8 +2358,12 @@ export class Reconciler {
     );
   }
 
-  async #recordRestorationFailure(instance: ComponentInstance, error: unknown): Promise<void> {
-    const observedAt = this.#options.clock.now().toISOString();
+  async #recordRestorationFailure(
+    instance: ComponentInstance,
+    error: unknown,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<void> {
+    const observedAt = decisionNow.iso;
     const operationId = restorationOperationId(instance);
     const diagnostic = runtimeDiagnostic({
       code: "LIFECYCLE_RESTORE_FAILED",
@@ -890,7 +2383,7 @@ export class Reconciler {
       if (current === undefined) return;
       const nextAttempt = (current.value.attempt ?? 0) + 1;
       const retryAt = new Date(
-        this.#options.clock.now().getTime() +
+        decisionNow.epochMs +
           deterministicRetryDelay({
             attempt: nextAttempt,
             baseDelayMs: 1_000,
@@ -900,12 +2393,10 @@ export class Reconciler {
       ).toISOString();
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
-          const { retryEffect: _retryEffect, ...stable } = current.value;
-          void _retryEffect;
           await transaction.put(
             key,
             {
-              ...stable,
+              ...current.value,
               attempt: nextAttempt,
               retryAt,
               diagnostic,
@@ -953,7 +2444,11 @@ export class Reconciler {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
           await transaction.put(key, stable, { expectedRevision: current.revision });
           await transaction.appendOperation({
-            operationId: restorationOperationId(current.value),
+            operationId: restorationOperationId({
+              ...current.value,
+              activation: parsePersistedActivation(current.value),
+              ...(!Object.hasOwn(current.value, "activation") ? { legacyActivation: true } : {}),
+            }),
             kind: "component.lifecycle",
             status: "completed",
             state: {
@@ -986,7 +2481,10 @@ export class Reconciler {
     deployments: readonly PluginDeployment[],
     installations: readonly PluginInstallation[],
     instances: readonly ComponentInstance[],
-  ): Promise<ArtifactDeploymentGate | DiagnosticError> {
+    loadedCapabilityBindings?: readonly LoadedCapabilityBinding[],
+  ): Promise<ArtifactDeploymentGate | DiagnosticError | typeof capabilityBindingConflict> {
+    const persistedCapabilityBindings =
+      loadedCapabilityBindings ?? (await this.#loadCapabilityBindings());
     const installation = installations.find(
       (candidate) =>
         candidate.pluginId === deployment.pluginId &&
@@ -1066,6 +2564,16 @@ export class Reconciler {
         manifest: installation.manifest,
         ...(installation.signature === undefined ? {} : { signature: installation.signature }),
       };
+      if (
+        !(await this.#persistResolvedBindings(
+          deployment,
+          installation.manifest.capabilities.requires,
+          [],
+          persistedCapabilityBindings,
+        ))
+      ) {
+        return capabilityBindingConflict;
+      }
       return {
         artifact,
         capabilityResolution: {
@@ -1107,6 +2615,12 @@ export class Reconciler {
           applicationId: candidate.applicationId,
           pluginId: candidate.pluginId,
         },
+        activated: candidateInstallation.manifest.components.every((component) =>
+          candidateInstances.some(
+            (instance) =>
+              instance.componentId === component.componentId && inferComponentHasStarted(instance),
+          ),
+        ),
         ready:
           candidate.state === "active" &&
           candidateInstallation.manifest.components.every((component) =>
@@ -1120,16 +2634,42 @@ export class Reconciler {
         bindings: candidate.capabilityBindings,
       });
     }
-    const previousBindings: PreviousCapabilityBinding[] = deployments.flatMap((candidate) =>
-      Object.entries(candidate.capabilityBindings).map(([capability, provider]) => ({
-        consumer: {
+    const previousByRequirement = new Map<string, PreviousCapabilityBinding>();
+    for (const record of persistedCapabilityBindings) {
+      const candidate = deployments.find(
+        (desired) =>
+          desired.applicationId === record.value.consumer.applicationId &&
+          desired.pluginId === record.value.consumer.pluginId,
+      );
+      if (candidate?.generation !== record.value.deploymentGeneration) continue;
+      previousByRequirement.set(
+        `${record.value.consumer.applicationId}/${record.value.consumer.pluginId}/${record.value.capability}`,
+        {
+          consumer: record.value.consumer,
+          capability: record.value.capability,
+          provider: record.value.provider,
+        },
+      );
+    }
+    for (const candidate of deployments) {
+      for (const [capability, provider] of Object.entries(candidate.capabilityBindings)) {
+        const consumer = {
           applicationId: candidate.applicationId,
           pluginId: candidate.pluginId,
-        },
-        capability: parseCapabilityName(capability),
-        provider,
-      })),
-    );
+        };
+        const name = parseCapabilityName(capability);
+        previousByRequirement.set(`${candidate.applicationId}/${candidate.pluginId}/${name}`, {
+          consumer,
+          capability: name,
+          provider,
+        });
+      }
+    }
+    const previousBindings = [...previousByRequirement.values()].sort((left, right) => {
+      const leftKey = capabilityBindingKey(left.consumer, left.capability).id;
+      const rightKey = capabilityBindingKey(right.consumer, right.capability).id;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
     const globalCapabilityResolution = resolveCapabilities({
       deployments: capabilityDeployments,
       previousBindings,
@@ -1163,6 +2703,16 @@ export class Reconciler {
         ? {}
         : { order: globalCapabilityResolution.order }),
     };
+    if (
+      !(await this.#persistResolvedBindings(
+        deployment,
+        artifact.manifest.capabilities.requires,
+        capabilityResolution.bindings ?? [],
+        persistedCapabilityBindings,
+      ))
+    ) {
+      return capabilityBindingConflict;
+    }
     const permissionDecision = validatePermissionGrant(
       artifact.manifest.permissions,
       deployment.permissionGrants,
@@ -1170,40 +2720,184 @@ export class Reconciler {
     return { artifact, capabilityResolution, permissionDecision };
   }
 
+  async #persistResolvedBindings(
+    deployment: PluginDeployment,
+    requirements: readonly { readonly name: string }[],
+    resolvedBindings: readonly ResolvedCapabilityBinding[],
+    loadedBindings: readonly LoadedCapabilityBinding[],
+  ): Promise<boolean> {
+    if (this.#options.loadDeployments !== undefined) return true;
+    const consumer = {
+      applicationId: deployment.applicationId,
+      pluginId: deployment.pluginId,
+    };
+    const requirementNames = new Set(requirements.map((requirement) => requirement.name));
+    const resolvedByCapability = new Map<
+      CapabilityName,
+      ResolvedCapabilityBinding & {
+        readonly provider: NonNullable<ResolvedCapabilityBinding["provider"]>;
+      }
+    >();
+    for (const binding of resolvedBindings) {
+      if (binding.provider !== null) {
+        resolvedByCapability.set(binding.requirement.name, {
+          ...binding,
+          provider: binding.provider,
+        });
+      }
+    }
+    const currentByCapability = new Map(
+      loadedBindings
+        .filter(
+          (record) =>
+            record.value.consumer.applicationId === consumer.applicationId &&
+            record.value.consumer.pluginId === consumer.pluginId,
+        )
+        .map((record) => [record.value.capability, record] as const),
+    );
+    const mutations: Array<
+      | {
+          readonly kind: "delete";
+          readonly key: StateKey<PersistedCapabilityBinding>;
+          readonly expectedRevision: Revision;
+        }
+      | {
+          readonly kind: "put";
+          readonly key: StateKey<PersistedCapabilityBinding>;
+          readonly value: PersistedCapabilityBinding;
+          readonly expectedRevision: Revision | "absent";
+        }
+    > = [];
+    const updatedAt = this.#options.clock.now().toISOString();
+
+    for (const [capability, current] of currentByCapability) {
+      const resolved = resolvedByCapability.get(capability);
+      const stale =
+        current.value.deploymentGeneration !== deployment.generation ||
+        !requirementNames.has(capability);
+      if (resolved === undefined) {
+        if (stale) {
+          mutations.push({
+            kind: "delete",
+            key: current.key,
+            expectedRevision: current.revision,
+          });
+        }
+        continue;
+      }
+      const source = Object.hasOwn(deployment.capabilityBindings, capability)
+        ? "explicit"
+        : "automatic";
+      const value: PersistedCapabilityBinding = {
+        consumer,
+        capability: resolved.requirement.name,
+        provider: resolved.provider.deployment,
+        source,
+        deploymentGeneration: deployment.generation,
+        updatedAt,
+      };
+      if (
+        !stale &&
+        current.value.provider.applicationId === value.provider.applicationId &&
+        current.value.provider.pluginId === value.provider.pluginId &&
+        current.value.source === value.source
+      ) {
+        resolvedByCapability.delete(capability);
+        continue;
+      }
+      mutations.push({
+        kind: "put",
+        key: capabilityBindingKey(consumer, resolved.requirement.name),
+        value,
+        expectedRevision: current.revision,
+      });
+      resolvedByCapability.delete(capability);
+    }
+
+    for (const [capability, resolved] of resolvedByCapability) {
+      const source = Object.hasOwn(deployment.capabilityBindings, capability)
+        ? "explicit"
+        : "automatic";
+      mutations.push({
+        kind: "put",
+        key: capabilityBindingKey(consumer, resolved.requirement.name),
+        value: {
+          consumer,
+          capability: resolved.requirement.name,
+          provider: resolved.provider.deployment,
+          source,
+          deploymentGeneration: deployment.generation,
+          updatedAt,
+        },
+        expectedRevision: "absent",
+      });
+    }
+    if (mutations.length === 0) return true;
+    mutations.sort((left, right) =>
+      left.key.id < right.key.id ? -1 : left.key.id > right.key.id ? 1 : 0,
+    );
+    try {
+      const committed = await this.#options.state.transact(
+        this.#transactionOptions(),
+        async (transaction) => {
+          const currentDeployment = await transaction.get(deploymentStateKey(deployment));
+          if (
+            currentDeployment === undefined ||
+            parsePluginDeployment(currentDeployment.value).generation !== deployment.generation
+          ) {
+            return false;
+          }
+          for (const mutation of mutations) {
+            if (mutation.kind === "delete") {
+              await transaction.delete(mutation.key, {
+                expectedRevision: mutation.expectedRevision,
+              });
+            } else {
+              await transaction.put(mutation.key, mutation.value, {
+                expectedRevision: mutation.expectedRevision,
+              });
+            }
+          }
+          return true;
+        },
+      );
+      if (!committed) {
+        this.#replanCount += 1;
+        return false;
+      }
+      this.#lastCommitAuthority = this.#options.authority;
+      return true;
+    } catch (error) {
+      if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
+      this.#replanCount += 1;
+      return false;
+    }
+  }
+
   async #recordBlocked(
     deployment: PluginDeployment,
     diagnostics: readonly RuntimeDiagnostic[],
   ): Promise<void> {
     this.#diagnosticsByDeployment.set(deploymentKey(deployment), diagnostics);
-    const codes = diagnostics.map((diagnostic) => diagnostic.code);
-    const status: DeploymentObservation["status"] = codes.some((code) =>
-      code.includes("INCONSISTENT"),
-    )
-      ? "inconsistent"
-      : codes.some(
-            (code) =>
-              code.includes("UNAVAILABLE") ||
-              code === "DEPLOYMENT_INSTALLATION_MISSING" ||
-              code === "DEPLOYMENT_EXECUTOR_UNAVAILABLE",
-          )
-        ? "unavailable"
-        : "blocked";
-    await this.#recordObservation(deployment, status, diagnostics);
+    await this.#recordObservation(deployment, "blocked", diagnostics);
   }
 
   async #recordObservation(
     deployment: PluginDeployment,
-    status: DeploymentObservation["status"],
+    status: PluginDeploymentObservation["status"],
     diagnostics: readonly RuntimeDiagnostic[],
   ): Promise<void> {
     const key = observationKey(deployment);
     const current = await this.#options.state.read(key);
+    const currentObservation =
+      current === undefined ? undefined : decodePersistedPluginDeploymentObservation(current.value);
     if (
-      current?.value.applicationId === deployment.applicationId &&
-      current.value.pluginId === deployment.pluginId &&
-      current.value.generation === deployment.generation &&
-      current.value.status === status &&
-      observationDiagnosticsFingerprint(current.value.diagnostics) ===
+      currentObservation?.legacy === false &&
+      currentObservation.observation.applicationId === deployment.applicationId &&
+      currentObservation.observation.pluginId === deployment.pluginId &&
+      currentObservation.observation.generation === deployment.generation &&
+      currentObservation.observation.status === status &&
+      observationDiagnosticsFingerprint(currentObservation.observation.diagnostics) ===
         observationDiagnosticsFingerprint(diagnostics)
     ) {
       return;
@@ -1225,7 +2919,11 @@ export class Reconciler {
     });
   }
 
-  async #persistStep(deployment: PluginDeployment, step: ReconcilePlanStep): Promise<void> {
+  async #persistStep(
+    deployment: PluginDeployment,
+    step: ReconcilePlanStep,
+    now: string,
+  ): Promise<void> {
     if (!this.#running) return;
     const desired = (await this.#loadDeployments()).find(
       (candidate) =>
@@ -1254,6 +2952,8 @@ export class Reconciler {
     if (current === undefined) {
       instance = {
         instanceId: step.instanceId,
+        ...(step.legacyActivation === true ? {} : { activation: step.effect.activation }),
+        hasStarted: false,
         applicationId: step.effect.applicationId,
         pluginId: step.effect.pluginId,
         componentId: step.effect.componentId,
@@ -1275,6 +2975,7 @@ export class Reconciler {
         instance = {
           ...stable,
           artifactDigest: step.effect.artifactDigest,
+          ...(step.legacyActivation === true ? {} : { activation: step.effect.activation }),
           executor: step.effect.executor,
           ...(step.effect.workerId === undefined ? {} : { workerId: step.effect.workerId }),
         };
@@ -1282,7 +2983,6 @@ export class Reconciler {
       const next = this.#preEffectLifecycle(step.effect.kind, instance);
       if (next !== instance.lifecycle) instance = { ...instance, lifecycle: next };
     }
-    const now = this.#options.clock.now().toISOString();
     if (!this.#running) return;
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -1296,11 +2996,17 @@ export class Reconciler {
           state: step.effect,
           updatedAt: now,
         });
+        const payload =
+          step.legacyActivation === true
+            ? Object.fromEntries(
+                Object.entries(step.effect).filter(([field]) => field !== "activation"),
+              )
+            : step.effect;
         await transaction.enqueueOutbox({
           messageId: step.messageId,
           operationId: step.operationId,
           topic: "component.lifecycle",
-          payload: step.effect,
+          payload,
           createdAt: now,
           availableAt: now,
         });
@@ -1351,24 +3057,44 @@ export class Reconciler {
     return instance.lifecycle;
   }
 
-  async #executeClaim(claim: OutboxClaim): Promise<void> {
+  async #executeClaim(
+    claim: OutboxClaim,
+    batchNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<undefined | typeof capabilityBindingConflict> {
     if (!this.#running) return;
-    let effect: ReconcileEffect;
+    const decisionNow = this.#claimDecisionNow(batchNow, claim.claimedAt);
+    let effect: ParsedReconcileEffect;
     try {
       effect = parseReconcileEffect(claim);
     } catch (error) {
-      await this.#rejectInvalidClaim(claim, error);
+      await this.#rejectInvalidClaim(claim, error, decisionNow);
       return;
     }
-    const canonical = reconcileEffectIdentities(
-      {
-        applicationId: effect.applicationId,
-        generation: effect.deploymentGeneration,
-        pluginId: effect.pluginId,
-      },
-      effect.componentId,
-      effect.kind,
-    );
+    const current = await this.#options.state.read(instanceKey(effect.instanceId));
+    const legacyActivation =
+      current !== undefined &&
+      !Object.hasOwn(current.value, "activation") &&
+      effect[legacyActivationProvenance];
+    const canonical = legacyActivation
+      ? legacyReconcileEffectIdentities(
+          {
+            applicationId: effect.applicationId,
+            generation: effect.deploymentGeneration,
+            pluginId: effect.pluginId,
+          },
+          effect.componentId,
+          effect.kind,
+        )
+      : reconcileEffectIdentities(
+          {
+            applicationId: effect.applicationId,
+            generation: effect.deploymentGeneration,
+            pluginId: effect.pluginId,
+          },
+          effect.componentId,
+          effect.kind,
+          effect.activation,
+        );
     if (
       effect.instanceId !== canonical.instanceId ||
       effect.operationId !== canonical.operationId ||
@@ -1377,18 +3103,26 @@ export class Reconciler {
       await this.#rejectInvalidClaim(
         claim,
         new TypeError("Lifecycle effect identity is not canonical for its deployment tuple"),
+        decisionNow,
       );
       return;
     }
-    const current = await this.#options.state.read(instanceKey(effect.instanceId));
     if (current === undefined) {
       this.#replanCount += 1;
       await this.#acknowledge(claim, "completed");
       return;
     }
     const instance = current.value;
+    const instanceActivation = parsePersistedActivation(instance);
+    const bindingMatchesCheckpoint =
+      instance.executionBinding === undefined
+        ? effect.executionBinding === undefined
+        : effect.executionBinding !== undefined &&
+          instance.executionBinding.fingerprint === effect.executionBinding.fingerprint &&
+          isDeepStrictEqual(instance.executionBinding, effect.executionBinding);
     if (
       instance.instanceId !== effect.instanceId ||
+      instanceActivation !== effect.activation ||
       instance.applicationId !== effect.applicationId ||
       instance.pluginId !== effect.pluginId ||
       instance.componentId !== effect.componentId ||
@@ -1396,11 +3130,13 @@ export class Reconciler {
       instance.observedGeneration !== effect.deploymentGeneration ||
       instance.artifactDigest !== effect.artifactDigest ||
       instance.executor !== effect.executor ||
-      instance.workerId !== effect.workerId
+      instance.workerId !== effect.workerId ||
+      !bindingMatchesCheckpoint
     ) {
       await this.#rejectInvalidClaim(
         claim,
         new TypeError("Lifecycle effect tuple does not match its persisted component instance"),
+        decisionNow,
       );
       return;
     }
@@ -1411,31 +3147,78 @@ export class Reconciler {
       await this.#acknowledge(claim, "completed");
       return;
     }
+    if (
+      effect.kind === "start" &&
+      instance.lifecycle === "starting" &&
+      instance.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
+      instance.retryAt !== undefined &&
+      instance.retryAt > decisionNow.iso
+    ) {
+      await this.#retryClaim(claim, instance.retryAt, decisionNow);
+      return;
+    }
     const deployments = await this.#loadDeployments();
     const desired = deployments.find(
       (candidate) =>
         candidate.applicationId === effect.applicationId && candidate.pluginId === effect.pluginId,
     );
-    const [installations, loadedInstances] = await Promise.all([
+    const [installations, loadedInstances, providerLosses, capabilityBindings] = await Promise.all([
       this.#loadInstallations(),
       this.#loadInstances(),
+      this.#loadProviderLosses(),
+      this.#loadCapabilityBindings(),
     ]);
     const instances = loadedInstances
       .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value);
-    let currentGate: ArtifactDeploymentGate | DiagnosticError | undefined;
+    let currentGate:
+      | ArtifactDeploymentGate
+      | DiagnosticError
+      | typeof capabilityBindingConflict
+      | undefined;
     if (desired !== undefined) {
       currentGate = await this.#gateDeployment(desired, deployments, installations, instances);
     }
     if (!this.#running) return;
+    if (currentGate === capabilityBindingConflict) return capabilityBindingConflict;
+    const providerLossHold = providerLosses.find(
+      (loss) =>
+        loss.value.consumer.applicationId === effect.applicationId &&
+        loss.value.consumer.pluginId === effect.pluginId &&
+        loss.value.deploymentGeneration === effect.deploymentGeneration &&
+        (loss.value.action === "fail" || loss.value.action === "suspend"),
+    );
+    const suspendedLoss =
+      providerLossHold?.value.action === "suspend" ? providerLossHold : undefined;
+    const recoveryActivation = suspendedLoss?.value.recoveryActivations?.[effect.componentId];
+    const exactRecoveryEffect =
+      recoveryActivation !== undefined && recoveryActivation === effect.activation;
+    const recoveryPermitted =
+      exactRecoveryEffect &&
+      suspendedLoss !== undefined &&
+      this.#recoveryPrerequisitesReady(
+        suspendedLoss.value,
+        deployments,
+        installations,
+        instances,
+        capabilityBindings,
+      );
+    const suspended =
+      providerLossHold?.value.action === "fail" ||
+      (suspendedLoss !== undefined && !recoveryPermitted);
     if (effect.kind === "prepare" || effect.kind === "start") {
       if (
         desired === undefined ||
         desired.state !== "active" ||
         desired.generation !== effect.deploymentGeneration ||
-        desired.artifactDigest !== effect.artifactDigest
+        desired.artifactDigest !== effect.artifactDigest ||
+        suspended
       ) {
         this.#replanCount += 1;
+        if (exactRecoveryEffect && suspendedLoss !== undefined) {
+          await this.#retryClaim(claim, undefined, decisionNow);
+          return;
+        }
         await this.#acknowledge(claim, "completed");
         return;
       }
@@ -1466,10 +3249,11 @@ export class Reconciler {
                 }),
               );
         await this.#recordBlocked(desired, diagnostics);
-        await this.#retryClaim(claim);
+        await this.#retryClaim(claim, undefined, decisionNow);
         return;
       }
     } else if (
+      !suspended &&
       desired !== undefined &&
       desired.state === "active" &&
       desired.generation === effect.deploymentGeneration &&
@@ -1508,7 +3292,7 @@ export class Reconciler {
         );
         if (!eligible) {
           this.#replanCount += 1;
-          await this.#retryClaim(claim);
+          await this.#retryClaim(claim, undefined, decisionNow);
           return;
         }
       }
@@ -1524,8 +3308,7 @@ export class Reconciler {
     const retryableFailure =
       instance.lifecycle === "failed" &&
       instance.retryEffect === effect.kind &&
-      (instance.retryAt === undefined ||
-        instance.retryAt <= this.#options.clock.now().toISOString());
+      (instance.retryAt === undefined || instance.retryAt <= decisionNow.iso);
     if (instance.lifecycle !== expectedLifecycle && !retryableFailure) {
       this.#replanCount += 1;
       await this.#acknowledge(claim, "completed");
@@ -1537,26 +3320,52 @@ export class Reconciler {
         : undefined;
     if (!this.#running) return;
     try {
-      await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
-        if (retryPreState !== undefined) {
-          await transaction.put(
-            instanceKey(effect.instanceId),
-            {
-              ...instance,
-              lifecycle: retryPreState,
-            },
-            { expectedRevision: current.revision },
-          );
+      const authorization = await this.#options.state.transact(
+        this.#transactionOptions(),
+        async (transaction) => {
+          if (exactRecoveryEffect) {
+            const recoveryAuthorization = await this.#authorizeRecoveryEffect(
+              transaction,
+              effect,
+              instance.lifecycle,
+              current.revision,
+            );
+            if (recoveryAuthorization !== "authorized") {
+              return recoveryAuthorization;
+            }
+          }
+          if (retryPreState !== undefined) {
+            await transaction.put(
+              instanceKey(effect.instanceId),
+              {
+                ...instance,
+                lifecycle: retryPreState,
+              },
+              { expectedRevision: current.revision },
+            );
+          }
+          await transaction.appendOperation({
+            operationId: effect.operationId,
+            kind: "component.lifecycle",
+            status: "executing",
+            state: effect,
+            updatedAt: this.#options.clock.now().toISOString(),
+          });
+          return "authorized";
+        },
+      );
+      if (authorization !== "authorized") {
+        this.#replanCount += 1;
+        if (authorization === "abandoned") {
+          this.#lastCommitAuthority = this.#options.authority;
         }
-        await transaction.appendOperation({
-          operationId: effect.operationId,
-          kind: "component.lifecycle",
-          status: "executing",
-          state: effect,
-          updatedAt: this.#options.clock.now().toISOString(),
-        });
-        return null;
-      });
+        if (authorization === "retry") {
+          await this.#retryClaim(claim, undefined, decisionNow);
+        } else {
+          await this.#acknowledge(claim, "completed");
+        }
+        return;
+      }
       if (retryPreState !== undefined) this.#lastCommitAuthority = this.#options.authority;
     } catch (error) {
       if (conflictCode(error) !== "STATE_REVISION_CONFLICT") throw error;
@@ -1568,33 +3377,73 @@ export class Reconciler {
       ) {
         await this.#acknowledge(claim, "completed");
       } else {
-        await this.#retryClaim(claim);
+        await this.#retryClaim(claim, undefined, decisionNow);
       }
       return;
     }
     if (!this.#running) return;
+    if (exactRecoveryEffect) {
+      const authorization = await this.#options.state.transact(
+        this.#transactionOptions(),
+        (transaction) =>
+          this.#authorizeRecoveryEffect(
+            transaction,
+            effect,
+            retryPreState ?? instance.lifecycle,
+            current.revision,
+          ),
+      );
+      if (authorization !== "authorized") {
+        this.#replanCount += 1;
+        if (authorization === "abandoned") {
+          this.#lastCommitAuthority = this.#options.authority;
+        }
+        if (authorization === "retry") {
+          await this.#retryClaim(claim, undefined, decisionNow);
+        } else {
+          await this.#acknowledge(claim, "completed");
+        }
+        return;
+      }
+    }
+    // biome-ignore lint/suspicious/noConfusingVoidType: only prepare returns a binding result.
+    let effectResult: void | { readonly executionBinding?: ExecutionBinding };
     try {
-      await this.#options.effects.perform(effect);
+      effectResult = await this.#options.effects.perform(effect);
     } catch (error) {
-      await this.#commitFailedEffect(effect, claim, error);
+      await this.#commitFailedEffect(effect, claim, error, decisionNow);
       return;
     }
     if (this.#options.interruptAfterEffect && !this.#interrupted) {
       this.#interrupted = true;
       return;
     }
-    await this.#commitEffect(effect, claim, "completed");
+    await this.#commitEffect(
+      effect,
+      claim,
+      "completed",
+      effectResult === undefined ? undefined : effectResult,
+    );
   }
 
   async #commitEffect(
     effect: ReconcileEffect,
     claim: OutboxClaim,
     outcome: "completed",
+    result?: { readonly executionBinding?: ExecutionBinding },
   ): Promise<void> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const key = instanceKey(effect.instanceId);
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
+      if (
+        parsePersistedActivation(current.value) !== effect.activation ||
+        current.value.deploymentGeneration !== effect.deploymentGeneration ||
+        current.value.componentId !== effect.componentId
+      ) {
+        this.#replanCount += 1;
+        return;
+      }
       const lifecycle = this.#successfulLifecycle(effect.kind, current.value);
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -1618,6 +3467,10 @@ export class Reconciler {
             {
               ...stable,
               lifecycle,
+              ...(effect.kind === "prepare" && result?.executionBinding !== undefined
+                ? { executionBinding: result.executionBinding }
+                : {}),
+              ...(effect.kind === "start" ? { hasStarted: true } : {}),
               observedGeneration: effect.deploymentGeneration,
               completedOperationId: effect.operationId,
               completedOperationIds,
@@ -1672,9 +3525,10 @@ export class Reconciler {
     effect: ReconcileEffect,
     claim: OutboxClaim,
     error: unknown,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
   ): Promise<void> {
     const key = instanceKey(effect.instanceId);
-    const observedAt = this.#options.clock.now().toISOString();
+    const observedAt = decisionNow.iso;
     const diagnostic = effectDiagnostic(effect, error, observedAt);
     const retryDelay = deterministicRetryDelay({
       attempt: claim.attempt,
@@ -1682,10 +3536,18 @@ export class Reconciler {
       maxDelayMs: 60_000,
       operationId: effect.operationId,
     });
-    const retryAt = new Date(this.#options.clock.now().getTime() + retryDelay).toISOString();
+    const retryAt = new Date(decisionNow.epochMs + retryDelay).toISOString();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
+      if (
+        parsePersistedActivation(current.value) !== effect.activation ||
+        current.value.deploymentGeneration !== effect.deploymentGeneration ||
+        current.value.componentId !== effect.componentId
+      ) {
+        this.#replanCount += 1;
+        return;
+      }
       try {
         await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
           const lifecycle =
@@ -1746,7 +3608,11 @@ export class Reconciler {
   }
 
   async #refreshReadiness(): Promise<void> {
-    const instances = (await this.#loadInstances())
+    const [loadedInstances, providerLosses] = await Promise.all([
+      this.#loadInstances(),
+      this.#loadProviderLosses(),
+    ]);
+    const instances = loadedInstances
       .filter((record) => isInstanceContextConsistent(record, this.#deployments))
       .map((record) => record.value);
     for (const deployment of this.#deployments) {
@@ -1767,7 +3633,72 @@ export class Reconciler {
         this.#diagnosticsByDeployment.set(deploymentKey(deployment), failedDiagnostics);
         await this.#recordObservation(deployment, "failed", failedDiagnostics);
       }
-      if (deployment.state !== "active") continue;
+      if (deployment.state !== "active") {
+        if (failedDiagnostics.length > 0) continue;
+        await this.#recordObservation(
+          deployment,
+          deploymentInstances.every((instance) => instance.lifecycle === "stopped")
+            ? "disabled"
+            : "reconciling",
+          [],
+        );
+        continue;
+      }
+      const failedProviderLoss = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === deployment.applicationId &&
+          loss.value.consumer.pluginId === deployment.pluginId &&
+          loss.value.deploymentGeneration === deployment.generation &&
+          loss.value.action === "fail",
+      );
+      if (failedProviderLoss !== undefined) {
+        const diagnostic = runtimeDiagnostic({
+          code: "CAPABILITY_PROVIDER_LOST",
+          message: "A required capability provider was lost",
+          source: { kind: "deployment", id: deploymentKey(deployment) },
+          retryable: false,
+          details: {
+            capabilities: failedProviderLoss.value.capabilities,
+            deploymentGeneration: failedProviderLoss.value.deploymentGeneration,
+            providers: failedProviderLoss.value.providers,
+          },
+          observedAt: this.#options.clock.now().toISOString(),
+        });
+        this.#diagnosticsByDeployment.set(deploymentKey(deployment), [diagnostic]);
+        await this.#recordObservation(deployment, "failed", [diagnostic]);
+        continue;
+      }
+      const suspendedLoss = providerLosses.find(
+        (loss) =>
+          loss.value.consumer.applicationId === deployment.applicationId &&
+          loss.value.consumer.pluginId === deployment.pluginId &&
+          loss.value.deploymentGeneration === deployment.generation &&
+          loss.value.action === "suspend",
+      );
+      if (suspendedLoss !== undefined) {
+        const blockedDiagnostics = this.#diagnosticsByDeployment
+          .get(deploymentKey(deployment))
+          ?.filter((diagnostic) => diagnostic.code === "DEPLOYMENT_ACTIVATION_EXHAUSTED");
+        if (blockedDiagnostics !== undefined && blockedDiagnostics.length > 0) {
+          await this.#recordObservation(deployment, "blocked", blockedDiagnostics);
+          continue;
+        }
+        const installation = (await this.#loadInstallations()).find(
+          (candidate) =>
+            candidate.pluginId === deployment.pluginId &&
+            candidate.digest === deployment.artifactDigest,
+        );
+        const allStopped =
+          suspendedLoss.value.recoveryActivations !== undefined ||
+          installation?.manifest.components.every((component) => {
+            const latest = deploymentInstances
+              .filter((instance) => instance.componentId === component.componentId)
+              .sort((left, right) => compareActivations(right.activation, left.activation))[0];
+            return latest?.lifecycle === "stopped";
+          }) === true;
+        await this.#recordObservation(deployment, allStopped ? "suspended" : "reconciling", []);
+        continue;
+      }
       const existingDiagnostics = this.#diagnosticsByDeployment.get(deploymentKey(deployment));
       if (
         existingDiagnostics?.some(
@@ -1787,12 +3718,12 @@ export class Reconciler {
           candidate.digest === deployment.artifactDigest,
       );
       if (installation === undefined) continue;
-      const ready = installation.manifest.components.every((component) =>
-        deploymentInstances.some(
-          (instance) =>
-            instance.componentId === component.componentId && this.#isReadyAndLive(instance),
-        ),
-      );
+      const ready = installation.manifest.components.every((component) => {
+        const latest = deploymentInstances
+          .filter((instance) => instance.componentId === component.componentId)
+          .sort((left, right) => compareActivations(right.activation, left.activation))[0];
+        return latest !== undefined && this.#isReadyAndLive(latest);
+      });
       if (ready) {
         this.#readyDeployments.add(deploymentKey(deployment));
         this.#diagnosticsByDeployment.delete(deploymentKey(deployment));
@@ -1803,16 +3734,16 @@ export class Reconciler {
       ) {
         await this.#recordObservation(deployment, "degraded", []);
       } else if (failedDiagnostics.length === 0) {
-        await this.#recordObservation(deployment, "converging", []);
+        await this.#recordObservation(deployment, "reconciling", []);
       }
     }
   }
 
-  #needsImmediateReconcile(instance: PersistedComponentInstance): boolean {
+  #needsImmediateReconcile(instance: PersistedComponentInstance, now: string): boolean {
     if (
       instance.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
       instance.retryAt !== undefined &&
-      instance.retryAt > this.#options.clock.now().toISOString()
+      instance.retryAt > now
     ) {
       return false;
     }
@@ -1828,8 +3759,7 @@ export class Reconciler {
     return (
       instance.lifecycle === "failed" &&
       instance.retryEffect !== undefined &&
-      (instance.retryAt === undefined ||
-        instance.retryAt <= this.#options.clock.now().toISOString())
+      (instance.retryAt === undefined || instance.retryAt <= now)
     );
   }
 
@@ -1847,8 +3777,7 @@ export class Reconciler {
     );
   }
 
-  #deferRetries(instances: readonly LoadedComponentInstance[]): void {
-    const now = this.#options.clock.now().getTime();
+  #deferRetries(instances: readonly LoadedComponentInstance[], now: number): void {
     for (const { value } of instances) {
       if (
         value.retryAt === undefined ||
@@ -1867,13 +3796,15 @@ export class Reconciler {
     this.#nextWakeAt = this.#nextWakeAt === undefined ? at : Math.min(this.#nextWakeAt, at);
   }
 
-  #armDeferredWake(): void {
+  async #armDeferredWake(): Promise<void> {
     const at = this.#nextWakeAt;
     if (!this.#running || at === undefined) return;
     if (this.#deferredWake !== undefined && this.#deferredWake.at <= at) return;
+    const schedulingNow = await this.#authoritativeNow();
+    if (!this.#running) return;
     this.#cancelDeferredWake();
     const controller = new AbortController();
-    const delay = Math.max(0, at - this.#options.clock.now().getTime());
+    const delay = Math.max(0, at - schedulingNow.epochMs);
     const promise = this.#options.clock
       .sleep(delay, controller.signal)
       .then(async () => {
@@ -1885,7 +3816,8 @@ export class Reconciler {
           return;
         }
         this.#deferredWake = undefined;
-        if (this.#options.clock.now().getTime() < at) return;
+        const wakeNow = await this.#authoritativeNow();
+        if (wakeNow.epochMs < at) return;
         await this.wake();
       })
       .catch(async (error: unknown) => {
@@ -1895,6 +3827,7 @@ export class Reconciler {
         if (this.#running) {
           this.#running = false;
           this.#cancelDeferredWake();
+          this.#notifyBackgroundError(error);
           try {
             await this.#componentLifecycle?.close(this.#options.authority);
           } catch (closeError) {
@@ -1904,7 +3837,7 @@ export class Reconciler {
             );
           }
         }
-        await this.#reportFatalFailure(failure);
+        this.#reportFatalFailure(failure);
       });
     this.#deferredWake = { at, controller, promise };
   }
@@ -1916,7 +3849,7 @@ export class Reconciler {
     deferred.controller.abort("reconciler-deferred-wake-cancelled");
   }
 
-  async #reportFatalFailure(error: unknown): Promise<void> {
+  #reportFatalFailure(error: unknown): void {
     if (this.#fatalReported) return;
     this.#fatalReported = true;
     this.#fatalError = error;
@@ -1930,9 +3863,15 @@ export class Reconciler {
             cause: serializeCause(error),
             observedAt: this.#options.clock.now().toISOString(),
           });
-    if (this.#starting) return;
+    this.#notifyBackgroundError(error);
+  }
+
+  #notifyBackgroundError(error: unknown): void {
+    if (this.#starting || this.#backgroundErrorNotified) return;
+    this.#backgroundErrorNotified = true;
     try {
-      await this.#options.onBackgroundError?.(error);
+      const reported = this.#options.onBackgroundError?.(error);
+      void Promise.resolve(reported).catch(() => undefined);
     } catch {
       // The reconciler is already failed closed; error reporting must not resurrect it.
     }
@@ -1954,8 +3893,12 @@ export class Reconciler {
     });
   }
 
-  async #rejectInvalidClaim(claim: OutboxClaim, error: unknown): Promise<void> {
-    const observedAt = this.#options.clock.now().toISOString();
+  async #rejectInvalidClaim(
+    claim: OutboxClaim,
+    error: unknown,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<void> {
+    const observedAt = decisionNow.iso;
     const diagnostic = invalidMessageDiagnostic(claim, error, observedAt);
     this.#diagnosticsByDeployment.set(`outbox/${claim.message.messageId}`, [diagnostic]);
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -1968,11 +3911,19 @@ export class Reconciler {
       });
       return null;
     });
-    await this.#retryClaim(claim);
+    await this.#retryClaim(claim, undefined, decisionNow);
   }
 
-  async #retryClaim(claim: OutboxClaim): Promise<void> {
-    const retryAt = this.#options.clock.now().getTime() + 60_000;
+  async #retryClaim(
+    claim: OutboxClaim,
+    requestedRetryAt: string | undefined,
+    authoritativeNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<void> {
+    const requested = requestedRetryAt === undefined ? Number.NaN : Date.parse(requestedRetryAt);
+    const retryAt =
+      Number.isFinite(requested) && requested > authoritativeNow.epochMs
+        ? requested
+        : authoritativeNow.epochMs + 60_000;
     await this.#options.state.acknowledgeOutbox({
       messageId: claim.message.messageId,
       owner: claim.owner,

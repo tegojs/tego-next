@@ -1,14 +1,5 @@
 import {
-  parseApplicationId,
-  parseArtifactDigest,
-  parseAttemptId,
-  parseComponentId,
-  parseComponentInstanceId,
-  parseGeneration,
-  parsePluginId,
-  parseTaskId,
-  parseWorkerId,
-  runtimeDiagnostic,
+  createExecutionBinding,
   type AttemptId,
   type AttemptStatus,
   type DrainOptions,
@@ -19,6 +10,16 @@ import {
   type ExecutorCapabilities,
   type ExecutorHealth,
   type JsonValue,
+  parseApplicationId,
+  parseArtifactDigest,
+  parseAttemptId,
+  parseComponentId,
+  parseComponentInstanceId,
+  parseGeneration,
+  parsePluginId,
+  parseTaskId,
+  parseWorkerId,
+  runtimeDiagnostic,
   type TaskId,
   type WorkerMessageType,
 } from "@tegojs/contracts";
@@ -40,14 +41,16 @@ export class MemoryRemoteSession implements RemoteSession {
   #peer?: MemoryRemoteSession;
   #state: RemoteSessionState = "ready";
   #sequence = 0;
+  readonly #endpoint: "main" | "worker";
   readonly #listeners = new Set<(message: RemoteSessionMessage) => void>();
   readonly #stateListeners = new Set<(state: RemoteSessionState) => void>();
   readonly #pending = new Map<string, PendingRequest>();
   #dropNext = false;
   #gate: Promise<void> | undefined;
 
-  constructor(epoch: string) {
+  constructor(epoch: string, endpoint: "main" | "worker") {
     this.epoch = epoch;
+    this.#endpoint = endpoint;
   }
 
   get state(): RemoteSessionState {
@@ -81,12 +84,12 @@ export class MemoryRemoteSession implements RemoteSession {
     payload: JsonValue,
     options: { readonly correlationId?: string } = {},
   ): Promise<string> {
-    const messageId = `message-${this.epoch}-${this.#sequence++}`;
+    const messageId = `message-${this.epoch}-${this.#endpoint}-${this.#sequence++}`;
     await this.#deliver({
       messageId,
+      correlationId: options.correlationId ?? messageId,
       type,
       payload,
-      ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
     });
     return messageId;
   }
@@ -95,14 +98,14 @@ export class MemoryRemoteSession implements RemoteSession {
     if (this.#state !== "ready") {
       throw new Error("session is closed");
     }
-    const messageId = `message-${this.epoch}-${this.#sequence++}`;
+    const messageId = `message-${this.epoch}-${this.#endpoint}-${this.#sequence++}`;
     const pending = Promise.withResolvers<RemoteSessionMessage>();
     this.#pending.set(messageId, {
       resolve: pending.resolve,
       reject: pending.reject,
     });
     try {
-      await this.#deliver({ messageId, type, payload });
+      await this.#deliver({ messageId, correlationId: messageId, type, payload });
     } catch (error) {
       this.#pending.delete(messageId);
       throw error;
@@ -158,7 +161,7 @@ export class MemoryRemoteSession implements RemoteSession {
 
   #receive(message: RemoteSessionMessage): void {
     if (this.#state !== "ready") return;
-    if (message.correlationId !== undefined) {
+    if (message.correlationId !== message.messageId) {
       const pending = this.#pending.get(message.correlationId);
       if (pending !== undefined) {
         this.#pending.delete(message.correlationId);
@@ -173,8 +176,8 @@ export class MemoryRemoteSession implements RemoteSession {
 export function memorySessionPair(
   epoch: string,
 ): readonly [MemoryRemoteSession, MemoryRemoteSession] {
-  const main = new MemoryRemoteSession(epoch);
-  const worker = new MemoryRemoteSession(epoch);
+  const main = new MemoryRemoteSession(epoch, "main");
+  const worker = new MemoryRemoteSession(epoch, "worker");
   main.link(worker);
   worker.link(main);
   return [main, worker];
@@ -341,24 +344,41 @@ export function executionRequest(
   orphanPolicy: ExecutionRequest["orphanPolicy"] = "cancel",
   targetWorkerId = parseWorkerId("worker-remote"),
 ): ExecutionRequest {
-  return {
-    taskId: parseTaskId(`remote-task-${suffix}`),
-    attemptId: parseAttemptId(`remote-attempt-${suffix}`),
-    target: {
-      instanceId: parseComponentInstanceId("app.org.example.remote.echo.g1"),
-      deploymentGeneration: parseGeneration("1"),
-      artifactDigest: parseArtifactDigest(
-        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-      ),
-      executor: {
-        id: "remote",
-        type: "remote",
-        workerId: targetWorkerId,
-      },
+  const target = {
+    instanceId: parseComponentInstanceId("app.org.example.remote.echo.g1"),
+    deploymentGeneration: parseGeneration("1"),
+    artifactDigest: parseArtifactDigest(
+      "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    ),
+    executor: {
+      id: "remote",
+      type: "remote" as const,
+      workerId: targetWorkerId,
     },
+  };
+  const identity = {
     applicationId: parseApplicationId("app"),
     pluginId: parsePluginId("org.example.remote"),
     componentId: parseComponentId("echo"),
+    target,
+  };
+  return {
+    taskId: parseTaskId(`remote-task-${suffix}`),
+    attemptId: parseAttemptId(`remote-attempt-${suffix}`),
+    ...identity,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants: [
+        { kind: "executor", executors: ["remote"] },
+        {
+          kind: "worker",
+          labels: {},
+          resources: { cpuMillis: 1, memoryBytes: 1, storageBytes: 1 },
+        },
+      ],
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
     input,
     deadline: new Date(60_000).toISOString(),
     orphanPolicy,

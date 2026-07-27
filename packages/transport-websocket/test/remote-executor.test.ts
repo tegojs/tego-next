@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import {
+  createExecutionBinding,
+  DiagnosticError,
   type ExecutionRequest,
   type JsonValue,
+  parseAttemptId,
   parseComponentInstanceId,
+  parseTaskId,
   parseWorkerId,
 } from "@tegojs/contracts";
 import {
@@ -18,9 +22,11 @@ import {
   REMOTE_ASSIGN,
   REMOTE_CANCEL,
   REMOTE_RESULT_ACK,
+  type RemoteAttemptRecord,
   type RemoteAttemptStore,
   RemoteExecutor,
   type RemoteExecutorOptions,
+  requestFingerprint,
   WorkerRuntime,
 } from "../src/index.js";
 import {
@@ -145,6 +151,21 @@ executorConformance(async () => {
   return (await connected({}, currentLocal)).remote;
 }, fixture);
 
+test("memory session peers allocate distinct self-correlated message identities", async () => {
+  const [main, worker] = memorySessionPair("1");
+  const mainReceived = Promise.withResolvers<string>();
+  const workerReceived = Promise.withResolvers<string>();
+  main.onMessage((message) => mainReceived.resolve(message.messageId));
+  worker.onMessage((message) => workerReceived.resolve(message.messageId));
+
+  await Promise.all([
+    main.send("session.reconcile", { source: "main" }),
+    worker.send("session.reconcile", { source: "worker" }),
+  ]);
+
+  assert.notEqual(await mainReceived.promise, await workerReceived.promise);
+});
+
 test("assignment is recorded before the Worker receives it", async () => {
   const events: string[] = [];
   const store = new MemoryRemoteAttemptStore({
@@ -255,6 +276,10 @@ test("RemoteExecutor rejects mismatched immutable targets before attempt-store a
           storeCalls += 1;
           return [];
         },
+        recover: async () => {
+          storeCalls += 1;
+          return { highestEpoch: "0", records: [] };
+        },
       };
       const remote = new RemoteExecutor({
         id: "remote",
@@ -270,6 +295,205 @@ test("RemoteExecutor rejects mismatched immutable targets before attempt-store a
       );
       assert.equal(storeCalls, 0);
     });
+  }
+});
+
+test("target-scoped recovery rejects a foreign executor before attempt lookup", async () => {
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const request = executionRequest(null, "foreign-recovery-target");
+  const foreignTarget: ExecutionRequest["target"] = {
+    ...request.target,
+    executor: {
+      id: "different-remote",
+      type: "remote",
+      workerId,
+    },
+  };
+
+  await assert.rejects(
+    remote.resumeTarget(foreignTarget, request.taskId, request.attemptId),
+    (error: unknown) =>
+      error instanceof DiagnosticError &&
+      error.diagnostic.code === "PROTOCOL_EXECUTION_TARGET_INVALID",
+  );
+});
+
+test("hydration rejects foreign persisted attempts before target-scoped access", async (t) => {
+  const expectedRequest = executionRequest(null, "foreign-persisted-attempt");
+  const foreignWorkerId = parseWorkerId("different-worker");
+  const cases: readonly {
+    readonly name: string;
+    readonly workerId: RemoteAttemptRecord["workerId"];
+    readonly target: ExecutionRequest["target"];
+  }[] = [
+    {
+      name: "record Worker",
+      workerId: foreignWorkerId,
+      target: expectedRequest.target,
+    },
+    {
+      name: "executor id",
+      workerId,
+      target: {
+        ...expectedRequest.target,
+        executor: { id: "different-remote", type: "remote", workerId },
+      },
+    },
+    {
+      name: "executor Worker",
+      workerId,
+      target: {
+        ...expectedRequest.target,
+        executor: { id: "remote", type: "remote", workerId: foreignWorkerId },
+      },
+    },
+    {
+      name: "executor type",
+      workerId,
+      target: {
+        ...expectedRequest.target,
+        executor: { id: "remote", type: "process" },
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      const identity = {
+        applicationId: expectedRequest.applicationId,
+        pluginId: expectedRequest.pluginId,
+        componentId: expectedRequest.componentId,
+        target: testCase.target,
+      };
+      const request = {
+        ...expectedRequest,
+        target: testCase.target,
+        binding: createExecutionBinding(identity, expectedRequest.binding),
+      };
+      const record: RemoteAttemptRecord = {
+        workerId: testCase.workerId,
+        request,
+        fingerprint: requestFingerprint(request),
+        state: "assigned",
+        epoch: "1",
+        updatedAt: clock.now().toISOString(),
+        revision: "1",
+      };
+      const store: RemoteAttemptStore = {
+        save: async () => undefined,
+        commit: async () => undefined,
+        delete: async () => undefined,
+        load: async () => undefined,
+        list: async () => [record],
+        recover: async () => ({ highestEpoch: record.epoch, records: [record] }),
+      };
+      const [mainSession, workerSession] = memorySessionPair("1");
+      const runtime = new WorkerRuntime({
+        workerId,
+        clock,
+        attemptStore: new MemoryRemoteAttemptStore(),
+        selectExecutor: () => new TestLocalExecutor(),
+      });
+      await runtime.attach(workerSession);
+      const remote = new RemoteExecutor({
+        id: "remote",
+        workerId,
+        clock,
+        attemptStore: store,
+      });
+
+      try {
+        await assert.rejects(remote.attach(mainSession), /owner|identity|target/iu);
+        assert.equal(
+          await remote.observeTarget(
+            expectedRequest.target,
+            expectedRequest.taskId,
+            expectedRequest.attemptId,
+          ),
+          undefined,
+        );
+        assert.equal(
+          await remote.resumeTarget(
+            expectedRequest.target,
+            expectedRequest.taskId,
+            expectedRequest.attemptId,
+          ),
+          undefined,
+        );
+        await remote.cancelTarget(
+          expectedRequest.target,
+          expectedRequest.taskId,
+          expectedRequest.attemptId,
+        );
+      } finally {
+        await Promise.all([remote.close(), runtime.close()]);
+      }
+    });
+  }
+});
+
+test("hydration rejects a forged persisted terminal result before observation or recovery", async () => {
+  const request = executionRequest(null, "forged-persisted-result");
+  const completedAt = clock.now().toISOString();
+  const record: RemoteAttemptRecord = {
+    workerId,
+    request,
+    fingerprint: requestFingerprint(request),
+    state: "terminal",
+    epoch: "1",
+    updatedAt: completedAt,
+    revision: "1",
+    result: {
+      taskId: parseTaskId("foreign-task"),
+      attemptId: parseAttemptId("foreign-attempt"),
+      status: "succeeded",
+      output: "forged",
+      executor: { kind: "remote", workerId: parseWorkerId("foreign-worker") },
+      startedAt: completedAt,
+      completedAt,
+    },
+  };
+  const store: RemoteAttemptStore = {
+    save: async () => undefined,
+    commit: async () => undefined,
+    delete: async () => undefined,
+    load: async () => undefined,
+    list: async () => [record],
+    recover: async () => ({ highestEpoch: record.epoch, records: [record] }),
+  };
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: store,
+  });
+
+  try {
+    await assert.rejects(remote.attach(mainSession), /result|request|Worker|identity/iu);
+    assert.equal(
+      await remote.observeTarget(request.target, request.taskId, request.attemptId),
+      undefined,
+    );
+    assert.equal(
+      await remote.resumeTarget(request.target, request.taskId, request.attemptId),
+      undefined,
+    );
+    await remote.cancelTarget(request.target, request.taskId, request.attemptId);
+  } finally {
+    await Promise.all([remote.close(), runtime.close()]);
   }
 });
 
@@ -324,6 +548,10 @@ test("WorkerRuntime rejects non-bound immutable targets before persistence, ACK,
         list: async () => {
           storeCalls += 1;
           return [];
+        },
+        recover: async () => {
+          storeCalls += 1;
+          return { highestEpoch: "0", records: [] };
         },
       };
       const [mainSession, workerSession] = memorySessionPair("1");
@@ -506,13 +734,16 @@ test("authority revoke fences an attach that was queued before revocation", asyn
 });
 
 test("authority revoke fences an attach whose hydration is already in progress", async () => {
-  const listStarted = Promise.withResolvers<void>();
-  const releaseList = Promise.withResolvers<void>();
-  class BlockingListStore extends MemoryRemoteAttemptStore {
-    override async list(requestedWorkerId: typeof workerId) {
-      listStarted.resolve();
-      await releaseList.promise;
-      return super.list(requestedWorkerId);
+  const recoveryStarted = Promise.withResolvers<void>();
+  const releaseRecovery = Promise.withResolvers<void>();
+  class BlockingRecoveryStore extends MemoryRemoteAttemptStore {
+    override async recover(
+      requestedWorkerId: Parameters<MemoryRemoteAttemptStore["recover"]>[0],
+      limit: Parameters<MemoryRemoteAttemptStore["recover"]>[1],
+    ) {
+      recoveryStarted.resolve();
+      await releaseRecovery.promise;
+      return super.recover(requestedWorkerId, limit);
     }
   }
   const [mainSession, workerSession] = memorySessionPair("1");
@@ -527,14 +758,14 @@ test("authority revoke fences an attach whose hydration is already in progress",
     id: "remote",
     workerId,
     clock,
-    attemptStore: new BlockingListStore(),
+    attemptStore: new BlockingRecoveryStore(),
   });
   cleanups.push(async () => runtime.close());
 
   const attaching = remote.attach(mainSession);
-  await listStarted.promise;
+  await recoveryStarted.promise;
   remote.revokeAuthority();
-  releaseList.resolve();
+  releaseRecovery.resolve();
 
   await assert.rejects(attaching, /authority|revoked/iu);
   assert.equal((await remote.probe()).available, false);
@@ -793,6 +1024,7 @@ test("Worker attempt-store failure rejects before local execution instead of lea
       },
       load: async () => undefined,
       list: async () => [],
+      recover: async () => ({ highestEpoch: "0", records: [] }),
     },
     selectExecutor: () => local,
   });

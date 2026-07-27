@@ -2,14 +2,13 @@ import type { Stats } from "node:fs";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import { extname, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  DiagnosticError,
-  runtimeDiagnostic,
   type ArtifactDigest,
+  DiagnosticError,
   type JsonObject,
   type JsonValue,
+  runtimeDiagnostic,
 } from "@tegojs/contracts";
 import { cloneComponentHostValue } from "./protocol.js";
 
@@ -114,6 +113,7 @@ export interface LoadedComponentDefinition {
   readonly start?: (context: unknown) => Promise<void> | void;
   readonly health?: (context: unknown) => Promise<unknown> | unknown;
   readonly run?: (context: unknown, input: unknown) => Promise<unknown> | unknown;
+  readonly invokeCapability?: (context: unknown, request: unknown) => Promise<unknown> | unknown;
   readonly drain?: (context: unknown) => Promise<void> | void;
   readonly stop?: (context: unknown) => Promise<void> | void;
 }
@@ -260,6 +260,7 @@ function validateDefinition(
   const allowed = new Set([
     "drain",
     "health",
+    "invokeCapability",
     "kind",
     "metadata",
     "protocol",
@@ -296,7 +297,7 @@ function validateDefinition(
       "Component definition kind does not match the manifest",
     );
   }
-  for (const hook of ["drain", "health", "run", "start", "stop"] as const) {
+  for (const hook of ["drain", "health", "invokeCapability", "run", "start", "stop"] as const) {
     const candidate = fields.get(hook);
     if (candidate !== undefined && typeof candidate !== "function") {
       throw loaderError(
@@ -304,6 +305,12 @@ function validateDefinition(
         `Component definition ${hook} must be a function`,
       );
     }
+  }
+  if (expectedKind === "service" && fields.get("invokeCapability") !== undefined) {
+    throw loaderError(
+      "EXECUTOR_COMPONENT_DEFINITION_INVALID",
+      "Capability provider hooks are supported only by task components",
+    );
   }
   const metadataValue = fields.get("metadata");
   let metadata: JsonObject | undefined;
@@ -330,6 +337,13 @@ function validateDefinition(
     ...(fields.get("run") === undefined
       ? {}
       : { run: fields.get("run") as NonNullable<LoadedComponentDefinition["run"]> }),
+    ...(fields.get("invokeCapability") === undefined
+      ? {}
+      : {
+          invokeCapability: fields.get("invokeCapability") as NonNullable<
+            LoadedComponentDefinition["invokeCapability"]
+          >,
+        }),
     ...(fields.get("drain") === undefined
       ? {}
       : { drain: fields.get("drain") as NonNullable<LoadedComponentDefinition["drain"]> }),
