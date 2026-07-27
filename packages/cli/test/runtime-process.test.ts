@@ -44,6 +44,32 @@ async function waitForPath(path: string, directory: string): Promise<void> {
   }
 }
 
+async function waitForRuntimeControl(endpoint: string): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    try {
+      const status = await requestControl({
+        endpoint,
+        operation: "runtime.status",
+        input: {},
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
+      assert.equal(status.ok, true);
+      return;
+    } catch (error) {
+      const code =
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        typeof error.code === "string"
+          ? error.code
+          : undefined;
+      if ((code !== "ECONNREFUSED" && code !== "ENOENT") || Date.now() >= deadline) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
 async function waitForExit(child: ChildProcess): Promise<{
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -578,13 +604,7 @@ test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-clean
   );
   try {
     await waitForPath(endpoint, directory);
-    const status = await requestControl({
-      endpoint,
-      operation: "runtime.status",
-      input: {},
-      timeoutMs: deadlineMs,
-    });
-    assert.equal(status.ok, true);
+    await waitForRuntimeControl(endpoint);
     assert.equal(child.kill("SIGTERM"), true);
     const exit = await waitForExit(child);
     assert.deepEqual(exit, { code: 0, signal: null });
