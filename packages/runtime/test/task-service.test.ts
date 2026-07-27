@@ -37,6 +37,7 @@ import {
   type StateTransactionOptions,
   type StateWriteOptions,
   type TaskExecutionTarget,
+  type TaskRecord,
   type Versioned,
 } from "@tegojs/contracts";
 import { eventually, FakeClock } from "@tegojs/testkit";
@@ -344,6 +345,36 @@ const generationTwoTarget: TaskExecutionTarget = {
   },
 };
 
+const immutableExecutionBinding = {
+  configuration: {
+    nested: {
+      retries: 3,
+      values: ["one", { enabled: true }],
+    },
+  },
+  permissionGrants: [
+    { kind: "executor", executors: ["process", "remote", "thread"] },
+    { kind: "secret", names: ["api-token"] },
+  ],
+  capabilityDefinitions: [
+    {
+      identity: { name: "records", protocolVersion: "1.0.0" },
+      requestSchema: { type: "object" },
+      responseSchema: { type: "object" },
+    },
+  ],
+  capabilityBindings: [
+    {
+      capability: { name: "records", protocolVersion: "1.0.0" },
+      providerDeployment: {
+        applicationId: "application-01",
+        pluginId: "records-provider",
+      },
+    },
+  ],
+  fingerprint: "a".repeat(64),
+} as const;
+
 function executorSelection(
   executor: Executor,
   target: TaskExecutionTarget = generationOneTarget,
@@ -364,8 +395,9 @@ function executorSelection(
       ...target,
       executor: targetExecutor,
     },
+    binding: immutableExecutionBinding,
     executor,
-  };
+  } as unknown as TaskExecutorSelection;
 }
 
 function serviceFixture(executor = new ControlledExecutor()) {
@@ -1354,6 +1386,57 @@ test("@spec:runtime-operations/task-operations/task-record-preserves-immutable-e
   });
 
   assert.deepEqual(record.target, generationOneTarget);
+});
+
+test("execution binding parity persists one selection and reuses it after restart", async () => {
+  const executor = new ControlledExecutor();
+  const state = new TransactionalState();
+  const first = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => executorSelection(executor),
+    createIdentity: () => identity,
+  });
+  await first.setAuthority(authority);
+  const admitted = await first.run(request);
+
+  assert.deepEqual(
+    (admitted as TaskRecord & { readonly binding?: unknown }).binding,
+    immutableExecutionBinding,
+  );
+  assert.deepEqual(
+    (executor.submitted[0] as ExecutionRequest & { readonly binding?: unknown }).binding,
+    immutableExecutionBinding,
+  );
+  await first.close();
+
+  const restartedExecutor = new ControlledExecutor();
+  let restartSelection:
+    | (TaskExecutorSelection & { readonly binding?: unknown })
+    | undefined;
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async (_request, target) => {
+      restartSelection = executorSelection(restartedExecutor, target);
+      return {
+        ...restartSelection,
+        binding: {
+          ...immutableExecutionBinding,
+          configuration: { nested: { retries: 99 } },
+          fingerprint: "b".repeat(64),
+        },
+      } as unknown as TaskExecutorSelection;
+    },
+  });
+  await restarted.recover();
+  await restarted.setAuthority(authority);
+
+  assert.deepEqual(
+    (restartedExecutor.submitted[0] as ExecutionRequest & { readonly binding?: unknown }).binding,
+    immutableExecutionBinding,
+  );
+  assert.notDeepEqual(restartSelection?.binding, immutableExecutionBinding);
 });
 
 test("@spec:runtime-operations/task-operations/admission-does-not-follow-a-generation-upgrade", async () => {

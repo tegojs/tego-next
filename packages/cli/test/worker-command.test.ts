@@ -309,11 +309,82 @@ function assignment(
     applicationId: "application-artifact-selection" as ExecutionRequest["applicationId"],
     pluginId: pluginId as ExecutionRequest["pluginId"],
     componentId: "echo" as ExecutionRequest["componentId"],
+    binding: {
+      configuration: {
+        nested: {
+          retries: 3,
+          values: ["one", { enabled: true }],
+        },
+      },
+      permissionGrants: [
+        { kind: "executor", executors: ["process", "remote", "thread"] },
+        { kind: "secret", names: ["api-token"] },
+      ],
+      capabilityDefinitions: [
+        {
+          identity: { name: "records", protocolVersion: "1.0.0" },
+          requestSchema: { type: "object" },
+          responseSchema: { type: "object" },
+        },
+      ],
+      capabilityBindings: [
+        {
+          capability: { name: "records", protocolVersion: "1.0.0" },
+          providerDeployment: {
+            applicationId: "application-artifact-selection",
+            pluginId: "records-provider",
+          },
+        },
+      ],
+      fingerprint: "a".repeat(64),
+    },
     input: null,
     deadline: new Date(Date.now() + 60_000).toISOString(),
     orphanPolicy: "cancel",
-  };
+  } as unknown as ExecutionRequest;
 }
+
+test("execution binding parity forwards nested configuration, grants, and capabilities verbatim", () => {
+  const selection = createPreparedArtifactSelection(
+    [preparedArtifact("org.example.exact", "a")],
+    "worker-runtime",
+  );
+  const request = assignment("org.example.exact");
+  const component = selection.resolveComponent(request);
+
+  assert.deepEqual(
+    component.configuration,
+    (request as ExecutionRequest & { readonly binding: { readonly configuration: JsonValue } })
+      .binding.configuration,
+  );
+  assert.deepEqual(
+    component.permissionGrants,
+    (
+      request as ExecutionRequest & {
+        readonly binding: { readonly permissionGrants: readonly JsonValue[] };
+      }
+    ).binding.permissionGrants,
+  );
+  assert.deepEqual(
+    component.capabilityDefinitions,
+    (
+      request as ExecutionRequest & {
+        readonly binding: { readonly capabilityDefinitions: readonly JsonValue[] };
+      }
+    ).binding.capabilityDefinitions,
+  );
+  const generationMismatch = {
+    ...structuredClone(request),
+    target: {
+      ...request.target,
+      deploymentGeneration: parseGeneration("2"),
+    },
+  } as ExecutionRequest;
+  assert.equal(
+    selection.validateAssignment(generationMismatch)?.code,
+    "PROTOCOL_EXECUTION_BINDING_INVALID",
+  );
+});
 
 test("@spec:worker-protocol/prepared-artifact-admission/selects-one-digest-per-plugin", () => {
   const exact = createPreparedArtifactSelection(
