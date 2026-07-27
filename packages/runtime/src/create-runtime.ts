@@ -5,7 +5,6 @@ import {
   type PluginDeployment,
   type PluginDeploymentObservation,
   parsePluginDeployment,
-  parsePluginDeploymentObservation,
   parseRuntimeConfiguration,
   parseRuntimeEvent,
   parseRuntimeStatus,
@@ -16,12 +15,14 @@ import {
   type RuntimeEvent,
   type RuntimeLifecycleState,
   type RuntimeStatus,
+  type ScannedState,
   type StateStore,
   type StateTransaction,
   runtimeDiagnostic,
   type StopOptions,
   serializeCause,
 } from "@tegojs/contracts";
+import { decodePersistedPluginDeploymentObservation } from "./deployment-observation.js";
 import { DriverSupervisor } from "./driver-supervisor.js";
 import { LeadershipController } from "./leadership-controller.js";
 import { isRuntimeReady } from "./readiness.js";
@@ -66,26 +67,58 @@ const observedStatusPageSize = 100;
 async function scanObservedStatusCollection<T extends JsonValue>(
   transaction: StateTransaction,
   collection: "deployment-observations" | "deployments" | "installations",
-  idPrefix?: string,
-): Promise<readonly T[]> {
-  const values: T[] = [];
+): Promise<readonly ScannedState<T>[]> {
+  const records: ScannedState<T>[] = [];
   let afterId: string | undefined;
   while (true) {
-    const page = [];
+    const page: ScannedState<T>[] = [];
     for await (const record of transaction.scan<T>({
       namespace: "tego",
       collection,
-      ...(idPrefix === undefined ? {} : { idPrefix }),
       ...(afterId === undefined ? {} : { afterId }),
       limit: observedStatusPageSize,
     })) {
       page.push(record);
     }
-    values.push(...page.map((record) => record.value));
-    if (page.length < observedStatusPageSize) return values;
+    records.push(...page);
+    if (page.length < observedStatusPageSize) return records;
     afterId = page.at(-1)?.key.id;
-    if (afterId === undefined) return values;
+    if (afterId === undefined) return records;
   }
+}
+
+function compareDeploymentRecords(
+  left: ScannedState<PluginDeployment>,
+  right: ScannedState<PluginDeployment>,
+): number {
+  const leftGeneration = BigInt(left.value.generation);
+  const rightGeneration = BigInt(right.value.generation);
+  if (leftGeneration !== rightGeneration) {
+    return leftGeneration < rightGeneration ? -1 : 1;
+  }
+  const canonicalId = `${left.value.applicationId}/${left.value.pluginId}`;
+  const leftCanonical = left.key.id === canonicalId;
+  const rightCanonical = right.key.id === canonicalId;
+  if (leftCanonical !== rightCanonical) return leftCanonical ? 1 : -1;
+  return left.key.id < right.key.id ? 1 : left.key.id > right.key.id ? -1 : 0;
+}
+
+function currentDeploymentRecords(
+  records: readonly ScannedState<PluginDeployment>[],
+  applicationId: RuntimeConfiguration["applicationId"],
+): readonly ScannedState<PluginDeployment>[] {
+  const current = new Map<string, ScannedState<PluginDeployment>>();
+  for (const record of records) {
+    const deployment = parsePluginDeployment(record.value);
+    if (deployment.applicationId !== applicationId) continue;
+    const parsed = { ...record, value: deployment };
+    const identity = `${deployment.applicationId}/${deployment.pluginId}`;
+    const previous = current.get(identity);
+    if (previous === undefined || compareDeploymentRecords(previous, parsed) < 0) {
+      current.set(identity, parsed);
+    }
+  }
+  return [...current.values()];
 }
 
 class DurableRuntimeObservedStatusReader implements RuntimeObservedStatusReader {
@@ -103,37 +136,46 @@ class DurableRuntimeObservedStatusReader implements RuntimeObservedStatusReader 
         transaction,
         "installations",
       );
-      const deployments = (
-        await scanObservedStatusCollection<PluginDeployment>(
-          transaction,
-          "deployments",
-          `${this.#applicationId}/`,
-        )
-      )
-        .map((deployment) => parsePluginDeployment(deployment))
-        .filter((deployment) => deployment.applicationId === this.#applicationId);
-      const observations = (
-        await scanObservedStatusCollection<PluginDeploymentObservation>(
-          transaction,
-          "deployment-observations",
-          `${this.#applicationId}/`,
-        )
-      )
-        .map((observation) => parsePluginDeploymentObservation(observation))
-        .filter((observation) => observation.applicationId === this.#applicationId);
-      const observationByDeployment = new Map(
-        observations.map((observation) => [
-          `${observation.applicationId}/${observation.pluginId}`,
-          observation,
-        ]),
+      const deployments = currentDeploymentRecords(
+        await scanObservedStatusCollection<PluginDeployment>(transaction, "deployments"),
+        this.#applicationId,
       );
+      const observations = await scanObservedStatusCollection<PluginDeploymentObservation>(
+        transaction,
+        "deployment-observations",
+      );
+      const observationByDeployment = new Map<string, ScannedState<PluginDeploymentObservation>>();
+      for (const record of observations) {
+        const decoded = decodePersistedPluginDeploymentObservation(record.value).observation;
+        if (decoded.applicationId !== this.#applicationId) continue;
+        const identity = `${decoded.applicationId}/${decoded.pluginId}`;
+        const deployment = deployments.find(
+          (candidate) =>
+            `${candidate.value.applicationId}/${candidate.value.pluginId}` === identity,
+        );
+        if (deployment === undefined || decoded.generation !== deployment.value.generation) {
+          continue;
+        }
+        const parsed = { ...record, value: decoded };
+        const previous = observationByDeployment.get(identity);
+        const canonicalId = identity;
+        const parsedCanonical = parsed.key.id === canonicalId;
+        const previousCanonical = previous?.key.id === canonicalId;
+        if (
+          previous === undefined ||
+          (parsedCanonical && !previousCanonical) ||
+          (parsedCanonical === previousCanonical && parsed.key.id < previous.key.id)
+        ) {
+          observationByDeployment.set(identity, parsed);
+        }
+      }
       return {
         deploymentCount: deployments.length,
         installationCount: installations.length,
-        deploymentReadiness: deployments.map((deployment) => {
+        deploymentReadiness: deployments.map(({ value: deployment }) => {
           const observation = observationByDeployment.get(
             `${deployment.applicationId}/${deployment.pluginId}`,
-          );
+          )?.value;
           return {
             essential: deployment.essential,
             ready:
@@ -222,6 +264,16 @@ class RuntimeEventStream implements AsyncIterable<RuntimeEvent> {
   }
 }
 
+type TerminalObservedStatus =
+  | {
+      readonly kind: "failure";
+      readonly error: unknown;
+    }
+  | {
+      readonly kind: "status";
+      readonly status: RuntimeObservedStatus;
+    };
+
 class TegoRuntime implements Runtime {
   readonly operations: RuntimeOperationController;
   readonly events: AsyncIterable<RuntimeEvent>;
@@ -249,7 +301,8 @@ class TegoRuntime implements Runtime {
   #stopPromise: Promise<void> | undefined;
   #stopRequested = false;
   #servicesClosed = false;
-  #terminalObservedStatus: RuntimeObservedStatus | undefined;
+  #driversOpened = false;
+  #terminalObservedStatus: TerminalObservedStatus | undefined;
 
   constructor(
     configuration: RuntimeConfiguration,
@@ -311,6 +364,7 @@ class TegoRuntime implements Runtime {
       this.#assertCoordinationScope();
       this.#setLifecycle("opening");
       await this.#supervisor.open();
+      this.#driversOpened = true;
       if (this.#stopRequested) return;
 
       this.#setLifecycle("recovering");
@@ -353,8 +407,14 @@ class TegoRuntime implements Runtime {
       this.operations.close();
       await this.#leadershipController?.stop().catch(() => undefined);
       await this.#stopReconciler().catch(() => undefined);
+      if (this.#driversOpened) {
+        await this.#captureTerminalObservedStatus();
+      } else {
+        this.#captureRecoveredObservedStatus();
+      }
       await this.#closeServices();
       await this.#supervisor.close();
+      this.#driversOpened = false;
       if (
         this.#lifecycle !== "failed" &&
         this.#lifecycle !== "stopped" &&
@@ -383,12 +443,10 @@ class TegoRuntime implements Runtime {
     } catch (error) {
       errors.push(error);
     }
-    try {
-      this.#terminalObservedStatus = await this.#observedStatus.read();
-    } catch (error) {
-      errors.push(error);
-    }
+    const observedStatusFailure = await this.#captureTerminalObservedStatus();
+    if (observedStatusFailure !== undefined) errors.push(observedStatusFailure);
     errors.push(...(await this.#closeServices()), ...(await this.#supervisor.close()));
+    this.#driversOpened = false;
     this.#setLifecycle(errors.length === 0 ? "stopped" : "failed");
     this.#eventStream.close();
     if (errors.length > 0) {
@@ -410,7 +468,7 @@ class TegoRuntime implements Runtime {
     if (this.#lifecycle === "running") {
       this.#driverHealth = await this.#supervisor.health(this.#drivers.clock.now().toISOString());
     }
-    const observed = this.#terminalObservedStatus ?? (await this.#observedStatus.read());
+    const observed = await this.#readObservedStatus();
     const driverHealth = this.#driverHealth.map(({ health }) => health);
     const status = {
       identity: {
@@ -448,6 +506,48 @@ class TegoRuntime implements Runtime {
           }),
     } satisfies RuntimeStatus;
     return structuredClone(parseRuntimeStatus(status));
+  }
+
+  async #captureTerminalObservedStatus(): Promise<unknown | undefined> {
+    if (this.#terminalObservedStatus !== undefined) return undefined;
+    try {
+      this.#terminalObservedStatus = {
+        kind: "status",
+        status: await this.#observedStatus.read(),
+      };
+      return undefined;
+    } catch (error) {
+      this.#terminalObservedStatus = {
+        kind: "failure",
+        error,
+      };
+      return error;
+    }
+  }
+
+  #captureRecoveredObservedStatus(): void {
+    if (this.#terminalObservedStatus !== undefined) return;
+    this.#terminalObservedStatus = {
+      kind: "status",
+      status: {
+        deploymentCount: this.#recovery.deploymentCount,
+        installationCount: this.#recovery.installationCount,
+        deploymentReadiness: this.#recovery.deploymentReadiness.map(({ essential, ready }) => ({
+          essential,
+          ready,
+        })),
+      },
+    };
+  }
+
+  #readObservedStatus(): Promise<RuntimeObservedStatus> {
+    if (this.#terminalObservedStatus?.kind === "failure") {
+      return Promise.reject(this.#terminalObservedStatus.error);
+    }
+    if (this.#terminalObservedStatus?.kind === "status") {
+      return Promise.resolve(this.#terminalObservedStatus.status);
+    }
+    return this.#observedStatus.read();
   }
 
   #assertCoordinationScope(): void {

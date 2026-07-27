@@ -22,7 +22,6 @@ import {
   parseMessageId,
   parseOperationId,
   parsePluginDeployment,
-  parsePluginDeploymentObservation,
   parsePluginId,
   parsePluginInstallation,
   type Revision,
@@ -51,6 +50,7 @@ import {
   strongestProviderLoss,
 } from "../capabilities/resolver.js";
 import { satisfiesVersionRange } from "../capabilities/version.js";
+import { decodePersistedPluginDeploymentObservation } from "../deployment-observation.js";
 import { validatePermissionGrant } from "../permissions/permission-set.js";
 import { transitionComponentLifecycle } from "./component-lifecycle.js";
 import type { PlacementWorker } from "./placement.js";
@@ -2792,13 +2792,14 @@ export class Reconciler {
     const key = observationKey(deployment);
     const current = await this.#options.state.read(key);
     const currentObservation =
-      current === undefined ? undefined : parsePluginDeploymentObservation(current.value);
+      current === undefined ? undefined : decodePersistedPluginDeploymentObservation(current.value);
     if (
-      currentObservation?.applicationId === deployment.applicationId &&
-      currentObservation.pluginId === deployment.pluginId &&
-      currentObservation.generation === deployment.generation &&
-      currentObservation.status === status &&
-      observationDiagnosticsFingerprint(currentObservation.diagnostics) ===
+      currentObservation?.legacy === false &&
+      currentObservation.observation.applicationId === deployment.applicationId &&
+      currentObservation.observation.pluginId === deployment.pluginId &&
+      currentObservation.observation.generation === deployment.generation &&
+      currentObservation.observation.status === status &&
+      observationDiagnosticsFingerprint(currentObservation.observation.diagnostics) ===
         observationDiagnosticsFingerprint(diagnostics)
     ) {
       return;

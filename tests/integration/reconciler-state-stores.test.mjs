@@ -14,7 +14,7 @@ import {
   parsePluginId,
 } from "@tegojs/contracts";
 import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import { planReconcile, Reconciler } from "@tegojs/runtime";
+import { planReconcile, reconcileEffectIdentities, Reconciler } from "@tegojs/runtime";
 
 const applicationId = parseApplicationId("app");
 const pluginId = parsePluginId("org.example.echo");
@@ -223,14 +223,38 @@ test("legacy deployment observations migrate across Memory and SQLite restart", 
             },
             { expectedRevision: "absent" },
           );
+          if (scenario.current === "reconciling") {
+            const instanceId = reconcileEffectIdentities(
+              deployment(),
+              componentId,
+              "prepare",
+            ).instanceId;
+            await transaction.put(
+              {
+                namespace: "tego",
+                collection: "component-instances",
+                id: instanceId,
+              },
+              {
+                activation: "1",
+                applicationId,
+                artifactDigest: digest,
+                componentId,
+                deploymentGeneration: parseGeneration("1"),
+                executor: "thread",
+                instanceId,
+                lifecycle: "failed",
+                observedGeneration: parseGeneration("1"),
+                pluginId,
+              },
+              { expectedRevision: "absent" },
+            );
+          }
           return null;
         });
 
         const state = await reopen();
         const effects = new RecordingEffects();
-        if (scenario.current === "reconciling") {
-          effects.isLive = () => false;
-        }
         const reconciler = new Reconciler({
           artifactGate: { validate: async () => gate().artifact },
           clock,
