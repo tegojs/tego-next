@@ -92,6 +92,21 @@ The protocol SHALL reconcile running attempts, buffered terminal results, Worker
 - **WHEN** a Worker connect list reaches an authenticated Main that rejects registration because it is not authoritative
 - **THEN** the session reports a retryable endpoint-unavailable outcome, the Worker tries the next bounded URL, and authentication failures remain terminal
 
+### Requirement: Bounded durable attempt recovery
+The attempt store SHALL expose a bounded recovery inventory containing only non-expired attempts plus a durable highest-session-epoch watermark. Main and Worker SHALL request at most one item beyond their configured active-inventory limit, reject an oversized or expired recovery response before adopting any record, and validate every returned record and revision before recovery. Expired identity tombstones SHALL remain available to exact attempt lookup without consuming active restart inventory. A conditional-commit conflict SHALL be authoritative only when the reloaded record has the same immutable identity and a revision strictly greater than the caller's prior revision.
+
+#### Scenario: Historical tombstones do not exhaust restart
+- **WHEN** a Worker has more expired identity tombstones than its active recovery limit and only a bounded number of non-expired attempts
+- **THEN** restart recovers the non-expired attempts and epoch watermark without loading the tombstones into active inventory
+
+#### Scenario: Nonconforming recovery response fails closed
+- **WHEN** an attempt store returns more recovery records than requested or includes an expired record in active recovery
+- **THEN** Main or Worker rejects recovery before parsing or adopting any attempt
+
+#### Scenario: Conditional-conflict reload must advance
+- **WHEN** a conditional attempt commit reports a conflict and reload returns an equal or lower revision
+- **THEN** Main or Worker rejects the stale record without adopting its state, cancellation, epoch, or terminal result
+
 ### Requirement: Orphan policy
 The runtime SHALL apply `cancel`, `finish-and-buffer`, or `finish-and-persist` when a Worker loses its Main session.
 

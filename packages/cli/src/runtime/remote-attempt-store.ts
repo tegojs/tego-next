@@ -1,17 +1,21 @@
 import {
   type ExecutionRequest,
+  type JsonObject,
   parseExecutionRequest,
   parseExecutionResult,
   parseWorkerId,
+  STATE_QUERY_MAX_LIMIT,
   type StateFencing,
   type StateKey,
   type StateStore,
+  type StateTransaction,
   serializeWireValue,
   type WorkerId,
 } from "@tegojs/contracts";
 import {
   parseAttemptRevision,
   type RemoteAttemptCommitCondition,
+  type RemoteAttemptRecovery,
   type RemoteAttemptRecord,
   type RemoteAttemptState,
   type RemoteAttemptStore,
@@ -19,6 +23,8 @@ import {
 } from "@tegojs/transport-websocket";
 
 const WORKER_ATTEMPT_COLLECTION = "worker-attempts";
+const WORKER_ACTIVE_ATTEMPT_COLLECTION = "worker-active-attempts";
+const WORKER_ATTEMPT_METADATA_COLLECTION = "worker-attempt-metadata";
 const WORKER_ATTEMPT_STATES = new Set<RemoteAttemptState>([
   "acknowledged",
   "assigned",
@@ -39,6 +45,33 @@ const WORKER_ATTEMPT_FIELDS = new Set([
   "updatedAt",
   "workerId",
 ]);
+
+interface WorkerAttemptMetadata extends JsonObject {
+  readonly highestEpoch: string;
+  readonly workerId: WorkerId;
+}
+
+function parseAttemptMetadata(value: unknown, workerId: WorkerId): WorkerAttemptMetadata {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Persisted Worker attempt metadata must be an object");
+  }
+  const fields = value as Readonly<Record<string, unknown>>;
+  if (
+    Object.keys(fields).length !== 2 ||
+    !Object.hasOwn(fields, "highestEpoch") ||
+    !Object.hasOwn(fields, "workerId")
+  ) {
+    throw new Error("Persisted Worker attempt metadata fields are invalid");
+  }
+  const persistedWorkerId = parseWorkerId(fields.workerId);
+  if (persistedWorkerId !== workerId) {
+    throw new Error("Persisted Worker attempt metadata belongs to a different Worker");
+  }
+  return {
+    highestEpoch: parseAttemptRevision(fields.highestEpoch),
+    workerId: persistedWorkerId,
+  };
+}
 
 function attemptStateId(
   workerId: WorkerId,
@@ -178,6 +211,7 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
       await transaction.put(key, snapshot, {
         expectedRevision: current?.revision ?? "absent",
       });
+      await this.#writeRecoveryState(transaction, snapshot);
       return null;
     });
   }
@@ -228,6 +262,7 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
       await transaction.put(key, snapshot, {
         expectedRevision: current?.revision ?? "absent",
       });
+      await this.#writeRecoveryState(transaction, snapshot);
       return snapshot;
     });
     return committed === null ? undefined : cloneRecord(committed);
@@ -242,6 +277,11 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
       const current = await transaction.get(key);
       if (current !== undefined) {
         await transaction.delete(key, { expectedRevision: current.revision });
+      }
+      const activeKey = this.#activeKey(taskId, attemptId);
+      const active = await transaction.get(activeKey);
+      if (active !== undefined) {
+        await transaction.delete(activeKey, { expectedRevision: active.revision });
       }
       return null;
     });
@@ -281,6 +321,84 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
     return records;
   }
 
+  async recover(workerId: WorkerId, limit: number): Promise<RemoteAttemptRecovery> {
+    if (parseWorkerId(workerId) !== this.#workerId) {
+      return { highestEpoch: "0", records: [] };
+    }
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new RangeError("Remote attempt recovery limit must be a positive safe integer");
+    }
+    return this.#state.transact(this.#transactionOptions, async (transaction) => {
+      const metadata = await transaction.get(this.#metadataKey());
+      let highestEpoch =
+        metadata === undefined
+          ? "0"
+          : parseAttemptMetadata(metadata.value, this.#workerId).highestEpoch;
+      const records: RemoteAttemptRecord[] = [];
+      let afterId: string | undefined;
+      while (records.length < limit) {
+        const pageLimit = Math.min(limit - records.length, STATE_QUERY_MAX_LIMIT);
+        let pageCount = 0;
+        for await (const record of transaction.scan<RemoteAttemptRecord>({
+          namespace: "tego",
+          collection: WORKER_ACTIVE_ATTEMPT_COLLECTION,
+          idPrefix: `${this.#workerId}:`,
+          ...(afterId === undefined ? {} : { afterId }),
+          limit: pageLimit,
+        })) {
+          pageCount += 1;
+          afterId = record.key.id;
+          const parsed = parsePersistedAttempt(record.value, {
+            expectedStateId: record.key.id,
+            workerId: this.#workerId,
+          });
+          if (parsed.state === "expired") {
+            throw new Error("Active Worker attempt index contains an expired tombstone");
+          }
+          if (BigInt(parsed.epoch) > BigInt(highestEpoch)) highestEpoch = parsed.epoch;
+          records.push(parsed);
+        }
+        if (pageCount < pageLimit) break;
+      }
+      return {
+        highestEpoch,
+        records,
+      };
+    });
+  }
+
+  async #writeRecoveryState(
+    transaction: StateTransaction,
+    snapshot: RemoteAttemptRecord,
+  ): Promise<void> {
+    const activeKey = this.#activeKey(snapshot.request.taskId, snapshot.request.attemptId);
+    const active = await transaction.get(activeKey);
+    if (snapshot.state === "expired") {
+      if (active !== undefined) {
+        await transaction.delete(activeKey, { expectedRevision: active.revision });
+      }
+    } else {
+      await transaction.put(activeKey, snapshot, {
+        expectedRevision: active?.revision ?? "absent",
+      });
+    }
+    const metadataKey = this.#metadataKey();
+    const currentMetadata = await transaction.get(metadataKey);
+    const highestEpoch =
+      currentMetadata === undefined
+        ? "0"
+        : parseAttemptMetadata(currentMetadata.value, this.#workerId).highestEpoch;
+    if (BigInt(snapshot.epoch) > BigInt(highestEpoch)) {
+      const metadata: WorkerAttemptMetadata = {
+        highestEpoch: snapshot.epoch,
+        workerId: this.#workerId,
+      };
+      await transaction.put(metadataKey, metadata, {
+        expectedRevision: currentMetadata?.revision ?? "absent",
+      });
+    }
+  }
+
   #assertWorker(workerId: WorkerId): void {
     if (parseWorkerId(workerId) !== this.#workerId) {
       throw new Error("Remote attempt record belongs to a different Worker");
@@ -295,6 +413,25 @@ export class StateRemoteAttemptStore implements RemoteAttemptStore {
       namespace: "tego",
       collection: WORKER_ATTEMPT_COLLECTION,
       id: attemptStateId(this.#workerId, taskId, attemptId),
+    };
+  }
+
+  #activeKey(
+    taskId: ExecutionRequest["taskId"],
+    attemptId: ExecutionRequest["attemptId"],
+  ): StateKey<RemoteAttemptRecord> {
+    return {
+      namespace: "tego",
+      collection: WORKER_ACTIVE_ATTEMPT_COLLECTION,
+      id: attemptStateId(this.#workerId, taskId, attemptId),
+    };
+  }
+
+  #metadataKey(): StateKey<WorkerAttemptMetadata> {
+    return {
+      namespace: "tego",
+      collection: WORKER_ATTEMPT_METADATA_COLLECTION,
+      id: this.#workerId,
     };
   }
 }

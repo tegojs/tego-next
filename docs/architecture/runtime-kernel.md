@@ -236,6 +236,16 @@ results, attempt revisions, and the Worker's persistence availability.
 Acknowledged terminal results become `expired` retention tombstones after the
 configured retention period.
 
+Durable restart uses a separate bounded recovery inventory. The store returns
+only non-expired attempts, limited to one item beyond the configured active
+capacity, together with a durable highest-session-epoch watermark. Expired
+tombstones remain addressable through exact attempt lookup for permanent
+identity deduplication, but do not consume active restart capacity. The runtime
+rejects an oversized inventory or any expired record returned through this
+active-only path before adopting records. A conditional-commit conflict may be
+adopted only when its reloaded revision is strictly newer than the caller's
+prior revision.
+
 ## Persistence, revisions, and fencing
 
 State keys contain a namespace, collection, and ID. Stored values carry

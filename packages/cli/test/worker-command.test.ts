@@ -600,6 +600,10 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
     const reopened = await store.load(request.taskId, request.attemptId);
     assert.equal(reopened?.revision, "1");
     assert.equal(reopened?.fingerprint, initial.fingerprint);
+    assert.deepEqual(await store.recover(workerId, 2), {
+      highestEpoch: "1",
+      records: [reopened],
+    });
 
     const unknown = {
       ...(reopened ?? initial),
@@ -619,9 +623,115 @@ test("@spec:worker-protocol/durable-worker-attempts/sqlite-reopen-and-cas", asyn
       (await store.list(workerId)).map((record: RemoteAttemptRecord) => record.revision),
       ["2"],
     );
+    assert.deepEqual(
+      (await store.recover(workerId, 2)).records.map((record) => record.revision),
+      ["2"],
+    );
+    const completedAt = new Date(3).toISOString();
+    const terminal = await store.commit(
+      {
+        ...unknown,
+        state: "terminal",
+        updatedAt: completedAt,
+        revision: "2",
+        result: {
+          taskId: request.taskId,
+          attemptId: request.attemptId,
+          status: "succeeded",
+          executor: { kind: "remote", workerId },
+          startedAt: completedAt,
+          completedAt,
+        },
+      },
+      { expectedRevision: "2", expectedEpoch: "1" },
+    );
+    assert.equal(terminal?.revision, "3");
+    const expired = await store.commit(
+      {
+        ...(terminal ?? initial),
+        state: "expired",
+        updatedAt: new Date(4).toISOString(),
+        acknowledgedAt: new Date(4).toISOString(),
+      },
+      { expectedRevision: "3", expectedEpoch: "1" },
+    );
+    assert.equal(expired?.revision, "4");
+    assert.deepEqual(await store.recover(workerId, 2), {
+      highestEpoch: "1",
+      records: [],
+    });
   } finally {
     await state.close().catch(() => undefined);
     await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("StateRemoteAttemptStore recovery keeps tombstones out of its bounded active index", async () => {
+  const state = new MemoryStateStore();
+  const workerId = parseWorkerId("worker-attempt-recovery-index");
+  await state.open();
+  try {
+    let store = new StateRemoteAttemptStore({ state, workerId });
+    for (let index = 0; index < 513; index += 1) {
+      const request = {
+        ...assignment("org.example.expired", {
+          id: "remote-recovery-index",
+          workerId,
+        }),
+        taskId: `task-expired-${index}` as ExecutionRequest["taskId"],
+        attemptId: `attempt-expired-${index}` as ExecutionRequest["attemptId"],
+      };
+      const completedAt = new Date(index).toISOString();
+      await store.save({
+        workerId,
+        request,
+        fingerprint: requestFingerprint(request),
+        state: "expired",
+        epoch: "7",
+        updatedAt: completedAt,
+        revision: "1",
+        result: {
+          taskId: request.taskId,
+          attemptId: request.attemptId,
+          status: "succeeded",
+          executor: { kind: "remote", workerId },
+          startedAt: completedAt,
+          completedAt,
+        },
+      });
+    }
+    for (let index = 0; index < 2; index += 1) {
+      const request = {
+        ...assignment("org.example.active", {
+          id: "remote-recovery-index",
+          workerId,
+        }),
+        taskId: `task-active-${index}` as ExecutionRequest["taskId"],
+        attemptId: `attempt-active-${index}` as ExecutionRequest["attemptId"],
+      };
+      await store.save({
+        workerId,
+        request,
+        fingerprint: requestFingerprint(request),
+        state: "assigned",
+        epoch: "9",
+        updatedAt: new Date(1_000 + index).toISOString(),
+        revision: "1",
+      });
+    }
+
+    store = new StateRemoteAttemptStore({ state, workerId });
+    const recovered = await store.recover(workerId, 3);
+
+    assert.equal((await store.list(workerId)).length, 515);
+    assert.equal(recovered.highestEpoch, "9");
+    assert.equal(recovered.records.length, 2);
+    assert.equal(
+      recovered.records.every((record) => record.state !== "expired"),
+      true,
+    );
+  } finally {
+    await state.close();
   }
 });
 
@@ -672,10 +782,11 @@ test("@spec:worker-protocol/durable-worker-attempts/fences-every-mutation-when-c
       await store.delete(request.taskId, request.attemptId);
       await store.load(request.taskId, request.attemptId);
       await store.list(workerId);
+      await store.recover(workerId, 2);
 
       assert.deepEqual(
         state.transactionOptions,
-        Array.from({ length: 3 }, () =>
+        Array.from({ length: 4 }, () =>
           configuredFencing === undefined ? {} : { fencing: configuredFencing },
         ),
       );
@@ -700,9 +811,20 @@ async function putRawAttempt(
   value: RemoteAttemptRecord,
 ): Promise<void> {
   await state.transact({}, async (transaction) => {
-    await transaction.put(attemptStateKey(keyRecord), value, {
+    const key = attemptStateKey(keyRecord);
+    await transaction.put(key, value, {
       expectedRevision: "absent",
     });
+    if (value.state !== "expired") {
+      await transaction.put(
+        {
+          ...key,
+          collection: "worker-active-attempts",
+        },
+        value,
+        { expectedRevision: "absent" },
+      );
+    }
     return null;
   });
 }
@@ -760,6 +882,11 @@ test("@spec:worker-protocol/durable-worker-attempts/rejects-corrupt-sqlite-recor
       );
       await assert.rejects(
         store.list(workerId),
+        /attempt|epoch|fingerprint|worker|identity|invalid/iu,
+        fixture.name,
+      );
+      await assert.rejects(
+        store.recover(workerId, 2),
         /attempt|epoch|fingerprint|worker|identity|invalid/iu,
         fixture.name,
       );

@@ -49,6 +49,7 @@ import {
   REMOTE_INVENTORY_RESULT,
   REMOTE_RESULT,
   REMOTE_RESULT_ACK,
+  RemoteAttemptRevisionError,
   type RemoteAttemptRecord,
   type RemoteAttemptRecordExpectation,
   type RemoteAttemptStore,
@@ -571,22 +572,42 @@ export class WorkerRuntime {
   async #hydrate(): Promise<void> {
     if (this.#hydrated) return;
     this.#assertAttemptPersistenceAvailable();
-    const records = await this.#storeOperation(this.#attemptStore.list(this.#workerId));
+    const recoveryLimit =
+      this.#maxInventoryItems === Number.MAX_SAFE_INTEGER
+        ? Number.MAX_SAFE_INTEGER
+        : this.#maxInventoryItems + 1;
+    const inventory = await this.#storeOperation(
+      this.#attemptStore.recover(this.#workerId, recoveryLimit),
+    );
+    const records = inventory.records;
     if (records.length > this.#maxInventoryItems) {
       throw new Error("Worker attempt inventory exceeds maxInventoryItems");
     }
+    const recoveredHighestEpoch = BigInt(parseAttemptRevision(inventory.highestEpoch));
     const parsedRecords = records.map((record) => this.#parseStoredRecord(record));
+    const recoveredAttempts = new Set<string>();
+    for (const { record, request } of parsedRecords) {
+      if (record.state === "expired") {
+        throw new TypeError("Worker attempt recovery inventory cannot contain expired records");
+      }
+      if (BigInt(record.epoch) > recoveredHighestEpoch) {
+        throw new TypeError("Worker attempt recovery epoch exceeds its durable watermark");
+      }
+      const key = attemptKey(request.taskId, request.attemptId);
+      if (recoveredAttempts.has(key)) {
+        throw new TypeError("Worker attempt recovery inventory contains a duplicate identity");
+      }
+      recoveredAttempts.add(key);
+    }
     const durableResults = new Map(
       ((await this.#resultStore?.list()) ?? []).map((result) => [
         attemptKey(result.taskId, result.attemptId),
         parseExecutionResult(result),
       ]),
     );
+    if (recoveredHighestEpoch > this.#highestEpoch) this.#highestEpoch = recoveredHighestEpoch;
     for (const { record, request, result: terminalResult } of parsedRecords) {
-      const persistedEpoch = BigInt(record.epoch);
-      if (persistedEpoch > this.#highestEpoch) this.#highestEpoch = persistedEpoch;
       const key = attemptKey(request.taskId, request.attemptId);
-      if (record.state === "expired") continue;
       const durableResult = durableResults.get(key);
       if (durableResult !== undefined) {
         if (
@@ -1933,7 +1954,7 @@ export class WorkerRuntime {
       fingerprint: expected.fingerprint,
     });
     if (BigInt(parsed.record.revision) <= BigInt(parseAttemptRevision(expected.revision))) {
-      throw new TypeError("Committed Worker attempt revision must advance");
+      throw new RemoteAttemptRevisionError("Committed Worker attempt revision must advance");
     }
     const { revision: _committedRevision, ...committedValue } = parsed.record;
     const { revision: _expectedRevision, ...expectedValue } = expected;
@@ -1994,6 +2015,11 @@ export class WorkerRuntime {
           attemptId: attempt.request.attemptId,
           fingerprint: attempt.fingerprint,
         }).record;
+        if (BigInt(parsedLatest.revision) <= BigInt(parseAttemptRevision(attempt.revision))) {
+          throw new RemoteAttemptRevisionError(
+            "Reloaded Worker attempt revision must advance after a conditional conflict",
+          );
+        }
         attempt.revision = parsedLatest.revision;
         attempt.epoch = parsedLatest.epoch;
         if (parsedLatest.cancellation === undefined) {

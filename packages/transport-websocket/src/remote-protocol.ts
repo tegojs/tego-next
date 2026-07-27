@@ -147,6 +147,11 @@ export interface RemoteAttemptCommitCondition {
   readonly expectedEpoch?: string;
 }
 
+export interface RemoteAttemptRecovery {
+  readonly highestEpoch: string;
+  readonly records: readonly RemoteAttemptRecord[];
+}
+
 export interface RemoteAttemptStore {
   save(record: RemoteAttemptRecord): Promise<void>;
   commit(
@@ -162,6 +167,7 @@ export interface RemoteAttemptStore {
     attemptId: ExecutionRequest["attemptId"],
   ): Promise<RemoteAttemptRecord | undefined>;
   list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]>;
+  recover(workerId: WorkerId, limit: number): Promise<RemoteAttemptRecovery>;
 }
 
 export interface RemoteAttemptRecordExpectation {
@@ -196,6 +202,8 @@ export function isRemoteAttemptRevisionError(error: unknown): error is RemoteAtt
 }
 
 export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
+  readonly #activeRecords = new Map<string, RemoteAttemptRecord>();
+  readonly #highestEpochs = new Map<WorkerId, bigint>();
   readonly #records = new Map<string, RemoteAttemptRecord>();
   readonly #onSave: ((record: RemoteAttemptRecord) => void) | undefined;
 
@@ -209,7 +217,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       ...record,
       revision: parseAttemptRevision(record.revision),
     }) as unknown as RemoteAttemptRecord;
-    this.#records.set(key, snapshot);
+    this.#storeSnapshot(key, snapshot);
     this.#onSave?.(snapshot);
   }
 
@@ -237,7 +245,7 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
       ...record,
       revision: incrementRevision(currentRevision ?? "0"),
     }) as unknown as RemoteAttemptRecord;
-    this.#records.set(key, snapshot);
+    this.#storeSnapshot(key, snapshot);
     this.#onSave?.(snapshot);
     return cloneJson(snapshot) as unknown as RemoteAttemptRecord;
   }
@@ -254,13 +262,43 @@ export class MemoryRemoteAttemptStore implements RemoteAttemptStore {
     taskId: ExecutionRequest["taskId"],
     attemptId: ExecutionRequest["attemptId"],
   ): Promise<void> {
-    this.#records.delete(attemptKey(taskId, attemptId));
+    const key = attemptKey(taskId, attemptId);
+    this.#records.delete(key);
+    this.#activeRecords.delete(key);
   }
 
   async list(workerId: WorkerId): Promise<readonly RemoteAttemptRecord[]> {
     return [...this.#records.values()]
       .filter((record) => record.workerId === workerId)
       .map((record) => cloneJson(record) as unknown as RemoteAttemptRecord);
+  }
+
+  async recover(workerId: WorkerId, limit: number): Promise<RemoteAttemptRecovery> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new RangeError("Remote attempt recovery limit must be a positive safe integer");
+    }
+    const records: RemoteAttemptRecord[] = [];
+    for (const record of this.#activeRecords.values()) {
+      if (record.workerId !== workerId) continue;
+      if (records.length >= limit) break;
+      records.push(cloneJson(record) as unknown as RemoteAttemptRecord);
+    }
+    return {
+      highestEpoch: (this.#highestEpochs.get(workerId) ?? 0n).toString(),
+      records,
+    };
+  }
+
+  #storeSnapshot(key: string, snapshot: RemoteAttemptRecord): void {
+    this.#records.set(key, snapshot);
+    if (snapshot.state === "expired") {
+      this.#activeRecords.delete(key);
+    } else {
+      this.#activeRecords.set(key, snapshot);
+    }
+    const epoch = BigInt(parseAttemptRevision(snapshot.epoch));
+    const highestEpoch = this.#highestEpochs.get(snapshot.workerId) ?? 0n;
+    if (epoch > highestEpoch) this.#highestEpochs.set(snapshot.workerId, epoch);
   }
 }
 

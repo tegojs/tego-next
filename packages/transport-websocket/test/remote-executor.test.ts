@@ -276,6 +276,10 @@ test("RemoteExecutor rejects mismatched immutable targets before attempt-store a
           storeCalls += 1;
           return [];
         },
+        recover: async () => {
+          storeCalls += 1;
+          return { highestEpoch: "0", records: [] };
+        },
       };
       const remote = new RemoteExecutor({
         id: "remote",
@@ -386,6 +390,7 @@ test("hydration rejects foreign persisted attempts before target-scoped access",
         delete: async () => undefined,
         load: async () => undefined,
         list: async () => [record],
+        recover: async () => ({ highestEpoch: record.epoch, records: [record] }),
       };
       const [mainSession, workerSession] = memorySessionPair("1");
       const runtime = new WorkerRuntime({
@@ -459,6 +464,7 @@ test("hydration rejects a forged persisted terminal result before observation or
     delete: async () => undefined,
     load: async () => undefined,
     list: async () => [record],
+    recover: async () => ({ highestEpoch: record.epoch, records: [record] }),
   };
   const [mainSession, workerSession] = memorySessionPair("1");
   const runtime = new WorkerRuntime({
@@ -542,6 +548,10 @@ test("WorkerRuntime rejects non-bound immutable targets before persistence, ACK,
         list: async () => {
           storeCalls += 1;
           return [];
+        },
+        recover: async () => {
+          storeCalls += 1;
+          return { highestEpoch: "0", records: [] };
         },
       };
       const [mainSession, workerSession] = memorySessionPair("1");
@@ -724,13 +734,16 @@ test("authority revoke fences an attach that was queued before revocation", asyn
 });
 
 test("authority revoke fences an attach whose hydration is already in progress", async () => {
-  const listStarted = Promise.withResolvers<void>();
-  const releaseList = Promise.withResolvers<void>();
-  class BlockingListStore extends MemoryRemoteAttemptStore {
-    override async list(requestedWorkerId: typeof workerId) {
-      listStarted.resolve();
-      await releaseList.promise;
-      return super.list(requestedWorkerId);
+  const recoveryStarted = Promise.withResolvers<void>();
+  const releaseRecovery = Promise.withResolvers<void>();
+  class BlockingRecoveryStore extends MemoryRemoteAttemptStore {
+    override async recover(
+      requestedWorkerId: Parameters<MemoryRemoteAttemptStore["recover"]>[0],
+      limit: Parameters<MemoryRemoteAttemptStore["recover"]>[1],
+    ) {
+      recoveryStarted.resolve();
+      await releaseRecovery.promise;
+      return super.recover(requestedWorkerId, limit);
     }
   }
   const [mainSession, workerSession] = memorySessionPair("1");
@@ -745,14 +758,14 @@ test("authority revoke fences an attach whose hydration is already in progress",
     id: "remote",
     workerId,
     clock,
-    attemptStore: new BlockingListStore(),
+    attemptStore: new BlockingRecoveryStore(),
   });
   cleanups.push(async () => runtime.close());
 
   const attaching = remote.attach(mainSession);
-  await listStarted.promise;
+  await recoveryStarted.promise;
   remote.revokeAuthority();
-  releaseList.resolve();
+  releaseRecovery.resolve();
 
   await assert.rejects(attaching, /authority|revoked/iu);
   assert.equal((await remote.probe()).available, false);
@@ -1011,6 +1024,7 @@ test("Worker attempt-store failure rejects before local execution instead of lea
       },
       load: async () => undefined,
       list: async () => [],
+      recover: async () => ({ highestEpoch: "0", records: [] }),
     },
     selectExecutor: () => local,
   });
