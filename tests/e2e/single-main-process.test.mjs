@@ -190,7 +190,7 @@ async function deployAndRun({ endpoint, executor, generation, input }) {
     "--permissions",
     JSON.stringify(permissions),
     "--configuration",
-    JSON.stringify(input.configuration),
+    JSON.stringify(input.configuration ?? {}),
     "--endpoint",
     endpoint,
     "--json",
@@ -844,8 +844,6 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
     await settleWithCleanup(async () => {
       if (operationError !== undefined) throw operationError;
     }, [
-      async () => stopProcess(restartedWorker),
-      async () => stopProcess(worker),
       ...mains.flatMap((main) =>
         main.handle === killedLeader
           ? []
@@ -855,6 +853,8 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
               async () => stopProcess(main.handle),
             ],
       ),
+      async () => stopProcess(restartedWorker),
+      async () => stopProcess(worker),
       ...mainConfigurations.map(
         (configuration) => async () => rm(configuration.endpoint, { force: true }),
       ),
