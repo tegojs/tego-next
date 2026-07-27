@@ -237,7 +237,14 @@ test("@spec:runtime-operations/plugin-development-operations/deploy-and-status-u
     return response(
       {
         identity: request.input,
-        observation: { state: "running" },
+        observation: {
+          applicationId: "application-test",
+          pluginId: "org.example.echo",
+          generation: "1",
+          status: "ready",
+          diagnostics: [],
+          updatedAt: "2026-07-25T00:00:00.000Z",
+        },
       },
       request.requestId,
     );
@@ -337,7 +344,14 @@ test("@spec:runtime-operations/plugin-development-operations/human-and-json-use-
       applicationId: "application-default",
       pluginId: "org.example.echo",
     },
-    observation: { state: "running" },
+    observation: {
+      applicationId: "application-default",
+      pluginId: "org.example.echo",
+      generation: "1",
+      status: "ready",
+      diagnostics: [],
+      updatedAt: "2026-07-25T00:00:00.000Z",
+    },
   };
   const requestControl = async (request: ControlClientOptions) =>
     response(result, request.requestId);

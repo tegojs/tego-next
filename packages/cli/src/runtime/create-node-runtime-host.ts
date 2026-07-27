@@ -983,6 +983,20 @@ export async function createNodeRuntimeHost(
       return activeReconciler;
     },
   });
+  let runtimeStarted = false;
+  const ownedRuntime: Runtime = {
+    operations: runtime.operations,
+    events: runtime.events,
+    start: async () => {
+      await runtime.start();
+      runtimeStarted = true;
+    },
+    status: () => runtime.status(),
+    stop: async (stopOptions) => {
+      runtimeStarted = false;
+      await runtime.stop(stopOptions);
+    },
+  };
   const artifactIngress: LocalArtifactIngress = {
     putPath: async (artifactPath) => {
       const resolved = await realpath(artifactPath);
@@ -1003,6 +1017,9 @@ export async function createNodeRuntimeHost(
   };
   const startWorkerListener = async (): Promise<string | undefined> => {
     if (listenerOwner === undefined) return undefined;
+    if (!runtimeStarted) {
+      throw new Error("Runtime must be running before the Worker listener binds");
+    }
     const status = await runtime.status();
     if (status.lifecycle !== "running") {
       throw new Error("Runtime must be running before the Worker listener binds");
@@ -1010,7 +1027,7 @@ export async function createNodeRuntimeHost(
     return listenerOwner.start();
   };
   return {
-    runtime,
+    runtime: ownedRuntime,
     artifactIngress,
     startWorkerListener,
   };
