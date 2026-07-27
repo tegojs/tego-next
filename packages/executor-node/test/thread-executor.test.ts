@@ -447,6 +447,19 @@ export default {
 };
 `;
 
+const remoteRuntimeComponentSource = `
+export default {
+  protocol: "tego.component/1.0",
+  kind: "task",
+  async run(context) {
+    return {
+      executor: context.runtime.executor,
+      runtimeId: context.runtime.runtimeId
+    };
+  }
+};
+`;
+
 const nonSettlingStartComponentSource = `
 export default {
   protocol: "tego.component/1.0",
@@ -1748,6 +1761,70 @@ test("thread component session owns one Worker across same-target attempts and r
 
   await eventually(() => assert.equal(factory.active, 0));
   assert.deepEqual(lifecycle, ["lifecycle.start", "lifecycle.drain", "lifecycle.stop"]);
+});
+
+test("thread component session materializes an exact remote target through local isolation", async () => {
+  const local = request({ mode: "runtime" }, "session-remote-target");
+  const remoteTarget = {
+    ...local.target,
+    executor: {
+      id: "remote-worker",
+      type: "remote" as const,
+      workerId: parseWorkerId("worker-a"),
+    },
+  };
+  const identity = {
+    applicationId: local.applicationId,
+    pluginId: local.pluginId,
+    componentId: local.componentId,
+    target: remoteTarget,
+  };
+  const permissionGrants = [{ kind: "executor", executors: ["remote"] }] as const;
+  const execution = {
+    ...local,
+    target: remoteTarget,
+    binding: createExecutionBinding(identity, {
+      configuration: {},
+      permissionGrants,
+      capabilityDefinitions: [],
+      capabilityBindings: [],
+    }),
+  };
+  const fixture = await artifact({ source: remoteRuntimeComponentSource });
+  const manifest = parsePluginManifest({ ...fixture.manifest, permissions: permissionGrants });
+  const factory = new TrackingWorkerFactory();
+  const executorOptions = await options(factory, {
+    remoteWorkerIsolation: true,
+  });
+  const createSession = await loadThreadComponentSessionFactory();
+  const session = await createSession({
+    target: execution.target,
+    identity: execution,
+    component: {
+      target: local.target,
+      artifactDigest: digest,
+      artifactRoot: fixture.artifactRoot,
+      manifest,
+      runtimeId: "runtime",
+      instanceId: execution.target.instanceId,
+      configuration: {},
+      permissionGrants,
+      capabilityDefinitions: [],
+    },
+    executorOptions,
+  });
+
+  try {
+    assert.deepEqual(session.target, remoteTarget);
+    assert.deepEqual((await (await session.submit(execution)).result).output, {
+      executor: "remote",
+      runtimeId: "runtime",
+    });
+    assert.equal(factory.active, 1);
+  } finally {
+    await session.close();
+  }
+  await eventually(() => assert.equal(factory.active, 0));
 });
 
 test("thread component session refuses unhealthy activation before accepting a run", async () => {
