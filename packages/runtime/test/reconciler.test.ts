@@ -2519,10 +2519,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   );
   const alternateManifest = capabilityManifest(
     alternateId,
-    [
-      capabilityProvision(capabilityZ, "1.0.0"),
-      capabilityProvision(capabilityA, "1.0.0"),
-    ],
+    [capabilityProvision(capabilityZ, "1.0.0"), capabilityProvision(capabilityA, "1.0.0")],
     [],
   );
   const consumerManifest = capabilityManifest(
