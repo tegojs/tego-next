@@ -372,18 +372,124 @@ test("CI reporter times out and terminates a child before writing final metadata
   }
 });
 
-test("release verification converts command failures into structured diagnostics", async () => {
+test("CI reporter reaps a timed-out child and grandchild before final metadata", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-ci-reporter-process-tree-"));
+  const reporter = join(root, "scripts", "run-ci-test.mjs");
+  const grandchild = [
+    'console.log("grandchild-pid:" + process.pid);',
+    'process.on("SIGTERM", () => console.log("grandchild-ignored-sigterm"));',
+    "setInterval(() => {}, 1000);",
+  ].join("");
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    `const grandchild = spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}],`,
+    "{ stdio: ['ignore', 'inherit', 'inherit'] });",
+    'console.log("child-pid:" + process.pid);',
+    'console.log("spawned-grandchild-pid:" + grandchild.pid);',
+    'process.on("SIGTERM", () => console.log("child-ignored-sigterm"));',
+    "setInterval(() => {}, 1000);",
+  ].join("");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        reporter,
+        "--name",
+        "process-tree-timeout",
+        "--artifacts",
+        directory,
+        "--timeout-ms",
+        "200",
+        "--",
+        process.execPath,
+        "--input-type=commonjs",
+        "-e",
+        parent,
+      ],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(result.error, undefined);
+    assert.notEqual(result.status, 0);
+
+    const metadata = JSON.parse(
+      await readFile(join(directory, "process-tree-timeout-result.json"), "utf8"),
+    );
+    const log = await readFile(join(directory, "process-tree-timeout-process.log"), "utf8");
+    const childPid = Number.parseInt(log.match(/child-pid:(\d+)/u)?.[1] ?? "", 10);
+    const grandchildPid = Number.parseInt(
+      log.match(/spawned-grandchild-pid:(\d+)/u)?.[1] ?? "",
+      10,
+    );
+    assert.ok(Number.isInteger(childPid));
+    assert.ok(Number.isInteger(grandchildPid));
+    assert.equal(metadata.timedOut, true);
+    assert.equal(metadata.processTreeTerminated, true);
+    assert.equal(metadata.childPid, childPid);
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+    assert.throws(() => process.kill(grandchildPid, 0), { code: "ESRCH" });
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("release verification bounds stages and reports deterministic process metadata", async () => {
   const { runReleaseCommand } = await import(
     new URL(`../../scripts/verify-release.mjs?command=${Date.now()}`, import.meta.url)
   );
 
-  assert.throws(
+  const success = await runReleaseCommand({
+    name: "successful probe",
+    command: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    timeoutMs: 1_000,
+  });
+  assert.equal(success.name, "successful probe");
+  assert.equal(success.timedOut, false);
+  assert.equal(success.exitCode, 0);
+  assert.equal(success.childExitCode, 0);
+  assert.equal(success.childSignal, null);
+  assert.equal(success.timeoutMs, 1_000);
+  assert.ok(success.startedAt.length > 0);
+  assert.ok(success.finishedAt.length > 0);
+  assert.ok(success.durationMs >= 0);
+
+  await assert.rejects(
     () =>
       runReleaseCommand({
         name: "failing probe",
         command: process.execPath,
         args: ["-e", "process.exit(7)"],
+        timeoutMs: 1_000,
       }),
-    (error) => error.code === "command_failed" && error.command === process.execPath,
+    (error) =>
+      error.code === "command_failed" &&
+      error.command === process.execPath &&
+      error.stage.exitCode === 7 &&
+      error.stage.timedOut === false,
   );
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () =>
+      runReleaseCommand({
+        name: "hanging probe",
+        command: process.execPath,
+        args: [
+          "-e",
+          'process.on("SIGTERM", () => {}); setTimeout(() => process.exit(0), 750);',
+        ],
+        timeoutMs: 100,
+      }),
+    (error) =>
+      error.code === "command_timed_out" &&
+      error.command === process.execPath &&
+      error.stage.name === "hanging probe" &&
+      error.stage.timedOut === true &&
+      error.stage.timeoutMs === 100 &&
+      error.stage.exitCode === 124 &&
+      typeof error.stage.startedAt === "string" &&
+      typeof error.stage.finishedAt === "string" &&
+      error.stage.durationMs >= 100,
+  );
+  assert.ok(Date.now() - startedAt < 700, "release stage timeout must be bounded");
 });

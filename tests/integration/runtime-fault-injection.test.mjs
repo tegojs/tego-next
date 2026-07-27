@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createNodeRuntimeHost, packPlugin } from "@tegojs/cli";
+import { createNodeRuntimeHost, packPlugin, StateRemoteAttemptStore } from "@tegojs/cli";
 import {
   createExecutionBinding,
   diagnosticCode,
@@ -18,6 +27,7 @@ import {
   parseWorkerId,
 } from "@tegojs/contracts";
 import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
+import { PostgresStateStore } from "@tegojs/drivers-postgres";
 import { ComponentEffects, ComponentRegistry, Reconciler } from "@tegojs/runtime";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tegojs/transport-websocket";
@@ -280,6 +290,15 @@ async function cleanupPermissionFaultEvidence({ directory, host, primaryError, r
   assert.equal(teardownComplete, true, "runtime teardown must complete before evidence deletion");
 
   try {
+    const makeDirectoriesWritable = async (path) => {
+      const identity = await lstat(path).catch(() => undefined);
+      if (identity === undefined || identity.isSymbolicLink() || !identity.isDirectory()) return;
+      await chmod(path, 0o700);
+      for (const entry of await readdir(path)) {
+        await makeDirectoriesWritable(join(path, entry));
+      }
+    };
+    await makeDirectoriesWritable(directory);
     await remove(directory, { recursive: true, force: true });
   } catch (removalError) {
     if (primaryError !== undefined) {
@@ -292,6 +311,32 @@ async function cleanupPermissionFaultEvidence({ directory, host, primaryError, r
   }
 
   if (primaryError !== undefined) throw primaryError;
+}
+
+async function withFaultStateStores(t, run) {
+  await t.test("MemoryStateStore", async () => {
+    const store = new MemoryStateStore({ clock: new FakeClock(new Date(0)) });
+    await store.open();
+    try {
+      await run(store);
+    } finally {
+      await store.close();
+    }
+  });
+  await t.test("SqliteStateStore", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tego-runtime-fault-store-"));
+    const store = new SqliteStateStore({
+      clock: new FakeClock(new Date(0)),
+      databasePath: join(directory, "state.sqlite"),
+    });
+    await store.open();
+    try {
+      await run(store);
+    } finally {
+      await store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 }
 
 test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-before-commit", async () => {
@@ -408,36 +453,126 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/starting-checkpoint-real-
   }
 });
 
-test("@spec:coordination-provider/fenced-leadership/stale-epoch-fault", async () => {
-  const state = new MemoryStateStore({ clock: new FakeClock(new Date(0)) });
+async function assertStaleAuthorityRejected(state) {
   const key = { namespace: "fault", collection: "authority", id: "runtime" };
   const staleKey = { namespace: "fault", collection: "authority", id: "stale-write" };
-  await state.open();
-  try {
-    await state.transact(
-      { fencing: { resource: "runtime", epoch: parseFencingEpoch("2") } },
+  await state.transact(
+    { fencing: { resource: "runtime", epoch: parseFencingEpoch("2") } },
+    async (transaction) => {
+      await transaction.put(key, { owner: "leader-b" }, { expectedRevision: "absent" });
+      return null;
+    },
+  );
+
+  await assert.rejects(
+    state.transact(
+      { fencing: { resource: "runtime", epoch: parseFencingEpoch("1") } },
       async (transaction) => {
-        await transaction.put(key, { owner: "leader-b" }, { expectedRevision: "absent" });
+        await transaction.put(staleKey, { owner: "leader-a" }, { expectedRevision: "absent" });
         return null;
       },
-    );
+    ),
+    (error) => diagnosticCode(error) === "STATE_FENCE_STALE",
+  );
+  assert.equal((await state.read(key))?.value.owner, "leader-b");
+  assert.equal(await state.read(staleKey), undefined);
+}
 
-    await assert.rejects(
-      state.transact(
-        { fencing: { resource: "runtime", epoch: parseFencingEpoch("1") } },
-        async (transaction) => {
-          await transaction.put(staleKey, { owner: "leader-a" }, { expectedRevision: "absent" });
-          return null;
-        },
-      ),
-      (error) => diagnosticCode(error) === "STATE_FENCE_STALE",
-    );
-    assert.equal((await state.read(key))?.value.owner, "leader-b");
-    assert.equal(await state.read(staleKey), undefined);
-  } finally {
+test("@spec:coordination-provider/fenced-leadership/stale-epoch-fault", async (t) => {
+  await withFaultStateStores(t, assertStaleAuthorityRejected);
+});
+
+test(
+  "@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
+  { skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false },
+  async () => {
+    const namespace = `fault_${process.pid}_${Date.now()}`;
+    const state = new PostgresStateStore({
+      connectionString: process.env.TEGO_POSTGRES_URL,
+      namespace,
+    });
+    await state.open();
+    try {
+      await assertStaleAuthorityRejected(state);
+    } finally {
+      await state.close();
+    }
+  },
+);
+
+test("@spec:worker-protocol/durable-worker-attempts/restart-terminal-replay-fault", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-remote-attempt-restart-"));
+  const databasePath = join(directory, "state.sqlite");
+  const workerId = parseWorkerId("worker-fault-restart");
+  const request = executionRequest(workerId);
+  const result = terminalResult(request);
+  let state = new SqliteStateStore({ databasePath });
+  let firstRemote;
+  let secondRemote;
+  let firstSession;
+  let secondSession;
+  try {
+    await state.open();
+    firstRemote = new RemoteExecutor({
+      id: "fault-remote",
+      workerId,
+      clock: new FakeClock(new Date(0)),
+      attemptStore: new StateRemoteAttemptStore({ state, workerId }),
+    });
+    firstSession = new DeterministicRemoteSession();
+    await firstRemote.attach(firstSession);
+    const firstHandle = await firstRemote.submit(request);
+    firstSession.emitResult(result, "before-restart");
+    assert.deepEqual(await firstHandle.result, result);
+    await eventually(() => assert.equal(firstSession.resultAcknowledgements.length, 1));
+    await firstRemote.close();
+    firstRemote = undefined;
+    firstSession.close();
+    firstSession = undefined;
     await state.close();
+
+    state = new SqliteStateStore({ databasePath });
+    await state.open();
+    const reopenedAttempts = new StateRemoteAttemptStore({ state, workerId });
+    secondRemote = new RemoteExecutor({
+      id: "fault-remote",
+      workerId,
+      clock: new FakeClock(new Date(0)),
+      attemptStore: reopenedAttempts,
+    });
+    secondSession = new DeterministicRemoteSession();
+    secondSession.epoch = "2";
+    const requestFromSession = secondSession.request.bind(secondSession);
+    secondSession.request = async (type, payload) => {
+      const response = await requestFromSession(type, payload);
+      return type === "session.reconcile"
+        ? {
+            ...response,
+            payload: {
+              ...response.payload,
+              terminalUnacknowledged: [{ result }],
+            },
+          }
+        : response;
+    };
+    await secondRemote.attach(secondSession);
+    const recovered = await secondRemote.submit(request);
+    assert.deepEqual(await recovered.result, result);
+    await eventually(() => assert.equal(secondSession.resultAcknowledgements.length, 1));
+
+    const terminal = (await reopenedAttempts.list(workerId)).filter(
+      (record) => record.state === "terminal",
+    );
+    assert.equal(terminal.length, 1);
+    assert.deepEqual(terminal[0].result, result);
+  } finally {
+    await secondRemote?.close();
+    await firstRemote?.close();
+    secondSession?.close();
+    firstSession?.close();
+    await state.close().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
   }
-  await assert.rejects(state.read(key), (error) => diagnosticCode(error) === "STATE_CLOSED");
 });
 
 test("@spec:worker-protocol/durable-worker-attempts/duplicate-terminal-result-fault", async () => {
@@ -639,8 +774,59 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/permission-before-im
       ),
       true,
     );
-    const loadCount = await readMarkerLoadCount(markerPath);
-    assert.equal(loadCount, 0);
+    assert.equal(await readMarkerLoadCount(markerPath), 0);
+    await host.runtime.stop();
+    host = undefined;
+
+    const correctedState = new SqliteStateStore({
+      databasePath: join(dataDirectory, "state.sqlite"),
+    });
+    await correctedState.open();
+    try {
+      await correctedState.transact({}, async (transaction) => {
+        const key = {
+          namespace: "tego",
+          collection: "deployments",
+          id: "application-default/org.example.permission-fault",
+        };
+        const current = await transaction.get(key);
+        assert.ok(current);
+        await transaction.put(
+          key,
+          {
+            ...current.value,
+            permissionGrants: [{ kind: "executor", executors: ["thread"] }],
+          },
+          { expectedRevision: current.revision },
+        );
+        return null;
+      });
+    } finally {
+      await correctedState.close();
+    }
+
+    host = await createNodeRuntimeHost({
+      applicationId: "application-default",
+      dataDirectory,
+      mode: "single-main",
+      nodeId: "node-permission-fault-corrected",
+      runtimeId: "runtime-permission-fault",
+    });
+    await host.runtime.start();
+    await eventually(async () => {
+      const status = await host.runtime.operations.pluginStatus({
+        applicationId: "application-default",
+        pluginId: "org.example.permission-fault",
+      });
+      assert.equal(status.observation?.status, "ready");
+    });
+    assert.equal(await readMarkerLoadCount(markerPath), 1);
+    const stableStatus = await host.runtime.operations.pluginStatus({
+      applicationId: "application-default",
+      pluginId: "org.example.permission-fault",
+    });
+    assert.equal(stableStatus.observation?.status, "ready");
+    assert.equal(await readMarkerLoadCount(markerPath), 1);
   } catch (error) {
     testError = error;
   } finally {

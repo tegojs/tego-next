@@ -1382,6 +1382,24 @@ test("starting checkpoint lifecycle interruption restores exact effect across Me
     const ready = await readOnlyInstance(state, start.instanceId);
     assert.equal(ready?.value.lifecycle, "ready");
     assert.equal(ready?.value.diagnostic, undefined);
+    const operationHistory = [];
+    for await (const entry of state.scanOperationHistory()) {
+      if (entry.operationId === start.operationId) operationHistory.push(entry);
+    }
+    assert.equal(operationHistory.at(-1)?.status, "completed");
+    assert.equal(
+      operationHistory.filter((entry) => entry.status === "completed").length,
+      1,
+    );
+    assert.deepEqual(
+      await state.claimOutbox({
+        leaseDurationMs: 1_000,
+        limit: 10,
+        owner: "post-recovery-audit",
+        topic: "component.lifecycle",
+      }),
+      [],
+    );
     await reconciler.stop();
   });
 });
