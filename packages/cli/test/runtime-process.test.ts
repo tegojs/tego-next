@@ -578,6 +578,13 @@ test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-clean
   );
   try {
     await waitForPath(endpoint, directory);
+    const status = await requestControl({
+      endpoint,
+      operation: "runtime.status",
+      input: {},
+      timeoutMs: 1_000,
+    });
+    assert.equal(status.ok, true);
     assert.equal(child.kill("SIGTERM"), true);
     const exit = await waitForExit(child);
     assert.deepEqual(exit, { code: 0, signal: null });

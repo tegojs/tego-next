@@ -82,6 +82,10 @@ The runtime SHALL authorize a capability call against the consumer's permission 
 - **WHEN** a replacement Main observes durable executing evidence without a terminal result for the same invocation ID and fingerprint
 - **THEN** it reports the invocation as indeterminate and does not execute provider code again
 
+#### Scenario: Successful provider completion persistence is uncertain
+- **WHEN** provider code succeeds but writing its durable completed record fails with an unknown commit outcome
+- **THEN** the runtime reloads authoritative evidence, returns a committed completed result when present, otherwise reports the invocation as indeterminate while retaining executing evidence, and never rewrites the successful provider effect as failed
+
 #### Scenario: Capability invocation identity cannot equivocate
 - **WHEN** the same exact consumer reuses an invocation ID with a different canonical payload
 - **THEN** the runtime rejects it as an idempotency conflict before provider dispatch

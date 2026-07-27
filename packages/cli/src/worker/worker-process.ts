@@ -416,6 +416,7 @@ function isRetryableNetworkError(error: unknown): boolean {
     return (
       error.diagnostic.code === "PROTOCOL_HANDSHAKE_TIMEOUT" ||
       error.diagnostic.code === "WORKER_HEARTBEAT_EXPIRED" ||
+      error.diagnostic.code === "WORKER_ENDPOINT_UNAVAILABLE" ||
       error.diagnostic.code === "WORKER_TRANSPORT_ERROR"
     );
   }

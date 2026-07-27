@@ -1518,9 +1518,10 @@ export class RemoteExecutor implements Executor {
   }
 
   async #reconcile(session: RemoteSession): Promise<boolean> {
-    const activations = [...this.#componentActivations.values()]
-      .filter((entry) => entry.state === "active")
-      .map((entry) => cloneJson(entry.activation));
+    const activations = [...this.#componentActivations.values()].map((entry) => ({
+      activation: cloneJson(entry.activation),
+      state: entry.state,
+    }));
     if (
       activations.length > this.#maxInventoryItems ||
       jsonBytes(activations) > this.#maxInventoryBytes
@@ -1587,6 +1588,46 @@ export class RemoteExecutor implements Executor {
     }
     if (acknowledged.size + running.size + terminal.length > this.#maxInventoryItems) {
       throw new Error("Remote attempt inventory exceeds maxInventoryItems");
+    }
+    if (
+      !Array.isArray(payload.componentActivations) ||
+      payload.componentActivations.length > this.#maxInventoryItems
+    ) {
+      throw new Error("Remote component activation inventory is invalid");
+    }
+    if (payload.componentActivations.length > 0) {
+      this.#lifecycleManaged = true;
+    }
+    const retainedActivationKeys = new Set<string>();
+    for (const value of payload.componentActivations) {
+      const retained = asObject(value, "remote component activation inventory");
+      if (retained.state !== "active" && retained.state !== "draining") {
+        throw new Error("Remote component activation state is invalid");
+      }
+      const activation = parseRemoteComponentActivation(retained.activation);
+      this.#assertExactTarget(activation.target, "component activation inventory");
+      const key = this.#activationKey(activation.target);
+      if (retainedActivationKeys.has(key)) {
+        throw new Error("Remote component activation inventory contains a duplicate target");
+      }
+      retainedActivationKeys.add(key);
+      const existing = this.#componentActivations.get(key);
+      if (existing !== undefined) {
+        if (
+          existing.state !== retained.state ||
+          existing.activation.bindingFingerprint !== activation.bindingFingerprint ||
+          !this.#sameTarget(existing.activation.target, activation.target)
+        ) {
+          throw new Error("Remote component activation inventory conflicts with Main state");
+        }
+        continue;
+      }
+      if (retained.state === "draining") {
+        this.#componentActivations.set(key, {
+          activation: cloneJson(activation),
+          state: "draining",
+        });
+      }
     }
     const terminalKeys = new Set<string>();
     for (const result of terminal) {

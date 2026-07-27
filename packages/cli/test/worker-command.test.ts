@@ -8,6 +8,7 @@ import { test } from "node:test";
 import {
   type ArtifactDigest,
   createExecutionBinding,
+  DiagnosticError,
   type ExecutionRequest,
   type JsonValue,
   parseApplicationId,
@@ -19,6 +20,7 @@ import {
   parsePluginId,
   parsePluginManifest,
   parseWorkerId,
+  runtimeDiagnostic,
   type StateFencing,
   type StateTransaction,
   type StateTransactionOptions,
@@ -1142,6 +1144,89 @@ test("@spec:worker-protocol/independent-worker-command/connect-retries-initial-n
     if (disruptor.listening) await closeServer(disruptor);
     await Promise.allSettled([listener?.close(), main.close()]);
     await beforeDeadline(running, "initial retry Worker cleanup");
+    await cleanupDirectory(directory);
+  }
+});
+
+test("@spec:worker-protocol/independent-worker-command/connect-rotates-from-follower-to-leader", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-worker-connect-follower-"));
+  const workerId = parseWorkerId("worker-connect-follower");
+  const credential = "follower-rotation-secret";
+  const follower = createMainEndpoint({
+    credential,
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+    assertRegistrationPublishable: () => {
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "COORDINATION_NOT_LEADER",
+          message: "Worker registration requires the authoritative Main",
+          source: { kind: "runtime", id: "follower" },
+        }),
+      );
+    },
+  });
+  const leader = createMainEndpoint({
+    credential,
+    workerId,
+    epochAllocator: new MemoryWorkerEpochAllocator(),
+  });
+  const followerListener = await listenForMain({
+    endpoint: follower,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const leaderListener = await listenForMain({
+    endpoint: leader,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const parsed = parseCommand([
+    "worker",
+    "start",
+    "--connect",
+    followerListener.url.href,
+    "--credential",
+    credential,
+    "--worker-id",
+    workerId,
+    "--data-dir",
+    join(directory, "data"),
+  ]) as WorkerStartCommand;
+  if (parsed.direction !== "connect") throw new Error("test command must connect");
+  const command: WorkerStartCommand = {
+    ...parsed,
+    fallbackUrls: [leaderListener.url.href],
+  };
+  const controller = new AbortController();
+  const ready = Promise.withResolvers<WorkerReadiness>();
+  const running = runWorkerProcess(command, {
+    signal: controller.signal,
+    onReady: (readiness) => ready.resolve(readiness),
+  });
+
+  try {
+    const readiness = await beforeDeadline(
+      Promise.race([
+        ready.promise,
+        running.then(() => {
+          throw new Error("Worker exited before connecting to the leader");
+        }),
+      ]),
+      "Worker follower-to-leader rotation",
+    );
+    assert.equal(readiness.url, leaderListener.url.href);
+    assert.equal(follower.current(workerId), undefined);
+    assert.equal(leader.current(workerId)?.available, true);
+  } finally {
+    controller.abort();
+    await Promise.allSettled([
+      followerListener.close(),
+      leaderListener.close(),
+      follower.close(),
+      leader.close(),
+    ]);
+    await running.catch(() => undefined);
     await cleanupDirectory(directory);
   }
 });

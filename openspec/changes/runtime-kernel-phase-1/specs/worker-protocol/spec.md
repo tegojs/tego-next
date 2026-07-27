@@ -42,7 +42,7 @@ The Worker SHALL register labels, resources, executors, and prepared artifacts a
 - **THEN** the Main marks it unavailable and stops assigning new tasks
 
 ### Requirement: Reconnect reconciliation
-The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and Main-authoritative active component bindings after a session reconnect. Active bindings SHALL be validated and materialized on a replacement Worker runtime before Main accepts assignments. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active.
+The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and exact component activation lifecycle state after a session reconnect. Main SHALL send every locally retained active or draining binding so a replacement Worker can validate and materialize it with the same admission state. Worker SHALL report every retained binding and lifecycle state so a replacement Main can recover exact draining teardown authority without trusting a Worker-reported active binding as a new Main activation. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active.
 
 #### Scenario: Result completes while disconnected
 - **WHEN** a task using `finish-and-buffer` completes after its session disconnects
@@ -62,7 +62,19 @@ The protocol SHALL reconcile running attempts, buffered terminal results, Worker
 
 #### Scenario: Draining component replay cannot become active
 - **WHEN** a higher-epoch session encounters a retained draining activation or Main retries that same activation
-- **THEN** the Worker rejects the replay and Main does not publish the component as active
+- **THEN** reconciliation preserves the non-accepting binding, the Worker rejects an active promotion, and Main does not publish the component as active
+
+#### Scenario: Replacement Worker completes draining teardown
+- **WHEN** Main retains a draining component binding and a replacement Worker runtime reconnects
+- **THEN** the Worker materializes that exact binding as non-accepting so a later exact stop can release it
+
+#### Scenario: Replacement Main completes retained Worker teardown
+- **WHEN** a Worker retains a draining component binding and reconnects to a replacement authoritative Main
+- **THEN** the Worker reports that exact non-accepting state and the Main hydrates enough lifecycle identity to issue the exact stop without restarting the Worker
+
+#### Scenario: Worker rotates away from a follower endpoint
+- **WHEN** a Worker connect list reaches an authenticated Main that rejects registration because it is not authoritative
+- **THEN** the session reports a retryable endpoint-unavailable outcome, the Worker tries the next bounded URL, and authentication failures remain terminal
 
 ### Requirement: Orphan policy
 The runtime SHALL apply `cancel`, `finish-and-buffer`, or `finish-and-persist` when a Worker loses its Main session.

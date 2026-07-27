@@ -104,6 +104,49 @@ function durableState(): StateStore {
   } as StateStore;
 }
 
+function durableStateWithCompletionFault(mode: "after-commit" | "before-commit"): StateStore {
+  const state = durableState();
+  let injected = false;
+  return {
+    ...state,
+    transact: async <T extends JsonValue>(
+      options: Parameters<StateStore["transact"]>[0],
+      work: (candidate: StateTransaction) => Promise<T>,
+    ) =>
+      state.transact(options, async (transaction) =>
+        work(
+          new Proxy(transaction, {
+            get(target, property, receiver) {
+              if (property !== "put") return Reflect.get(target, property, receiver);
+              return async <Value extends JsonValue>(
+                key: StateKey<Value>,
+                value: Value,
+                writeOptions: Parameters<StateTransaction["put"]>[2],
+              ) => {
+                const record =
+                  typeof value === "object" && value !== null && !Array.isArray(value)
+                    ? value
+                    : undefined;
+                if (
+                  !injected &&
+                  (record as { readonly status?: unknown } | undefined)?.status === "completed"
+                ) {
+                  injected = true;
+                  if (mode === "before-commit") {
+                    throw new Error("completion persistence failed before commit");
+                  }
+                  await target.put(key, value, writeOptions);
+                  throw new Error("completion persistence failed after commit");
+                }
+                return target.put(key, value, writeOptions);
+              };
+            },
+          }),
+        ),
+      ),
+  } as StateStore;
+}
+
 function route(overrides: Partial<CapabilityRoute> = {}): CapabilityRoute {
   return {
     consumer,
@@ -298,6 +341,54 @@ test("capability invocation replay remains durable across router restart and mem
       error instanceof DiagnosticError && error.diagnostic.code === "PROTOCOL_IDEMPOTENCY_CONFLICT",
   );
   assert.equal(dispatches, 2);
+});
+
+test("provider success remains indeterminate when completion persistence fails before commit", async () => {
+  const state = durableStateWithCompletionFault("before-commit");
+  let dispatches = 0;
+  const createRouter = () =>
+    new CapabilityRouter({
+      state,
+      resolve: async () => route(),
+      revalidate: async () => true,
+      dispatch: async () => {
+        dispatches += 1;
+        return { echoed: "hello" };
+      },
+    });
+
+  await assert.rejects(
+    createRouter().invoke(consumer, call()),
+    (error: unknown) =>
+      error instanceof DiagnosticError &&
+      error.diagnostic.code === "CAPABILITY_INVOCATION_INDETERMINATE",
+  );
+  await assert.rejects(
+    createRouter().invoke(consumer, call()),
+    (error: unknown) =>
+      error instanceof DiagnosticError &&
+      error.diagnostic.code === "CAPABILITY_INVOCATION_INDETERMINATE",
+  );
+  assert.equal(dispatches, 1);
+});
+
+test("provider success reloads authoritative completion after an after-commit persistence error", async () => {
+  const state = durableStateWithCompletionFault("after-commit");
+  let dispatches = 0;
+  const createRouter = () =>
+    new CapabilityRouter({
+      state,
+      resolve: async () => route(),
+      revalidate: async () => true,
+      dispatch: async () => {
+        dispatches += 1;
+        return { echoed: "hello" };
+      },
+    });
+
+  assert.deepEqual(await createRouter().invoke(consumer, call()), { echoed: "hello" });
+  assert.deepEqual(await createRouter().invoke(consumer, call()), { echoed: "hello" });
+  assert.equal(dispatches, 1);
 });
 
 test("capability invocation left executing by another runtime is indeterminate and never redispatched", async () => {

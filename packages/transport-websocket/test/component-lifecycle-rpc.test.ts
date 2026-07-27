@@ -419,6 +419,107 @@ test("a draining activation cannot be promoted by replay after a higher session 
   cleanups.push(async () => replacementRuntime.close());
 
   await assert.rejects(remote.activateComponent(activationFor(request)), /drain|active/iu);
-  assert.deepEqual(replacementMaterialized, []);
+  assert.deepEqual(replacementMaterialized, [activationFor(request)]);
   await assert.rejects(remote.submit(request), /drain|active/iu);
+});
+
+test("replacement Worker materializes draining components and completes teardown", async () => {
+  const request = executionRequest(null, "draining-replacement");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  const firstRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    drainComponent: () => {
+      throw new Error("drain interrupted");
+    },
+  });
+  await firstRuntime.attach(firstWorker);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await remote.attach(firstMain);
+  await remote.activateComponent(activationFor(request));
+  await assert.rejects(remote.drainComponent(request.target), /drain/iu);
+  await firstRuntime.close();
+
+  const materialized: RemoteComponentActivation[] = [];
+  const stopped: RemoteComponentActivation[] = [];
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  const replacementRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    activateComponent: (activation) => {
+      materialized.push(activation);
+    },
+    stopComponent: (activation) => {
+      stopped.push(activation);
+    },
+  });
+  await replacementRuntime.attach(replacementWorker);
+  await remote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([remote.close(), replacementRuntime.close()]);
+  });
+
+  assert.deepEqual(materialized, [activationFor(request)]);
+  await assert.rejects(remote.submit(request), /drain|active/iu);
+  await remote.stopComponent(request.target);
+  assert.deepEqual(stopped, [activationFor(request)]);
+});
+
+test("fresh Main hydrates retained draining Worker state and completes teardown", async () => {
+  const request = executionRequest(null, "draining-takeover");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const stopped: RemoteComponentActivation[] = [];
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    drainComponent: () => {
+      throw new Error("drain interrupted");
+    },
+    stopComponent: (activation) => {
+      stopped.push(activation);
+    },
+  });
+  await runtime.attach(firstWorker);
+  const firstRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await firstRemote.attach(firstMain);
+  await firstRemote.activateComponent(activationFor(request));
+  await assert.rejects(firstRemote.drainComponent(request.target), /drain/iu);
+  firstMain.close();
+
+  const [replacementMain, replacementWorker] = memorySessionPair("2");
+  await runtime.attach(replacementWorker);
+  const replacementRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await replacementRemote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([firstRemote.close(), replacementRemote.close(), runtime.close()]);
+  });
+
+  await assert.rejects(replacementRemote.submit(request), /drain|active/iu);
+  await replacementRemote.stopComponent(request.target);
+  assert.deepEqual(stopped, [activationFor(request)]);
 });

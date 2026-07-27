@@ -13,13 +13,13 @@ import {
   type OperationId,
   type Permission,
   type PluginId,
-  type RuntimeDiagnostic,
-  type StateKey,
-  type StateStore,
   parseCapabilityName,
   parseComponentId,
   parseOperationId,
+  type RuntimeDiagnostic,
   runtimeDiagnostic,
+  type StateKey,
+  type StateStore,
   serializeWireValue,
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
@@ -412,15 +412,9 @@ export class CapabilityRouter {
         "Capability invocation is already executing under another runtime authority",
       );
     }
+    let result: JsonValue;
     try {
-      const result = await this.#execute(consumer, call);
-      await this.#completeInvocation(key, callFingerprint, {
-        operationId: admitted.operationId,
-        fingerprint: callFingerprint,
-        status: "completed",
-        result,
-      });
-      return result;
+      result = await this.#execute(consumer, call);
     } catch (cause) {
       const diagnostic =
         cause instanceof DiagnosticError
@@ -438,14 +432,25 @@ export class CapabilityRouter {
       });
       throw new DiagnosticError(diagnostic);
     }
+    try {
+      const terminal = await this.#completeInvocation(key, callFingerprint, {
+        operationId: admitted.operationId,
+        fingerprint: callFingerprint,
+        status: "completed",
+        result,
+      });
+      return this.#successfulInvocationResult(terminal);
+    } catch {
+      return this.#reloadSuccessfulInvocation(key, callFingerprint);
+    }
   }
 
   async #completeInvocation(
     key: StateKey<DurableInvocationRecord>,
     callFingerprint: string,
     terminal: DurableInvocationRecord,
-  ): Promise<void> {
-    await this.#options.state.transact({}, async (transaction) => {
+  ): Promise<DurableInvocationRecord> {
+    return this.#options.state.transact({}, async (transaction) => {
       const current = await transaction.get(key);
       if (current === undefined || current.value.fingerprint !== callFingerprint) {
         throw error(
@@ -454,11 +459,53 @@ export class CapabilityRouter {
         );
       }
       if (current.value.status !== "executing") {
-        return null;
+        return current.value;
       }
       await transaction.put(key, terminal, { expectedRevision: current.revision });
-      return null;
+      return terminal;
     });
+  }
+
+  async #reloadSuccessfulInvocation(
+    key: StateKey<DurableInvocationRecord>,
+    callFingerprint: string,
+  ): Promise<JsonValue> {
+    let current:
+      | {
+          readonly value: DurableInvocationRecord;
+        }
+      | undefined;
+    try {
+      current = await this.#options.state.read(key);
+    } catch {
+      throw error(
+        "CAPABILITY_INVOCATION_INDETERMINATE",
+        "Provider completed but durable completion evidence could not be read",
+      );
+    }
+    if (current === undefined) {
+      throw error(
+        "CAPABILITY_INVOCATION_INDETERMINATE",
+        "Provider completed but durable completion evidence is missing",
+      );
+    }
+    if (current.value.fingerprint !== callFingerprint) {
+      throw error(
+        "PROTOCOL_IDEMPOTENCY_CONFLICT",
+        "Durable capability invocation identity changed before completion",
+      );
+    }
+    return this.#successfulInvocationResult(current.value);
+  }
+
+  #successfulInvocationResult(record: DurableInvocationRecord): JsonValue {
+    if (record.status !== "completed" || !Object.hasOwn(record, "result")) {
+      throw error(
+        "CAPABILITY_INVOCATION_INDETERMINATE",
+        "Provider completed but durable terminal success is unresolved",
+      );
+    }
+    return serializeWireValue(record.result);
   }
 
   #schemaGate(provision: CapabilityProvisionRoute): CapabilitySchemaGate {

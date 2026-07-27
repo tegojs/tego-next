@@ -696,6 +696,15 @@ export async function createNodeRuntimeHost(
   let requestedWorkerAuthority: RuntimeAuthority | undefined;
   let authorityGeneration = 0;
   let allocatedWorkerAuthorityGeneration: number | undefined;
+  const workerRegistrationAuthorityError = (message: string): DiagnosticError =>
+    new DiagnosticError(
+      runtimeDiagnostic({
+        code: "COORDINATION_NOT_LEADER",
+        message,
+        source: { kind: "runtime", id: configuration.runtimeId },
+        observedAt: drivers.clock.now().toISOString(),
+      }),
+    );
   const mainEndpoint =
     options.worker === undefined
       ? undefined
@@ -707,7 +716,9 @@ export async function createNodeRuntimeHost(
               const authority = activeWorkerAuthority;
               const generation = authorityGeneration;
               if (authority === undefined || !sameAuthority(authority, requestedWorkerAuthority)) {
-                throw new Error("Only the authoritative Main can register a Worker session");
+                throw workerRegistrationAuthorityError(
+                  "Only the authoritative Main can register a Worker session",
+                );
               }
               const epoch = await new StateWorkerEpochAllocator({
                 state: drivers.state,
@@ -718,7 +729,9 @@ export async function createNodeRuntimeHost(
                 !sameAuthority(authority, activeWorkerAuthority) ||
                 !sameAuthority(authority, requestedWorkerAuthority)
               ) {
-                throw new Error("Main authority changed during Worker session registration");
+                throw workerRegistrationAuthorityError(
+                  "Main authority changed during Worker session registration",
+                );
               }
               allocatedWorkerAuthorityGeneration = generation;
               return epoch;
@@ -730,7 +743,9 @@ export async function createNodeRuntimeHost(
               allocatedWorkerAuthorityGeneration !== authorityGeneration ||
               !sameAuthority(activeWorkerAuthority, requestedWorkerAuthority)
             ) {
-              throw new Error("Main authority changed before Worker session publication");
+              throw workerRegistrationAuthorityError(
+                "Main authority changed before Worker session publication",
+              );
             }
             allocatedWorkerAuthorityGeneration = undefined;
           },

@@ -72,6 +72,7 @@ const RESERVED_SESSION_MESSAGE_TYPES = new Set([
   "session.ready",
   "worker.register",
 ]);
+const RETRYABLE_ENDPOINT_CLOSE_REASONS = new Set(["COORDINATION_NOT_LEADER"]);
 
 interface WebSocketTransport {
   readonly readyState: number;
@@ -365,6 +366,28 @@ function closeCode(diagnostic: RuntimeDiagnostic): number {
   return diagnostic.code.startsWith("PROTOCOL_") ? 1008 : 1011;
 }
 
+function isRetryableEndpointClose(arguments_: readonly unknown[]): boolean {
+  const event = arguments_[0];
+  const code =
+    typeof event === "number"
+      ? event
+      : typeof event === "object" &&
+          event !== null &&
+          "code" in event &&
+          typeof event.code === "number"
+        ? event.code
+        : undefined;
+  const rawReason =
+    typeof event === "object" && event !== null && "reason" in event ? event.reason : arguments_[1];
+  const reason =
+    typeof rawReason === "string"
+      ? rawReason
+      : rawReason instanceof Uint8Array
+        ? new TextDecoder().decode(rawReason)
+        : undefined;
+  return code === 1011 && reason !== undefined && RETRYABLE_ENDPOINT_CLOSE_REASONS.has(reason);
+}
+
 export class WorkerSession {
   readonly ready: Promise<void>;
   readonly #readyDeferred = deferred<void>();
@@ -423,8 +446,8 @@ export class WorkerSession {
   readonly #messageListener: SocketListener = (...arguments_) => {
     this.#receive(arguments_);
   };
-  readonly #closeListener: SocketListener = () => {
-    this.#transportClosed();
+  readonly #closeListener: SocketListener = (...arguments_) => {
+    this.#transportClosed(isRetryableEndpointClose(arguments_));
   };
   readonly #errorListener: SocketListener = () => {
     this.#fail(diagnosticError("WORKER_TRANSPORT_ERROR", "Worker WebSocket transport failed"));
@@ -1298,7 +1321,7 @@ export class WorkerSession {
     this.#detach();
   }
 
-  #transportClosed(): void {
+  #transportClosed(endpointUnavailable: boolean): void {
     if (this.#state === "closed" || this.#state === "unavailable") {
       this.#detach();
       return;
@@ -1307,9 +1330,15 @@ export class WorkerSession {
     this.#notifyState();
     this.#available = false;
     this.#acceptingAssignments = false;
-    const error = diagnosticError("WORKER_SESSION_CLOSED", "Worker WebSocket session closed", {
-      category: "transport-closed",
-    });
+    const error = diagnosticError(
+      endpointUnavailable ? "WORKER_ENDPOINT_UNAVAILABLE" : "WORKER_SESSION_CLOSED",
+      endpointUnavailable
+        ? "Worker endpoint is not accepting authoritative registrations"
+        : "Worker WebSocket session closed",
+      {
+        category: endpointUnavailable ? "endpoint-unavailable" : "transport-closed",
+      },
+    );
     this.#diagnostic = error.diagnostic;
     this.#abort.abort(error);
     this.#handshakeAbort.abort();

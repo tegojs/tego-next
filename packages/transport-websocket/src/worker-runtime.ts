@@ -1584,16 +1584,25 @@ export class WorkerRuntime {
       return;
     }
     for (const value of payload.activations) {
-      const activation = parseRemoteComponentActivation(value);
+      const retained = asObject(value, "Worker reconnect component activation");
+      if (retained.state !== "active" && retained.state !== "draining") {
+        throw new Error("Worker reconnect component activation state is invalid");
+      }
+      const activation = parseRemoteComponentActivation(retained.activation);
       const key = this.#activationKey(activation.target);
       const existing = this.#activations.get(key);
       if (existing !== undefined) {
         if (
-          existing.state !== "active" ||
           existing.activation.bindingFingerprint !== activation.bindingFingerprint ||
           !this.#sameTarget(existing.activation.target, activation.target)
         ) {
           throw new Error("Worker reconnect component activation conflicts with retained state");
+        }
+        if (existing.state === "draining" && retained.state === "active") {
+          throw new Error("Worker reconnect cannot promote a draining component activation");
+        }
+        if (retained.state === "draining") {
+          existing.state = "draining";
         }
         continue;
       }
@@ -1608,7 +1617,10 @@ export class WorkerRuntime {
       }
       await this.#validateActivation?.(cloneJson(activation));
       await this.#activateComponentCallback?.(cloneJson(activation));
-      this.#activations.set(key, { activation: cloneJson(activation), state: "active" });
+      this.#activations.set(key, {
+        activation: cloneJson(activation),
+        state: retained.state,
+      });
     }
     const attempts = [...this.#attempts.values()];
     const buffered = this.#results.list();
@@ -1640,6 +1652,10 @@ export class WorkerRuntime {
         .map((attempt) => identity(attempt.request)),
       terminalUnacknowledged: buffered.map((result) => ({ result })),
       preparedArtifacts: artifacts,
+      componentActivations: [...this.#activations.values()].map((entry) => ({
+        activation: cloneJson(entry.activation),
+        state: entry.state,
+      })),
     } as const;
     if (jsonBytes(inventory) > this.#maxInventoryBytes) {
       await this.#inventoryError(

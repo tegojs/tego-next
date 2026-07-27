@@ -893,6 +893,7 @@ test("a correlated assignment result must match the assigned attempt identity", 
         running: [],
         terminalUnacknowledged: [],
         preparedArtifacts: [],
+        componentActivations: [],
       },
       { correlationId: message.messageId },
     );
@@ -2502,6 +2503,7 @@ test("assignment and cancellation acknowledgements are bound to type and attempt
         running: [],
         terminalUnacknowledged: [],
         preparedArtifacts: [],
+        componentActivations: [],
       },
       { correlationId: message.messageId },
     );

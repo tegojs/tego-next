@@ -261,6 +261,14 @@ latch. The Main schedules on that Worker again only after reconciliation
 explicitly reports persistence available. Duplicate assignments and results
 deduplicate by `(taskId, attemptId)`.
 
+Reconnect reconciliation also exchanges exact component activation lifecycle
+state. A replacement Worker materializes Main-retained active or draining
+bindings before admission; a replacement Main may hydrate a Worker-retained
+draining binding only to complete exact teardown. Neither direction may promote
+`draining` back to `active`. Worker connect mode rotates through its bounded URL
+set when an authenticated follower rejects registration as non-authoritative,
+while authentication failures remain terminal.
+
 ## Failure, indeterminate, and recovery semantics
 
 Validation failures are definite pre-execution outcomes: invalid artifacts,
