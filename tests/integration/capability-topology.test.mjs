@@ -4,12 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import {
-  createNodeRuntimeHost,
-  packPlugin,
-  parseCommand,
-  runWorkerProcess,
-} from "@tegojs/cli";
+import { createNodeRuntimeHost, packPlugin, parseCommand, runWorkerProcess } from "@tegojs/cli";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const examplePlugin = join(root, "examples/echo-plugin");
@@ -96,6 +91,15 @@ export default defineComponent({
   ];
   manifest.permissions = [
     { kind: "executor", executors: ["process", "thread", "remote"] },
+    {
+      kind: "worker",
+      labels: {},
+      resources: {
+        cpuMillis: 1_000,
+        memoryBytes: 64 * 1024 * 1024,
+        storageBytes: 64 * 1024 * 1024,
+      },
+    },
     ...(provider
       ? []
       : [
@@ -150,15 +154,21 @@ export default defineComponent({
 }
 
 async function waitReady(runtime, pluginId, generation) {
-  return eventually(async () => {
-    const status = await runtime.operations.pluginStatus({
-      applicationId: "capability-app",
-      pluginId,
-    });
-    return status.desired?.generation === generation && status.observation?.status === "ready"
-      ? status
-      : undefined;
-  }, `${pluginId}@${generation} ready`);
+  let latest;
+  try {
+    return await eventually(async () => {
+      const status = await runtime.operations.pluginStatus({
+        applicationId: "capability-app",
+        pluginId,
+      });
+      latest = status;
+      return status.desired?.generation === generation && status.observation?.status === "ready"
+        ? status
+        : undefined;
+    }, `${pluginId}@${generation} ready`);
+  } catch (error) {
+    throw new Error(`${String(error)} latest=${JSON.stringify(latest)}`);
+  }
 }
 
 async function deploy(runtime, plugin, executor, capabilityPermission = false) {
@@ -170,6 +180,19 @@ async function deploy(runtime, plugin, executor, capabilityPermission = false) {
     configuration: {},
     permissionGrants: [
       { kind: "executor", executors: [executor] },
+      ...(executor === "remote"
+        ? [
+            {
+              kind: "worker",
+              labels: {},
+              resources: {
+                cpuMillis: 1_000,
+                memoryBytes: 64 * 1024 * 1024,
+                storageBytes: 64 * 1024 * 1024,
+              },
+            },
+          ]
+        : []),
       ...(capabilityPermission
         ? [
             {
@@ -314,42 +337,49 @@ test("capability topology routes through an exact materialized remote Worker act
       await host.artifactIngress.putPath(plugin.artifactPath);
       await host.runtime.operations.installPlugin({ digest: plugin.digest });
     }
-    await deploy(host.runtime, provider, "remote", false);
-    await deploy(host.runtime, consumer, "remote", true);
-
-    const input = { value: "remote-topology" };
-    const accepted = await host.runtime.operations.runTask({
-      applicationId: "capability-app",
-      pluginId: consumer.pluginId,
-      componentId: consumer.componentId,
-      input,
-      deadline: new Date(Date.now() + deadlineMs).toISOString(),
-      orphanPolicy: "finish-and-persist",
-      operationId: "capability-remote-topology",
-    });
-    const completed = await host.runtime.operations.waitTask(accepted.taskId);
-    assert.equal(
-      completed.result?.status,
-      "succeeded",
-      JSON.stringify(completed.result?.diagnostic),
-    );
-    const snapshot = await host.runtime.operations.snapshot({});
-    const providerInstance = snapshot.instances.items
-      .map((item) => item.value)
-      .find(
-        (instance) =>
-          instance.pluginId === provider.pluginId &&
-          instance.componentId === provider.componentId &&
-          instance.lifecycle === "ready",
+    for (const [index, [consumerExecutor, providerExecutor]] of [
+      ["remote", "remote"],
+      ["thread", "remote"],
+      ["remote", "process"],
+    ].entries()) {
+      await deploy(host.runtime, provider, providerExecutor, false);
+      await deploy(host.runtime, consumer, consumerExecutor, true);
+      const input = {
+        value: `remote-topology-${consumerExecutor}-to-${providerExecutor}`,
+      };
+      const accepted = await host.runtime.operations.runTask({
+        applicationId: "capability-app",
+        pluginId: consumer.pluginId,
+        componentId: consumer.componentId,
+        input,
+        deadline: new Date(Date.now() + deadlineMs).toISOString(),
+        orphanPolicy: "cancel",
+        operationId: `capability-remote-topology-${index}`,
+      });
+      const completed = await host.runtime.operations.waitTask(accepted.taskId);
+      assert.equal(
+        completed.result?.status,
+        "succeeded",
+        `${consumerExecutor}->${providerExecutor}: ${JSON.stringify(completed.result?.diagnostic)}`,
       );
-    assert.ok(providerInstance);
-    assert.deepEqual(completed.result?.output, {
-      activation: providerInstance.instanceId,
-      componentId: provider.componentId,
-      executor: "remote",
-      input,
-      method: "echo",
-    });
+      const snapshot = await host.runtime.operations.snapshot({});
+      const providerInstance = snapshot.instances.items
+        .map((item) => item.value)
+        .find(
+          (instance) =>
+            instance.pluginId === provider.pluginId &&
+            instance.componentId === provider.componentId &&
+            instance.lifecycle === "ready",
+        );
+      assert.ok(providerInstance);
+      assert.deepEqual(completed.result?.output, {
+        activation: providerInstance.instanceId,
+        componentId: provider.componentId,
+        executor: providerExecutor,
+        input,
+        method: "echo",
+      });
+    }
   } finally {
     await host?.runtime.stop().catch(() => undefined);
     controller.abort();
