@@ -1,6 +1,7 @@
 import type { JsonObject, JsonValue } from "./json.js";
 
 export const DIAGNOSTIC_GROUPS = [
+  "ACTIVATION",
   "BOOTSTRAP",
   "ARTIFACT",
   "DEPLOYMENT",

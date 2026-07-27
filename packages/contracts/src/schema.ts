@@ -49,7 +49,7 @@ const DECIMAL_PATTERN = "^(?:0|[1-9]\\d*)$";
 const SEMVER_PATTERN =
   "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$";
 const DIAGNOSTIC_CODE_PATTERN =
-  "^(?:BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_.+$";
+  "^(?:ACTIVATION|BOOTSTRAP|ARTIFACT|DEPLOYMENT|CAPABILITY|PERMISSION|LIFECYCLE|EXECUTOR|WORKER|COORDINATION|STATE|PROTOCOL)_.+$";
 const JSON_VALUE_SCHEMA_ID = "https://tegojs.dev/schemas/json-value.json";
 const DIAGNOSTIC_SCHEMA_ID = "https://tegojs.dev/schemas/runtime-diagnostic-1.0.json";
 const PLUGIN_MANIFEST_SCHEMA_ID = "https://tegojs.dev/schemas/plugin-manifest-1.0.json";

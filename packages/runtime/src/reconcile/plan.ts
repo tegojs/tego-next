@@ -43,7 +43,7 @@ export function parseActivation(value: unknown): Activation {
   ) {
     throw new DiagnosticError(
       runtimeDiagnostic({
-        code: "ACTIVATION_INVALID" as RuntimeDiagnostic["code"],
+        code: "ACTIVATION_INVALID",
         message: "Activation is invalid",
         source: { kind: "runtime", id: "activation" },
         details: {
