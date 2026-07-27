@@ -14,10 +14,10 @@ import {
 } from "@tegojs/contracts";
 import {
   parseAttemptRevision,
-  RemoteAttemptRevisionError,
   type RemoteAttemptCommitCondition,
-  type RemoteAttemptRecovery,
   type RemoteAttemptRecord,
+  type RemoteAttemptRecovery,
+  RemoteAttemptRevisionError,
   type RemoteAttemptState,
   type RemoteAttemptStore,
   requestFingerprint,
