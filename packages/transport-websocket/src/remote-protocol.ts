@@ -36,13 +36,11 @@ export const REMOTE_INVENTORY = "session.reconcile";
 export const REMOTE_INVENTORY_RESULT = REMOTE_INVENTORY;
 export const REMOTE_RESULT = "task.result";
 export const REMOTE_RESULT_ACK = REMOTE_ACK;
-// WorkerMessageType is extended by the contracts-owned protocol lane. Keep the
-// transport substrate source-compatible until that enum lands.
-export const REMOTE_CAPABILITY_INVOKE = "capability.invoke" as WorkerMessageType;
-export const REMOTE_COMPONENT_ACTIVATE = "component.activate" as WorkerMessageType;
-export const REMOTE_COMPONENT_ACTIVATED = "component.activated" as WorkerMessageType;
-export const REMOTE_COMPONENT_DRAIN = "component.drain" as WorkerMessageType;
-export const REMOTE_COMPONENT_STOP = "component.stop" as WorkerMessageType;
+export const REMOTE_CAPABILITY_INVOKE = "capability.invoke";
+export const REMOTE_COMPONENT_ACTIVATE = "component.activate";
+export const REMOTE_COMPONENT_ACTIVATED = "component.activated";
+export const REMOTE_COMPONENT_DRAIN = "component.drain";
+export const REMOTE_COMPONENT_STOP = "component.stop";
 
 export interface RemoteSessionMessage {
   readonly messageId: string;
