@@ -87,10 +87,24 @@ async function taskkill(processId, force) {
   return result.error === undefined && result.status === 0;
 }
 
-async function signalProcessTree(child, signal) {
+function createWindowsTreeStrategy() {
+  const provenTerminated = new Set();
+  return {
+    async probe(processId) {
+      return provenTerminated.has(processId);
+    },
+    async terminate(processId, signal) {
+      const terminated = await taskkill(processId, signal === "SIGKILL");
+      if (terminated) provenTerminated.add(processId);
+      return terminated;
+    },
+  };
+}
+
+async function signalProcessTree(child, signal, platform, windowsTreeStrategy) {
   if (child.pid === undefined) return false;
-  if (process.platform === "win32") {
-    return taskkill(child.pid, signal === "SIGKILL");
+  if (platform === "win32") {
+    return windowsTreeStrategy.terminate(child.pid, signal);
   }
   try {
     process.kill(-child.pid, signal);
@@ -99,6 +113,12 @@ async function signalProcessTree(child, signal) {
     if (error?.code === "ESRCH") return true;
     throw error;
   }
+}
+
+async function isProcessTreeTerminated(processId, platform, windowsTreeStrategy) {
+  return platform === "win32"
+    ? windowsTreeStrategy.probe(processId)
+    : !posixProcessTreeExists(processId);
 }
 
 function settleWithin(promise, timeoutMs) {
@@ -120,6 +140,8 @@ export async function runManagedProcessTree({
   env = process.env,
   onStdout = () => {},
   onStderr = () => {},
+  platform = process.platform,
+  windowsTreeStrategy = createWindowsTreeStrategy(),
 }) {
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
@@ -131,7 +153,7 @@ export async function runManagedProcessTree({
     cwd,
     env,
     stdio: ["inherit", "pipe", "pipe"],
-    detached: process.platform !== "win32",
+    detached: platform !== "win32",
     windowsHide: true,
   });
   child.stdout.on("data", onStdout);
@@ -151,40 +173,56 @@ export async function runManagedProcessTree({
   if (initial.settled) {
     closeResult = initial.value;
     processTreeTerminated =
-      child.pid === undefined || process.platform === "win32" || !posixProcessTreeExists(child.pid);
+      child.pid === undefined ||
+      (await isProcessTreeTerminated(child.pid, platform, windowsTreeStrategy));
     if (!processTreeTerminated && child.pid !== undefined) {
       terminationSignal = "SIGTERM";
-      await signalProcessTree(child, "SIGTERM");
-      processTreeTerminated = await waitForPosixProcessTreeExit(child.pid, gracefulTerminationMs);
+      const terminated = await signalProcessTree(child, "SIGTERM", platform, windowsTreeStrategy);
+      const gracefulTreeExit =
+        platform === "win32"
+          ? await isProcessTreeTerminated(child.pid, platform, windowsTreeStrategy)
+          : await waitForPosixProcessTreeExit(child.pid, gracefulTerminationMs);
+      processTreeTerminated = terminated && gracefulTreeExit;
       if (!processTreeTerminated) {
         terminationSignal = "SIGKILL";
-        await signalProcessTree(child, "SIGKILL");
-        processTreeTerminated = await waitForPosixProcessTreeExit(
-          child.pid,
-          forcedTerminationWaitMs,
-        );
+        const forced = await signalProcessTree(child, "SIGKILL", platform, windowsTreeStrategy);
+        const forcedTreeExit =
+          platform === "win32"
+            ? await isProcessTreeTerminated(child.pid, platform, windowsTreeStrategy)
+            : await waitForPosixProcessTreeExit(child.pid, forcedTerminationWaitMs);
+        processTreeTerminated = forced && forcedTreeExit;
       }
     }
   } else {
     timedOut = true;
     terminationSignal = "SIGTERM";
-    let treeSignalSucceeded = await signalProcessTree(child, "SIGTERM");
+    let treeSignalSucceeded = await signalProcessTree(
+      child,
+      "SIGTERM",
+      platform,
+      windowsTreeStrategy,
+    );
     const graceful =
-      process.platform === "win32"
+      platform === "win32"
         ? await settleWithin(closed, gracefulTerminationMs)
         : {
             settled: await waitForPosixProcessTreeExit(child.pid, gracefulTerminationMs),
           };
-    if (!graceful.settled) {
+    if (!graceful.settled || !treeSignalSucceeded) {
       terminationSignal = "SIGKILL";
-      treeSignalSucceeded = (await signalProcessTree(child, "SIGKILL")) || treeSignalSucceeded;
+      treeSignalSucceeded =
+        (await signalProcessTree(child, "SIGKILL", platform, windowsTreeStrategy)) ||
+        treeSignalSucceeded;
     }
-    if (process.platform === "win32") {
+    if (platform === "win32") {
       const forced = graceful.settled
         ? graceful
         : await settleWithin(closed, forcedTerminationWaitMs);
       closeResult = forced.settled ? forced.value : { childExitCode: null, childSignal: null };
-      processTreeTerminated = forced.settled && treeSignalSucceeded;
+      processTreeTerminated =
+        forced.settled &&
+        treeSignalSucceeded &&
+        (await isProcessTreeTerminated(child.pid, platform, windowsTreeStrategy));
     } else {
       processTreeTerminated = await waitForPosixProcessTreeExit(child.pid, forcedTerminationWaitMs);
       const reaped = await settleWithin(closed, forcedTerminationWaitMs);

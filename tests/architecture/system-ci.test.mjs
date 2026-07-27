@@ -557,7 +557,7 @@ test("managed runner fails closed when Windows tree termination cannot be proven
   assert.match(metadata.error, /process tree did not terminate/iu);
   assert.deepEqual(
     events.map((event) => event.replace(/:\d+/u, ":pid")),
-    ["probe:pid", "terminate:pid:SIGTERM", "probe:pid"],
+    ["probe:pid", "terminate:pid:SIGTERM", "probe:pid", "terminate:pid:SIGKILL", "probe:pid"],
   );
 });
 
