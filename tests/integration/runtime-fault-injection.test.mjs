@@ -84,8 +84,9 @@ function artifact() {
   };
 }
 
-function realComponentEffects(startDeliveries) {
+function realComponentEffects(startDeliveries, options = {}) {
   const registry = new ComponentRegistry();
+  let failPrepares = options.failPrepares ?? 0;
   const prepared = Object.freeze({
     digest,
     root: "/immutable/fault-artifact",
@@ -97,6 +98,10 @@ function realComponentEffects(startDeliveries) {
     async prepare(request) {
       assert.equal(request.digest, digest);
       this.prepares += 1;
+      if (failPrepares > 0) {
+        failPrepares -= 1;
+        throw new Error("FAULT_INJECTED_STARTING_RESTORE_PREPARE_FAILURE");
+      }
       return prepared;
     },
     async release(releasedDigest) {
@@ -351,7 +356,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/starting-checkpoint-real-
     assert.equal(startDeliveries.length, 1);
 
     clock.advanceBy(31_000);
-    const secondRuntime = realComponentEffects(startDeliveries);
+    const secondRuntime = realComponentEffects(startDeliveries, { failPrepares: 1 });
     recovered = new Reconciler({
       artifactGate: { validate: async () => artifact() },
       clock,
@@ -361,6 +366,13 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/starting-checkpoint-real-
       loadInstallations: async () => [installation()],
     });
     await recovered.start();
+
+    const deferred = await state.read(checkpoint.key);
+    assert.equal(deferred?.value.lifecycle, "starting");
+    assert.equal(deferred?.value.diagnostic?.code, "LIFECYCLE_RESTORE_FAILED");
+    assert.equal(startDeliveries.length, 1);
+
+    clock.advanceBy(60_000);
     await recovered.wake();
 
     const restored = await state.read(checkpoint.key);
