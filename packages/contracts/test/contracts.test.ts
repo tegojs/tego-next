@@ -392,6 +392,14 @@ test("execution request validation preserves JsonValue payloads", () => {
     () => parseExecutionRequest({ ...validExecutionRequest, input: undefined }),
     (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_INVALID",
   );
+  assert.throws(
+    () =>
+      parseExecutionRequest({
+        ...validExecutionRequest,
+        bindingTarget: validExecutionRequest.target,
+      }),
+    (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_INVALID",
+  );
 });
 
 test("execution binding canonicalization is deterministic and target-bound", () => {

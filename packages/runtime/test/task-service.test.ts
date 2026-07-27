@@ -1872,6 +1872,41 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/legacy-binding-without-ta
   assert.equal((await restarted.status(identity.taskId))?.result?.status, "indeterminate");
 });
 
+test("@spec:runtime-bootstrap/durable-restart-recovery/remote-target-without-binding-fails-closed", async () => {
+  const executor = new ControlledExecutor("remote", "remote-01");
+  const state = new TransactionalState();
+  state.records.set(`tego/tasks/${identity.taskId}`, {
+    value: parseTaskRecord({
+      taskId: identity.taskId,
+      attemptId: identity.attemptId,
+      request,
+      state: "accepted",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      target: executorSelection(executor).target,
+      authority,
+    }),
+    revision: 1,
+  });
+  let selections = 0;
+  const restarted = new TaskService({
+    state,
+    clock,
+    selectExecutor: async () => {
+      selections += 1;
+      return executorSelection(executor);
+    },
+  });
+  await restarted.recover();
+  await restarted.setAuthority(authority);
+
+  const terminal = await restarted.status(identity.taskId);
+  assert.equal(selections, 0);
+  assert.equal(terminal?.state, "terminal");
+  assert.equal(terminal?.result?.diagnostic?.code, "EXECUTOR_RESULT_INVALID");
+  assert.equal(terminal?.result?.diagnostic?.retryable, false);
+});
+
 test("@spec:runtime-bootstrap/durable-restart-recovery/replays-durable-cancellation-intent", async () => {
   const { executor, service, state } = serviceFixture();
   state.records.set(`tego/tasks/${identity.taskId}`, {
