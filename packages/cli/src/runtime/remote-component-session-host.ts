@@ -115,6 +115,7 @@ class ScopedRemoteExecutor implements Executor {
   readonly #target: TaskExecutionTarget;
   readonly #bindingFingerprint: string;
   readonly #active = new Set<Promise<void>>();
+  readonly #activeCapabilities = new Set<Promise<void>>();
   #submitTail = Promise.resolve();
   #accepting = true;
   #drainPromise: Promise<void> | undefined;
@@ -163,16 +164,16 @@ class ScopedRemoteExecutor implements Executor {
   }
 
   #track(handle: ExecutionHandle): void {
-    this.#trackActive(handle.result);
+    this.#trackActive(this.#active, handle.result);
   }
 
-  #trackActive(result: Promise<unknown>): void {
+  #trackActive(activeOperations: Set<Promise<void>>, result: Promise<unknown>): void {
     const active = result.then(
       () => undefined,
       () => undefined,
     );
-    this.#active.add(active);
-    void active.then(() => this.#active.delete(active));
+    activeOperations.add(active);
+    void active.then(() => activeOperations.delete(active));
   }
 
   observe(taskId: TaskId, attemptId: AttemptId): Promise<AttemptStatus | undefined> {
@@ -195,15 +196,16 @@ class ScopedRemoteExecutor implements Executor {
       target: this.#target,
       invocation,
     });
-    this.#trackActive(result);
+    this.#trackActive(this.#activeCapabilities, result);
     return result;
   }
 
   drain(_options: DrainOptions): Promise<void> {
     this.#accepting = false;
     this.#drainPromise ??= this.#submitTail.then(async () => {
-      await Promise.all([...this.#active]);
+      await Promise.all([...this.#activeCapabilities]);
       await Promise.all([
+        Promise.all([...this.#active]),
         this.#shared.drainTarget(this.#target, _options),
         this.#shared.drainComponent(this.#target),
       ]);
@@ -216,7 +218,7 @@ class ScopedRemoteExecutor implements Executor {
     return {
       ...health,
       accepting: health.accepting && this.#accepting,
-      active: this.#active.size,
+      active: this.#active.size + this.#activeCapabilities.size,
     };
   }
 
