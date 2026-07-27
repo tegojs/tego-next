@@ -584,12 +584,32 @@ export class Reconciler {
   }
 
   async #authoritativeNow(): Promise<{ readonly epochMs: number; readonly iso: string }> {
-    const iso = await this.#clusterTime.now();
+    return this.#parseAuthoritativeTime(
+      await this.#clusterTime.now(),
+      "Cluster time must be a canonical UTC timestamp",
+    );
+  }
+
+  #parseAuthoritativeTime(
+    iso: unknown,
+    message: string,
+  ): { readonly epochMs: number; readonly iso: string } {
     const epochMs = typeof iso === "string" ? Date.parse(iso) : Number.NaN;
     if (!Number.isFinite(epochMs) || new Date(epochMs).toISOString() !== iso) {
-      throw new TypeError("Cluster time must be a canonical UTC timestamp");
+      throw new TypeError(message);
     }
     return { epochMs, iso };
+  }
+
+  #claimDecisionNow(
+    batchNow: { readonly epochMs: number; readonly iso: string },
+    claimedAt: string,
+  ): { readonly epochMs: number; readonly iso: string } {
+    const claimNow = this.#parseAuthoritativeTime(
+      claimedAt,
+      "Outbox claim time must be a canonical UTC timestamp",
+    );
+    return claimNow.epochMs > batchNow.epochMs ? claimNow : batchNow;
   }
 
   get kernelRunning(): boolean {
@@ -2985,9 +3005,10 @@ export class Reconciler {
 
   async #executeClaim(
     claim: OutboxClaim,
-    decisionNow: { readonly epochMs: number; readonly iso: string },
+    batchNow: { readonly epochMs: number; readonly iso: string },
   ): Promise<undefined | typeof capabilityBindingConflict> {
     if (!this.#running) return;
+    const decisionNow = this.#claimDecisionNow(batchNow, claim.claimedAt);
     let effect: ParsedReconcileEffect;
     try {
       effect = parseReconcileEffect(claim);

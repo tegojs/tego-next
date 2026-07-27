@@ -78,9 +78,12 @@ reconciliation availability and retry deadlines. One canonical UTC timestamp
 is sampled for a reconciliation batch and carried through planning, outbox
 availability, retry evaluation, and retry persistence. A database-clock read
 occurs before the batch's fenced state transactions; those transactions reuse
-the immutable sample instead of observing different instants mid-batch. A
-database-clock read failure fails reconciliation closed; it never falls back to
-a process clock.
+the immutable sample instead of observing different instants mid-batch. When
+PostgreSQL makes an outbox message newly claimable during the batch, its
+database-stamped `claimedAt` may advance that claim's lower-bound timestamp;
+this prevents a due claim from being evaluated against an older batch sample
+without introducing another process-clock read. A database-clock read failure
+fails reconciliation closed; it never falls back to a process clock.
 `single-main` keeps its injected local clock, so embedded tests and deployments
 remain deterministic and require no distributed-time service. Every Main can
 report diagnostics. Exactly the Main holding the current leadership epoch
