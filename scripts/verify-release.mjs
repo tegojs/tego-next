@@ -203,18 +203,38 @@ function postgresServiceIsValid(job) {
   );
 }
 
+function workflowStepSource(workflow, jobName, stepName) {
+  const lines = workflow.split("\n");
+  const jobStart = lines.indexOf(`  ${jobName}:`);
+  if (jobStart === -1) return [];
+  const jobEnd = lines.findIndex(
+    (line, index) => index > jobStart && /^ {2}[a-zA-Z0-9_-]+:\s*$/u.test(line),
+  );
+  const end = jobEnd === -1 ? lines.length : jobEnd;
+  const stepStart = lines.findIndex(
+    (line, index) => index > jobStart && index < end && line === `      - name: ${stepName}`,
+  );
+  if (stepStart === -1) return [];
+  const stepEnd = lines.findIndex(
+    (line, index) => index > stepStart && index < end && /^ {6}- /u.test(line),
+  );
+  return lines.slice(stepStart, stepEnd === -1 ? end : stepEnd);
+}
+
 function validateActionVersionComments(errors, workflow) {
-  for (const [name, pin, expectedCount] of [
-    ["checkout", actionPins.checkout, 3],
-    ["setup-node", actionPins.setupNode, 3],
-    ["upload-artifact", actionPins.uploadArtifact, 2],
+  for (const [jobName, stepName, pin] of [
+    ["quality", "Check out repository", actionPins.checkout],
+    ["quality", "Set up Node.js", actionPins.setupNode],
+    ["integration", "Check out repository", actionPins.checkout],
+    ["integration", "Set up Node.js", actionPins.setupNode],
+    ["integration", "Upload integration diagnostics", actionPins.uploadArtifact],
+    ["system-e2e", "Check out repository", actionPins.checkout],
+    ["system-e2e", "Set up Node.js", actionPins.setupNode],
+    ["system-e2e", "Upload process diagnostics", actionPins.uploadArtifact],
   ]) {
-    const expected = `uses: ${pin.reference} # ${pin.version}`;
-    const count = workflow.split("\n").filter((line) => line.trim() === expected).length;
-    if (count !== expectedCount) {
-      errors.push(
-        `${name} must use ${pin.reference} with ${pin.version} review comments exactly ${expectedCount} times`,
-      );
+    const expected = `        uses: ${pin.reference} # ${pin.version}`;
+    if (!workflowStepSource(workflow, jobName, stepName).includes(expected)) {
+      errors.push(`${jobName} step ${stepName} must carry the ${pin.version} review comment`);
     }
   }
 }

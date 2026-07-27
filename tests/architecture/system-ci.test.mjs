@@ -338,10 +338,12 @@ test("CI workflow validation rejects extra or duplicate PostgreSQL health flags"
 test("CI workflow validation binds action review comments to their required steps", async () => {
   const workflow = await readFile(workflowPath, "utf8");
   const { validateReleasePreflight } = await import(
-    new URL(`../../scripts/verify-release.mjs?action-comment-mutations=${Date.now()}`, import.meta.url)
+    new URL(
+      `../../scripts/verify-release.mjs?action-comment-mutations=${Date.now()}`,
+      import.meta.url,
+    )
   );
-  const checkout =
-    "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0";
+  const checkout = "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0";
   const mutation = workflow
     .replace(`        uses: ${checkout}`, `        uses: ${checkout.split(" # ")[0]}`)
     .replace(
