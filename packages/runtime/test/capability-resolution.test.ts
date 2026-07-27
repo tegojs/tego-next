@@ -6,6 +6,7 @@ import {
   parseApplicationId,
   parseCapabilityName,
   parsePluginId,
+  parseRuntimeDiagnostic,
 } from "@tegojs/contracts";
 import {
   type CapabilityResolutionDeployment,
@@ -94,6 +95,7 @@ test("invalid activations expose a stable public diagnostic with canonical bound
           maximum: "18446744073709551615",
         });
         assert.equal(error.diagnostic.cause, undefined);
+        assert.deepEqual(parseRuntimeDiagnostic(error.diagnostic), error.diagnostic);
         return true;
       },
     );
