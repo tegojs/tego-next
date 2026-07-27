@@ -17,7 +17,7 @@ import {
   parseWorkerId,
 } from "@tegojs/contracts";
 import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import { Reconciler } from "@tegojs/runtime";
+import { ComponentEffects, ComponentRegistry, Reconciler } from "@tegojs/runtime";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tegojs/transport-websocket";
 import { DeterministicRemoteSession } from "../fixtures/runtime-fault-session.mjs";
@@ -82,6 +82,61 @@ function artifact() {
     },
     manifest: manifest(),
   };
+}
+
+function realComponentEffects(startDeliveries) {
+  const registry = new ComponentRegistry();
+  const prepared = Object.freeze({
+    digest,
+    root: "/immutable/fault-artifact",
+    manifest: manifest(),
+  });
+  const cache = {
+    prepares: 0,
+    releases: 0,
+    async prepare(request) {
+      assert.equal(request.digest, digest);
+      this.prepares += 1;
+      return prepared;
+    },
+    async release(releasedDigest) {
+      assert.equal(releasedDigest, digest);
+      this.releases += 1;
+    },
+  };
+  const effects = new ComponentEffects({
+    artifacts: cache,
+    registry,
+    supportedExecutors: ["thread"],
+    resolveDeployment: async (effect) => {
+      assert.equal(effect.deploymentGeneration, deployment().generation);
+      assert.equal(effect.activation, "1");
+      assert.equal(effect.artifactDigest, digest);
+      assert.equal(effect.executor, "thread");
+      return {
+        deployment: deployment(),
+        artifact: {
+          digest,
+          manifest: manifest(),
+        },
+      };
+    },
+    host: {
+      async start(binding) {
+        assert.equal(registry.require(binding.instanceId).state, "prepared");
+        startDeliveries.push({
+          activation: binding.activation,
+          artifactDigest: binding.artifact.digest,
+          deploymentGeneration: binding.deployment.generation,
+          executor: binding.executor,
+          instanceId: binding.instanceId,
+        });
+      },
+      async drain() {},
+      async stop() {},
+    },
+  });
+  return { cache, effects, registry };
 }
 
 class IdempotentEffects {
@@ -260,6 +315,71 @@ test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-befor
     effects.cleanup();
     assert.equal(effects.live.size, 0);
   } finally {
+    await state.close();
+  }
+});
+
+test("@spec:runtime-bootstrap/durable-restart-recovery/starting-checkpoint-real-effects starting checkpoint", async () => {
+  const clock = new FakeClock(new Date(0));
+  const backingState = new MemoryStateStore({ clock });
+  const state = faultStartCommitOnce(backingState);
+  const startDeliveries = [];
+  await state.open();
+  let interrupted;
+  let recovered;
+  try {
+    const firstRuntime = realComponentEffects(startDeliveries);
+    interrupted = new Reconciler({
+      artifactGate: { validate: async () => artifact() },
+      clock,
+      effects: firstRuntime.effects,
+      state,
+      loadDeployments: async () => [deployment()],
+      loadInstallations: async () => [installation()],
+    });
+    await assert.rejects(interrupted.start(), /FAULT_INJECTED_START_COMMIT_INTERRUPTION/u);
+
+    const interruptedInstances = [];
+    for await (const record of state.scan({
+      namespace: "tego",
+      collection: "component-instances",
+    })) {
+      interruptedInstances.push(record);
+    }
+    const checkpoint = interruptedInstances.find(
+      (record) => record.value.lifecycle === "starting",
+    );
+    assert.ok(checkpoint);
+    assert.equal(startDeliveries.length, 1);
+
+    clock.advanceBy(31_000);
+    const secondRuntime = realComponentEffects(startDeliveries);
+    recovered = new Reconciler({
+      artifactGate: { validate: async () => artifact() },
+      clock,
+      effects: secondRuntime.effects,
+      state,
+      loadDeployments: async () => [deployment()],
+      loadInstallations: async () => [installation()],
+    });
+    await recovered.start();
+    await recovered.wake();
+
+    const restored = await state.read(checkpoint.key);
+    assert.equal(restored?.value.lifecycle, "ready");
+    assert.equal(restored?.value.diagnostic, undefined);
+    assert.equal(restored?.value.retryEffect, undefined);
+    assert.equal(startDeliveries.length, 2);
+    assert.deepEqual(startDeliveries[1], startDeliveries[0]);
+    const active = secondRuntime.registry.require(checkpoint.value.instanceId);
+    assert.equal(active.state, "active");
+    assert.equal(active.binding.activation, checkpoint.value.activation);
+    assert.equal(active.binding.deployment.generation, checkpoint.value.deploymentGeneration);
+    assert.equal(active.binding.artifact.digest, checkpoint.value.artifactDigest);
+    assert.equal(active.binding.executor, checkpoint.value.executor);
+  } finally {
+    await recovered?.stop();
+    await interrupted?.stop();
     await state.close();
   }
 });

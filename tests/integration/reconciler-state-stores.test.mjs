@@ -46,6 +46,7 @@ class RecordingEffects {
   calls = [];
   live = new Set();
   restored = [];
+  startingRestored = [];
   terminationRestored = [];
 
   async perform(effect) {
@@ -57,6 +58,10 @@ class RecordingEffects {
   async restore(instance) {
     this.restored.push(instance);
     this.live.add(instance.instanceId);
+  }
+
+  async restoreStarting(effect) {
+    this.startingRestored.push(effect);
   }
 
   async restoreTermination(instance) {
@@ -1201,6 +1206,104 @@ test("failed start and stop retries persist a legal pre-state before external ef
       });
     });
   }
+});
+
+test("starting checkpoint lifecycle interruption restores exact effect across Memory and SQLite", async (t) => {
+  await withRealStateStores(t, async (initialState, clock, reopen) => {
+    const desired = deployment();
+    const prepared = planReconcile({
+      deployment: desired,
+      gate: gate(),
+      instances: [],
+      now: clock.now().toISOString(),
+      supportedExecutors: ["thread"],
+    }).steps[0];
+    assert.ok(prepared);
+    const start = planReconcile({
+      deployment: desired,
+      gate: gate(),
+      instances: [
+        {
+          activation: prepared.effect.activation,
+          applicationId,
+          artifactDigest: digest,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: "thread",
+          instanceId: prepared.instanceId,
+          lifecycle: "preparing",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+          revision: "1",
+        },
+      ],
+      now: clock.now().toISOString(),
+      supportedExecutors: ["thread"],
+    }).steps[0];
+    assert.ok(start);
+    assert.equal(start.effect.kind, "start");
+    const now = clock.now().toISOString();
+    await initialState.transact({}, async (transaction) => {
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "component-instances",
+          id: start.instanceId,
+        },
+        {
+          activation: start.effect.activation,
+          applicationId,
+          artifactDigest: digest,
+          componentId,
+          deploymentGeneration: parseGeneration("1"),
+          executor: "thread",
+          instanceId: start.instanceId,
+          lifecycle: "starting",
+          observedGeneration: parseGeneration("1"),
+          pluginId,
+        },
+        { expectedRevision: "absent" },
+      );
+      await transaction.appendOperation({
+        operationId: start.operationId,
+        kind: "component.lifecycle",
+        status: "executing",
+        state: start.effect,
+        updatedAt: now,
+      });
+      await transaction.enqueueOutbox({
+        availableAt: now,
+        createdAt: now,
+        messageId: start.messageId,
+        operationId: start.operationId,
+        payload: start.effect,
+        topic: "component.lifecycle",
+      });
+      return null;
+    });
+
+    const state = await reopen();
+    const effects = new RecordingEffects();
+    const reconciler = new Reconciler({
+      artifactGate: { validate: async () => gate().artifact },
+      clock,
+      effects,
+      state,
+      loadDeployments: async () => [desired],
+      loadInstallations: async () => [installation()],
+    });
+    await reconciler.start();
+
+    assert.deepEqual(effects.startingRestored, [start.effect]);
+    assert.deepEqual(
+      effects.calls.filter((effect) => effect.kind === "start"),
+      [start.effect],
+    );
+    const ready = await readOnlyInstance(state, start.instanceId);
+    assert.equal(ready?.value.lifecycle, "ready");
+    assert.equal(ready?.value.diagnostic, undefined);
+    await reconciler.stop();
+  });
 });
 
 test("suspended provider hold survives Memory and SQLite reopen before activation two", async (t) => {
