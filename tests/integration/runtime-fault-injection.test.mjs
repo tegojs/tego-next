@@ -1,14 +1,5 @@
 import assert from "node:assert/strict";
-import {
-  chmod,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -482,23 +473,21 @@ test("@spec:coordination-provider/fenced-leadership/stale-epoch-fault", async (t
   await withFaultStateStores(t, assertStaleAuthorityRejected);
 });
 
-test(
-  "@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
-  { skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false },
-  async () => {
-    const namespace = `fault_${process.pid}_${Date.now()}`;
-    const state = new PostgresStateStore({
-      connectionString: process.env.TEGO_POSTGRES_URL,
-      namespace,
-    });
-    await state.open();
-    try {
-      await assertStaleAuthorityRejected(state);
-    } finally {
-      await state.close();
-    }
-  },
-);
+test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault", {
+  skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
+}, async () => {
+  const namespace = `fault_${process.pid}_${Date.now()}`;
+  const state = new PostgresStateStore({
+    connectionString: process.env.TEGO_POSTGRES_URL,
+    namespace,
+  });
+  await state.open();
+  try {
+    await assertStaleAuthorityRejected(state);
+  } finally {
+    await state.close();
+  }
+});
 
 test("@spec:worker-protocol/durable-worker-attempts/restart-terminal-replay-fault", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tego-remote-attempt-restart-"));

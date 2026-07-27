@@ -474,10 +474,7 @@ test("release verification bounds stages and reports deterministic process metad
       runReleaseCommand({
         name: "hanging probe",
         command: process.execPath,
-        args: [
-          "-e",
-          'process.on("SIGTERM", () => {}); setTimeout(() => process.exit(0), 750);',
-        ],
+        args: ["-e", 'process.on("SIGTERM", () => {}); setTimeout(() => process.exit(0), 750);'],
         timeoutMs: 100,
       }),
     (error) =>
