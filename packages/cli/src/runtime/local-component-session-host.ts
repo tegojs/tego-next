@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   type Clock,
+  type ComponentCapabilityInvocation,
   DiagnosticError,
+  type ExecutionBinding,
   type ExecutorKind,
   type JsonValue,
   type PluginManifest,
@@ -14,6 +16,7 @@ import {
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
 import {
+  type ComponentSandboxSession,
   createProcessComponentSession,
   createThreadComponentSession,
   type ResolvedProcessComponent,
@@ -21,8 +24,10 @@ import {
 } from "@tegojs/executor-node";
 import {
   type ComponentBinding,
+  type ComponentInstanceIdentity,
   type ComponentLifecycleHost,
   canonicalJsonBytes,
+  createComponentBoundaries,
   parseActivation,
 } from "@tegojs/runtime";
 import type {
@@ -37,6 +42,14 @@ export interface LocalComponentSessionHostOptions {
   readonly processHost: ProcessHost;
   readonly secretProvider: SecretProvider;
   readonly registry: LocalComponentSessionRegistry;
+  readonly resolveExecutionBinding: (
+    binding: ComponentBinding,
+    target: TaskExecutionTarget,
+  ) => Promise<ExecutionBinding>;
+  readonly invokeCapability: (
+    consumer: ComponentInstanceIdentity,
+    invocation: ComponentCapabilityInvocation,
+  ) => Promise<JsonValue>;
 }
 
 export function localComponentExecutorId(
@@ -53,16 +66,6 @@ export function canonicalJsonEqual(left: JsonValue, right: JsonValue): boolean {
 }
 
 export function assertLocalComponentManifestSupported(manifest: PluginManifest): void {
-  if (manifest.capabilities.provides.length > 0 || manifest.capabilities.requires.length > 0) {
-    throw new DiagnosticError(
-      runtimeDiagnostic({
-        code: "CAPABILITY_DEFINITION_UNAVAILABLE",
-        message:
-          "Local component sessions require durable capability schemas and token definitions",
-        source: { kind: "artifact", id: manifest.pluginId },
-      }),
-    );
-  }
   const service = manifest.components.find((component) => component.kind === "service");
   if (service !== undefined) {
     throw new DiagnosticError(
@@ -94,6 +97,31 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
       pluginId: binding.deployment.pluginId,
       componentId: binding.component.componentId,
     };
+    const executionBinding = await this.#options.resolveExecutionBinding(binding, target);
+    const consumer: ComponentInstanceIdentity = {
+      ...identity,
+      activation: binding.activation,
+      target,
+      bindingFingerprint: executionBinding.fingerprint,
+    };
+    const boundaries = createComponentBoundaries({
+      invoke: (invocation) => this.#options.invokeCapability(consumer, invocation),
+    });
+    const capabilityRegistration = boundaries.capability.register(
+      executionBinding.capabilityDefinitions,
+    );
+    if (!capabilityRegistration.ok) {
+      boundaries.capability.clear();
+      throw new DiagnosticError(
+        runtimeDiagnostic({
+          code: "CAPABILITY_DEFINITION_INVALID",
+          message:
+            capabilityRegistration.diagnostics[0]?.message ??
+            "Component capability definitions are invalid",
+          source: { kind: "plugin", id: `${identity.pluginId}/${identity.componentId}` },
+        }),
+      );
+    }
     const component: ResolvedProcessComponent | ResolvedThreadComponent = {
       target,
       artifactDigest: binding.artifact.digest,
@@ -101,62 +129,70 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
       manifest: binding.artifact.manifest,
       runtimeId: this.#options.runtimeId,
       instanceId: binding.instanceId,
-      configuration: binding.deployment.configuration,
-      permissionGrants: binding.deployment.permissionGrants,
-      capabilityDefinitions: [],
+      configuration: executionBinding.configuration,
+      permissionGrants: executionBinding.permissionGrants,
+      capabilityDefinitions: executionBinding.capabilityDefinitions,
     };
-    const executor =
-      binding.executor === "thread"
-        ? await createThreadComponentSession({
-            target,
-            identity,
-            component,
-            executorOptions: {
-              id: target.executor.id,
-              clock: this.#options.clock,
-              resolveComponent: async (request) => ({
-                ...component,
-                configuration: structuredClone(request.binding.configuration),
-                permissionGrants: structuredClone(request.binding.permissionGrants),
-                capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
-              }),
-              secretProvider: this.#options.secretProvider,
-            },
-          })
-        : await createProcessComponentSession({
-            target,
-            identity,
-            component,
-            executorOptions: {
-              id: target.executor.id,
-              clock: this.#options.clock,
-              processHost: this.#options.processHost,
-              resolveComponent: async (request) => ({
-                ...component,
-                configuration: structuredClone(request.binding.configuration),
-                permissionGrants: structuredClone(request.binding.permissionGrants),
-                capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
-              }),
-              secretProvider: this.#options.secretProvider,
-            },
-          });
-    const registration: LocalComponentSessionRegistration = {
-      ...identity,
-      target,
-      executor,
-      drainLifecycle: (options) => executor.drainLifecycle(options),
-    };
+    let executor: ComponentSandboxSession | undefined;
     try {
+      executor =
+        binding.executor === "thread"
+          ? await createThreadComponentSession({
+              target,
+              identity,
+              component,
+              executorOptions: {
+                id: target.executor.id,
+                clock: this.#options.clock,
+                resolveComponent: async (request) => ({
+                  ...component,
+                  configuration: structuredClone(request.binding.configuration),
+                  permissionGrants: structuredClone(request.binding.permissionGrants),
+                  capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
+                }),
+                secretProvider: this.#options.secretProvider,
+                capabilityBoundary: boundaries.capability,
+              },
+            })
+          : await createProcessComponentSession({
+              target,
+              identity,
+              component,
+              executorOptions: {
+                id: target.executor.id,
+                clock: this.#options.clock,
+                processHost: this.#options.processHost,
+                resolveComponent: async (request) => ({
+                  ...component,
+                  configuration: structuredClone(request.binding.configuration),
+                  permissionGrants: structuredClone(request.binding.permissionGrants),
+                  capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
+                }),
+                secretProvider: this.#options.secretProvider,
+                capabilityBoundary: boundaries.capability,
+              },
+            });
+      if (executor === undefined) throw new Error("Component session creation returned no session");
+      const activeExecutor = executor;
+      const registration: LocalComponentSessionRegistration = {
+        ...identity,
+        target,
+        executor: activeExecutor,
+        drainLifecycle: (options) => activeExecutor.drainLifecycle(options),
+        releaseBoundaries: () => boundaries.capability.clear(),
+      };
       this.#options.registry.register(registration);
     } catch (error) {
       try {
-        await executor.close();
+        await executor?.close();
       } catch (closeError) {
+        boundaries.capability.clear();
         throw new AggregateError(
           [error, closeError],
           "Local component session registration rollback failed",
         );
       }
+      boundaries.capability.clear();
       throw error;
     }
   }
@@ -173,6 +209,7 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
     const registration = this.#options.registry.findExact(target);
     if (registration === undefined) return;
     await registration.executor.close();
+    registration.releaseBoundaries?.();
     this.#options.registry.remove(target);
   }
 

@@ -1,30 +1,31 @@
 import { createHash } from "node:crypto";
 import {
-  DiagnosticError,
-  parseCapabilityName,
-  parseComponentId,
-  parseOperationId,
-  runtimeDiagnostic,
-  serializeWireValue,
   type ApplicationId,
   type CapabilityBinding,
   type CapabilityDefinition,
   type CapabilityIdentity,
+  type ComponentCapabilityIdentity,
   type ComponentId,
+  DiagnosticError,
   type JsonObject,
   type JsonSchema,
   type JsonValue,
   type OperationId,
   type Permission,
   type PluginId,
+  parseCapabilityName,
+  parseComponentId,
+  parseOperationId,
+  runtimeDiagnostic,
+  serializeWireValue,
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
 import {
+  type CapabilitySchemaGate,
   CapabilitySchemaRegistry,
   gateCapabilityRequest,
   gateCapabilityResponse,
   gatePermission,
-  type CapabilitySchemaGate,
 } from "../permissions/gate.js";
 import type { Activation } from "../reconcile/plan.js";
 
@@ -34,11 +35,12 @@ export interface ComponentInstanceIdentity extends JsonObject {
   readonly componentId: ComponentId;
   readonly activation: Activation;
   readonly target: TaskExecutionTarget;
+  readonly bindingFingerprint: string;
 }
 
 export interface RoutedCapabilityInvocation extends JsonObject {
   readonly invocationId: OperationId | string;
-  readonly identity: CapabilityIdentity;
+  readonly identity: ComponentCapabilityIdentity;
   readonly method: string;
   readonly input: JsonValue;
 }
@@ -133,15 +135,13 @@ function sameConsumer(left: ComponentInstanceIdentity, right: ComponentInstanceI
     left.pluginId === right.pluginId &&
     left.componentId === right.componentId &&
     left.activation === right.activation &&
+    left.bindingFingerprint === right.bindingFingerprint &&
     sameTarget(left.target, right.target)
   );
 }
 
 function error(
-  code:
-    | `CAPABILITY_${string}`
-    | `PERMISSION_${string}`
-    | "PROTOCOL_IDEMPOTENCY_CONFLICT",
+  code: `CAPABILITY_${string}` | `PERMISSION_${string}` | "PROTOCOL_IDEMPOTENCY_CONFLICT",
   message: string,
 ) {
   return new DiagnosticError(
@@ -168,6 +168,7 @@ function invocationKey(consumer: ComponentInstanceIdentity, invocationId: Operat
     componentId: consumer.componentId,
     activation: consumer.activation,
     target: consumer.target,
+    bindingFingerprint: consumer.bindingFingerprint,
     invocationId,
   });
 }
@@ -361,9 +362,7 @@ export class CapabilityRouter {
       return existing.gate;
     }
     while (this.#schemas.size >= this.#maxSchemaGates) {
-      const oldest = this.#schemas.entries().next().value as
-        | [string, SchemaEntry]
-        | undefined;
+      const oldest = this.#schemas.entries().next().value as [string, SchemaEntry] | undefined;
       if (oldest === undefined) break;
       oldest[1].registry.clear();
       this.#schemas.delete(oldest[0]);

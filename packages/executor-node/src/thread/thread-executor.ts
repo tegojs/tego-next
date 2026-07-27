@@ -634,7 +634,12 @@ class ThreadChannel {
         }
         value = await this.#options.secretProvider.get(payload.name);
       } else if (message.type === "capability") {
-        const payload = this.#exactPayload(message.payload, ["identity", "method", "input"]);
+        const payload = this.#exactPayload(message.payload, [
+          "invocationId",
+          "identity",
+          "method",
+          "input",
+        ]);
         const identity = this.#exactPayload(payload.identity, ["name", "protocolVersion"]);
         const name = parseCapabilityName(identity.name);
         if (typeof identity.protocolVersion !== "string" || identity.protocolVersion.length === 0) {
@@ -653,7 +658,7 @@ class ThreadChannel {
         }
         value = validators.response.parse(
           await this.#options.capabilityBoundary.invoke({
-            invocationId: parseOperationId(message.id),
+            invocationId: parseOperationId(payload.invocationId),
             identity: capabilityIdentity,
             method: payload.method,
             input,

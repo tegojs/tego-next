@@ -438,7 +438,12 @@ class ProcessChannel {
         value = await this.#options.secretProvider.get(payload.name);
         if (typeof value === "string" && value.length > 0) this.#secretValues.add(value);
       } else if (message.type === "capability") {
-        const payload = this.#exactPayload(message.payload, ["identity", "method", "input"]);
+        const payload = this.#exactPayload(message.payload, [
+          "invocationId",
+          "identity",
+          "method",
+          "input",
+        ]);
         const identity = this.#exactPayload(payload.identity, ["name", "protocolVersion"]);
         const name = parseCapabilityName(identity.name);
         if (typeof identity.protocolVersion !== "string" || identity.protocolVersion.length === 0) {
@@ -457,7 +462,7 @@ class ProcessChannel {
         }
         value = validators.response.parse(
           await this.#options.capabilityBoundary.invoke({
-            invocationId: parseOperationId(message.id),
+            invocationId: parseOperationId(payload.invocationId),
             identity: capabilityIdentity,
             method: payload.method,
             input,

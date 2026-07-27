@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  type CapabilityBinding,
   DiagnosticError,
+  type JsonValue,
+  type Permission,
   parseApplicationId,
   parseArtifactDigest,
   parseCapabilityName,
@@ -9,14 +12,11 @@ import {
   parseComponentInstanceId,
   parseGeneration,
   parsePluginId,
-  type CapabilityBinding,
-  type JsonValue,
-  type Permission,
   type TaskExecutionTarget,
 } from "@tegojs/contracts";
 import {
-  CapabilityRouter,
   type CapabilityRoute,
+  CapabilityRouter,
   type ComponentInstanceIdentity,
 } from "../src/capabilities/router.js";
 
@@ -26,6 +26,7 @@ const consumer: ComponentInstanceIdentity = {
   pluginId: parsePluginId("consumer"),
   componentId: parseComponentId("consumer-task"),
   activation: "2",
+  bindingFingerprint: "consumer-binding",
   target: {
     instanceId: parseComponentInstanceId("consumer-instance"),
     deploymentGeneration: parseGeneration("1"),
@@ -129,8 +130,7 @@ test("capability router rejects invalid requests before provider code", async ()
   await assert.rejects(
     router.invoke(consumer, call({ value: 42 })),
     (error: unknown) =>
-      error instanceof DiagnosticError &&
-      error.diagnostic.code === "CAPABILITY_REQUEST_INVALID",
+      error instanceof DiagnosticError && error.diagnostic.code === "CAPABILITY_REQUEST_INVALID",
   );
   assert.equal(dispatched, false);
 });
@@ -145,8 +145,7 @@ test("capability router rejects invalid provider responses", async () => {
   await assert.rejects(
     router.invoke(consumer, call()),
     (error: unknown) =>
-      error instanceof DiagnosticError &&
-      error.diagnostic.code === "CAPABILITY_RESPONSE_INVALID",
+      error instanceof DiagnosticError && error.diagnostic.code === "CAPABILITY_RESPONSE_INVALID",
   );
 });
 
@@ -184,8 +183,7 @@ test("capability router revalidates the durable binding before dispatch", async 
   await assert.rejects(
     router.invoke(consumer, call()),
     (error: unknown) =>
-      error instanceof DiagnosticError &&
-      error.diagnostic.code === "CAPABILITY_BINDING_STALE",
+      error instanceof DiagnosticError && error.diagnostic.code === "CAPABILITY_BINDING_STALE",
   );
   assert.equal(dispatched, false);
 });
@@ -207,13 +205,9 @@ test("capability invocation identity deduplicates matching calls and rejects equ
   await assert.rejects(
     router.invoke(consumer, call({ value: "different" })),
     (error: unknown) =>
-      error instanceof DiagnosticError &&
-      error.diagnostic.code === "PROTOCOL_IDEMPOTENCY_CONFLICT",
+      error instanceof DiagnosticError && error.diagnostic.code === "PROTOCOL_IDEMPOTENCY_CONFLICT",
   );
   deferred.resolve({ echoed: "hello" });
-  assert.deepEqual(await Promise.all([first, replay]), [
-    { echoed: "hello" },
-    { echoed: "hello" },
-  ]);
+  assert.deepEqual(await Promise.all([first, replay]), [{ echoed: "hello" }, { echoed: "hello" }]);
   assert.equal(dispatches, 1);
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -10,6 +10,19 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const examplePlugin = join(root, "examples/echo-plugin");
 const capabilityName = "org.example.capability.echo";
 const deadlineMs = 5_000;
+
+async function makeTreeOwnerWritable(directory) {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const child = join(directory, entry.name);
+        await chmod(child, 0o700);
+        await makeTreeOwnerWritable(child);
+      }),
+  );
+}
 
 async function eventually(operation, description) {
   const signal = AbortSignal.timeout(deadlineMs);
@@ -203,7 +216,11 @@ test("capability topology routes task consumers to exact task providers across l
         operationId: `capability-topology-${index}`,
       });
       const completed = await host.runtime.operations.waitTask(accepted.taskId);
-      assert.equal(completed.result?.status, "succeeded");
+      assert.equal(
+        completed.result?.status,
+        "succeeded",
+        JSON.stringify(completed.result?.diagnostic),
+      );
       const snapshot = await host.runtime.operations.snapshot({});
       const providerInstance = snapshot.instances.items
         .map((item) => item.value)
@@ -224,6 +241,10 @@ test("capability topology routes task consumers to exact task providers across l
     }
   } finally {
     await host?.runtime.stop().catch(() => undefined);
+    // Prepared artifacts are intentionally immutable while live. The runtime is
+    // fully stopped above, so restore directory ownership permissions only for
+    // deterministic test cleanup.
+    await makeTreeOwnerWritable(dataDirectory);
     await rm(workspace, { force: true, recursive: true });
     await rm(dataDirectory, { force: true, recursive: true });
   }
