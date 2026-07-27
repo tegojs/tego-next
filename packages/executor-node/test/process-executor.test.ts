@@ -1520,17 +1520,11 @@ test("queued terminal attempts release their deadline sleeper", async () => {
 });
 
 test("an active deadline uses the shared clock and cannot be overwritten by a late exit", async () => {
-  const started = Promise.withResolvers<void>();
   const processHost = new TestProcessHost();
   const executor = new ProcessExecutor(
     await options({
       processHost,
       maxConcurrency: 1,
-      events: {
-        async emit(type) {
-          if (type === "run.started") started.resolve();
-        },
-      },
     }),
   );
   const execution = {
@@ -1538,13 +1532,32 @@ test("an active deadline uses the shared clock and cannot be overwritten by a la
     deadline: new Date(clock.now().getTime() + 50).toISOString(),
   };
   const handle = await executor.submit(execution);
-  await started.promise;
+  await eventually(
+    async () => {
+      assert.equal(
+        (await executor.observe(execution.taskId, execution.attemptId))?.state,
+        "running",
+      );
+      assert.equal(processHost.activeProcessCount, 1);
+    },
+    {
+      attempts: 1_000,
+      advance: () => new Promise<void>((resolve) => setImmediate(resolve)),
+    },
+  );
+  let first: Awaited<typeof handle.result> | undefined;
+  void handle.result.then((result) => {
+    first = result;
+  });
   clock.advanceBy(50);
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-  clock.advanceBy(100);
-  const first = await handle.result;
+  await eventually(() => assert.notEqual(first, undefined), {
+    attempts: 1_000,
+    advance: async () => {
+      clock.advanceBy(100);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    },
+  });
+  if (first === undefined) throw new Error("deadline result did not settle");
   assert.equal(first.status, "timed-out");
   assert.deepEqual(await executor.observe(execution.taskId, execution.attemptId), {
     state: "terminal",
