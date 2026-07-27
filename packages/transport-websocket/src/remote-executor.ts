@@ -2,6 +2,7 @@ import {
   type AttemptId,
   type AttemptStatus,
   type Clock,
+  DiagnosticError,
   type DrainOptions,
   type ExecutionHandle,
   type ExecutionRequest,
@@ -56,6 +57,21 @@ import {
   remoteError,
   requestFingerprint,
 } from "./remote-protocol.js";
+
+interface ReclaimableCapabilityEntry {
+  reclaimable: boolean;
+}
+
+function pruneSettledCapabilities<T extends ReclaimableCapabilityEntry>(
+  entries: Map<string, T>,
+  maximum: number,
+): void {
+  while (entries.size >= maximum) {
+    const settled = [...entries].find(([, entry]) => entry.reclaimable);
+    if (settled === undefined) return;
+    entries.delete(settled[0]);
+  }
+}
 
 const DEFAULT_MAX_ASSIGNMENTS = 256;
 const DEFAULT_MAX_CONTROL_PAYLOAD_BYTES = 48 * 1024;
@@ -133,11 +149,15 @@ export class RemoteExecutor implements Executor {
   readonly #attempts = new Map<string, RemoteAttempt>();
   readonly #capabilityInvocations = new Map<
     string,
-    { readonly fingerprint: string; readonly result: Promise<JsonValue> }
+    { readonly fingerprint: string; readonly result: Promise<JsonValue>; reclaimable: boolean }
   >();
   readonly #inboundCapabilityInvocations = new Map<
     string,
-    { readonly fingerprint: string; readonly response: Promise<RemoteCapabilityInvocationResponse> }
+    {
+      readonly fingerprint: string;
+      readonly response: Promise<RemoteCapabilityInvocationResponse>;
+      reclaimable: boolean;
+    }
   >();
   readonly #componentActivations = new Map<
     string,
@@ -278,6 +298,7 @@ export class RemoteExecutor implements Executor {
       }
       return existing.result;
     }
+    pruneSettledCapabilities(this.#capabilityInvocations, this.#maxCapabilityInvocations);
     if (this.#capabilityInvocations.size >= this.#maxCapabilityInvocations) {
       throw remoteError(
         "CAPABILITY_INVOCATION_EXHAUSTED",
@@ -302,7 +323,18 @@ export class RemoteExecutor implements Executor {
       );
     }
     const result = this.#requestCapability(session, request, fingerprint);
-    this.#capabilityInvocations.set(request.invocationId, { fingerprint, result });
+    const entry = { fingerprint, result, reclaimable: false };
+    this.#capabilityInvocations.set(request.invocationId, entry);
+    void result.then(
+      () => {
+        entry.reclaimable = true;
+      },
+      (error: unknown) => {
+        entry.reclaimable =
+          !(error instanceof DiagnosticError) ||
+          error.diagnostic.code !== "CAPABILITY_INVOCATION_INDETERMINATE";
+      },
+    );
     return result;
   }
 
@@ -1222,6 +1254,7 @@ export class RemoteExecutor implements Executor {
       );
       return;
     }
+    pruneSettledCapabilities(this.#inboundCapabilityInvocations, this.#maxCapabilityInvocations);
     if (this.#inboundCapabilityInvocations.size >= this.#maxCapabilityInvocations) {
       await this.#sendInboundCapabilityResponse(session, message.messageId, {
         invocationId: request.invocationId,
@@ -1235,7 +1268,16 @@ export class RemoteExecutor implements Executor {
       return;
     }
     const response = this.#routeInboundCapability(request, fingerprint);
-    this.#inboundCapabilityInvocations.set(request.invocationId, { fingerprint, response });
+    const entry = { fingerprint, response, reclaimable: false };
+    this.#inboundCapabilityInvocations.set(request.invocationId, entry);
+    void response.then(
+      () => {
+        entry.reclaimable = true;
+      },
+      () => {
+        entry.reclaimable = true;
+      },
+    );
     await this.#sendInboundCapabilityResponse(session, message.messageId, await response);
   }
 

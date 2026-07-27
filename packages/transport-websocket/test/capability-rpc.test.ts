@@ -18,6 +18,16 @@ const clock = new FakeClock(new Date(0));
 const workerId = parseWorkerId("worker-capability");
 const cleanups: Array<() => Promise<void>> = [];
 
+async function waitForReleases(
+  releases: readonly PromiseWithResolvers<void>[],
+  count: number,
+): Promise<void> {
+  for (let turn = 0; turn < 100 && releases.length < count; turn += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(releases.length, count);
+}
+
 const invocation: ComponentCapabilityInvocation = {
   invocationId: "placeholder",
   identity: {
@@ -244,6 +254,7 @@ test("capability invocation admission is bounded", async () => {
   releases[0]?.resolve();
   assert.deepEqual(await first, { value: "hello" });
   const afterSettlement = remote.invokeCapability(request("bounded-3"));
+  await waitForReleases(releases, 2);
   releases[1]?.resolve();
   assert.deepEqual(await afterSettlement, { value: "hello" });
 });
@@ -290,6 +301,7 @@ test("remote consumer capability admission reuses settled capacity", async () =>
   releases[0]?.resolve();
   assert.deepEqual(await first, { value: "hello" });
   const afterSettlement = runtime.invokeMainCapability(request("consumer-bounded-3"));
+  await waitForReleases(releases, 2);
   releases[1]?.resolve();
   assert.deepEqual(await afterSettlement, { value: "hello" });
 });
