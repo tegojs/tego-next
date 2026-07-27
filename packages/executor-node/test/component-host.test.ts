@@ -39,6 +39,12 @@ const componentTarget = {
   artifactDigest: digest,
   executor: { id: "component-host", type: "process" },
 } as const;
+const componentExecutionIdentity = {
+  applicationId: parseApplicationId("app-01"),
+  pluginId: parsePluginId("org.example.component"),
+  componentId: parseComponentId("component"),
+  target: componentTarget,
+} as const;
 
 interface ArtifactFixture {
   readonly directory: string;
@@ -113,6 +119,15 @@ function prepareCommand(
       ...overrides,
     },
   };
+}
+
+function executionBinding(fixture: ArtifactFixture) {
+  return createExecutionBinding(componentExecutionIdentity, {
+    configuration: { greeting: "hello" },
+    permissionGrants: fixture.manifest.permissions,
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
 }
 
 function command(
@@ -275,6 +290,7 @@ async function attachmentLimitResult(
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -401,6 +417,7 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sd
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -990,6 +1007,7 @@ test("failed stop cleanup is terminal and repeats its canonical result without r
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1110,6 +1128,7 @@ test("a plugin-created AsyncResource cannot self-await an active transition", as
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1164,6 +1183,7 @@ test("drain closes run intake synchronously before its hook settles", async (t) 
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1204,6 +1224,7 @@ test("non-cooperative runs respect hard capacity while cancel and drain remain a
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
+          binding: executionBinding(fixture),
           input: index,
           deadline: futureDeadline,
           orphanPolicy: "cancel",
@@ -1315,6 +1336,7 @@ test("duplicate task attempts compare full execution fingerprints and completed 
     applicationId: parseApplicationId("app-01"),
     pluginId: parsePluginId("org.example.component"),
     componentId: parseComponentId("component"),
+    binding: executionBinding(fixture),
     input: { version: 1 },
     deadline: futureDeadline,
     orphanPolicy: "cancel",
@@ -1411,6 +1433,7 @@ test("deadline acceptance and chunked timers use the same injected clock", async
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
+          binding: executionBinding(fixture),
           input: null,
           deadline,
           orphanPolicy: "cancel",
@@ -1928,6 +1951,7 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
       applicationId: parseApplicationId("app-01"),
       pluginId: parsePluginId("org.example.component"),
       componentId: parseComponentId("component"),
+      binding: executionBinding(fixture),
       input: null,
       deadline: futureDeadline,
       orphanPolicy: "cancel",
@@ -1991,6 +2015,7 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
           applicationId: parseApplicationId("app-01"),
           pluginId: parsePluginId("org.example.component"),
           componentId: parseComponentId("component"),
+          binding: executionBinding(fixture),
           input: null,
           deadline,
           orphanPolicy: "cancel",
@@ -2087,6 +2112,7 @@ test("secret access requires manifest request and deployment grant and never lea
         applicationId: parseApplicationId("app-01"),
         pluginId: parsePluginId("org.example.component"),
         componentId: parseComponentId("component"),
+        binding: executionBinding(fixture),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",
