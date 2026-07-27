@@ -42,7 +42,7 @@ The Worker SHALL register labels, resources, executors, and prepared artifacts a
 - **THEN** the Main marks it unavailable and stops assigning new tasks
 
 ### Requirement: Reconnect reconciliation
-The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and exact component activation lifecycle state after a session reconnect. Main SHALL send every locally retained active or draining binding so a replacement Worker can validate and materialize it with the same admission state. Worker SHALL report every retained binding and lifecycle state so a replacement Main can recover exact draining teardown authority without trusting a Worker-reported active binding as a new Main activation. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active.
+The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and exact component activation lifecycle state after a session reconnect. Main SHALL send every Main-originated active or draining binding so a replacement Worker can validate and materialize it with the same admission state. Worker SHALL report every retained binding and lifecycle state so a replacement Main can recover an exact draining teardown candidate without trusting a Worker-reported binding as transferable Main activation authority. Worker-originated candidates SHALL NOT be replayed to another Worker and SHALL authorize stop only when the Main supplies the matching durable target and binding fingerprint. Each side SHALL validate the complete activation inventory before committing lifecycle state or invoking materialization callbacks. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active.
 
 #### Scenario: Result completes while disconnected
 - **WHEN** a task using `finish-and-buffer` completes after its session disconnects
@@ -70,7 +70,11 @@ The protocol SHALL reconcile running attempts, buffered terminal results, Worker
 
 #### Scenario: Replacement Main completes retained Worker teardown
 - **WHEN** a Worker retains a draining component binding and reconnects to a replacement authoritative Main
-- **THEN** the Worker reports that exact non-accepting state and the Main hydrates enough lifecycle identity to issue the exact stop without restarting the Worker
+- **THEN** the Worker reports that exact non-accepting state and the Main retains a non-transferable teardown candidate that accepts only an exact stop with the Main-derived durable target and binding fingerprint
+
+#### Scenario: Rejected inventory has no lifecycle side effects
+- **WHEN** either peer receives an activation inventory containing a later duplicate, conflict, invalid target, or invalid lifecycle state
+- **THEN** it rejects the complete inventory without retaining earlier entries or invoking their materialization callbacks
 
 #### Scenario: Worker rotates away from a follower endpoint
 - **WHEN** a Worker connect list reaches an authenticated Main that rejects registration because it is not authoritative

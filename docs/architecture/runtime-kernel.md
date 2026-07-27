@@ -263,11 +263,14 @@ deduplicate by `(taskId, attemptId)`.
 
 Reconnect reconciliation also exchanges exact component activation lifecycle
 state. A replacement Worker materializes Main-retained active or draining
-bindings before admission; a replacement Main may hydrate a Worker-retained
-draining binding only to complete exact teardown. Neither direction may promote
-`draining` back to `active`. Worker connect mode rotates through its bounded URL
-set when an authenticated follower rejects registration as non-authoritative,
-while authentication failures remain terminal.
+bindings before admission; a replacement Main may retain a Worker-reported
+draining binding only as a non-transferable teardown candidate. That candidate
+is never replayed to another Worker and accepts stop only when the Main supplies
+the matching durable target and binding fingerprint. Both sides validate a
+complete inventory before lifecycle mutation or materialization. Neither
+direction may promote `draining` back to `active`. Worker connect mode rotates
+through its bounded URL set when an authenticated follower rejects registration
+as non-authoritative, while authentication failures remain terminal.
 
 ## Failure, indeterminate, and recovery semantics
 

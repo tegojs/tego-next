@@ -122,6 +122,7 @@ class ControlledRemoteExecutor implements Executor {
   drainedTargets: ExecutionRequest["target"][] = [];
   targetDrains = 0;
   activations: RemoteComponentActivation[] = [];
+  stopFingerprints: (string | undefined)[] = [];
   capabilityInvocations: RemoteCapabilityInvocation[] = [];
   lifecycle: string[] = [];
   submitGate: Promise<void> | undefined;
@@ -173,8 +174,9 @@ class ControlledRemoteExecutor implements Executor {
     this.lifecycle.push("drain");
   }
 
-  async stopComponent() {
+  async stopComponent(_target: ExecutionRequest["target"], bindingFingerprint?: string) {
     this.lifecycle.push("stop");
+    this.stopFingerprints.push(bindingFingerprint);
   }
 
   async invokeCapability(request: RemoteCapabilityInvocation) {
@@ -292,10 +294,15 @@ test("remote component stop drains the persisted target after a fresh registry r
   const registry = new LocalComponentSessionRegistry("runtime-remote-restart-stop");
   const shared = new ControlledRemoteExecutor();
   shared.targetDrain.resolve();
+  let resolvedFingerprint: string | undefined;
   const host = new RemoteComponentSessionHost({
     registry,
     resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
-    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    resolveExecutionBinding: (_binding, target) => {
+      const resolved = executionBinding(target);
+      resolvedFingerprint = resolved.fingerprint;
+      return Promise.resolve(resolved);
+    },
     runtimeId: "runtime-remote-restart-stop",
   });
   const component = binding();
@@ -303,6 +310,7 @@ test("remote component stop drains the persisted target after a fresh registry r
   await host.stop(component);
 
   assert.deepEqual(shared.lifecycle, ["stop"]);
+  assert.deepEqual(shared.stopFingerprints, [resolvedFingerprint]);
   await registry.close();
 });
 

@@ -1583,6 +1583,14 @@ export class WorkerRuntime {
       );
       return;
     }
+    const reconciledActivations: {
+      readonly activation: RemoteComponentActivation;
+      readonly existing: WorkerActivation | undefined;
+      readonly key: string;
+      readonly state: "active" | "draining";
+    }[] = [];
+    const activationKeys = new Set<string>();
+    let newActivationCount = 0;
     for (const value of payload.activations) {
       const retained = asObject(value, "Worker reconnect component activation");
       if (retained.state !== "active" && retained.state !== "draining") {
@@ -1590,6 +1598,10 @@ export class WorkerRuntime {
       }
       const activation = parseRemoteComponentActivation(retained.activation);
       const key = this.#activationKey(activation.target);
+      if (activationKeys.has(key)) {
+        throw new Error("Worker reconnect component activation inventory has a duplicate target");
+      }
+      activationKeys.add(key);
       const existing = this.#activations.get(key);
       if (existing !== undefined) {
         if (
@@ -1601,25 +1613,43 @@ export class WorkerRuntime {
         if (existing.state === "draining" && retained.state === "active") {
           throw new Error("Worker reconnect cannot promote a draining component activation");
         }
-        if (retained.state === "draining") {
-          existing.state = "draining";
+      } else {
+        if (
+          activation.target.executor.type !== "remote" ||
+          activation.target.executor.workerId !== this.#workerId
+        ) {
+          throw new Error("Worker reconnect component activation target is invalid");
+        }
+        newActivationCount += 1;
+      }
+      reconciledActivations.push({
+        activation,
+        existing,
+        key,
+        state: retained.state,
+      });
+    }
+    if (this.#activations.size + newActivationCount > this.#maxComponentActivations) {
+      throw new Error("Worker reconnect component activation capacity is exhausted");
+    }
+    for (const candidate of reconciledActivations) {
+      if (candidate.existing !== undefined) continue;
+      await this.#validateActivation?.(cloneJson(candidate.activation));
+    }
+    for (const candidate of reconciledActivations) {
+      if (candidate.existing !== undefined) continue;
+      await this.#activateComponentCallback?.(cloneJson(candidate.activation));
+    }
+    for (const candidate of reconciledActivations) {
+      if (candidate.existing !== undefined) {
+        if (candidate.state === "draining") {
+          candidate.existing.state = "draining";
         }
         continue;
       }
-      if (
-        activation.target.executor.type !== "remote" ||
-        activation.target.executor.workerId !== this.#workerId
-      ) {
-        throw new Error("Worker reconnect component activation target is invalid");
-      }
-      if (this.#activations.size >= this.#maxComponentActivations) {
-        throw new Error("Worker reconnect component activation capacity is exhausted");
-      }
-      await this.#validateActivation?.(cloneJson(activation));
-      await this.#activateComponentCallback?.(cloneJson(activation));
-      this.#activations.set(key, {
-        activation: cloneJson(activation),
-        state: retained.state,
+      this.#activations.set(candidate.key, {
+        activation: cloneJson(candidate.activation),
+        state: candidate.state,
       });
     }
     const attempts = [...this.#attempts.values()];

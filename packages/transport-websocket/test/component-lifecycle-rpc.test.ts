@@ -520,6 +520,166 @@ test("fresh Main hydrates retained draining Worker state and completes teardown"
   });
 
   await assert.rejects(replacementRemote.submit(request), /drain|active/iu);
-  await replacementRemote.stopComponent(request.target);
+  const stopExact = replacementRemote.stopComponent as (
+    target: typeof request.target,
+    bindingFingerprint: string,
+  ) => Promise<void>;
+  await assert.rejects(
+    stopExact.call(replacementRemote, request.target, "0".repeat(64)),
+    /binding|fingerprint|activation/iu,
+  );
+  await stopExact.call(
+    replacementRemote,
+    request.target,
+    activationFor(request).bindingFingerprint,
+  );
   assert.deepEqual(stopped, [activationFor(request)]);
+});
+
+test("Worker-reported draining state is never replayed to another replacement Worker", async () => {
+  const request = executionRequest(null, "draining-provenance");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const [retainedMain, retainedWorker] = memorySessionPair("1");
+  const retainedRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    drainComponent: () => {
+      throw new Error("drain interrupted");
+    },
+  });
+  await retainedRuntime.attach(retainedWorker);
+  const seedRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  await seedRemote.attach(retainedMain);
+  await seedRemote.activateComponent(activationFor(request));
+  await assert.rejects(seedRemote.drainComponent(request.target), /drain/iu);
+  retainedMain.close();
+
+  const candidateRemote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const [candidateMain, candidateWorker] = memorySessionPair("2");
+  await retainedRuntime.attach(candidateWorker);
+  await candidateRemote.attach(candidateMain);
+  candidateMain.close();
+  await retainedRuntime.close();
+
+  const materialized: RemoteComponentActivation[] = [];
+  const replacementRuntime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    activateComponent: (activation) => {
+      materialized.push(activation);
+    },
+  });
+  const [replacementMain, replacementWorker] = memorySessionPair("3");
+  await replacementRuntime.attach(replacementWorker);
+  await candidateRemote.attach(replacementMain);
+  cleanups.push(async () => {
+    await Promise.all([seedRemote.close(), candidateRemote.close(), replacementRuntime.close()]);
+  });
+
+  assert.deepEqual(materialized, []);
+});
+
+test("rejected Worker activation inventory cannot mutate the next reconciliation request", async () => {
+  const request = executionRequest(null, "invalid-inventory");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const activation = activationFor(request);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+  });
+  const [firstMain, firstWorker] = memorySessionPair("1");
+  firstWorker.onMessage((message) => {
+    if (message.type !== "session.reconcile") return;
+    void firstWorker.send(
+      "session.reconcile",
+      {
+        epoch: firstWorker.epoch,
+        attemptPersistenceAvailable: true,
+        acknowledged: [],
+        running: [],
+        terminalUnacknowledged: [],
+        preparedArtifacts: [],
+        componentActivations: [
+          { activation, state: "draining" },
+          { activation, state: "draining" },
+        ],
+      },
+      { correlationId: message.messageId },
+    );
+  });
+  await assert.rejects(remote.attach(firstMain), /duplicate/iu);
+
+  let nextActivations: unknown;
+  const [nextMain, nextWorker] = memorySessionPair("2");
+  nextWorker.onMessage((message) => {
+    if (message.type !== "session.reconcile") return;
+    nextActivations = (message.payload as { readonly activations?: unknown }).activations;
+    void nextWorker.send(
+      "session.reconcile",
+      {
+        epoch: nextWorker.epoch,
+        attemptPersistenceAvailable: true,
+        acknowledged: [],
+        running: [],
+        terminalUnacknowledged: [],
+        preparedArtifacts: [],
+        componentActivations: [],
+      },
+      { correlationId: message.messageId },
+    );
+  });
+  await remote.attach(nextMain);
+  cleanups.push(async () => remote.close());
+
+  assert.deepEqual(nextActivations, []);
+});
+
+test("Worker validates a complete activation inventory before materialization", async () => {
+  const request = executionRequest(null, "worker-invalid-inventory");
+  const target = request.target.executor;
+  if (target.type !== "remote") throw new Error("test target must be remote");
+  const activation = activationFor(request);
+  const materialized: RemoteComponentActivation[] = [];
+  const [main, worker] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId: target.workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    activateComponent: (candidate) => {
+      materialized.push(candidate);
+    },
+  });
+  await runtime.attach(worker);
+  cleanups.push(async () => runtime.close());
+
+  const response = await main.request("session.reconcile", {
+    workerId: target.workerId,
+    epoch: main.epoch,
+    activations: [
+      { activation, state: "active" },
+      { activation, state: "active" },
+    ],
+  });
+
+  assert.notEqual((response.payload as { readonly error?: unknown }).error, undefined);
+  assert.deepEqual(materialized, []);
 });

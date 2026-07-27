@@ -39,6 +39,10 @@ export interface RemoteComponentSessionHostOptions {
     binding: ComponentBinding,
     target: TaskExecutionTarget,
   ) => Promise<ExecutionBinding>;
+  readonly resolveTeardownExecutionBinding?: (
+    binding: ComponentBinding,
+    target: TaskExecutionTarget,
+  ) => Promise<ExecutionBinding>;
   readonly runtimeId: string;
 }
 
@@ -52,7 +56,7 @@ interface TargetDrainingExecutor extends Executor {
     taskId: TaskId,
     attemptId: AttemptId,
   ): Promise<ExecutionHandle | undefined>;
-  stopComponent(target: TaskExecutionTarget): Promise<void>;
+  stopComponent(target: TaskExecutionTarget, bindingFingerprint?: string): Promise<void>;
 }
 
 export function remoteComponentExecutorId(workerIdValue: WorkerId | string): string {
@@ -292,13 +296,20 @@ export class RemoteComponentSessionHost implements ComponentLifecycleHost {
   async stop(binding: ComponentBinding): Promise<void> {
     const target = this.#target(binding);
     const registration = this.#options.registry.findExact(target);
+    const bindingFingerprint =
+      registration?.capabilityConsumer?.bindingFingerprint ??
+      (
+        await (
+          this.#options.resolveTeardownExecutionBinding ?? this.#options.resolveExecutionBinding
+        )(binding, target)
+      ).fingerprint;
     if (registration !== undefined) {
       await registration.executor.close();
-      await this.#resolveShared(binding, target).stopComponent(target);
+      await this.#resolveShared(binding, target).stopComponent(target, bindingFingerprint);
       this.#options.registry.remove(target);
       return;
     }
-    await this.#resolveShared(binding, target).stopComponent(target);
+    await this.#resolveShared(binding, target).stopComponent(target, bindingFingerprint);
   }
 
   #resolveShared(binding: ComponentBinding, target: TaskExecutionTarget): TargetDrainingExecutor {

@@ -167,7 +167,11 @@ export class RemoteExecutor implements Executor {
   >();
   readonly #componentActivations = new Map<
     string,
-    { readonly activation: RemoteComponentActivation; state: "active" | "draining" }
+    {
+      readonly activation: RemoteComponentActivation;
+      readonly provenance: "main" | "worker-teardown";
+      state: "active" | "draining";
+    }
   >();
   #lifecycleManaged = false;
   #session: RemoteSession | undefined;
@@ -422,6 +426,7 @@ export class RemoteExecutor implements Executor {
     );
     this.#componentActivations.set(key, {
       activation: cloneJson(activation),
+      provenance: "main",
       state: "active",
     });
   }
@@ -448,7 +453,10 @@ export class RemoteExecutor implements Executor {
     );
   }
 
-  async stopComponent(targetValue: TaskExecutionTarget): Promise<void> {
+  async stopComponent(
+    targetValue: TaskExecutionTarget,
+    bindingFingerprint?: string,
+  ): Promise<void> {
     const target = parseTaskExecutionTarget(targetValue);
     this.#assertExactTarget(target, "component stop");
     const key = this.#activationKey(target);
@@ -457,6 +465,17 @@ export class RemoteExecutor implements Executor {
       throw remoteError(
         "LIFECYCLE_COMPONENT_NOT_ACTIVE",
         "Remote component stop requires an active exact target",
+        this.id,
+        this.#clock.now().toISOString(),
+      );
+    }
+    if (
+      activation.provenance === "worker-teardown" &&
+      bindingFingerprint !== activation.activation.bindingFingerprint
+    ) {
+      throw remoteError(
+        "PROTOCOL_COMPONENT_ACTIVATION_CONFLICT",
+        "Worker-reported teardown requires the Main-derived binding fingerprint",
         this.id,
         this.#clock.now().toISOString(),
       );
@@ -1518,10 +1537,12 @@ export class RemoteExecutor implements Executor {
   }
 
   async #reconcile(session: RemoteSession): Promise<boolean> {
-    const activations = [...this.#componentActivations.values()].map((entry) => ({
-      activation: cloneJson(entry.activation),
-      state: entry.state,
-    }));
+    const activations = [...this.#componentActivations.values()]
+      .filter((entry) => entry.provenance === "main")
+      .map((entry) => ({
+        activation: cloneJson(entry.activation),
+        state: entry.state,
+      }));
     if (
       activations.length > this.#maxInventoryItems ||
       jsonBytes(activations) > this.#maxInventoryBytes
@@ -1595,10 +1616,15 @@ export class RemoteExecutor implements Executor {
     ) {
       throw new Error("Remote component activation inventory is invalid");
     }
-    if (payload.componentActivations.length > 0) {
-      this.#lifecycleManaged = true;
-    }
     const retainedActivationKeys = new Set<string>();
+    const workerTeardownCandidates = new Map<
+      string,
+      {
+        readonly activation: RemoteComponentActivation;
+        readonly provenance: "worker-teardown";
+        readonly state: "draining";
+      }
+    >();
     for (const value of payload.componentActivations) {
       const retained = asObject(value, "remote component activation inventory");
       if (retained.state !== "active" && retained.state !== "draining") {
@@ -1623,11 +1649,23 @@ export class RemoteExecutor implements Executor {
         continue;
       }
       if (retained.state === "draining") {
-        this.#componentActivations.set(key, {
+        workerTeardownCandidates.set(key, {
           activation: cloneJson(activation),
+          provenance: "worker-teardown",
           state: "draining",
         });
       }
+    }
+    for (const [key, entry] of this.#componentActivations) {
+      if (entry.provenance === "worker-teardown") {
+        this.#componentActivations.delete(key);
+      }
+    }
+    for (const [key, candidate] of workerTeardownCandidates) {
+      this.#componentActivations.set(key, candidate);
+    }
+    if (payload.componentActivations.length > 0) {
+      this.#lifecycleManaged = true;
     }
     const terminalKeys = new Set<string>();
     for (const result of terminal) {

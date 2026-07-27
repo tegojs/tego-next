@@ -547,14 +547,17 @@ memory/disk buffers for `finish-and-buffer`. Reconnect reports:
 - Main-retained exact active and draining component bindings that a replacement
   Worker validates and materializes with the same admission state;
 - Worker-retained exact component bindings and lifecycle states, from which a
-  replacement Main may hydrate draining teardown identity but never create a
-  new active Main activation;
+  replacement Main may create a non-transferable draining teardown candidate
+  but never create or replay Main activation authority;
 - whether the Worker attempt-state persistence boundary is currently available.
 
 A retained `draining` activation is never promoted by replay. Reconciliation
 materializes it as non-accepting on a replacement Worker and lets a replacement
-Main recover enough exact identity to retry teardown. Only successful stop, or
-a later durable lifecycle decision after stop, permits a new active activation.
+Main recover a teardown candidate. That candidate is never sent to another
+Worker and accepts stop only with the matching Main-derived durable target and
+binding fingerprint. Each peer validates the complete activation inventory
+before committing state or invoking materialization. Only successful stop, or a
+later durable lifecycle decision after stop, permits a new active activation.
 
 A Worker with multiple bounded Main URLs rotates past an authenticated follower
 that rejects registration as non-authoritative. The peer exposes only a generic

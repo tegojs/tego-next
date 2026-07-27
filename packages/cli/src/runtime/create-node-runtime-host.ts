@@ -301,6 +301,19 @@ export async function createNodeRuntimeHost(
           target,
         ),
       ),
+    resolveTeardownExecutionBinding: (binding, target) =>
+      drivers.state.transact({}, async (transaction) =>
+        resolveExecutionBinding(
+          transaction,
+          {
+            applicationId: binding.deployment.applicationId,
+            pluginId: binding.deployment.pluginId,
+            componentId: binding.component.componentId,
+          },
+          target,
+          { allowInactiveDeployment: true },
+        ),
+      ),
     runtimeId: options.runtimeId,
   });
   const lifecycleHost: ComponentLifecycleHost = {
@@ -321,6 +334,7 @@ export async function createNodeRuntimeHost(
     transaction: StateTransaction,
     request: Pick<RunTaskRequest, "applicationId" | "componentId" | "pluginId">,
     target: TaskExecutionTarget,
+    options: { readonly allowInactiveDeployment?: boolean } = {},
   ): Promise<ExecutionBinding> => {
     const durableDeployment = await transaction.get({
       namespace: "tego",
@@ -334,7 +348,7 @@ export async function createNodeRuntimeHost(
     if (
       deployment.applicationId !== request.applicationId ||
       deployment.pluginId !== request.pluginId ||
-      deployment.state !== "active" ||
+      (deployment.state !== "active" && options.allowInactiveDeployment !== true) ||
       deployment.generation !== target.deploymentGeneration ||
       deployment.artifactDigest !== target.artifactDigest
     ) {
