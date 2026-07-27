@@ -582,7 +582,7 @@ test("@spec:runtime-operations/local-runtime-operations/foreground-sigterm-clean
       endpoint,
       operation: "runtime.status",
       input: {},
-      timeoutMs: 1_000,
+      timeoutMs: deadlineMs,
     });
     assert.equal(status.ok, true);
     assert.equal(child.kill("SIGTERM"), true);
