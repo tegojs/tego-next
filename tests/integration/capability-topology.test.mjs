@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { createNodeRuntimeHost, packPlugin } from "@tegojs/cli";
+import {
+  createNodeRuntimeHost,
+  packPlugin,
+  parseCommand,
+  runWorkerProcess,
+} from "@tegojs/cli";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const examplePlugin = join(root, "examples/echo-plugin");
@@ -247,5 +252,112 @@ test("capability topology routes task consumers to exact task providers across l
     await makeTreeOwnerWritable(dataDirectory);
     await rm(workspace, { force: true, recursive: true });
     await rm(dataDirectory, { force: true, recursive: true });
+  }
+});
+
+test("capability topology routes through an exact materialized remote Worker activation", async () => {
+  const workspace = await mkdtemp(join(root, ".tego-capability-remote-"));
+  const mainDataDirectory = await mkdtemp(join(tmpdir(), "tego-capability-main-"));
+  const workerDataDirectory = await mkdtemp(join(tmpdir(), "tego-capability-worker-"));
+  const controller = new AbortController();
+  let host;
+  let workerRunning;
+  try {
+    const provider = await preparePlugin(workspace, "provider");
+    const consumer = await preparePlugin(workspace, "consumer");
+    host = await createNodeRuntimeHost({
+      applicationId: "capability-app",
+      dataDirectory: mainDataDirectory,
+      mode: "single-main",
+      nodeId: "capability-main-node",
+      runtimeId: "capability-main-runtime",
+      worker: {
+        credential: "capability-worker-secret",
+        host: "127.0.0.1",
+        port: 0,
+        workerId: "capability-worker",
+      },
+    });
+    await host.runtime.start();
+    const workerUrl = await host.startWorkerListener();
+    assert.notEqual(workerUrl, undefined);
+    const workerReady = Promise.withResolvers();
+    workerRunning = runWorkerProcess(
+      parseCommand([
+        "worker",
+        "start",
+        "--connect",
+        workerUrl,
+        "--credential",
+        "capability-worker-secret",
+        "--worker-id",
+        "capability-worker",
+        "--data-dir",
+        workerDataDirectory,
+        "--prepare",
+        provider.artifactPath,
+        "--prepare",
+        consumer.artifactPath,
+      ]),
+      {
+        signal: controller.signal,
+        onReady: () => workerReady.resolve(),
+      },
+    );
+    await Promise.race([
+      workerReady.promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("remote Worker readiness timed out")), deadlineMs),
+      ),
+    ]);
+    for (const plugin of [provider, consumer]) {
+      await host.artifactIngress.putPath(plugin.artifactPath);
+      await host.runtime.operations.installPlugin({ digest: plugin.digest });
+    }
+    await deploy(host.runtime, provider, "remote", false);
+    await deploy(host.runtime, consumer, "remote", true);
+
+    const input = { value: "remote-topology" };
+    const accepted = await host.runtime.operations.runTask({
+      applicationId: "capability-app",
+      pluginId: consumer.pluginId,
+      componentId: consumer.componentId,
+      input,
+      deadline: new Date(Date.now() + deadlineMs).toISOString(),
+      orphanPolicy: "finish-and-persist",
+      operationId: "capability-remote-topology",
+    });
+    const completed = await host.runtime.operations.waitTask(accepted.taskId);
+    assert.equal(
+      completed.result?.status,
+      "succeeded",
+      JSON.stringify(completed.result?.diagnostic),
+    );
+    const snapshot = await host.runtime.operations.snapshot({});
+    const providerInstance = snapshot.instances.items
+      .map((item) => item.value)
+      .find(
+        (instance) =>
+          instance.pluginId === provider.pluginId &&
+          instance.componentId === provider.componentId &&
+          instance.lifecycle === "ready",
+      );
+    assert.ok(providerInstance);
+    assert.deepEqual(completed.result?.output, {
+      activation: providerInstance.instanceId,
+      componentId: provider.componentId,
+      executor: "remote",
+      input,
+      method: "echo",
+    });
+  } finally {
+    await host?.runtime.stop().catch(() => undefined);
+    controller.abort();
+    await workerRunning?.catch(() => undefined);
+    await makeTreeOwnerWritable(mainDataDirectory);
+    await makeTreeOwnerWritable(workerDataDirectory);
+    await rm(workspace, { force: true, recursive: true });
+    await rm(mainDataDirectory, { force: true, recursive: true });
+    await rm(workerDataDirectory, { force: true, recursive: true });
   }
 });
