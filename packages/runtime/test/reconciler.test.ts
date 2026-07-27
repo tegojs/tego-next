@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   type ArtifactDigest,
-  type ClusterTime,
   type Clock,
+  type ClusterTime,
   compareOperationJournalCursors,
   DiagnosticError,
   type DriverHealth,
@@ -5538,7 +5538,7 @@ test("retry deadlines follow authoritative cluster time across a skewed authorit
   await replacement.stop();
 });
 
-test("invalid cluster time fails retry persistence closed", async () => {
+test("invalid cluster time fails reconciliation closed before lifecycle effects", async () => {
   const stateClock = new ManualClock();
   const state = await createHarnessStore(stateClock);
   const effects = new RecordingEffects();
@@ -5555,6 +5555,7 @@ test("invalid cluster time fails retry persistence closed", async () => {
 
   await assert.rejects(reconciler.start(), /canonical UTC timestamp/u);
   assert.equal(reconciler.kernelRunning, false);
+  assert.deepEqual(effects.calls, []);
 });
 
 test("deferred scheduler failure is observable and fails the reconciler closed", async () => {

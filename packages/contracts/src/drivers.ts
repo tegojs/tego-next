@@ -2,14 +2,22 @@ import type { Clock } from "./clock.js";
 import type { LeadershipHandle } from "./coordination.js";
 import type { ArtifactDigest, FencingEpoch, Revision } from "./identity.js";
 import type { JsonObject, JsonValue } from "./json.js";
-import type { DriverHealth, StateStore, StorageScope } from "./state.js";
-import type { SecretProvider } from "./secrets.js";
 import type { ProcessHost } from "./process-host.js";
+import type { SecretProvider } from "./secrets.js";
+import type { DriverHealth, StateStore, StorageScope } from "./state.js";
 
 export interface ManagedDriver {
   open(): Promise<void>;
   health(): Promise<DriverHealth>;
   close(): Promise<void>;
+}
+
+export interface ClusterTime {
+  /**
+   * Returns the authoritative cluster timestamp as canonical UTC
+   * (`Date#toISOString()` form).
+   */
+  now(): Promise<string>;
 }
 
 export interface CampaignRequest {

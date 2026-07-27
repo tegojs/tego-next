@@ -3,6 +3,7 @@ import {
   type ArtifactDigest,
   type CapabilityName,
   type Clock,
+  type ClusterTime,
   DiagnosticError,
   diagnosticCode,
   type ExecutorKind,
@@ -209,6 +210,7 @@ function startingEffect(instance: ComponentInstance): ReconcileEffect & { readon
 export interface ReconcilerOptions {
   readonly state: StateStore;
   readonly clock: Clock;
+  readonly clusterTime?: ClusterTime;
   readonly effects: ComponentEffectExecutor;
   readonly artifactGate: ReconcileArtifactGate | Pick<ArtifactService, "validate">;
   readonly authority?: RuntimeAuthority;
@@ -542,6 +544,7 @@ function parseReconcileEffect(claim: OutboxClaim): ParsedReconcileEffect {
 
 export class Reconciler {
   readonly #options: ReconcilerOptions;
+  readonly #clusterTime: ClusterTime;
   readonly #owner: string;
   readonly #componentLifecycle: ComponentLifecycleExecutor | undefined;
   readonly #maxConvergencePasses: number;
@@ -569,12 +572,24 @@ export class Reconciler {
 
   constructor(options: ReconcilerOptions) {
     this.#options = options;
+    this.#clusterTime = options.clusterTime ?? {
+      now: async () => options.clock.now().toISOString(),
+    };
     this.#owner = options.owner ?? "reconciler";
     this.#componentLifecycle = componentLifecycle(options.effects);
     this.#maxConvergencePasses = options.maxConvergencePasses ?? defaultMaxConvergencePasses;
     if (!Number.isSafeInteger(this.#maxConvergencePasses) || this.#maxConvergencePasses < 1) {
       throw new RangeError("maxConvergencePasses must be a positive safe integer");
     }
+  }
+
+  async #authoritativeNow(): Promise<{ readonly epochMs: number; readonly iso: string }> {
+    const iso = await this.#clusterTime.now();
+    const epochMs = typeof iso === "string" ? Date.parse(iso) : Number.NaN;
+    if (!Number.isFinite(epochMs) || new Date(epochMs).toISOString() !== iso) {
+      throw new TypeError("Cluster time must be a canonical UTC timestamp");
+    }
+    return { epochMs, iso };
   }
 
   get kernelRunning(): boolean {
@@ -673,17 +688,18 @@ export class Reconciler {
 
   async #reconcileUntilQuiescent(preservedWakeAt?: number): Promise<void> {
     this.#diagnosticsByDeployment.clear();
+    const decisionNow = await this.#authoritativeNow();
     this.#nextWakeAt =
-      preservedWakeAt !== undefined && preservedWakeAt > this.#options.clock.now().getTime()
+      preservedWakeAt !== undefined && preservedWakeAt > decisionNow.epochMs
         ? preservedWakeAt
         : undefined;
     for (let pass = 0; pass < this.#maxConvergencePasses; pass += 1) {
       if (!this.#running) return;
-      const pending = await this.#reconcilePass();
+      const pending = await this.#reconcilePass(decisionNow);
       if (!this.#running || this.#interrupted) return;
       if (!pending) {
-        this.#deferUntil(this.#options.clock.now().getTime() + claimLeaseMs);
-        this.#armDeferredWake();
+        this.#deferUntil(decisionNow.epochMs + claimLeaseMs);
+        await this.#armDeferredWake();
         return;
       }
     }
@@ -699,7 +715,10 @@ export class Reconciler {
     );
   }
 
-  async #reconcilePass(): Promise<boolean> {
+  async #reconcilePass(decisionNow: {
+    readonly epochMs: number;
+    readonly iso: string;
+  }): Promise<boolean> {
     if (!this.#running) return false;
     const replanCount = this.#replanCount;
     let [deployments, installations, loadedInstances, capabilityBindings, providerLosses] =
@@ -721,17 +740,20 @@ export class Reconciler {
       loadedInstances,
       providerLosses,
       capabilityBindings,
+      decisionNow,
     );
     if (!this.#running) return false;
     loadedInstances = await this.#loadInstances();
-    this.#deferRetries(loadedInstances);
+    this.#deferRetries(loadedInstances, decisionNow.epochMs);
     this.#deployments = deployments;
     this.#readyDeployments.clear();
 
     const existingClaim = await this.#claimNext();
     let performedImmediateWork = existingClaim !== undefined;
     if (existingClaim !== undefined) {
-      if ((await this.#executeClaim(existingClaim)) === capabilityBindingConflict) return true;
+      if ((await this.#executeClaim(existingClaim, decisionNow)) === capabilityBindingConflict) {
+        return true;
+      }
       if (!this.#running || this.#interrupted) return false;
       [deployments, installations, loadedInstances, capabilityBindings, providerLosses] =
         await Promise.all([
@@ -746,7 +768,7 @@ export class Reconciler {
       capabilityBindings = capabilityBindings.filter((record) =>
         this.#isCurrentCapabilityBinding(record, deployments),
       );
-      this.#deferRetries(loadedInstances);
+      this.#deferRetries(loadedInstances, decisionNow.epochMs);
       this.#deployments = deployments;
     }
 
@@ -808,6 +830,7 @@ export class Reconciler {
         capabilityBindings,
         providerLosses,
         gates,
+        decisionNow.iso,
       )
     ) {
       return true;
@@ -897,7 +920,7 @@ export class Reconciler {
         deployment,
         gate,
         instances: planningInstances,
-        now: this.#options.clock.now().toISOString(),
+        now: decisionNow.iso,
         supportedExecutors: this.#options.effects.supportedExecutors,
         suspended:
           providerLossHold?.value.action === "fail" ||
@@ -925,7 +948,7 @@ export class Reconciler {
       }
       for (const step of plan.steps) {
         if (!this.#running) return false;
-        await this.#persistStep(deployment, step);
+        await this.#persistStep(deployment, step, decisionNow.iso);
       }
     }
 
@@ -933,14 +956,16 @@ export class Reconciler {
       const claim = await this.#claimNext();
       if (claim !== undefined) {
         performedImmediateWork = true;
-        if ((await this.#executeClaim(claim)) === capabilityBindingConflict) return true;
+        if ((await this.#executeClaim(claim, decisionNow)) === capabilityBindingConflict) {
+          return true;
+        }
       }
     }
     if (!this.#running || this.#interrupted) return false;
     await this.#refreshReadiness();
     if (!this.#running) return false;
     const latestInstances = await this.#loadInstances();
-    this.#deferRetries(latestInstances);
+    this.#deferRetries(latestInstances, decisionNow.epochMs);
     const canonicalLatestInstances = latestInstances.filter((record) =>
       isInstanceContextConsistent(record, this.#deployments),
     );
@@ -965,7 +990,7 @@ export class Reconciler {
       return (
         recoveryPrerequisitesReady &&
         !this.#isDeploymentPlanningBlocked(record.value) &&
-        this.#needsImmediateReconcile(record.value)
+        this.#needsImmediateReconcile(record.value, decisionNow.iso)
       );
     });
     const hasUnsettledDeployment = this.#deployments.some(
@@ -1596,6 +1621,7 @@ export class Reconciler {
     capabilityBindings: readonly LoadedCapabilityBinding[],
     loadedLosses: readonly LoadedProviderLoss[],
     gates: ReadonlyMap<string, ArtifactDeploymentGate | DiagnosticError>,
+    now: string,
   ): Promise<boolean> {
     if (this.#options.loadDeployments !== undefined) return false;
     if (await this.#cleanupOrphanProviderLosses(deployments, loadedLosses)) return true;
@@ -1999,15 +2025,15 @@ export class Reconciler {
                 kind: "component.lifecycle",
                 status: "planned",
                 state: step.effect,
-                updatedAt: this.#options.clock.now().toISOString(),
+                updatedAt: now,
               });
               await transaction.enqueueOutbox({
                 messageId: step.messageId,
                 operationId: step.operationId,
                 topic: "component.lifecycle",
                 payload: step.effect,
-                createdAt: this.#options.clock.now().toISOString(),
-                availableAt: this.#options.clock.now().toISOString(),
+                createdAt: now,
+                availableAt: now,
               });
             }
             return true;
@@ -2032,21 +2058,15 @@ export class Reconciler {
   }
 
   async #restorePersistedComponents(
-    loadedDeployments?: readonly PluginDeployment[],
-    loadedInstallations?: readonly PluginInstallation[],
-    loadedInstances?: readonly LoadedComponentInstance[],
-    loadedProviderLosses?: readonly LoadedProviderLoss[],
-    loadedCapabilityBindings?: readonly LoadedCapabilityBinding[],
+    deployments: readonly PluginDeployment[],
+    installations: readonly PluginInstallation[],
+    instances: readonly LoadedComponentInstance[],
+    providerLosses: readonly LoadedProviderLoss[],
+    capabilityBindings: readonly LoadedCapabilityBinding[],
+    decisionNow: { readonly epochMs: number; readonly iso: string },
   ): Promise<void> {
     if (this.#componentLifecycle === undefined) return;
-    const [deployments, installations, instances] = await Promise.all([
-      loadedDeployments ?? this.#loadDeployments(),
-      loadedInstallations ?? this.#loadInstallations(),
-      loadedInstances ?? this.#loadInstances(),
-    ]);
-    const now = this.#options.clock.now().toISOString();
-    const providerLosses = loadedProviderLosses ?? (await this.#loadProviderLosses());
-    const capabilityBindings = loadedCapabilityBindings ?? (await this.#loadCapabilityBindings());
+    const now = decisionNow.iso;
     const restorable = instances
       .filter((record) => isInstanceContextConsistent(record, deployments))
       .map((record) => record.value)
@@ -2107,7 +2127,7 @@ export class Reconciler {
           await this.#markTerminationRestored(instance);
           await this.#clearRestorationFailure(instance);
         } catch (error) {
-          await this.#recordRestorationFailure(instance, error);
+          await this.#recordRestorationFailure(instance, error, decisionNow);
         }
         continue;
       }
@@ -2123,7 +2143,7 @@ export class Reconciler {
           await this.#componentLifecycle.restoreStarting(startingEffect(instance));
           await this.#clearRestorationFailure(instance);
         } catch (error) {
-          await this.#recordRestorationFailure(instance, error);
+          await this.#recordRestorationFailure(instance, error, decisionNow);
         }
         continue;
       }
@@ -2163,7 +2183,7 @@ export class Reconciler {
         }
         await this.#clearRestorationFailure(instance);
       } catch (error) {
-        await this.#recordRestorationFailure(instance, error);
+        await this.#recordRestorationFailure(instance, error, decisionNow);
       }
     }
   }
@@ -2262,8 +2282,12 @@ export class Reconciler {
     );
   }
 
-  async #recordRestorationFailure(instance: ComponentInstance, error: unknown): Promise<void> {
-    const observedAt = this.#options.clock.now().toISOString();
+  async #recordRestorationFailure(
+    instance: ComponentInstance,
+    error: unknown,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<void> {
+    const observedAt = decisionNow.iso;
     const operationId = restorationOperationId(instance);
     const diagnostic = runtimeDiagnostic({
       code: "LIFECYCLE_RESTORE_FAILED",
@@ -2283,7 +2307,7 @@ export class Reconciler {
       if (current === undefined) return;
       const nextAttempt = (current.value.attempt ?? 0) + 1;
       const retryAt = new Date(
-        this.#options.clock.now().getTime() +
+        decisionNow.epochMs +
           deterministicRetryDelay({
             attempt: nextAttempt,
             baseDelayMs: 1_000,
@@ -2821,7 +2845,11 @@ export class Reconciler {
     });
   }
 
-  async #persistStep(deployment: PluginDeployment, step: ReconcilePlanStep): Promise<void> {
+  async #persistStep(
+    deployment: PluginDeployment,
+    step: ReconcilePlanStep,
+    now: string,
+  ): Promise<void> {
     if (!this.#running) return;
     const desired = (await this.#loadDeployments()).find(
       (candidate) =>
@@ -2881,7 +2909,6 @@ export class Reconciler {
       const next = this.#preEffectLifecycle(step.effect.kind, instance);
       if (next !== instance.lifecycle) instance = { ...instance, lifecycle: next };
     }
-    const now = this.#options.clock.now().toISOString();
     if (!this.#running) return;
     try {
       await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -2956,13 +2983,16 @@ export class Reconciler {
     return instance.lifecycle;
   }
 
-  async #executeClaim(claim: OutboxClaim): Promise<undefined | typeof capabilityBindingConflict> {
+  async #executeClaim(
+    claim: OutboxClaim,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<undefined | typeof capabilityBindingConflict> {
     if (!this.#running) return;
     let effect: ParsedReconcileEffect;
     try {
       effect = parseReconcileEffect(claim);
     } catch (error) {
-      await this.#rejectInvalidClaim(claim, error);
+      await this.#rejectInvalidClaim(claim, error, decisionNow);
       return;
     }
     const current = await this.#options.state.read(instanceKey(effect.instanceId));
@@ -2998,6 +3028,7 @@ export class Reconciler {
       await this.#rejectInvalidClaim(
         claim,
         new TypeError("Lifecycle effect identity is not canonical for its deployment tuple"),
+        decisionNow,
       );
       return;
     }
@@ -3023,6 +3054,7 @@ export class Reconciler {
       await this.#rejectInvalidClaim(
         claim,
         new TypeError("Lifecycle effect tuple does not match its persisted component instance"),
+        decisionNow,
       );
       return;
     }
@@ -3038,9 +3070,9 @@ export class Reconciler {
       instance.lifecycle === "starting" &&
       instance.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
       instance.retryAt !== undefined &&
-      instance.retryAt > this.#options.clock.now().toISOString()
+      instance.retryAt > decisionNow.iso
     ) {
-      await this.#retryClaim(claim, instance.retryAt);
+      await this.#retryClaim(claim, instance.retryAt, decisionNow);
       return;
     }
     const deployments = await this.#loadDeployments();
@@ -3102,7 +3134,7 @@ export class Reconciler {
       ) {
         this.#replanCount += 1;
         if (exactRecoveryEffect && suspendedLoss !== undefined) {
-          await this.#retryClaim(claim);
+          await this.#retryClaim(claim, undefined, decisionNow);
           return;
         }
         await this.#acknowledge(claim, "completed");
@@ -3135,7 +3167,7 @@ export class Reconciler {
                 }),
               );
         await this.#recordBlocked(desired, diagnostics);
-        await this.#retryClaim(claim);
+        await this.#retryClaim(claim, undefined, decisionNow);
         return;
       }
     } else if (
@@ -3178,7 +3210,7 @@ export class Reconciler {
         );
         if (!eligible) {
           this.#replanCount += 1;
-          await this.#retryClaim(claim);
+          await this.#retryClaim(claim, undefined, decisionNow);
           return;
         }
       }
@@ -3194,8 +3226,7 @@ export class Reconciler {
     const retryableFailure =
       instance.lifecycle === "failed" &&
       instance.retryEffect === effect.kind &&
-      (instance.retryAt === undefined ||
-        instance.retryAt <= this.#options.clock.now().toISOString());
+      (instance.retryAt === undefined || instance.retryAt <= decisionNow.iso);
     if (instance.lifecycle !== expectedLifecycle && !retryableFailure) {
       this.#replanCount += 1;
       await this.#acknowledge(claim, "completed");
@@ -3247,7 +3278,7 @@ export class Reconciler {
           this.#lastCommitAuthority = this.#options.authority;
         }
         if (authorization === "retry") {
-          await this.#retryClaim(claim);
+          await this.#retryClaim(claim, undefined, decisionNow);
         } else {
           await this.#acknowledge(claim, "completed");
         }
@@ -3264,7 +3295,7 @@ export class Reconciler {
       ) {
         await this.#acknowledge(claim, "completed");
       } else {
-        await this.#retryClaim(claim);
+        await this.#retryClaim(claim, undefined, decisionNow);
       }
       return;
     }
@@ -3286,7 +3317,7 @@ export class Reconciler {
           this.#lastCommitAuthority = this.#options.authority;
         }
         if (authorization === "retry") {
-          await this.#retryClaim(claim);
+          await this.#retryClaim(claim, undefined, decisionNow);
         } else {
           await this.#acknowledge(claim, "completed");
         }
@@ -3296,7 +3327,7 @@ export class Reconciler {
     try {
       await this.#options.effects.perform(effect);
     } catch (error) {
-      await this.#commitFailedEffect(effect, claim, error);
+      await this.#commitFailedEffect(effect, claim, error, decisionNow);
       return;
     }
     if (this.#options.interruptAfterEffect && !this.#interrupted) {
@@ -3401,9 +3432,10 @@ export class Reconciler {
     effect: ReconcileEffect,
     claim: OutboxClaim,
     error: unknown,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
   ): Promise<void> {
     const key = instanceKey(effect.instanceId);
-    const observedAt = this.#options.clock.now().toISOString();
+    const observedAt = decisionNow.iso;
     const diagnostic = effectDiagnostic(effect, error, observedAt);
     const retryDelay = deterministicRetryDelay({
       attempt: claim.attempt,
@@ -3411,7 +3443,7 @@ export class Reconciler {
       maxDelayMs: 60_000,
       operationId: effect.operationId,
     });
-    const retryAt = new Date(this.#options.clock.now().getTime() + retryDelay).toISOString();
+    const retryAt = new Date(decisionNow.epochMs + retryDelay).toISOString();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const current = await this.#options.state.read(key);
       if (current === undefined) return;
@@ -3614,11 +3646,11 @@ export class Reconciler {
     }
   }
 
-  #needsImmediateReconcile(instance: PersistedComponentInstance): boolean {
+  #needsImmediateReconcile(instance: PersistedComponentInstance, now: string): boolean {
     if (
       instance.diagnostic?.code === "LIFECYCLE_RESTORE_FAILED" &&
       instance.retryAt !== undefined &&
-      instance.retryAt > this.#options.clock.now().toISOString()
+      instance.retryAt > now
     ) {
       return false;
     }
@@ -3634,8 +3666,7 @@ export class Reconciler {
     return (
       instance.lifecycle === "failed" &&
       instance.retryEffect !== undefined &&
-      (instance.retryAt === undefined ||
-        instance.retryAt <= this.#options.clock.now().toISOString())
+      (instance.retryAt === undefined || instance.retryAt <= now)
     );
   }
 
@@ -3653,8 +3684,7 @@ export class Reconciler {
     );
   }
 
-  #deferRetries(instances: readonly LoadedComponentInstance[]): void {
-    const now = this.#options.clock.now().getTime();
+  #deferRetries(instances: readonly LoadedComponentInstance[], now: number): void {
     for (const { value } of instances) {
       if (
         value.retryAt === undefined ||
@@ -3673,13 +3703,15 @@ export class Reconciler {
     this.#nextWakeAt = this.#nextWakeAt === undefined ? at : Math.min(this.#nextWakeAt, at);
   }
 
-  #armDeferredWake(): void {
+  async #armDeferredWake(): Promise<void> {
     const at = this.#nextWakeAt;
     if (!this.#running || at === undefined) return;
     if (this.#deferredWake !== undefined && this.#deferredWake.at <= at) return;
+    const schedulingNow = await this.#authoritativeNow();
+    if (!this.#running) return;
     this.#cancelDeferredWake();
     const controller = new AbortController();
-    const delay = Math.max(0, at - this.#options.clock.now().getTime());
+    const delay = Math.max(0, at - schedulingNow.epochMs);
     const promise = this.#options.clock
       .sleep(delay, controller.signal)
       .then(async () => {
@@ -3691,7 +3723,8 @@ export class Reconciler {
           return;
         }
         this.#deferredWake = undefined;
-        if (this.#options.clock.now().getTime() < at) return;
+        const wakeNow = await this.#authoritativeNow();
+        if (wakeNow.epochMs < at) return;
         await this.wake();
       })
       .catch(async (error: unknown) => {
@@ -3760,8 +3793,12 @@ export class Reconciler {
     });
   }
 
-  async #rejectInvalidClaim(claim: OutboxClaim, error: unknown): Promise<void> {
-    const observedAt = this.#options.clock.now().toISOString();
+  async #rejectInvalidClaim(
+    claim: OutboxClaim,
+    error: unknown,
+    decisionNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<void> {
+    const observedAt = decisionNow.iso;
     const diagnostic = invalidMessageDiagnostic(claim, error, observedAt);
     this.#diagnosticsByDeployment.set(`outbox/${claim.message.messageId}`, [diagnostic]);
     await this.#options.state.transact(this.#transactionOptions(), async (transaction) => {
@@ -3774,13 +3811,19 @@ export class Reconciler {
       });
       return null;
     });
-    await this.#retryClaim(claim);
+    await this.#retryClaim(claim, undefined, decisionNow);
   }
 
-  async #retryClaim(claim: OutboxClaim, requestedRetryAt?: string): Promise<void> {
-    const now = this.#options.clock.now().getTime();
+  async #retryClaim(
+    claim: OutboxClaim,
+    requestedRetryAt: string | undefined,
+    authoritativeNow: { readonly epochMs: number; readonly iso: string },
+  ): Promise<void> {
     const requested = requestedRetryAt === undefined ? Number.NaN : Date.parse(requestedRetryAt);
-    const retryAt = Number.isFinite(requested) && requested > now ? requested : now + 60_000;
+    const retryAt =
+      Number.isFinite(requested) && requested > authoritativeNow.epochMs
+        ? requested
+        : authoritativeNow.epochMs + 60_000;
     await this.#options.state.acknowledgeOutbox({
       messageId: claim.message.messageId,
       owner: claim.owner,

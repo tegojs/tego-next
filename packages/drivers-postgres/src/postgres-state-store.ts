@@ -1,13 +1,13 @@
 import {
+  type ClusterTime,
   type DriverHealth,
   type ExpectedRevision,
+  isPortableStateString,
   type JsonValue,
   type OperationJournalEntry,
   type OperationJournalQuery,
   OUTBOX_PAYLOAD_MAX_BYTES,
   OUTBOX_TOPIC_MAX_LENGTH,
-  STATE_QUERY_MAX_LIMIT,
-  isPortableStateString,
   type OutboxAcknowledgement,
   type OutboxAcknowledgementRequest,
   type OutboxClaim,
@@ -18,9 +18,9 @@ import {
   parseMessageId,
   parseOperationId,
   parseRevision,
-  stateStringOrderKey,
   type Revision,
   type ScannedState,
+  STATE_QUERY_MAX_LIMIT,
   type StateChange,
   type StateKey,
   type StateQuery,
@@ -28,6 +28,7 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type StateWriteOptions,
+  stateStringOrderKey,
   type Versioned,
 } from "@tegojs/contracts";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
@@ -828,7 +829,7 @@ class StateWatchIterator implements AsyncIterator<StateChange>, AsyncIterable<St
   }
 }
 
-export class PostgresStateStore implements StateStore {
+export class PostgresStateStore implements StateStore, ClusterTime {
   readonly scope = "shared" as const;
   readonly #namespace: string;
   readonly #pool: Pool;
@@ -918,6 +919,12 @@ export class PostgresStateStore implements StateStore {
     if (row === undefined) return undefined;
     const record = stateRecord(row);
     return { value: record.value as T, revision: record.revision };
+  }
+
+  async now(): Promise<string> {
+    this.#assertOpen();
+    const result = await this.#pool.query<{ now: Date }>("SELECT clock_timestamp() AS now");
+    return isoTimestamp(result.rows[0]?.now, "cluster timestamp");
   }
 
   async *scan<T extends JsonValue>(query: StateQuery<T>): AsyncIterable<ScannedState<T>> {

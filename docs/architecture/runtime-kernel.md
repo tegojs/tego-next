@@ -21,8 +21,13 @@ imports, and forbidden import fragments. The WebSocket transport has one
 confined `node:http` import for its upgrade listener; that exception does not
 create an HTTP application API.
 
-The CLI composes public packages. It is an operator and development surface,
-not a privileged back door into the kernel.
+The phase-one Node host composition root currently lives in `@tegojs/cli`.
+That package owns the runtime commands and local control adapter as well as the
+current wiring of public kernel, driver, executor, and transport packages. It
+is therefore not a packaging-only shell, but it is also not a privileged back
+door into the kernel. Moving the composition code into a future
+`@tegojs/node-host` package is non-blocking packaging cleanup; it is not a
+phase-one behavioral or deployment prerequisite.
 
 ## Package graph and dependency direction
 
@@ -68,9 +73,18 @@ stores control-plane state, the filesystem stores immutable artifacts, and the
 local process host runs child executors.
 
 In `multi-main`, PostgreSQL replaces local state, artifact, and coordination
-drivers. Every Main can report diagnostics. Exactly the Main holding the
-current leadership epoch performs mutations, reconciliation, Worker
-registration, and assignment. See
+drivers. PostgreSQL `clock_timestamp()` is also the authoritative clock for
+reconciliation availability and retry deadlines. One canonical UTC timestamp
+is sampled for a reconciliation batch and carried through planning, outbox
+availability, retry evaluation, and retry persistence. A database-clock read
+occurs before the batch's fenced state transactions; those transactions reuse
+the immutable sample instead of observing different instants mid-batch. A
+database-clock read failure fails reconciliation closed; it never falls back to
+a process clock.
+`single-main` keeps its injected local clock, so embedded tests and deployments
+remain deterministic and require no distributed-time service. Every Main can
+report diagnostics. Exactly the Main holding the current leadership epoch
+performs mutations, reconciliation, Worker registration, and assignment. See
 [Deployment topologies](../operations/deployment-topologies.md) for the
 operator view.
 

@@ -557,9 +557,21 @@ test("@spec:plugin-deployment/idempotent-reconciliation/postgres-cluster-time-ta
   const createEffects = (failStart) => ({
     supportedExecutors: ["thread"],
     calls: [],
+    live: new Set(),
     async perform(effect) {
       this.calls.push(effect);
       if (failStart && effect.kind === "start") throw new Error("cluster retry fault");
+      if (effect.kind === "start") this.live.add(effect.instanceId);
+      if (effect.kind === "stop") this.live.delete(effect.instanceId);
+    },
+    async restore(instance) {
+      this.live.add(instance.instanceId);
+    },
+    isLive(instance) {
+      return this.live.has(instance.instanceId);
+    },
+    async close() {
+      this.live.clear();
     },
   });
   const farClock = (now) => ({

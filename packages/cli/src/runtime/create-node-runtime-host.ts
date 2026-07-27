@@ -6,6 +6,7 @@ import {
   assertExecutionBindingMatches,
   type CapabilityBinding,
   type CapabilityDefinition,
+  type ClusterTime,
   type ComponentCapabilityInvocation,
   createExecutionBinding,
   DiagnosticError,
@@ -161,6 +162,7 @@ export async function createNodeRuntimeHost(
   await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
   const local = await createLocalDrivers({ dataDirectory: options.dataDirectory });
   let drivers: RuntimeDrivers = local;
+  let clusterTime: ClusterTime | undefined;
   if (options.postgresUrl !== undefined) {
     const postgres = createPostgresDrivers({
       connectionString: options.postgresUrl,
@@ -172,6 +174,7 @@ export async function createNodeRuntimeHost(
       coordination: postgres.coordination,
       state: postgres.state,
     };
+    if (options.mode === "multi-main") clusterTime = postgres.clusterTime;
   }
 
   const configuration: RuntimeConfiguration = {
@@ -902,6 +905,7 @@ export async function createNodeRuntimeHost(
         artifactGate: localArtifactGate,
         authority,
         clock: drivers.clock,
+        ...(clusterTime === undefined ? {} : { clusterTime }),
         effects: new ComponentEffects({
           artifacts: preparedArtifacts,
           registry: componentRegistry,
