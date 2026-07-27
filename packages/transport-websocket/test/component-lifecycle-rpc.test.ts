@@ -270,23 +270,72 @@ test("drain callback runs after active attempts settle and before ACK", async ()
 test("failed stop callback retains the activation for a safe retry", async () => {
   let fail = true;
   let calls = 0;
-  const { remote } = await connected({
+  let local!: TestLocalExecutor;
+  let observedTerminal = false;
+  const connectedRuntime = await connected({
     stopComponent: () => {
       calls += 1;
+      observedTerminal = [...local.attempts.values()].every(
+        (attempt) => attempt.terminal !== undefined,
+      );
       if (fail) throw new Error("teardown failed");
     },
   });
-  const request = executionRequest(null, "stop-callback");
+  local = connectedRuntime.local;
+  const { remote } = connectedRuntime;
+  const request = executionRequest({ mode: "wait" }, "stop-callback");
+  await remote.activateComponent(activationFor(request));
+  const active = await remote.submit(request);
+  await bounded(
+    eventually(() => assert.equal(local.executions, 1)),
+    "stop callback local execution",
+  );
+  const stopping = remote.stopComponent(request.target);
+  try {
+    const localAttempt = [...local.attempts.values()][0];
+    assert.ok(localAttempt);
+    local.complete(localAttempt, "succeeded");
+    await bounded(active.result, "stop callback active result");
+    await assert.rejects(stopping, (error: unknown) => {
+      assert.equal(
+        (error as { diagnostic?: { code?: unknown } }).diagnostic?.code,
+        "LIFECYCLE_COMPONENT_STOP_FAILED",
+      );
+      return true;
+    });
+    assert.equal(observedTerminal, true);
+    fail = false;
+    await remote.stopComponent(request.target);
+    assert.equal(calls, 2);
+  } finally {
+    for (const attempt of local.attempts.values()) {
+      if (attempt.terminal === undefined) local.complete(attempt, "cancelled");
+    }
+    await stopping.catch(() => undefined);
+  }
+});
+
+test("failed drain callback retains a non-accepting activation for safe retry", async () => {
+  let fail = true;
+  let calls = 0;
+  const { remote } = await connected({
+    drainComponent: () => {
+      calls += 1;
+      if (fail) throw new Error("drain failed");
+    },
+  });
+  const request = executionRequest(null, "drain-callback-failure");
   await remote.activateComponent(activationFor(request));
 
-  await assert.rejects(remote.stopComponent(request.target), (error: unknown) => {
+  await assert.rejects(remote.drainComponent(request.target), (error: unknown) => {
     assert.equal(
       (error as { diagnostic?: { code?: unknown } }).diagnostic?.code,
-      "LIFECYCLE_COMPONENT_STOP_FAILED",
+      "LIFECYCLE_COMPONENT_DRAIN_FAILED",
     );
     return true;
   });
+  await assert.rejects(remote.submit(request), /activation|active|drain/iu);
   fail = false;
-  await remote.stopComponent(request.target);
+  await remote.drainComponent(request.target);
   assert.equal(calls, 2);
 });

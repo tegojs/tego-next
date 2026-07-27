@@ -94,6 +94,9 @@ export interface WorkerRuntimeOptions {
   readonly maxCapabilityInvocations?: number;
   readonly maxCapabilityInvocationBytes?: number;
   readonly validateActivation?: (activation: RemoteComponentActivation) => void | Promise<void>;
+  readonly activateComponent?: (activation: RemoteComponentActivation) => void | Promise<void>;
+  readonly drainComponent?: (activation: RemoteComponentActivation) => void | Promise<void>;
+  readonly stopComponent?: (activation: RemoteComponentActivation) => void | Promise<void>;
   readonly maxComponentActivations?: number;
   readonly maxAssignments?: number;
   readonly maxAssignmentBytes?: number;
@@ -144,6 +147,9 @@ export class WorkerRuntime {
   readonly #maxCapabilityInvocations: number;
   readonly #maxCapabilityInvocationBytes: number;
   readonly #validateActivation: WorkerRuntimeOptions["validateActivation"];
+  readonly #activateComponentCallback: WorkerRuntimeOptions["activateComponent"];
+  readonly #drainComponentCallback: WorkerRuntimeOptions["drainComponent"];
+  readonly #stopComponentCallback: WorkerRuntimeOptions["stopComponent"];
   readonly #maxComponentActivations: number;
   readonly #maxAssignments: number;
   readonly #maxAssignmentBytes: number;
@@ -199,6 +205,9 @@ export class WorkerRuntime {
       "maxCapabilityInvocationBytes",
     );
     this.#validateActivation = options.validateActivation;
+    this.#activateComponentCallback = options.activateComponent;
+    this.#drainComponentCallback = options.drainComponent;
+    this.#stopComponentCallback = options.stopComponent;
     this.#maxComponentActivations = positiveLimit(
       options.maxComponentActivations,
       DEFAULT_MAX_COMPONENT_ACTIVATIONS,
@@ -742,6 +751,20 @@ export class WorkerRuntime {
       });
       return;
     }
+    try {
+      await this.#activateComponentCallback?.(cloneJson(activation));
+    } catch {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
+        ok: false,
+        target: activation.target,
+        bindingFingerprint: activation.bindingFingerprint,
+        error: {
+          code: "LIFECYCLE_COMPONENT_ACTIVATION_FAILED",
+          message: "Worker could not materialize the component activation",
+        },
+      });
+      return;
+    }
     this.#activations.set(key, { activation: cloneJson(activation), state: "active" });
     await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_ACTIVATED, message.messageId, {
       ok: true,
@@ -777,6 +800,20 @@ export class WorkerRuntime {
         )
         .map(async (attempt) => attempt.completion.promise),
     );
+    try {
+      await this.#drainComponentCallback?.(cloneJson(activation.activation));
+    } catch {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_DRAIN, message.messageId, {
+        ok: false,
+        target,
+        bindingFingerprint: activation.activation.bindingFingerprint,
+        error: {
+          code: "LIFECYCLE_COMPONENT_DRAIN_FAILED",
+          message: "Worker could not drain the materialized component activation",
+        },
+      });
+      return;
+    }
     await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_DRAIN, message.messageId, {
       ok: true,
       target,
@@ -812,6 +849,20 @@ export class WorkerRuntime {
         )
         .map(async (attempt) => attempt.completion.promise),
     );
+    try {
+      await this.#stopComponentCallback?.(cloneJson(activation.activation));
+    } catch {
+      await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_STOP, message.messageId, {
+        ok: false,
+        target,
+        bindingFingerprint: activation.activation.bindingFingerprint,
+        error: {
+          code: "LIFECYCLE_COMPONENT_STOP_FAILED",
+          message: "Worker could not stop the materialized component activation",
+        },
+      });
+      return;
+    }
     this.#activations.delete(key);
     await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_STOP, message.messageId, {
       ok: true,
