@@ -432,6 +432,65 @@ test("CI reporter reaps a timed-out child and grandchild before final metadata",
   }
 });
 
+test("CI reporter reaps a background process after its successful parent exits", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tego-ci-reporter-background-tree-"));
+  const reporter = join(root, "scripts", "run-ci-test.mjs");
+  const background = [
+    'process.on("SIGTERM", () => process.exit(0));',
+    "setInterval(() => {}, 1000);",
+  ].join("");
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    `const background = spawn(process.execPath, ["-e", ${JSON.stringify(background)}],`,
+    "{ stdio: 'ignore' });",
+    'console.log("background-pid:" + background.pid);',
+    "background.unref();",
+  ].join("");
+  let processGroupId;
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        reporter,
+        "--name",
+        "background-tree",
+        "--artifacts",
+        directory,
+        "--timeout-ms",
+        "1000",
+        "--",
+        process.execPath,
+        "--input-type=commonjs",
+        "-e",
+        parent,
+      ],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0);
+
+    const metadata = JSON.parse(
+      await readFile(join(directory, "background-tree-result.json"), "utf8"),
+    );
+    const log = await readFile(join(directory, "background-tree-process.log"), "utf8");
+    const backgroundPid = Number.parseInt(log.match(/background-pid:(\d+)/u)?.[1] ?? "", 10);
+    assert.ok(Number.isInteger(backgroundPid));
+    processGroupId = metadata.childPid;
+    assert.equal(metadata.timedOut, false);
+    assert.equal(metadata.childExitCode, 0);
+    assert.equal(metadata.exitCode, 0);
+    assert.equal(metadata.processTreeTerminated, true);
+    assert.throws(() => process.kill(backgroundPid, 0), { code: "ESRCH" });
+  } finally {
+    if (process.platform !== "win32" && Number.isInteger(processGroupId)) {
+      try {
+        process.kill(-processGroupId, "SIGKILL");
+      } catch {}
+    }
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
 test("release verification bounds stages and reports deterministic process metadata", async () => {
   const { runReleaseCommand } = await import(
     new URL(`../../scripts/verify-release.mjs?command=${Date.now()}`, import.meta.url)

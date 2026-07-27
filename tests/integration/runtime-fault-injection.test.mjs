@@ -331,6 +331,37 @@ async function withFaultStateStores(t, run) {
   });
 }
 
+async function withRestartableFaultStateStores(t, run) {
+  await t.test("MemoryStateStore", async () => {
+    const clock = new FakeClock(new Date(0));
+    const store = new MemoryStateStore({ clock });
+    await store.open();
+    try {
+      await run(store, clock, async () => store);
+    } finally {
+      await store.close();
+    }
+  });
+  await t.test("SqliteStateStore", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tego-runtime-fault-restart-"));
+    const databasePath = join(directory, "state.sqlite");
+    const clock = new FakeClock(new Date(0));
+    let store = new SqliteStateStore({ clock, databasePath });
+    await store.open();
+    try {
+      await run(store, clock, async () => {
+        await store.close();
+        store = new SqliteStateStore({ clock, databasePath });
+        await store.open();
+        return store;
+      });
+    } finally {
+      await store.close().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
 async function cleanupPostgresFaultNamespace(connectionString, namespace) {
   const pool = new Pool({ connectionString, max: 1 });
   try {
@@ -351,27 +382,24 @@ async function cleanupPostgresFaultNamespace(connectionString, namespace) {
   }
 }
 
-test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-before-commit", async () => {
-  const clock = new FakeClock(new Date(0));
-  const backingState = new MemoryStateStore({ clock });
-  const state = faultStartCommitOnce(backingState);
-  const effects = new IdempotentEffects();
-  await state.open();
-  try {
-    const options = {
+test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-before-commit", async (t) => {
+  await withRestartableFaultStateStores(t, async (initialState, clock, reopen) => {
+    const effects = new IdempotentEffects();
+    const options = (state) => ({
       artifactGate: { validate: async () => artifact() },
       clock,
       effects,
       state,
       loadDeployments: async () => [deployment()],
       loadInstallations: async () => [installation()],
-    };
-    const interrupted = new Reconciler(options);
+    });
+    const interrupted = new Reconciler(options(faultStartCommitOnce(initialState)));
     await assert.rejects(interrupted.start(), /FAULT_INJECTED_START_COMMIT_INTERRUPTION/u);
     await interrupted.stop();
 
     clock.advanceBy(31_000);
-    const recovered = new Reconciler(options);
+    const state = await reopen();
+    const recovered = new Reconciler(options(state));
     await recovered.start();
     await recovered.wake();
 
@@ -390,9 +418,7 @@ test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-befor
     await recovered.stop();
     effects.cleanup();
     assert.equal(effects.live.size, 0);
-  } finally {
-    await state.close();
-  }
+  });
 });
 
 test("@spec:runtime-bootstrap/durable-restart-recovery/starting-checkpoint-real-effects starting checkpoint", async () => {
@@ -506,8 +532,11 @@ test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
   try {
     await assertStaleAuthorityRejected(state);
   } finally {
-    await state.close();
-    await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
+    try {
+      await state.close();
+    } finally {
+      await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
+    }
   }
 });
 
