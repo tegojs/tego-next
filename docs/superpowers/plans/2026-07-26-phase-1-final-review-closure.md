@@ -762,6 +762,6 @@ Expected: preflight `{"ok":true,"mode":"preflight"}` and empty status.
 ## Stop Conditions
 
 - Stop a task if a proposed compatibility path would accept an ambiguous legacy identity or mutable execution binding.
-- Stop capability routing if the exact persisted provider/activation cannot be fenced before provider code executes.
+- Stop capability routing if the exact persisted provider/activation and Main authority cannot be fenced before the synchronous exact-provider request reservation/send admission point.
 - Stop reclosure if any required CI gate is skipped, soft-failed, or has no exact-SHA evidence.
 - Do not merge or close `12.5` while any reviewer reports a Critical or Important finding.

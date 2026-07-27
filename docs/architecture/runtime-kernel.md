@@ -152,6 +152,14 @@ The runtime opens mutations only while it holds authority. A multi-Main
 follower can remain `running` and diagnosable without an `authority` field in
 status.
 
+Capability routing performs its revocable authority check after every
+asynchronous route and binding validation. The check and the exact-provider
+request reservation/send are one synchronous, no-yield admission step across
+thread, process, and remote transports. If authority is lost before that step,
+no provider command is created. Once the request has been reserved/sent, it is
+already admitted work and may settle after authority loss even when isolated or
+remote plugin code begins later; this does not authorize another dispatch.
+
 ### Component lifecycle
 
 The normal component path is:
