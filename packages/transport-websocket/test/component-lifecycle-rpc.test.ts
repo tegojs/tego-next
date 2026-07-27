@@ -12,6 +12,7 @@ import {
   type RemoteComponentActivation,
   RemoteExecutor,
   WorkerRuntime,
+  type WorkerRuntimeOptions,
 } from "../src/index.js";
 import { executionRequest, memorySessionPair, TestLocalExecutor } from "./remote-test-support.js";
 
@@ -48,7 +49,11 @@ function activationFor(request: ReturnType<typeof executionRequest>): RemoteComp
   };
 }
 
-async function connected(): Promise<{
+async function connected(
+  options: Partial<
+    Pick<WorkerRuntimeOptions, "activateComponent" | "drainComponent" | "stopComponent">
+  > = {},
+): Promise<{
   readonly local: TestLocalExecutor;
   readonly remote: RemoteExecutor;
   readonly validated: RemoteComponentActivation[];
@@ -66,6 +71,7 @@ async function connected(): Promise<{
     validateActivation: (activation) => {
       validated.push(activation);
     },
+    ...options,
   });
   await runtime.attach(workerSession);
   const remote = new RemoteExecutor({
@@ -172,4 +178,115 @@ test("component stop removes the exact activation", async () => {
 
   await assert.rejects(remote.submit(request), /activation|active/iu);
   assert.equal(local.executions, 0);
+});
+
+test("activation materialization completes before ACK and failed materialization is not stored", async () => {
+  const events: string[] = [];
+  const release = Promise.withResolvers<void>();
+  let fail = false;
+  const { remote } = await connected({
+    activateComponent: async () => {
+      events.push("activate:start");
+      await release.promise;
+      events.push("activate:finish");
+      if (fail) throw new Error("materialization failed");
+    },
+  });
+  const request = executionRequest({ mode: "echo", value: "materialized" }, "materialize");
+  const activation = activationFor(request);
+  let acknowledged = false;
+  const pending = remote.activateComponent(activation).then(() => {
+    acknowledged = true;
+  });
+  try {
+    await bounded(
+      eventually(() => assert.deepEqual(events, ["activate:start"])),
+      "activation materializer start",
+    );
+    assert.equal(acknowledged, false);
+    await assert.rejects(remote.submit(request), /activation|active/iu);
+    release.resolve();
+    await bounded(pending, "activation ACK");
+    assert.deepEqual(events, ["activate:start", "activate:finish"]);
+    assert.equal(acknowledged, true);
+
+    await remote.stopComponent(request.target);
+    fail = true;
+    const failed = remote.activateComponent(activation);
+    await assert.rejects(failed, (error: unknown) => {
+      assert.equal(
+        (error as { diagnostic?: { code?: unknown } }).diagnostic?.code,
+        "LIFECYCLE_COMPONENT_ACTIVATION_FAILED",
+      );
+      return true;
+    });
+    await assert.rejects(remote.submit(request), /activation|active/iu);
+  } finally {
+    release.resolve();
+  }
+});
+
+test("drain callback runs after active attempts settle and before ACK", async () => {
+  const callbackStarted = Promise.withResolvers<void>();
+  const releaseCallback = Promise.withResolvers<void>();
+  const { local, remote } = await connected({
+    drainComponent: async () => {
+      callbackStarted.resolve();
+      await releaseCallback.promise;
+    },
+  });
+  const request = executionRequest({ mode: "wait" }, "drain-callback");
+  await remote.activateComponent(activationFor(request));
+  const active = await remote.submit(request);
+  await bounded(
+    eventually(() => assert.equal(local.executions, 1)),
+    "drain callback local execution",
+  );
+  let acknowledged = false;
+  const draining = remote.drainComponent(request.target).then(() => {
+    acknowledged = true;
+  });
+  try {
+    await Promise.resolve();
+    assert.equal(acknowledged, false);
+    const localAttempt = [...local.attempts.values()][0];
+    assert.ok(localAttempt);
+    local.complete(localAttempt, "succeeded");
+    await bounded(active.result, "drain callback active result");
+    await bounded(callbackStarted.promise, "drain callback start");
+    assert.equal(acknowledged, false);
+    releaseCallback.resolve();
+    await bounded(draining, "drain callback ACK");
+    assert.equal(acknowledged, true);
+  } finally {
+    releaseCallback.resolve();
+    for (const attempt of local.attempts.values()) {
+      if (attempt.terminal === undefined) local.complete(attempt, "cancelled");
+    }
+    await bounded(draining, "drain callback cleanup");
+  }
+});
+
+test("failed stop callback retains the activation for a safe retry", async () => {
+  let fail = true;
+  let calls = 0;
+  const { remote } = await connected({
+    stopComponent: () => {
+      calls += 1;
+      if (fail) throw new Error("teardown failed");
+    },
+  });
+  const request = executionRequest(null, "stop-callback");
+  await remote.activateComponent(activationFor(request));
+
+  await assert.rejects(remote.stopComponent(request.target), (error: unknown) => {
+    assert.equal(
+      (error as { diagnostic?: { code?: unknown } }).diagnostic?.code,
+      "LIFECYCLE_COMPONENT_STOP_FAILED",
+    );
+    return true;
+  });
+  fail = false;
+  await remote.stopComponent(request.target);
+  assert.equal(calls, 2);
 });
