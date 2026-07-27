@@ -1,9 +1,4 @@
-import type {
-  JsonObject,
-  JsonValue,
-  WorkerId,
-  WorkerMessageType,
-} from "@tegojs/contracts";
+import type { JsonObject, JsonValue, WorkerId, WorkerMessageType } from "@tegojs/contracts";
 import {
   type MainEndpointLike,
   type WorkerEndpointFactoryOptions,

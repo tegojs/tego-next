@@ -3,6 +3,7 @@ import {
   type ApplicationId,
   type ArtifactDigest,
   type ComponentId,
+  DiagnosticError,
   type ExecutorKind,
   type Generation,
   type JsonObject,
@@ -14,6 +15,7 @@ import {
   parseOperationId,
   type Revision,
   type RuntimeDiagnostic,
+  runtimeDiagnostic,
 } from "@tegojs/contracts";
 import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { ResolutionResult } from "../capabilities/resolver.js";
@@ -39,7 +41,18 @@ export function parseActivation(value: unknown): Activation {
     value.length > UINT64_MAX.length ||
     (value.length === UINT64_MAX.length && value > UINT64_MAX)
   ) {
-    throw new TypeError("Activation must be a canonical unsigned decimal string");
+    throw new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ACTIVATION_INVALID" as RuntimeDiagnostic["code"],
+        message: "Activation is invalid",
+        source: { kind: "runtime", id: "activation" },
+        details: {
+          canonicalFormat: "unsigned decimal string",
+          minimum: "0",
+          maximum: UINT64_MAX,
+        },
+      }),
+    );
   }
   return value;
 }

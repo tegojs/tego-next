@@ -51,10 +51,14 @@ export {
   type CapabilityResolutionInput,
   type NormalizedCapabilityRequirement,
   type PreviousCapabilityBinding,
+  type PersistedProviderLoss,
+  type ProviderLossAction,
   type ProviderLossDecision,
+  type ProviderRecoveryBindingPrerequisite,
   type ResolutionResult,
   type ResolvedCapabilityBinding,
   type ResolvedCapabilityProvider,
+  strongestProviderLoss,
 } from "./capabilities/resolver.js";
 export {
   CapabilityRouter,

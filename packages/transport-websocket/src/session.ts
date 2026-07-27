@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   type ArtifactDigest,
   type Clock,
@@ -101,6 +101,11 @@ interface PendingRequest {
   readonly timeout: AbortController;
 }
 
+interface RetainedReplay {
+  readonly messageId: string;
+  readonly fingerprint: string;
+}
+
 export interface WorkerSessionOptions {
   readonly role: WorkerSessionRole;
   readonly socket: unknown;
@@ -146,6 +151,25 @@ function deferred<T>(): Deferred<T> {
     },
     settled: () => isSettled,
   };
+}
+
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  const object = value as JsonObject;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key] as JsonValue)}`)
+    .join(",")}}`;
+}
+
+function replayFingerprint(envelope: WorkerControlEnvelope): string {
+  return createHash("sha256")
+    .update("tego.worker-envelope-replay/1.0\0")
+    .update(canonicalJson(envelope))
+    .digest("hex");
 }
 
 function diagnosticError(
@@ -365,8 +389,8 @@ export class WorkerSession {
   readonly #listeners = new Set<(message: WorkerSessionMessage) => void>();
   readonly #stateListeners = new Set<(state: WorkerSessionState) => void>();
   readonly #pendingMessages: WorkerSessionMessage[] = [];
-  readonly #receivedIds = new Set<string>();
-  readonly #receivedIdOrder: string[] = [];
+  readonly #receivedFingerprints = new Map<string, string>();
+  readonly #receivedReplayOrder: RetainedReplay[] = [];
   readonly #pendingBinary = new Map<string, PendingBinary>();
   readonly #pendingRequests = new Map<string, PendingRequest>();
   #state: WorkerSessionState = "authenticating";
@@ -658,13 +682,17 @@ export class WorkerSession {
 
   #receiveControl(envelope: WorkerControlEnvelope): void {
     const sequence = BigInt(parseSequence(envelope.sequence));
+    const fingerprint = replayFingerprint(envelope);
+    const retainedFingerprint = this.#receivedFingerprints.get(envelope.messageId);
     if (sequence < this.#expectedSequence) {
-      if (this.#receivedIds.has(envelope.messageId)) {
+      if (retainedFingerprint === fingerprint) {
         return;
       }
       throw diagnosticError(
         "PROTOCOL_SEQUENCE_REPLAY",
-        "Worker message sequence was replayed with a different identity",
+        retainedFingerprint === undefined
+          ? "Worker message sequence was replayed with a different identity"
+          : "Worker message replay did not match its retained canonical content",
       );
     }
     if (sequence > this.#expectedSequence) {
@@ -676,11 +704,16 @@ export class WorkerSession {
         "Worker message sequence is not contiguous",
       );
     }
-    this.#expectedSequence += 1n;
-    if (this.#receivedIds.has(envelope.messageId)) {
-      return;
+    if (retainedFingerprint !== undefined) {
+      throw diagnosticError(
+        "PROTOCOL_SEQUENCE_REPLAY",
+        retainedFingerprint === fingerprint
+          ? "Worker message identity was replayed at a different sequence"
+          : "Worker message replay did not match its retained canonical content",
+      );
     }
-    this.#retainMessageId(envelope.messageId);
+    this.#expectedSequence += 1n;
+    this.#retainReplay({ messageId: envelope.messageId, fingerprint });
 
     if (
       this.#state === "ready" &&
@@ -1204,13 +1237,13 @@ export class WorkerSession {
     return messageId;
   }
 
-  #retainMessageId(messageId: string): void {
-    this.#receivedIds.add(messageId);
-    this.#receivedIdOrder.push(messageId);
-    while (this.#receivedIdOrder.length > this.#codec.limits.replayRetention) {
-      const removed = this.#receivedIdOrder.shift();
+  #retainReplay(replay: RetainedReplay): void {
+    this.#receivedFingerprints.set(replay.messageId, replay.fingerprint);
+    this.#receivedReplayOrder.push(replay);
+    while (this.#receivedReplayOrder.length > this.#codec.limits.replayRetention) {
+      const removed = this.#receivedReplayOrder.shift();
       if (removed !== undefined) {
-        this.#receivedIds.delete(removed);
+        this.#receivedFingerprints.delete(removed.messageId);
       }
     }
   }

@@ -144,6 +144,11 @@ export interface WorkerSessionMessage {
   readonly binary?: Uint8Array;
 }
 
+export interface WorkerSessionRequestOptions {
+  readonly binary?: Uint8Array;
+  readonly timeoutMs?: number;
+}
+
 export interface WorkerSessionLike {
   readonly ready: Promise<void>;
   readonly sessionId: SessionId;
@@ -160,6 +165,11 @@ export interface WorkerSessionLike {
       readonly binary?: Uint8Array;
     },
   ): Promise<string>;
+  request(
+    type: WorkerMessageType,
+    payload: JsonValue,
+    options?: WorkerSessionRequestOptions,
+  ): Promise<WorkerSessionMessage>;
   onMessage(listener: (message: WorkerSessionMessage) => void): () => void;
   close(): Promise<void>;
 }

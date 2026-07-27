@@ -16,7 +16,7 @@ import {
   resolveCapabilities,
   satisfiesVersionRange,
   strongestProviderLoss,
-} from "../src/index.js";
+} from "@tegojs/runtime";
 
 const applicationId = parseApplicationId("application-01");
 
@@ -81,12 +81,7 @@ test("provider loss precedence is explicit and independent of action order", () 
 });
 
 test("invalid activations expose a stable public diagnostic with canonical bounds", () => {
-  for (const value of [
-    -1,
-    "01",
-    "18446744073709551616",
-    "not-an-activation",
-  ] as const) {
+  for (const value of [-1, "01", "18446744073709551616", "not-an-activation"] as const) {
     assert.throws(
       () => parseActivation(value),
       (error: unknown) => {

@@ -520,12 +520,18 @@ interface WorkerEnvelope<T> {
   messageId: MessageId;
   sessionId: SessionId;
   sequence: Sequence;
-  correlationId?: MessageId;
+  correlationId: MessageId;
   type: WorkerMessageType;
   sentAt: string;
   payload: T;
 }
 ```
+
+Every envelope carries a correlation identity. One-way messages and requests
+self-correlate by setting `correlationId` to their own `messageId`; responses
+set it to the exact triggering request `messageId`. A missing or invalid
+correlation is a protocol error and never downgrades to an uncorrelated
+message.
 
 Control messages are JSON. Artifact chunks and large task payloads use binary
 frames correlated by message ID. Limits exist for message size, inflight
