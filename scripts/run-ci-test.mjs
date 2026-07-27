@@ -84,7 +84,7 @@ async function taskkill(processId, force) {
     killer.once("error", (error) => resolveTaskkill({ error, status: null }));
     killer.once("close", (status) => resolveTaskkill({ status }));
   });
-  return result.error === undefined && (result.status === 0 || result.status === 128);
+  return result.error === undefined && result.status === 0;
 }
 
 async function signalProcessTree(child, signal) {
@@ -124,7 +124,7 @@ export async function runManagedProcessTree({
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
   let timedOut = false;
-  let terminationSignal;
+  let terminationSignal = null;
   let processTreeTerminated = false;
   let spawnError;
   const child = spawn(command, args, {
@@ -152,10 +152,23 @@ export async function runManagedProcessTree({
     closeResult = initial.value;
     processTreeTerminated =
       child.pid === undefined || process.platform === "win32" || !posixProcessTreeExists(child.pid);
+    if (!processTreeTerminated && child.pid !== undefined) {
+      terminationSignal = "SIGTERM";
+      await signalProcessTree(child, "SIGTERM");
+      processTreeTerminated = await waitForPosixProcessTreeExit(child.pid, gracefulTerminationMs);
+      if (!processTreeTerminated) {
+        terminationSignal = "SIGKILL";
+        await signalProcessTree(child, "SIGKILL");
+        processTreeTerminated = await waitForPosixProcessTreeExit(
+          child.pid,
+          forcedTerminationWaitMs,
+        );
+      }
+    }
   } else {
     timedOut = true;
     terminationSignal = "SIGTERM";
-    await signalProcessTree(child, "SIGTERM");
+    let treeSignalSucceeded = await signalProcessTree(child, "SIGTERM");
     const graceful =
       process.platform === "win32"
         ? await settleWithin(closed, gracefulTerminationMs)
@@ -164,14 +177,14 @@ export async function runManagedProcessTree({
           };
     if (!graceful.settled) {
       terminationSignal = "SIGKILL";
-      await signalProcessTree(child, "SIGKILL");
+      treeSignalSucceeded = (await signalProcessTree(child, "SIGKILL")) || treeSignalSucceeded;
     }
     if (process.platform === "win32") {
       const forced = graceful.settled
         ? graceful
         : await settleWithin(closed, forcedTerminationWaitMs);
       closeResult = forced.settled ? forced.value : { childExitCode: null, childSignal: null };
-      processTreeTerminated = forced.settled;
+      processTreeTerminated = forced.settled && treeSignalSucceeded;
     } else {
       processTreeTerminated = await waitForPosixProcessTreeExit(child.pid, forcedTerminationWaitMs);
       const reaped = await settleWithin(closed, forcedTerminationWaitMs);
@@ -180,7 +193,7 @@ export async function runManagedProcessTree({
     }
   }
 
-  if (!processTreeTerminated && timedOut) {
+  if (!processTreeTerminated) {
     child.stdout.destroy();
     child.stderr.destroy();
     child.unref();
@@ -196,13 +209,13 @@ export async function runManagedProcessTree({
     timedOut,
     timeoutMs,
     terminationSignal,
-    childPid: child.pid,
+    childPid: child.pid ?? null,
     childExitCode: closeResult.childExitCode,
     childSignal: closeResult.childSignal,
     processTreeTerminated,
-    exitCode: timedOut ? 124 : (closeResult.childExitCode ?? 1),
+    exitCode: timedOut ? 124 : processTreeTerminated ? (closeResult.childExitCode ?? 1) : 125,
     ...(spawnError === undefined ? {} : { error: spawnError.message }),
-    ...(!processTreeTerminated && timedOut
+    ...(!processTreeTerminated
       ? { error: "process tree did not terminate within the bounded cleanup deadline" }
       : {}),
   };
