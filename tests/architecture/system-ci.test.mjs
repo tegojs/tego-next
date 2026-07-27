@@ -504,6 +504,7 @@ test("managed runner proves Windows normal-close tree cleanup before success", a
     timeoutMs: 1_000,
     platform: "win32",
     windowsTreeStrategy: {
+      canTerminateAfterLeaderExit: true,
       async probe(processId) {
         events.push(`probe:${processId}:${descendantAlive}`);
         return !descendantAlive;
@@ -539,6 +540,7 @@ test("managed runner fails closed when Windows tree termination cannot be proven
     timeoutMs: 1_000,
     platform: "win32",
     windowsTreeStrategy: {
+      canTerminateAfterLeaderExit: true,
       async probe(processId) {
         events.push(`probe:${processId}`);
         return false;
@@ -559,6 +561,26 @@ test("managed runner fails closed when Windows tree termination cannot be proven
     events.map((event) => event.replace(/:\d+/u, ":pid")),
     ["probe:pid", "terminate:pid:SIGTERM", "probe:pid", "terminate:pid:SIGKILL", "probe:pid"],
   );
+});
+
+test("managed runner never targets a closed Windows leader without stable tree ownership", async () => {
+  const { runManagedProcessTree } = await import(
+    new URL(`../../scripts/run-ci-test.mjs?windows-closed-leader=${Date.now()}`, import.meta.url)
+  );
+  const metadata = await runManagedProcessTree({
+    name: "windows-closed-leader",
+    command: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    timeoutMs: 1_000,
+    platform: "win32",
+  });
+
+  assert.equal(metadata.timedOut, false);
+  assert.equal(metadata.childExitCode, 0);
+  assert.equal(metadata.terminationSignal, null);
+  assert.equal(metadata.exitCode, 125);
+  assert.equal(metadata.processTreeTerminated, false);
+  assert.match(metadata.error, /stable Windows process-tree ownership.*closed PID/iu);
 });
 
 test("release verification bounds stages and reports deterministic process metadata", async () => {
