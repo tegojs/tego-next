@@ -81,6 +81,7 @@ export {
 } from "./leadership-controller.js";
 export {
   createRuntimeHost,
+  type RuntimeAuthorityAdmission,
   type RuntimeHost,
   type RuntimeHostServices,
   type RuntimeObservedStatus,

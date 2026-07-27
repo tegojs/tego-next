@@ -300,6 +300,7 @@ class TegoRuntime implements Runtime {
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
   #stopRequested = false;
+  #workerAuthorityActive = false;
   #servicesClosed = false;
   #driversOpened = false;
   #terminalObservedStatus: TerminalObservedStatus | undefined;
@@ -440,6 +441,7 @@ class TegoRuntime implements Runtime {
     if (this.#lifecycle !== "stopping") this.#setLifecycle("stopping");
     try {
       await this.#stopReconciler();
+      await this.#revokeWorkerAuthority();
     } catch (error) {
       errors.push(error);
     }
@@ -607,6 +609,7 @@ class TegoRuntime implements Runtime {
     }
 
     this.#reconcilerCurrentAuthority = structuredClone(authority);
+    this.#workerAuthorityActive = true;
     await this.#services.workers.setAuthority(authority);
     let reconciler!: Reconciler;
     reconciler = this.#services.createReconciler(authority, {
@@ -621,6 +624,7 @@ class TegoRuntime implements Runtime {
     await reconciler.start();
     await this.#services.tasks.setAuthority(authority);
     this.#leadership = structuredClone(authority);
+    this.#services.authorityAdmission.open(authority);
     if (this.#lifecycle === "running" && !this.#stopRequested) {
       this.operations.openMutations();
     }
@@ -641,19 +645,28 @@ class TegoRuntime implements Runtime {
 
     const errors: unknown[] = [];
     try {
+      this.#services.authorityAdmission.close(authority);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
       await this.#services.tasks.setAuthority(undefined);
     } catch (error) {
       errors.push(error);
     }
+    let reconcilerStopped = false;
     try {
-      await this.#services.workers.setAuthority(undefined);
+      await this.#stopReconciler();
+      reconcilerStopped = true;
     } catch (error) {
       errors.push(error);
     }
-    try {
-      await this.#stopReconciler();
-    } catch (error) {
-      errors.push(error);
+    if (reconcilerStopped) {
+      try {
+        await this.#revokeWorkerAuthority();
+      } catch (error) {
+        errors.push(error);
+      }
     }
     if (errors.length > 0) {
       throw new DiagnosticError(
@@ -679,6 +692,12 @@ class TegoRuntime implements Runtime {
     }
   }
 
+  async #revokeWorkerAuthority(): Promise<void> {
+    if (this.#services === undefined || !this.#workerAuthorityActive) return;
+    await this.#services.workers.setAuthority(undefined);
+    this.#workerAuthorityActive = false;
+  }
+
   #handleReconcilerBackgroundFailure(
     reconciler: Reconciler,
     authority: RuntimeAuthority,
@@ -694,6 +713,11 @@ class TegoRuntime implements Runtime {
     this.operations.closeMutations();
     this.#leadership = undefined;
     this.#reconcilerCurrentAuthority = undefined;
+    try {
+      this.#services?.authorityAdmission.close(authority);
+    } catch {
+      // The authoritative stop path retries and reports cleanup failures.
+    }
     const diagnostic = runtimeDiagnostic({
       code: "LIFECYCLE_RECONCILE_BACKGROUND_FAILED",
       message: "Leader-owned background reconciliation failed",

@@ -555,6 +555,7 @@ export class Reconciler {
   #starting = false;
   #stopRequested = false;
   #fatalReported = false;
+  #backgroundErrorNotified = false;
   #fatalError: unknown;
   #tail: Promise<void> = Promise.resolve();
   #interrupted = false;
@@ -662,13 +663,14 @@ export class Reconciler {
       } catch (error) {
         this.#running = false;
         this.#cancelDeferredWake();
+        if (!this.#starting) this.#notifyBackgroundError(error);
         let failure = error;
         try {
           await this.#componentLifecycle?.close(this.#options.authority);
         } catch (closeError) {
           failure = new AggregateError([error, closeError], "Reconciler failure cleanup failed");
         }
-        if (!this.#starting) await this.#reportFatalFailure(failure);
+        if (!this.#starting) this.#reportFatalFailure(failure);
         throw failure;
       }
     });
@@ -3755,6 +3757,7 @@ export class Reconciler {
         if (this.#running) {
           this.#running = false;
           this.#cancelDeferredWake();
+          this.#notifyBackgroundError(error);
           try {
             await this.#componentLifecycle?.close(this.#options.authority);
           } catch (closeError) {
@@ -3764,7 +3767,7 @@ export class Reconciler {
             );
           }
         }
-        await this.#reportFatalFailure(failure);
+        this.#reportFatalFailure(failure);
       });
     this.#deferredWake = { at, controller, promise };
   }
@@ -3776,7 +3779,7 @@ export class Reconciler {
     deferred.controller.abort("reconciler-deferred-wake-cancelled");
   }
 
-  async #reportFatalFailure(error: unknown): Promise<void> {
+  #reportFatalFailure(error: unknown): void {
     if (this.#fatalReported) return;
     this.#fatalReported = true;
     this.#fatalError = error;
@@ -3790,9 +3793,15 @@ export class Reconciler {
             cause: serializeCause(error),
             observedAt: this.#options.clock.now().toISOString(),
           });
-    if (this.#starting) return;
+    this.#notifyBackgroundError(error);
+  }
+
+  #notifyBackgroundError(error: unknown): void {
+    if (this.#starting || this.#backgroundErrorNotified) return;
+    this.#backgroundErrorNotified = true;
     try {
-      await this.#options.onBackgroundError?.(error);
+      const reported = this.#options.onBackgroundError?.(error);
+      void Promise.resolve(reported).catch(() => undefined);
     } catch {
       // The reconciler is already failed closed; error reporting must not resurrect it.
     }

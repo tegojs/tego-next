@@ -93,6 +93,40 @@ export interface NodeRuntimeHost {
   startWorkerListener(): Promise<string | undefined>;
 }
 
+export interface AuthorityCapabilityAdmission {
+  open(authority: RuntimeAuthority): void;
+  close(authority: RuntimeAuthority): void;
+  invoke<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+export function createAuthorityCapabilityAdmission(
+  unavailableError: () => Error = () => new Error("Capability invocation authority is unavailable"),
+): AuthorityCapabilityAdmission {
+  let authority: RuntimeAuthority | undefined;
+  const sameAuthority = (
+    left: RuntimeAuthority | undefined,
+    right: RuntimeAuthority | undefined,
+  ): boolean =>
+    left?.resource === right?.resource &&
+    left?.epoch === right?.epoch &&
+    (left !== undefined) === (right !== undefined);
+
+  return {
+    open: (nextAuthority) => {
+      authority = structuredClone(nextAuthority);
+    },
+    close: (closedAuthority) => {
+      if (sameAuthority(authority, closedAuthority)) {
+        authority = undefined;
+      }
+    },
+    invoke: async (operation) => {
+      if (authority === undefined) throw unavailableError();
+      return operation();
+    },
+  };
+}
+
 interface OwnedWorkerListener {
   readonly url: URL;
   close(): Promise<void>;
@@ -208,6 +242,17 @@ export async function createNodeRuntimeHost(
   const componentRegistry = new ComponentRegistry();
   const sessionRegistry = new LocalComponentSessionRegistry(options.runtimeId);
   let capabilityRouter: CapabilityRouter | undefined;
+  const capabilityAdmission = createAuthorityCapabilityAdmission(
+    () =>
+      new DiagnosticError(
+        runtimeDiagnostic({
+          code: "COORDINATION_FENCE_REJECTED",
+          message: "Capability invocation authority is unavailable",
+          source: { kind: "runtime", id: configuration.runtimeId },
+          observedAt: drivers.clock.now().toISOString(),
+        }),
+      ),
+  );
   const componentHost = new LocalComponentSessionHost({
     nodeId: options.nodeId,
     runtimeId: options.runtimeId,
@@ -228,9 +273,11 @@ export async function createNodeRuntimeHost(
         ),
       ),
     invokeCapability: (consumer, invocation) => {
-      const router = capabilityRouter;
-      if (router === undefined) throw new Error("Capability router is unavailable");
-      return router.invoke(consumer, invocation);
+      return capabilityAdmission.invoke(() => {
+        const router = capabilityRouter;
+        if (router === undefined) throw new Error("Capability router is unavailable");
+        return router.invoke(consumer, invocation);
+      });
     },
   });
   const configuredWorkerId =
@@ -840,17 +887,19 @@ export async function createNodeRuntimeHost(
           fencing: requested,
         }),
         routeCapability: (request) => {
-          const registration = sessionRegistry.resolveExact(request.target);
-          const consumer = registration.capabilityConsumer;
-          if (
-            consumer === undefined ||
-            consumer.bindingFingerprint !== request.bindingFingerprint
-          ) {
-            throw new Error("Remote capability consumer binding is not the exact active session");
-          }
-          const router = capabilityRouter;
-          if (router === undefined) throw new Error("Capability router is unavailable");
-          return router.invoke(consumer, request.invocation);
+          return capabilityAdmission.invoke(() => {
+            const registration = sessionRegistry.resolveExact(request.target);
+            const consumer = registration.capabilityConsumer;
+            if (
+              consumer === undefined ||
+              consumer.bindingFingerprint !== request.bindingFingerprint
+            ) {
+              throw new Error("Remote capability consumer binding is not the exact active session");
+            }
+            const router = capabilityRouter;
+            if (router === undefined) throw new Error("Capability router is unavailable");
+            return router.invoke(consumer, request.invocation);
+          });
         },
       });
       activeWorkerAuthority = requested;
@@ -896,6 +945,7 @@ export async function createNodeRuntimeHost(
     },
   };
   const runtime = createRuntimeHost(configuration, drivers, {
+    authorityAdmission: capabilityAdmission,
     artifactService,
     tasks,
     workers,

@@ -507,6 +507,15 @@ class ControlledServices implements RuntimeHostServices {
     this.workers = new ControlledWorkers(log);
   }
 
+  readonly authorityAdmission = {
+    open: (authority: RuntimeAuthority): void => {
+      this.log.push(`capabilities.authority:${authority.epoch}`);
+    },
+    close: (authority: RuntimeAuthority): void => {
+      this.log.push(`capabilities.authority:none:${authority.epoch}`);
+    },
+  };
+
   createReconciler = (
     authority: RuntimeAuthority,
     context: {
@@ -887,6 +896,10 @@ test("leadership loss closes mutation admission before task authority and reconc
   assert.equal(value.services.reconcilerCurrentAuthorities[0]?.(), undefined);
   assert.equal((await runtime.status()).acceptingOperations, false);
   assert.equal((await runtime.status()).authority, undefined);
+  assert.notEqual(value.log.indexOf("capabilities.authority:none:7"), -1);
+  assert.ok(
+    value.log.indexOf("capabilities.authority:none:7") < value.log.indexOf("tasks.authority:none"),
+  );
   assert.ok(value.log.indexOf("tasks.authority:none") < value.log.indexOf("reconciler.stop:7"));
   assert.ok(
     value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
@@ -900,6 +913,7 @@ test("leadership loss closes mutation admission before task authority and reconc
   await eventually(async () => assert.equal((await runtime.status()).authority?.epoch, "8"));
   assert.equal(value.services.reconcilerAuthorities.at(-1)?.epoch, "8");
   assert.equal(value.services.activeReconcilers, 1);
+  assert.ok(value.log.indexOf("tasks.authority:8") < value.log.indexOf("capabilities.authority:8"));
   await runtime.stop();
 });
 
@@ -915,7 +929,8 @@ test("stop is idempotent and retains Worker lifecycle transport until reconcilia
   assert.equal(first, second);
   await first;
 
-  assert.deepEqual(value.log.slice(-11), [
+  assert.deepEqual(value.log.slice(-12), [
+    "capabilities.authority:none:11",
     "tasks.authority:none",
     "reconciler.stop:11",
     "workers.authority:none",
@@ -954,6 +969,7 @@ test("single-main start waits for authority and initial reconciliation", async (
   assert.ok(value.log.indexOf("tasks.recover") < value.log.indexOf("workers.authority:1"));
   assert.ok(value.log.indexOf("workers.authority:1") < value.log.indexOf("reconciler.start:1"));
   assert.ok(value.log.indexOf("reconciler.start:1") < value.log.indexOf("tasks.authority:1"));
+  assert.ok(value.log.indexOf("tasks.authority:1") < value.log.indexOf("capabilities.authority:1"));
   await runtime.stop();
 });
 
@@ -966,6 +982,11 @@ test("background reconciliation failure closes authority and stops the runtime",
   assert.equal(value.services.reconcilerCurrentAuthorities[0]?.()?.epoch, "1");
   value.services.reconcilerBackgroundErrors[0]?.(new Error("background reconcile failed"));
   assert.equal(value.services.reconcilerCurrentAuthorities[0]?.(), undefined);
+  assert.equal(
+    value.log.includes("capabilities.authority:none:1"),
+    true,
+    "background failure must synchronously fence capability admission",
+  );
   await eventually(async () => {
     const status = await runtime.status();
     assert.equal(status.lifecycle, "stopped");
@@ -1038,7 +1059,11 @@ test("stop retries retained reconciler cleanup, closes every service, and aggreg
   assert.equal(value.services.activeReconcilers, 0);
   assert.equal((await runtime.status()).lifecycle, "failed");
   assert.equal((await runtime.status()).acceptingOperations, false);
-  assert.equal(value.log.filter((entry) => entry === "reconciler.stop:14").length, 2);
+  const reconcilerStops = value.log
+    .map((entry, index) => (entry === "reconciler.stop:14" ? index : -1))
+    .filter((index) => index !== -1);
+  assert.equal(reconcilerStops.length, 2);
+  assert.ok(value.log.indexOf("workers.authority:none") > (reconcilerStops[1] ?? -1));
   for (const entry of [
     "coordination.release:14",
     "tasks.close",

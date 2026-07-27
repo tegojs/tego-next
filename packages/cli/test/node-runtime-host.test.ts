@@ -4,9 +4,10 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseWorkerId } from "@tegojs/contracts";
+import { parseFencingEpoch, parseWorkerId } from "@tegojs/contracts";
 import { connectWorker, createWorkerEndpoint } from "@tegojs/transport-websocket";
 import {
+  createAuthorityCapabilityAdmission,
   createNodeRuntimeHost,
   NodeWorkerListenerOwner,
 } from "../src/runtime/create-node-runtime-host.js";
@@ -153,6 +154,49 @@ test("Worker listener shutdown does not reclassify a bind failure as cleanup fai
 
   await assert.rejects(starting, /listener bind failed/iu);
   await owner.close();
+});
+
+test("capability authority admission rejects post-loss calls while admitted calls finish", async () => {
+  const admission = createAuthorityCapabilityAdmission();
+  const authority = {
+    epoch: parseFencingEpoch("3"),
+    resource: "runtime:runtime-listener",
+  };
+  const inFlight = Promise.withResolvers<string>();
+
+  admission.open(authority);
+  const admitted = admission.invoke(() => inFlight.promise);
+  admission.close(authority);
+
+  await assert.rejects(
+    admission.invoke(async () => "not admitted"),
+    /capability invocation authority is unavailable/iu,
+  );
+  inFlight.resolve("completed");
+  assert.equal(await admitted, "completed");
+});
+
+test("stale capability authority close cannot fence a newer leadership epoch", async () => {
+  const admission = createAuthorityCapabilityAdmission();
+  const first = {
+    epoch: parseFencingEpoch("3"),
+    resource: "runtime:runtime-listener",
+  };
+  const second = {
+    epoch: parseFencingEpoch("4"),
+    resource: "runtime:runtime-listener",
+  };
+
+  admission.open(first);
+  admission.open(second);
+  admission.close(first);
+
+  assert.equal(await admission.invoke(async () => "new leader"), "new leader");
+  admission.close(second);
+  await assert.rejects(
+    admission.invoke(async () => "not admitted"),
+    /capability invocation authority is unavailable/iu,
+  );
 });
 
 test("SQLite-backed Worker epochs advance across Main restart", async () => {

@@ -11,7 +11,13 @@ import { createManagedRuntime } from "./create-runtime.js";
 import type { Reconciler } from "./reconcile/reconciler.js";
 import type { RuntimeArtifactInstaller, RuntimeTaskOperations } from "./runtime-operations.js";
 
+export interface RuntimeAuthorityAdmission {
+  open(authority: RuntimeAuthority): void;
+  close(authority: RuntimeAuthority): void;
+}
+
 export interface RuntimeHostServices {
+  readonly authorityAdmission: RuntimeAuthorityAdmission;
   readonly createReconciler: (
     authority: RuntimeAuthority,
     context: {

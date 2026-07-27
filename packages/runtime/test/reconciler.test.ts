@@ -1132,6 +1132,17 @@ class RecordingEffects implements ComponentEffectExecutor {
   }
 }
 
+class BlockingCloseEffects extends RecordingEffects {
+  readonly closeEntered = Promise.withResolvers<void>();
+  readonly closeRelease = Promise.withResolvers<void>();
+
+  override async close(): Promise<void> {
+    this.closeEntered.resolve();
+    await this.closeRelease.promise;
+    await super.close();
+  }
+}
+
 class GatedRecordingEffects extends RecordingEffects {
   readonly #gates = new Map<
     string,
@@ -5328,6 +5339,35 @@ test("a later wake budget failure stops an already-started reconciler", async ()
   assert.equal(reconciler.kernelRunning, false);
   assert.equal(effects.live.size, 0);
   assert.equal(backgroundErrors.length, 1);
+});
+
+test("background failure notification precedes blocked component cleanup", async () => {
+  const clock = new ManualClock();
+  const effects = new BlockingCloseEffects();
+  const state = await createHarnessStore(clock);
+  let deployments: readonly PluginDeployment[] = [];
+  const backgroundErrors: unknown[] = [];
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock,
+    effects,
+    maxConvergencePasses: 1,
+    state,
+    loadDeployments: async () => deployments,
+    loadInstallations: async () => [installation()],
+    onBackgroundError: (error) => {
+      backgroundErrors.push(error);
+    },
+  });
+
+  await reconciler.start();
+  deployments = [deployment()];
+  const waking = reconciler.wake();
+  await effects.closeEntered.promise;
+
+  assert.equal(backgroundErrors.length, 1);
+  effects.closeRelease.resolve();
+  await assert.rejects(waking, /did not converge within 1 pass/u);
 });
 
 test("the convergence pass budget counts lifecycle work without an extra idle proof pass", async () => {
