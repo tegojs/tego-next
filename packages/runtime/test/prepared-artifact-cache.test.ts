@@ -302,8 +302,9 @@ test("@spec:plugin-artifacts/immutable-artifacts/pre-pointer-crash-reuses-determ
   });
 
   await ready;
+  const exited = once(child, "exit");
   child.kill("SIGKILL");
-  const [, signal] = await once(child, "exit");
+  const [, signal] = await exited;
   assert.equal(signal, "SIGKILL");
 
   const artifacts = new MemoryArtifacts();
