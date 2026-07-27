@@ -562,13 +562,13 @@ async function runSystemFlow(runIndex) {
     await settleWithCleanup(async () => {
       if (operationError !== undefined) throw operationError;
     }, [
-      async () => stopProcess(worker),
       async () => {
         if (restartedMain !== undefined) {
           await runCli(["runtime", "stop", "--endpoint", restartedEndpoint, "--json"]);
         }
       },
       async () => stopProcess(restartedMain),
+      async () => stopProcess(worker),
       async () => {
         if (main !== undefined) {
           await runCli(["runtime", "stop", "--endpoint", endpoint, "--json"]);

@@ -891,7 +891,7 @@ test("leadership loss closes mutation admission before task authority and reconc
   assert.ok(
     value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
   );
-  assert.ok(value.log.indexOf("workers.authority:none") < value.log.indexOf("reconciler.stop:7"));
+  assert.ok(value.log.indexOf("reconciler.stop:7") < value.log.indexOf("workers.authority:none"));
 
   await eventually(() =>
     assert.equal(value.log.filter((entry) => entry === "coordination.campaign").length, 2),
@@ -903,7 +903,7 @@ test("leadership loss closes mutation admission before task authority and reconc
   await runtime.stop();
 });
 
-test("stop is idempotent and closes admission, leader services, tasks, workers, then drivers", async () => {
+test("stop is idempotent and retains Worker lifecycle transport until reconciliation closes", async () => {
   const value = fixture();
   const runtime = createRuntimeHost(value.configuration, value.drivers, value.services);
   await runtime.start();
@@ -917,8 +917,8 @@ test("stop is idempotent and closes admission, leader services, tasks, workers, 
 
   assert.deepEqual(value.log.slice(-11), [
     "tasks.authority:none",
-    "workers.authority:none",
     "reconciler.stop:11",
+    "workers.authority:none",
     "coordination.release:11",
     "tasks.close",
     "workers.close",
@@ -1128,6 +1128,6 @@ test("task authority activation failure rolls back workers before stopping recon
   assert.ok(
     value.log.indexOf("tasks.authority:none") < value.log.indexOf("workers.authority:none"),
   );
-  assert.ok(value.log.indexOf("workers.authority:none") < value.log.indexOf("reconciler.stop:17"));
+  assert.ok(value.log.indexOf("reconciler.stop:17") < value.log.indexOf("workers.authority:none"));
   await runtime.stop();
 });
