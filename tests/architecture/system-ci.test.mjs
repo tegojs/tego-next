@@ -321,9 +321,7 @@ test("deterministic package gate compares independent artifacts and manifests wi
     beforeStatus,
   );
   assert.deepEqual(
-    (await readdir(tmpdir()))
-      .filter((name) => name.startsWith("tego-release-package-"))
-      .sort(),
+    (await readdir(tmpdir())).filter((name) => name.startsWith("tego-release-package-")).sort(),
     beforeTemporaryDirectories,
   );
 });

@@ -70,7 +70,7 @@ test("TypeScript workspaces reference every internal build dependency", async ()
 test("GitHub CI declares quality, integration, and system E2E gates", async () => {
   assert.equal(existsSync(workflowUrl), true, "CI workflow must exist");
   const workflow = await readFile(workflowUrl, "utf8");
-  const { parseWorkflowJobs } = await import(
+  const { parseWorkflowJobs, validateWorkflowContract } = await import(
     new URL(`../../scripts/verify-release.mjs?project-ci=${Date.now()}`, import.meta.url)
   );
   const jobs = parseWorkflowJobs(workflow);
@@ -84,9 +84,9 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "integration:",
     "system-e2e:",
     "timeout-minutes:",
-    "actions/checkout@v6",
-    "actions/setup-node@v6",
-    "actions/upload-artifact@v7",
+    "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0",
+    "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0",
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
     "node-version-file: .node-version",
     "npm run commitlint:ci",
     "npm run format:check",
@@ -94,6 +94,7 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "npm run typecheck",
     "npm test",
     "npm run build",
+    "node scripts/verify-release.mjs --deterministic-package",
     "postgres:16.14-alpine",
     "TEGO_POSTGRES_URL:",
     "TEGO_TEST_ARTIFACTS_DIR:",
@@ -105,6 +106,8 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
   ]) {
     assert.match(workflow, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   }
+  assert.deepEqual(validateWorkflowContract(workflow), []);
+  assert.doesNotMatch(workflow, /uses: actions\/[^@\s]+@v\d/u);
 
   assert.ok(
     workflow.indexOf("run: npm run build") < workflow.indexOf("run: npm run typecheck"),
@@ -122,35 +125,27 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     ["PostgreSQL integration", integrationJob],
     ["process E2E", processE2eJob],
   ]) {
-    assert.match(job, /timeout-minutes: 15/u, `${name} CI must have a bounded job timeout`);
+    assert.equal(job["timeout-minutes"], 15, `${name} CI must have a bounded job timeout`);
   }
   for (const [name, job] of [
     ["PostgreSQL integration", integrationJob],
     ["process E2E", processE2eJob],
   ]) {
-    assert.match(
-      job,
-      /uses: actions\/upload-artifact@v7/u,
+    assert.equal(
+      job.steps.some((step) => step.uses?.startsWith("actions/upload-artifact@")),
+      true,
       `${name} CI must upload process diagnostics`,
     );
-    assert.match(
-      job,
-      /TEGO_TEST_ARTIFACTS_DIR:/u,
+    assert.equal(
+      job.steps.some((step) => step.env?.TEGO_TEST_ARTIFACTS_DIR !== undefined),
+      true,
       `${name} CI must retain process diagnostics for upload`,
     );
   }
-  assert.ok(
-    integrationJob.indexOf("TEGO_TEST_ARTIFACTS_DIR:") >
-      integrationJob.indexOf("- name: Run integration tests"),
-    "PostgreSQL diagnostic paths must be resolved inside a runner step",
+  const integrationBuild = integrationJob.steps.findIndex((step) => step.run === "npm run build");
+  const integrationTests = integrationJob.steps.findIndex((step) =>
+    step.run?.endsWith("-- npm run test:integration"),
   );
-  assert.ok(
-    processE2eJob.indexOf("TEGO_TEST_ARTIFACTS_DIR:") >
-      processE2eJob.indexOf("- name: Run single-Main system smoke"),
-    "process E2E diagnostic paths must be resolved inside a runner step",
-  );
-  const integrationBuild = integrationJob.indexOf("run: npm run build");
-  const integrationTests = integrationJob.indexOf("-- npm run test:integration");
   assert.notEqual(integrationBuild, -1, "PostgreSQL CI must build workspace packages");
   assert.ok(
     integrationBuild < integrationTests,
