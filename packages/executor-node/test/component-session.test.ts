@@ -4,6 +4,7 @@ import {
   type ComponentCapabilityInvocation,
   createExecutionBinding,
   type ExecutionRequest,
+  type JsonValue,
   parseApplicationId,
   parseArtifactDigest,
   parseAttemptId,
@@ -151,6 +152,77 @@ test("component session delegates exact provider capability invocations to its t
 
   assert.deepEqual(received, invocation);
   assert.deepEqual(value, { echoed: invocation });
+});
+
+test("component session drain closes capability admission and waits for in-flight invocations", async () => {
+  const fixture = hangingTransport();
+  const release = Promise.withResolvers<JsonValue>();
+  let invocations = 0;
+  let drainCalls = 0;
+  const sandbox = session({
+    ...fixture.transport,
+    invokeCapability() {
+      invocations += 1;
+      return release.promise;
+    },
+    async drain() {
+      drainCalls += 1;
+    },
+  });
+  const invocation = {
+    invocationId: "operation-session-drain",
+    identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+    method: "echo",
+    input: null,
+  };
+
+  const active = sandbox.invokeCapability(invocation);
+  const draining = sandbox.drainLifecycle({});
+  const rejectedCode = sandbox.invokeCapability(invocation).then(
+    () => undefined,
+    (error: unknown) =>
+      (error as { readonly diagnostic?: { readonly code?: string } }).diagnostic?.code,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const invocationsBeforeRelease = invocations;
+  const drainCallsBeforeRelease = drainCalls;
+
+  release.resolve({ ok: true });
+  assert.deepEqual(await active, { ok: true });
+  assert.equal(await rejectedCode, "EXECUTOR_DRAINING");
+  await draining;
+  assert.equal(invocationsBeforeRelease, 1);
+  assert.equal(drainCallsBeforeRelease, 0);
+  assert.equal(drainCalls, 1);
+});
+
+test("component session close waits for in-flight capability invocations before transport stop", async () => {
+  const fixture = hangingTransport();
+  const release = Promise.withResolvers<JsonValue>();
+  let closeCalls = 0;
+  const sandbox = session({
+    ...fixture.transport,
+    invokeCapability: () => release.promise,
+    async close() {
+      closeCalls += 1;
+    },
+  });
+  const invocation = {
+    invocationId: "operation-session-stop",
+    identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+    method: "echo",
+    input: null,
+  };
+
+  const active = sandbox.invokeCapability(invocation);
+  const closing = sandbox.close();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const closeCallsBeforeRelease = closeCalls;
+
+  release.resolve(null);
+  await Promise.all([active, closing]);
+  assert.equal(closeCallsBeforeRelease, 0);
+  assert.equal(closeCalls, 1);
 });
 
 test("component session close does not await a non-settling transport termination forever", async () => {

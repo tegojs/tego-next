@@ -125,6 +125,7 @@ class ControlledRemoteExecutor implements Executor {
   capabilityInvocations: RemoteCapabilityInvocation[] = [];
   lifecycle: string[] = [];
   submitGate: Promise<void> | undefined;
+  capabilityGate: Promise<void> | undefined;
 
   async probe() {
     return {
@@ -178,6 +179,7 @@ class ControlledRemoteExecutor implements Executor {
 
   async invokeCapability(request: RemoteCapabilityInvocation) {
     this.capabilityInvocations.push(request);
+    await this.capabilityGate;
     return { invoked: request.invocation.method };
   }
 
@@ -386,6 +388,80 @@ test("remote component drain waits for a submit admitted before drain to reach t
   await Promise.all([handle.result, draining]);
 
   assert.equal(targetDrainStartedBeforeSubmitSettled, false);
+  await host.stop(component);
+  await registry.close();
+});
+
+test("remote component drain closes capability admission and waits before lifecycle callbacks", async () => {
+  const registry = new LocalComponentSessionRegistry("runtime-remote-capability-race");
+  const shared = new ControlledRemoteExecutor();
+  const capabilityGate = Promise.withResolvers<void>();
+  shared.capabilityGate = capabilityGate.promise;
+  const host = new RemoteComponentSessionHost({
+    registry,
+    resolveExecutor: (candidate: typeof workerId) => (candidate === workerId ? shared : undefined),
+    resolveExecutionBinding: (_binding, target) => Promise.resolve(executionBinding(target)),
+    runtimeId: "runtime-remote-capability-race",
+  });
+  const component = binding();
+
+  await host.start(component);
+  const registration = registry.resolveFresh({
+    applicationId,
+    pluginId,
+    componentId,
+    input: null,
+    deadline: new Date(Date.now() + 60_000).toISOString(),
+    orphanPolicy: "finish-and-persist",
+  });
+  const provider = registration.executor as Executor & {
+    invokeCapability(request: {
+      readonly invocationId: ReturnType<typeof parseOperationId>;
+      readonly identity: {
+        readonly name: ReturnType<typeof parseCapabilityName>;
+        readonly protocolVersion: string;
+      };
+      readonly method: string;
+      readonly input: null;
+    }): Promise<unknown>;
+  };
+  const invocation = {
+    invocationId: parseOperationId("remote-capability-race-1"),
+    identity: {
+      name: parseCapabilityName("org.example.echo"),
+      protocolVersion: "1.0.0",
+    },
+    method: "echo",
+    input: null,
+  };
+
+  const active = provider.invokeCapability(invocation);
+  const draining = host.drain(component);
+  const rejectedMessage = provider
+    .invokeCapability({
+      ...invocation,
+      invocationId: parseOperationId("remote-capability-race-2"),
+    })
+    .then(
+      () => undefined,
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const invocationsBeforeRelease = shared.capabilityInvocations.length;
+  const targetDrainsBeforeRelease = shared.targetDrains;
+  const lifecycleBeforeRelease = [...shared.lifecycle];
+
+  capabilityGate.resolve();
+  assert.deepEqual(await active, { invoked: "echo" });
+  assert.match((await rejectedMessage) ?? "", /draining|accepting/iu);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(invocationsBeforeRelease, 1);
+  assert.equal(targetDrainsBeforeRelease, 0);
+  assert.deepEqual(lifecycleBeforeRelease, ["activate"]);
+  assert.equal(shared.targetDrains, 1);
+  assert.deepEqual(shared.lifecycle, ["activate", "drain"]);
+  shared.targetDrain.resolve();
+  await draining;
   await host.stop(component);
   await registry.close();
 });

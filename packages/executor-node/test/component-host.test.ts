@@ -1777,6 +1777,81 @@ test("secret values cannot cross the capability request boundary or diagnostic s
   assert.doesNotMatch(JSON.stringify(result), /raw-capability-secret/u);
 });
 
+test("provider capability responses reject secret exfiltration before wire redaction", async (t) => {
+  const secret = "raw-provider-capability-secret";
+  const fixture = await artifactFixture(
+    t,
+    `
+      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      export default defineComponent({
+        kind: "task",
+        run: async () => null,
+        invokeCapability: async (context) => ({
+          value: await context.secrets.get("API_TOKEN")
+        })
+      });
+    `,
+    {
+      permissions: [{ kind: "secret", names: ["API_TOKEN"] }],
+      provides: [
+        {
+          name: parseCapabilityName("org.example.echo"),
+          protocolVersion: "1.0.0",
+          componentId: parseComponentId("component"),
+          methods: ["echo"],
+          requestSchema: true,
+          responseSchema: true,
+        },
+      ],
+    },
+  );
+  const host = new ComponentHost(
+    allowedOptions(fixture, {
+      secretProvider: {
+        developmentOnly: true,
+        open: async () => {},
+        health: async () => ({
+          status: "healthy",
+          checkedAt: "2026-07-23T00:00:00.000Z",
+        }),
+        close: async () => {},
+        get: async () => secret,
+      },
+      permissionBoundary: {
+        validateGrant: (_requested, granted) => ({
+          allowed: true,
+          diagnostics: [],
+          granted,
+        }),
+        authorize: () => ({ allowed: true, diagnostics: [] }),
+      },
+    }),
+  );
+  await host.handle(prepareCommand(fixture));
+  await host.handle(command("import", "provider-secret-import", { artifactDigest: digest }));
+  await host.handle(command("start", "provider-secret-start", { artifactDigest: digest }));
+
+  const result = await host.handle(
+    command("invokeCapability" as never, "provider-secret-invoke", {
+      artifactDigest: digest,
+      invocation: {
+        invocationId: "operation-provider-secret",
+        identity: { name: "org.example.echo", protocolVersion: "1.0.0" },
+        method: "echo",
+        input: null,
+      },
+    }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.diagnostics[0]?.code,
+    "PERMISSION_SECRET_EXFILTRATION_BLOCKED",
+    JSON.stringify(result.diagnostics),
+  );
+  assert.doesNotMatch(JSON.stringify(result), /raw-provider-capability-secret/u);
+});
+
 test("service components explicitly reject provider capability hooks", async (t) => {
   const fixture = await artifactFixture(
     t,
