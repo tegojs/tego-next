@@ -359,18 +359,35 @@ function analyzeImports(source) {
       continue;
     }
 
-    if (
-      token.value === "import" &&
-      next?.value === "{" &&
-      tokens[index + 2]?.type === "identifier" &&
-      tokens[index + 2]?.value === "pathToFileURL" &&
-      tokens[index + 3]?.value === "}" &&
-      tokens[index + 4]?.value === "from" &&
-      tokens[index + 5]?.type === "string" &&
-      !tokens[index + 5].escaped &&
-      tokens[index + 5].value === "node:url"
-    ) {
-      hasPathToFileUrlImport = true;
+    if (token.value === "import" && next?.value === "{") {
+      const close = tokens.findIndex(
+        (candidate, candidateIndex) => candidateIndex > index + 1 && candidate.value === "}",
+      );
+      if (
+        close !== -1 &&
+        tokens[close + 1]?.value === "from" &&
+        tokens[close + 2]?.type === "string" &&
+        !tokens[close + 2].escaped &&
+        tokens[close + 2].value === "node:url"
+      ) {
+        const bindings = [];
+        let binding = [];
+        for (const candidate of tokens.slice(index + 2, close)) {
+          if (candidate.value === ",") {
+            if (binding.length > 0) bindings.push(binding);
+            binding = [];
+          } else {
+            binding.push(candidate);
+          }
+        }
+        if (binding.length > 0) bindings.push(binding);
+        hasPathToFileUrlImport = bindings.some(
+          (candidate) =>
+            candidate.length === 1 &&
+            candidate[0].type === "identifier" &&
+            candidate[0].value === "pathToFileURL",
+        );
+      }
     }
 
     if (token.value === "import" && next?.value === "(") {

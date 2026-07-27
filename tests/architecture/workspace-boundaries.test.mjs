@@ -210,7 +210,7 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
     ],
     [
       "accepts multiline spacing around named imports",
-      ['import {', "  fileURLToPath,", "  pathToFileURL,", '} from "node:url";'].join("\n"),
+      ["import {", "  fileURLToPath,", "  pathToFileURL,", '} from "node:url";'].join("\n"),
     ],
   ]) {
     await t.test(name, async () => {
