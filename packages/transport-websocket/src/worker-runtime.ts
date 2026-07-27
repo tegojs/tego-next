@@ -17,6 +17,11 @@ import {
   type WorkerMessageType,
 } from "@tegojs/contracts";
 import {
+  countPendingCapabilityEntries,
+  getCapabilityEntry,
+  reserveCapabilityEntry,
+} from "./capability-dedupe.js";
+import {
   asObject,
   attemptKey,
   capabilityInvocationFingerprint,
@@ -55,22 +60,6 @@ import {
   remoteDiagnostic,
   requestFingerprint,
 } from "./remote-protocol.js";
-
-interface ReclaimableCapabilityEntry {
-  reclaimable: boolean;
-}
-
-function pruneSettledCapabilities<T extends ReclaimableCapabilityEntry>(
-  entries: Map<string, T>,
-  maximum: number,
-): void {
-  while (entries.size >= maximum) {
-    const settled = [...entries].find(([, entry]) => entry.reclaimable);
-    if (settled === undefined) return;
-    entries.delete(settled[0]);
-  }
-}
-
 import { ResultBuffer, type ResultBufferOptions } from "./result-buffer.js";
 
 const DEFAULT_MAX_ASSIGNMENTS = 256;
@@ -108,6 +97,7 @@ export interface WorkerRuntimeOptions {
     request: RemoteCapabilityInvocation,
   ) => JsonValue | Promise<JsonValue>;
   readonly maxCapabilityInvocations?: number;
+  readonly maxIndeterminateCapabilityInvocations?: number;
   readonly maxCapabilityInvocationBytes?: number;
   readonly validateActivation?: (activation: RemoteComponentActivation) => void | Promise<void>;
   readonly activateComponent?: (activation: RemoteComponentActivation) => void | Promise<void>;
@@ -161,6 +151,7 @@ export class WorkerRuntime {
   readonly #preparedArtifacts: WorkerRuntimeOptions["preparedArtifacts"];
   readonly #invokeCapability: WorkerRuntimeOptions["invokeCapability"];
   readonly #maxCapabilityInvocations: number;
+  readonly #maxIndeterminateCapabilityInvocations: number;
   readonly #maxCapabilityInvocationBytes: number;
   readonly #validateActivation: WorkerRuntimeOptions["validateActivation"];
   readonly #activateComponentCallback: WorkerRuntimeOptions["activateComponent"];
@@ -182,12 +173,26 @@ export class WorkerRuntime {
     {
       readonly fingerprint: string;
       readonly response: Promise<RemoteCapabilityInvocationResponse>;
-      reclaimable: boolean;
+      readonly target: TaskExecutionTarget;
+      settled: boolean;
     }
   >();
   readonly #mainCapabilityInvocations = new Map<
     string,
-    { readonly fingerprint: string; readonly result: Promise<JsonValue>; reclaimable: boolean }
+    {
+      readonly fingerprint: string;
+      readonly result: Promise<JsonValue>;
+      readonly target: TaskExecutionTarget;
+      settled: boolean;
+    }
+  >();
+  readonly #indeterminateMainCapabilityInvocations = new Map<
+    string,
+    {
+      readonly fingerprint: string;
+      readonly error: DiagnosticError;
+      readonly target: TaskExecutionTarget;
+    }
   >();
   readonly #activations = new Map<string, WorkerActivation>();
   #session: RemoteSession | undefined;
@@ -218,6 +223,11 @@ export class WorkerRuntime {
       options.maxCapabilityInvocations,
       DEFAULT_MAX_CAPABILITY_INVOCATIONS,
       "maxCapabilityInvocations",
+    );
+    this.#maxIndeterminateCapabilityInvocations = positiveLimit(
+      options.maxIndeterminateCapabilityInvocations,
+      DEFAULT_MAX_CAPABILITY_INVOCATIONS,
+      "maxIndeterminateCapabilityInvocations",
     );
     this.#maxCapabilityInvocationBytes = positiveLimit(
       options.maxCapabilityInvocationBytes,
@@ -326,7 +336,7 @@ export class WorkerRuntime {
       }
     }
     const fingerprint = capabilityInvocationFingerprint(request);
-    const existing = this.#mainCapabilityInvocations.get(request.invocationId);
+    const existing = getCapabilityEntry(this.#mainCapabilityInvocations, request.invocationId);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
         throw new DiagnosticError(
@@ -340,12 +350,39 @@ export class WorkerRuntime {
       }
       return existing.result;
     }
-    pruneSettledCapabilities(this.#mainCapabilityInvocations, this.#maxCapabilityInvocations);
-    if (this.#mainCapabilityInvocations.size >= this.#maxCapabilityInvocations) {
+    const indeterminate = this.#indeterminateMainCapabilityInvocations.get(request.invocationId);
+    if (indeterminate !== undefined) {
+      if (indeterminate.fingerprint !== fingerprint) {
+        throw new DiagnosticError(
+          remoteDiagnostic(
+            "PROTOCOL_CAPABILITY_INVOCATION_CONFLICT",
+            "Capability invocation identity has a different canonical fingerprint",
+            this.#workerId,
+            this.#clock.now().toISOString(),
+          ),
+        );
+      }
+      throw indeterminate.error;
+    }
+    if (!reserveCapabilityEntry(this.#mainCapabilityInvocations, this.#maxCapabilityInvocations)) {
       throw new DiagnosticError(
         remoteDiagnostic(
           "CAPABILITY_INVOCATION_EXHAUSTED",
           "Worker to Main capability invocation capacity is exhausted",
+          this.#workerId,
+          this.#clock.now().toISOString(),
+        ),
+      );
+    }
+    if (
+      this.#indeterminateMainCapabilityInvocations.size +
+        countPendingCapabilityEntries(this.#mainCapabilityInvocations) >=
+      this.#maxIndeterminateCapabilityInvocations
+    ) {
+      throw new DiagnosticError(
+        remoteDiagnostic(
+          "CAPABILITY_INVOCATION_EXHAUSTED",
+          "Worker indeterminate capability tombstone capacity is exhausted until component stop",
           this.#workerId,
           this.#clock.now().toISOString(),
         ),
@@ -363,16 +400,31 @@ export class WorkerRuntime {
       );
     }
     const result = this.#requestMainCapability(session, request, fingerprint);
-    const entry = { fingerprint, result, reclaimable: false };
+    const entry = {
+      fingerprint,
+      result,
+      target: cloneJson(request.target),
+      settled: false,
+    };
     this.#mainCapabilityInvocations.set(request.invocationId, entry);
     void result.then(
       () => {
-        entry.reclaimable = true;
+        entry.settled = true;
       },
       (error: unknown) => {
-        entry.reclaimable =
-          !(error instanceof DiagnosticError) ||
-          error.diagnostic.code !== "CAPABILITY_INVOCATION_INDETERMINATE";
+        if (
+          error instanceof DiagnosticError &&
+          error.diagnostic.code === "CAPABILITY_INVOCATION_INDETERMINATE"
+        ) {
+          this.#mainCapabilityInvocations.delete(request.invocationId);
+          this.#indeterminateMainCapabilityInvocations.set(request.invocationId, {
+            fingerprint,
+            error,
+            target: cloneJson(request.target),
+          });
+          return;
+        }
+        entry.settled = true;
       },
     );
     return result;
@@ -509,6 +561,9 @@ export class WorkerRuntime {
         await attempt.handle?.result;
       }),
     );
+    this.#capabilityInvocations.clear();
+    this.#mainCapabilityInvocations.clear();
+    this.#indeterminateMainCapabilityInvocations.clear();
   }
 
   async #hydrate(): Promise<void> {
@@ -896,11 +951,30 @@ export class WorkerRuntime {
       return;
     }
     this.#activations.delete(key);
+    this.#clearCapabilityHistory(target);
     await this.#sendLifecycleResponse(session, REMOTE_COMPONENT_STOP, message.messageId, {
       ok: true,
       target,
       bindingFingerprint: activation.activation.bindingFingerprint,
     });
+  }
+
+  #clearCapabilityHistory(target: TaskExecutionTarget): void {
+    for (const [invocationId, entry] of this.#capabilityInvocations) {
+      if (this.#sameTarget(entry.target, target)) {
+        this.#capabilityInvocations.delete(invocationId);
+      }
+    }
+    for (const [invocationId, entry] of this.#mainCapabilityInvocations) {
+      if (this.#sameTarget(entry.target, target)) {
+        this.#mainCapabilityInvocations.delete(invocationId);
+      }
+    }
+    for (const [invocationId, entry] of this.#indeterminateMainCapabilityInvocations) {
+      if (this.#sameTarget(entry.target, target)) {
+        this.#indeterminateMainCapabilityInvocations.delete(invocationId);
+      }
+    }
   }
 
   async #sendLifecycleResponse(
@@ -982,7 +1056,7 @@ export class WorkerRuntime {
         return;
       }
     }
-    const existing = this.#capabilityInvocations.get(request.invocationId);
+    const existing = getCapabilityEntry(this.#capabilityInvocations, request.invocationId);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
         await this.#sendCapabilityResponse(session, message.messageId, {
@@ -999,8 +1073,7 @@ export class WorkerRuntime {
       await this.#sendCapabilityResponse(session, message.messageId, await existing.response);
       return;
     }
-    pruneSettledCapabilities(this.#capabilityInvocations, this.#maxCapabilityInvocations);
-    if (this.#capabilityInvocations.size >= this.#maxCapabilityInvocations) {
+    if (!reserveCapabilityEntry(this.#capabilityInvocations, this.#maxCapabilityInvocations)) {
       await this.#sendCapabilityResponse(session, message.messageId, {
         invocationId: request.invocationId,
         fingerprint,
@@ -1013,14 +1086,19 @@ export class WorkerRuntime {
       return;
     }
     const response = this.#executeCapability(request, fingerprint);
-    const entry = { fingerprint, response, reclaimable: false };
+    const entry = {
+      fingerprint,
+      response,
+      target: cloneJson(request.target),
+      settled: false,
+    };
     this.#capabilityInvocations.set(request.invocationId, entry);
     void response.then(
       () => {
-        entry.reclaimable = true;
+        entry.settled = true;
       },
       () => {
-        entry.reclaimable = true;
+        entry.settled = true;
       },
     );
     await this.#sendCapabilityResponse(session, message.messageId, await response);

@@ -82,7 +82,10 @@ function activationFor(request: RemoteCapabilityInvocation) {
 
 async function connected(
   invokeCapability: (request: RemoteCapabilityInvocation) => JsonValue | Promise<JsonValue>,
-  options: { readonly maxCapabilityInvocations?: number } = {},
+  options: {
+    readonly maxCapabilityInvocations?: number;
+    readonly maxIndeterminateCapabilityInvocations?: number;
+  } = {},
 ): Promise<{
   readonly remote: RemoteExecutor;
   readonly runtime: WorkerRuntime;
@@ -270,6 +273,45 @@ test("authoritative remote capability failure releases active admission capacity
   assert.equal(calls, 2);
 });
 
+test("remote indeterminate tombstones are bounded until exact component stop", async () => {
+  let calls = 0;
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const { remote, runtime, mainSession } = await connected(
+    async (received) => {
+      calls += 1;
+      if (calls === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return received.invocation.input;
+    },
+    { maxIndeterminateCapabilityInvocations: 1 },
+  );
+  const first = request("bounded-tombstone-1");
+  await remote.activateComponent(activationFor(first));
+  const pending = remote.invokeCapability(first);
+  await started.promise;
+  mainSession.close();
+  await assert.rejects(pending, /indeterminate/iu);
+  release.resolve();
+
+  const [mainReplacement, workerReplacement] = memorySessionPair("2");
+  await runtime.attach(workerReplacement);
+  await remote.attach(mainReplacement);
+  await assert.rejects(
+    remote.invokeCapability(request("bounded-tombstone-2")),
+    /tombstone|capacity|exhausted/iu,
+  );
+  assert.equal(calls, 1);
+
+  await remote.stopComponent(first.target);
+  const second = request("bounded-tombstone-2");
+  await remote.activateComponent(activationFor(second));
+  assert.deepEqual(await remote.invokeCapability(second), { value: "hello" });
+  assert.equal(calls, 2);
+});
+
 test("authoritative Main capability failure releases Worker admission capacity", async () => {
   let calls = 0;
   const [mainSession, workerSession] = memorySessionPair("1");
@@ -414,6 +456,64 @@ test("remote consumer invokes Main through its authenticated exact activation", 
     fromMain: { value: "hello" },
   });
   assert.deepEqual(routed, [expected]);
+});
+
+test("Worker indeterminate tombstones are bounded until exact component stop", async () => {
+  let calls = 0;
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const [mainSession, workerSession] = memorySessionPair("1");
+  const runtime = new WorkerRuntime({
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    selectExecutor: () => new TestLocalExecutor(),
+    validateActivation: () => undefined,
+    maxIndeterminateCapabilityInvocations: 1,
+  });
+  await runtime.attach(workerSession);
+  const remote = new RemoteExecutor({
+    id: "remote",
+    workerId,
+    clock,
+    attemptStore: new MemoryRemoteAttemptStore(),
+    maxIndeterminateCapabilityInvocations: 1,
+    routeCapability: async (received) => {
+      calls += 1;
+      if (calls === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return received.invocation.input;
+    },
+  });
+  await remote.attach(mainSession);
+  cleanups.push(async () => {
+    release.resolve();
+    await Promise.all([remote.close(), runtime.close()]);
+  });
+  const first = request("consumer-bounded-tombstone-1");
+  await remote.activateComponent(activationFor(first));
+  const pending = runtime.invokeMainCapability(first);
+  await started.promise;
+  workerSession.close();
+  await assert.rejects(pending, /indeterminate/iu);
+  release.resolve();
+
+  const [mainReplacement, workerReplacement] = memorySessionPair("2");
+  await runtime.attach(workerReplacement);
+  await remote.attach(mainReplacement);
+  await assert.rejects(
+    runtime.invokeMainCapability(request("consumer-bounded-tombstone-2")),
+    /tombstone|capacity|exhausted/iu,
+  );
+  assert.equal(calls, 1);
+
+  await remote.stopComponent(first.target);
+  const second = request("consumer-bounded-tombstone-2");
+  await remote.activateComponent(activationFor(second));
+  assert.deepEqual(await runtime.invokeMainCapability(second), { value: "hello" });
+  assert.equal(calls, 2);
 });
 
 test("remote consumer to Main disconnect is indeterminate and is not auto-retried", async () => {
