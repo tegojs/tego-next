@@ -1446,6 +1446,301 @@ test("suspended provider hold survives Memory and SQLite reopen before activatio
   });
 });
 
+test("stale recovery authorization is replaced after durable evidence returns", async (t) => {
+  await withRealStateStores(t, async (state, clock) => {
+    const providerId = parsePluginId("stale-recovery-provider");
+    const consumerId = parsePluginId("stale-recovery-consumer");
+    const providerComponentId = parseComponentId("stale-recovery-provider-service");
+    const consumerComponentId = parseComponentId("stale-recovery-consumer-service");
+    const capability = parseCapabilityName("org.example.stale-recovery");
+    const providerDigest = parseArtifactDigest(`sha256:${"c".repeat(64)}`);
+    const consumerDigest = parseArtifactDigest(`sha256:${"d".repeat(64)}`);
+    const component = (targetComponentId) => ({
+      componentId: targetComponentId,
+      kind: "service",
+      entrypoint: `components/${targetComponentId}.js`,
+      executors: ["process"],
+    });
+    const providerManifest = {
+      ...manifest(),
+      pluginId: providerId,
+      components: [component(providerComponentId)],
+      permissions: [{ kind: "executor", executors: ["process"] }],
+      capabilities: {
+        provides: [{ name: capability, protocolVersion: "1.0.0" }],
+        requires: [],
+      },
+    };
+    const consumerManifest = {
+      ...manifest(),
+      pluginId: consumerId,
+      components: [component(consumerComponentId)],
+      permissions: [{ kind: "executor", executors: ["process"] }],
+      capabilities: {
+        provides: [],
+        requires: [{ name: capability, protocolRange: "^1.0.0", lossPolicy: "suspend" }],
+      },
+    };
+    const providerDeployment = {
+      ...deployment(),
+      pluginId: providerId,
+      artifactDigest: providerDigest,
+      permissionGrants: [{ kind: "executor", executors: ["process"] }],
+    };
+    const consumerDeployment = {
+      ...deployment(),
+      pluginId: consumerId,
+      artifactDigest: consumerDigest,
+      permissionGrants: [{ kind: "executor", executors: ["process"] }],
+    };
+    const providerInstallation = {
+      ...installation(),
+      pluginId: providerId,
+      digest: providerDigest,
+      manifest: providerManifest,
+    };
+    const consumerInstallation = {
+      ...installation(),
+      pluginId: consumerId,
+      digest: consumerDigest,
+      manifest: consumerManifest,
+    };
+    const installations = [providerInstallation, consumerInstallation];
+    const artifacts = new Map(
+      installations.map((installed) => [
+        installed.digest,
+        {
+          digest: installed.digest,
+          files: { schemaVersion: "1.0", files: [] },
+          manifest: installed.manifest,
+        },
+      ]),
+    );
+    const artifactGate = {
+      validate: async (request) => {
+        const artifact = artifacts.get(request.digest);
+        assert.ok(artifact);
+        return artifact;
+      },
+    };
+    const deploymentKey = (desired) => ({
+      namespace: "tego",
+      collection: "deployments",
+      id: `${desired.applicationId}/${desired.pluginId}`,
+    });
+    const installationKey = (installed) => ({
+      namespace: "tego",
+      collection: "installations",
+      id: `${installed.pluginId}@${installed.version}@${installed.digest}`,
+    });
+    const providerGate = {
+      ...gate(),
+      artifact: artifacts.get(providerDigest),
+    };
+    const consumerGate = {
+      ...gate(),
+      artifact: artifacts.get(consumerDigest),
+    };
+    assert.ok(providerGate.artifact);
+    assert.ok(consumerGate.artifact);
+    const planned = (desired, deploymentGate, activation = "1") => {
+      const effect = planReconcile({
+        deployment: desired,
+        gate: deploymentGate,
+        instances: [],
+        now: clock.now().toISOString(),
+        supportedExecutors: ["process"],
+        activations: {
+          [deploymentGate.artifact.manifest.components[0].componentId]: activation,
+        },
+      }).steps[0]?.effect;
+      assert.ok(effect);
+      return effect;
+    };
+    const providerInstance = planned(providerDeployment, providerGate);
+    const consumerActivationOne = planned(consumerDeployment, consumerGate);
+    const recoveryPrepare = planned(consumerDeployment, consumerGate, "2");
+    const lossKey = {
+      namespace: "tego",
+      collection: "provider-loss",
+      id: `${applicationId}/${consumerId}`,
+    };
+    const recoveryInstanceKey = {
+      namespace: "tego",
+      collection: "component-instances",
+      id: recoveryPrepare.instanceId,
+    };
+    const providerInstallationKey = installationKey(providerInstallation);
+    const now = clock.now().toISOString();
+    await state.transact({}, async (transaction) => {
+      for (const desired of [providerDeployment, consumerDeployment]) {
+        await transaction.put(deploymentKey(desired), desired, { expectedRevision: "absent" });
+      }
+      for (const installed of installations) {
+        await transaction.put(installationKey(installed), installed, {
+          expectedRevision: "absent",
+        });
+      }
+      for (const [effect, lifecycle] of [
+        [providerInstance, "ready"],
+        [consumerActivationOne, "stopped"],
+        [recoveryPrepare, "created"],
+      ]) {
+        await transaction.put(
+          {
+            namespace: "tego",
+            collection: "component-instances",
+            id: effect.instanceId,
+          },
+          {
+            activation: effect.activation,
+            applicationId: effect.applicationId,
+            artifactDigest: effect.artifactDigest,
+            componentId: effect.componentId,
+            deploymentGeneration: effect.deploymentGeneration,
+            executor: effect.executor,
+            instanceId: effect.instanceId,
+            lifecycle,
+            observedGeneration: effect.deploymentGeneration,
+            pluginId: effect.pluginId,
+          },
+          { expectedRevision: "absent" },
+        );
+      }
+      await transaction.put(
+        {
+          namespace: "tego",
+          collection: "capability-bindings",
+          id: `${applicationId}/${consumerId}/${capability}`,
+        },
+        {
+          consumer: { applicationId, pluginId: consumerId },
+          capability,
+          provider: { applicationId, pluginId: providerId },
+          source: "automatic",
+          deploymentGeneration: consumerDeployment.generation,
+          updatedAt: now,
+        },
+        { expectedRevision: "absent" },
+      );
+      await transaction.put(
+        lossKey,
+        {
+          consumer: { applicationId, pluginId: consumerId },
+          deploymentGeneration: consumerDeployment.generation,
+          action: "suspend",
+          capabilities: [capability],
+          providers: [{ applicationId, pluginId: providerId }],
+          bindingPrerequisites: [
+            {
+              capability,
+              provider: { applicationId, pluginId: providerId },
+            },
+          ],
+          recoveryActivations: { [consumerComponentId]: "2" },
+          updatedAt: now,
+        },
+        { expectedRevision: "absent" },
+      );
+      await transaction.appendOperation({
+        operationId: recoveryPrepare.operationId,
+        kind: "component.lifecycle",
+        status: "planned",
+        state: recoveryPrepare,
+        updatedAt: now,
+      });
+      await transaction.enqueueOutbox({
+        availableAt: now,
+        createdAt: now,
+        messageId: recoveryPrepare.messageId,
+        operationId: recoveryPrepare.operationId,
+        payload: recoveryPrepare,
+        topic: "component.lifecycle",
+      });
+      return null;
+    });
+
+    let installationLoads = 0;
+    const loadInstallations = async () => {
+      installationLoads += 1;
+      const loaded = [];
+      for await (const record of state.scan({
+        namespace: "tego",
+        collection: "installations",
+      })) {
+        loaded.push(record.value);
+      }
+      if (installationLoads === 2) {
+        const persistedProvider = await state.read(providerInstallationKey);
+        assert.ok(persistedProvider);
+        await state.transact({}, async (transaction) => {
+          await transaction.delete(providerInstallationKey, {
+            expectedRevision: persistedProvider.revision,
+          });
+          return null;
+        });
+        return installations;
+      }
+      return loaded;
+    };
+    const effects = new RecordingEffects();
+    effects.supportedExecutors = ["process"];
+    effects.live.add(providerInstance.instanceId);
+    const reconciler = new Reconciler({
+      artifactGate,
+      clock,
+      effects,
+      state,
+      loadInstallations,
+      maxConvergencePasses: 20,
+    });
+
+    await reconciler.start();
+
+    assert.equal(
+      effects.calls.some((effect) => effect.pluginId === consumerId && effect.activation !== "1"),
+      false,
+      "transactional authorization failure must have zero external effects",
+    );
+    const invalidatedLoss = await state.read(lossKey);
+    assert.equal(invalidatedLoss?.value.recoveryActivations, undefined);
+    assert.equal((await state.read(recoveryInstanceKey))?.value.lifecycle, "stopped");
+    const replanCountAfterInvalidation = reconciler.replanCount;
+    for (let wake = 0; wake < 3; wake += 1) {
+      await reconciler.wake();
+    }
+    assert.equal(reconciler.replanCount, replanCountAfterInvalidation);
+    assert.equal(
+      effects.calls.some((effect) => effect.pluginId === consumerId && effect.activation !== "1"),
+      false,
+      "missing durable evidence must not create a recovery activation hot loop",
+    );
+
+    await state.transact({}, async (transaction) => {
+      await transaction.put(providerInstallationKey, providerInstallation, {
+        expectedRevision: "absent",
+      });
+      return null;
+    });
+    for (let wake = 0; wake < 4; wake += 1) {
+      await reconciler.wake();
+    }
+
+    assert.deepEqual(
+      effects.calls
+        .filter((effect) => effect.pluginId === consumerId && effect.activation === "3")
+        .map((effect) => effect.kind),
+      ["prepare", "start"],
+    );
+    assert.equal(
+      effects.calls.some((effect) => effect.pluginId === consumerId && effect.activation === "2"),
+      false,
+    );
+    assert.equal(await state.read(lossKey), undefined);
+    await reconciler.stop();
+  });
+});
+
 test("suspension restart terminalizes ready, draining, and stopping checkpoints without start", async (t) => {
   await withRealStateStores(t, async (initialState, clock, reopen) => {
     const missingProviderId = parsePluginId("missing-suspend-provider");
