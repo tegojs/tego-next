@@ -1444,7 +1444,7 @@ test("capability calls are forced through permission, request, invoke, and respo
       export default defineComponent({
         kind: "task",
         run: async (context, input) => context.capabilities.call({
-          name: parseCapabilityName("org.example.echo"),
+          name: "org.example.echo",
           protocolVersion: "1.0.0",
           method: "echo",
           input
@@ -1516,6 +1516,18 @@ test("capability calls are forced through permission, request, invoke, and respo
     }),
   );
   await host.handle(command("start", "start-01", { artifactDigest: digest }));
+  const executionIdentity = {
+    applicationId: parseApplicationId("app-01"),
+    pluginId: parsePluginId("org.example.component"),
+    componentId: parseComponentId("component"),
+    target: componentTarget,
+  };
+  const binding = createExecutionBinding(executionIdentity, {
+    configuration: { greeting: "hello" },
+    permissionGrants: fixture.manifest.permissions,
+    capabilityDefinitions: [],
+    capabilityBindings: [],
+  });
 
   const invalidRequest = await host.handle(
     command("run", "run-invalid-request", {
@@ -1523,10 +1535,8 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-invalid"),
         attemptId: parseAttemptId("attempt-invalid"),
-        target: componentTarget,
-        applicationId: parseApplicationId("app-01"),
-        pluginId: parsePluginId("org.example.component"),
-        componentId: parseComponentId("component"),
+        ...executionIdentity,
+        binding,
         input: { message: 7 },
         deadline: futureDeadline,
         orphanPolicy: "cancel",
@@ -1534,6 +1544,11 @@ test("capability calls are forced through permission, request, invoke, and respo
     }),
   );
   assert.equal(invalidRequest.ok, false);
+  assert.equal(
+    invalidRequest.diagnostics[0]?.code,
+    "CAPABILITY_REQUEST_INVALID",
+    JSON.stringify(invalidRequest.diagnostics),
+  );
   assert.deepEqual(order, ["permission:capability", "request"]);
 
   order.length = 0;
@@ -1544,10 +1559,8 @@ test("capability calls are forced through permission, request, invoke, and respo
       execution: {
         taskId: parseTaskId("task-response"),
         attemptId: parseAttemptId("attempt-response"),
-        target: componentTarget,
-        applicationId: parseApplicationId("app-01"),
-        pluginId: parsePluginId("org.example.component"),
-        componentId: parseComponentId("component"),
+        ...executionIdentity,
+        binding,
         input: { message: "hello" },
         deadline: futureDeadline,
         orphanPolicy: "cancel",
