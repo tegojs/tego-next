@@ -45,6 +45,7 @@ export {
 export {
   resolveCapabilities,
   type CapabilityResolutionDeployment,
+  type CapabilityResolutionProvision,
   type CapabilityResolutionDiagnostic,
   type CapabilityResolutionDiagnosticCode,
   type CapabilityResolutionInput,
@@ -55,6 +56,15 @@ export {
   type ResolvedCapabilityBinding,
   type ResolvedCapabilityProvider,
 } from "./capabilities/resolver.js";
+export {
+  CapabilityRouter,
+  type CapabilityProviderRoute,
+  type CapabilityProvisionRoute,
+  type CapabilityRoute,
+  type CapabilityRouterOptions,
+  type ComponentInstanceIdentity,
+  type RoutedCapabilityInvocation,
+} from "./capabilities/router.js";
 export {
   isValidVersion,
   isValidVersionRange,

@@ -361,6 +361,7 @@ const immutableExecutionBindingContent = {
   capabilityDefinitions: [
     {
       identity: { name: parseCapabilityName("records"), protocolVersion: "1.0.0" },
+      methods: ["query"],
       requestSchema: { type: "object" },
       responseSchema: { type: "object" },
     },
@@ -1032,7 +1033,16 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
           pluginId: mismatch.pluginId,
           version: mismatch.version,
           capabilities: {
-            provides: [{ name: "records", protocolVersion: "1.0.0" }],
+            provides: [
+              {
+                name: "records",
+                protocolVersion: "1.0.0",
+                componentId: "echo",
+                methods: ["query"],
+                requestSchema: true,
+                responseSchema: true,
+              },
+            ],
             requires: [],
           },
         },
@@ -1063,7 +1073,16 @@ test("deploy is transactional, idempotent, generation-monotonic, and status is f
         ...installation.manifest,
         pluginId: parsePluginId("provider"),
         capabilities: {
-          provides: [{ name: "records", protocolVersion: "1.0.0" }],
+          provides: [
+            {
+              name: "records",
+              protocolVersion: "1.0.0",
+              componentId: "echo",
+              methods: ["query"],
+              requestSchema: true,
+              responseSchema: true,
+            },
+          ],
           requires: [],
         },
       },

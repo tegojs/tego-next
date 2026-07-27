@@ -65,6 +65,20 @@ const componentId = parseComponentId("echo-service");
 const digestOne = parseArtifactDigest(`sha256:${"1".repeat(64)}`);
 const digestTwo = parseArtifactDigest(`sha256:${"2".repeat(64)}`);
 
+function capabilityProvision(
+  name: ReturnType<typeof parseCapabilityName>,
+  protocolVersion: string,
+) {
+  return {
+    name,
+    protocolVersion,
+    componentId,
+    methods: ["invoke"],
+    requestSchema: true,
+    responseSchema: true,
+  } as const;
+}
+
 class ManualClock implements Clock {
   #now = Date.parse("2026-07-23T00:00:00.000Z");
 
@@ -1540,7 +1554,7 @@ test("suspended provider drains activation one, holds, and reactivates activatio
     pluginId: providerId,
     components: [component(providerComponentId)],
     capabilities: {
-      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      provides: [capabilityProvision(capability, "1.0.0")],
       requires: [],
     },
   };
@@ -1882,7 +1896,7 @@ test("an unready capability consumer does not block its provider from bootstrapp
     pluginId: providerId,
     components: [component("provider")],
     capabilities: {
-      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      provides: [capabilityProvision(capability, "1.0.0")],
       requires: [],
     },
   };
@@ -1970,12 +1984,12 @@ test("automatic capability binding is persisted without revision churn or provid
   });
   const providerAManifest = capabilityManifest(
     providerAId,
-    [{ name: capability, protocolVersion: "1.0.0" }],
+    [capabilityProvision(capability, "1.0.0")],
     [],
   );
   const providerBManifest = capabilityManifest(
     providerBId,
-    [{ name: capability, protocolVersion: "1.1.0" }],
+    [capabilityProvision(capability, "1.1.0")],
     [],
   );
   const consumerManifest = capabilityManifest(
@@ -2120,12 +2134,12 @@ test("a losing automatic binding CAS aborts lifecycle work and replans from the 
   });
   const providerAManifest = capabilityManifest(
     providerAId,
-    [{ name: capability, protocolVersion: "1.0.0" }],
+    [capabilityProvision(capability, "1.0.0")],
     [],
   );
   const providerBManifest = capabilityManifest(
     providerBId,
-    [{ name: capability, protocolVersion: "1.1.0" }],
+    [capabilityProvision(capability, "1.1.0")],
     [],
   );
   const consumerManifest = capabilityManifest(
@@ -2285,12 +2299,12 @@ test("a generation-2 binding inserted after the deployment read is not deleted o
   });
   const providerAManifest = capabilityManifest(
     providerAId,
-    [{ name: capability, protocolVersion: "1.0.0" }],
+    [capabilityProvision(capability, "1.0.0")],
     [],
   );
   const providerBManifest = capabilityManifest(
     providerBId,
-    [{ name: capability, protocolVersion: "1.1.0" }],
+    [capabilityProvision(capability, "1.1.0")],
     [],
   );
   const consumerManifest = capabilityManifest(
@@ -2479,7 +2493,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   });
   const providerZManifest = capabilityManifest(
     providerZId,
-    [{ name: capabilityZ, protocolVersion: "1.0.0" }],
+    [capabilityProvision(capabilityZ, "1.0.0")],
     [],
     [
       {
@@ -2492,7 +2506,7 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   );
   const providerAManifest = capabilityManifest(
     providerAId,
-    [{ name: capabilityA, protocolVersion: "1.0.0" }],
+    [capabilityProvision(capabilityA, "1.0.0")],
     [],
     [
       {
@@ -2506,8 +2520,8 @@ test("degrade persists lexical provider loss evidence and recovers only the same
   const alternateManifest = capabilityManifest(
     alternateId,
     [
-      { name: capabilityZ, protocolVersion: "1.0.0" },
-      { name: capabilityA, protocolVersion: "1.0.0" },
+      capabilityProvision(capabilityZ, "1.0.0"),
+      capabilityProvision(capabilityA, "1.0.0"),
     ],
     [],
   );
@@ -2986,7 +3000,7 @@ test("non-canonical provider instances cannot satisfy execution-time capabilitie
     pluginId: providerId,
     components: [component("provider")],
     capabilities: {
-      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      provides: [capabilityProvision(capability, "1.0.0")],
       requires: [],
     },
   };
@@ -3152,7 +3166,7 @@ test("optional capability edges still enqueue providers before lexical-first con
     pluginId: providerId,
     components: [component("optional-provider")],
     capabilities: {
-      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      provides: [capabilityProvision(capability, "1.0.0")],
       requires: [],
     },
   };
@@ -4513,7 +4527,7 @@ test("recovery restoration invalidates its activation when durable providers cha
     pluginId: targetPluginId,
     components: [component(targetComponentId)],
     capabilities: {
-      provides: [{ name: capability, protocolVersion: "1.0.0" }],
+      provides: [capabilityProvision(capability, "1.0.0")],
       requires: [],
     },
   });
@@ -5681,7 +5695,7 @@ async function createProviderLossTestFixture(
     pluginId: providerId,
     components: [component(providerComponentId)],
     capabilities: {
-      provides: capabilities.map((name) => ({ name, protocolVersion: "1.0.0" })),
+      provides: capabilities.map((name) => capabilityProvision(name, "1.0.0")),
       requires: [],
     },
   };

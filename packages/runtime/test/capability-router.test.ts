@@ -25,16 +25,17 @@ const consumer: ComponentInstanceIdentity = {
   applicationId: parseApplicationId("app"),
   pluginId: parsePluginId("consumer"),
   componentId: parseComponentId("consumer-task"),
+  activation: "2",
   target: {
     instanceId: parseComponentInstanceId("consumer-instance"),
-    deploymentGeneration: parseGeneration(1),
+    deploymentGeneration: parseGeneration("1"),
     artifactDigest: parseArtifactDigest(`sha256:${"1".repeat(64)}`),
     executor: { id: "consumer-thread", type: "thread" },
   },
 };
 const providerTarget: TaskExecutionTarget = {
   instanceId: parseComponentInstanceId("provider-instance"),
-  deploymentGeneration: parseGeneration(3),
+  deploymentGeneration: parseGeneration("3"),
   artifactDigest: parseArtifactDigest(`sha256:${"2".repeat(64)}`),
   executor: { id: "provider-process", type: "process" },
 };

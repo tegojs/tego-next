@@ -15,6 +15,7 @@ const definition = {
     name: parseCapabilityName("org.example.echo"),
     protocolVersion: "1.0.0",
   },
+  methods: ["echo"],
   requestSchema: {
     type: "object",
     additionalProperties: false,
@@ -81,6 +82,7 @@ test("component boundaries adapt the Task 7 registry and permission gates withou
     capability.response(
       definition.identity,
       (await capability.invoke({
+        invocationId: "invoke-echo",
         identity: definition.identity,
         method: "echo",
         input: request.value ?? null,

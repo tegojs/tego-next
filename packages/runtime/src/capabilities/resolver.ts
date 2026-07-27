@@ -2,7 +2,6 @@ import type {
   CapabilityName,
   Generation,
   JsonObject,
-  PluginCapabilityProvision,
   PluginCapabilityRequirement,
   PluginDeploymentIdentity,
 } from "@tegojs/contracts";
@@ -10,11 +9,16 @@ import type { Activation } from "../reconcile/plan.js";
 import { stronglyConnectedComponents, topologicalOrder } from "./graph.js";
 import { isValidVersion, isValidVersionRange, satisfiesVersionRange } from "./version.js";
 
+export interface CapabilityResolutionProvision extends JsonObject {
+  readonly name: CapabilityName;
+  readonly protocolVersion: string;
+}
+
 export interface CapabilityResolutionDeployment extends JsonObject {
   readonly identity: PluginDeploymentIdentity;
   readonly activated: boolean;
   readonly ready: boolean;
-  readonly provides: readonly PluginCapabilityProvision[];
+  readonly provides: readonly CapabilityResolutionProvision[];
   readonly requires: readonly PluginCapabilityRequirement[];
   readonly bindings: Readonly<Record<string, PluginDeploymentIdentity>>;
 }
@@ -52,7 +56,7 @@ export interface CapabilityResolutionDiagnostic extends JsonObject {
 
 export interface ResolvedCapabilityProvider extends JsonObject {
   readonly deployment: PluginDeploymentIdentity;
-  readonly capability: PluginCapabilityProvision;
+  readonly capability: CapabilityResolutionProvision;
 }
 
 export interface NormalizedCapabilityRequirement extends JsonObject {
@@ -382,7 +386,7 @@ function inputDiagnostics(
 function compatibleProvisions(
   deployment: CapabilityResolutionDeployment,
   requirement: NormalizedCapabilityRequirement,
-): readonly PluginCapabilityProvision[] {
+): readonly CapabilityResolutionProvision[] {
   return deployment.provides
     .filter(
       (provided) =>
