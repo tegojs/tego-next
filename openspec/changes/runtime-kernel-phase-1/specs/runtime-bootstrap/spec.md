@@ -48,6 +48,10 @@ The single-Main runtime SHALL recover persisted installations, deployments, oper
 - **WHEN** a Main restarts after external component start succeeds but before the durable `starting` checkpoint advances to `ready`
 - **THEN** recovery reconstructs the exact validated prepared binding without claiming start completion and lets the durable start claim replay idempotently
 
+#### Scenario: Multi-Main takeover recovers historical teardown and task completion
+- **WHEN** a leader loses authority after persisting replacement desired state while an old remote task and activation remain in progress
+- **THEN** the new leader uses the old activation's persisted binding to complete idempotent teardown, recovers the existing task attempt without redispatch, and converges the replacement generation to ready
+
 ### Requirement: Essential readiness
 The kernel SHALL distinguish kernel liveness from application readiness.
 

@@ -27,11 +27,15 @@ The reconciler SHALL validate artifact availability, runtime compatibility, capa
 - **THEN** the deployment becomes `blocked` and its component is not started
 
 ### Requirement: Kernel-owned component lifecycle
-The kernel SHALL enforce legal transitions through `created`, `preparing`, `starting`, `ready`, `degraded`, `draining`, `stopping`, `stopped`, and `failed`.
+The kernel SHALL enforce legal transitions through `created`, `preparing`, `starting`, `ready`, `degraded`, `draining`, `stopping`, `stopped`, and `failed`. Before component materialization, the kernel SHALL persist the exact immutable execution binding in the component instance checkpoint. Historical teardown after restart, authority transfer, disablement, or upgrade SHALL use that persisted binding rather than recomputing from current deployment, provider, or Worker state.
 
 #### Scenario: Plugin attempts an illegal transition
 - **WHEN** a component or driver requests a transition not allowed from its current state
 - **THEN** the runtime rejects it and records a lifecycle diagnostic
+
+#### Scenario: Authority transfers before durable draining
+- **WHEN** a component is still durably `ready` while its old Main loses authority during an upgrade or disablement
+- **THEN** the replacement Main reconstructs a non-accepting termination session from the historical artifact and persisted execution binding, drains and stops the exact activation, and does not fail the replacement generation
 
 ### Requirement: Reconciliation convergence
 The reconciler SHALL repeatedly converge observed instances to desired deployment state and SHALL make reconciliation operations idempotent.

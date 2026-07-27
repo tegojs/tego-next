@@ -42,7 +42,7 @@ The Worker SHALL register labels, resources, executors, and prepared artifacts a
 - **THEN** the Main marks it unavailable and stops assigning new tasks
 
 ### Requirement: Reconnect reconciliation
-The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and exact component activation lifecycle state after a session reconnect. Main SHALL send every Main-originated active or draining binding so a replacement Worker can validate and materialize it with the same admission state. Worker SHALL report every retained binding and lifecycle state so a replacement Main can recover an exact draining teardown candidate without trusting a Worker-reported binding as transferable Main activation authority. Worker-originated candidates SHALL NOT be replayed to another Worker and SHALL authorize stop only when the Main supplies the matching durable target and binding fingerprint. Each side SHALL validate the complete activation inventory before committing lifecycle state or invoking materialization callbacks. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active.
+The protocol SHALL reconcile running attempts, buffered terminal results, Worker attempt-persistence availability, and exact component activation lifecycle state after a session reconnect. Main SHALL send every Main-originated active or draining binding so a replacement Worker can validate and materialize it with the same admission state. Worker SHALL report every retained binding and lifecycle state so a replacement Main can recover an exact draining teardown candidate without trusting a Worker-reported binding as transferable Main activation authority. Worker-originated candidates SHALL NOT be replayed to another Worker and SHALL authorize stop only when the Main supplies the matching durable target and binding fingerprint. A replacement Main MAY adopt a Worker-retained active activation only as a non-accepting, non-transferable teardown candidate when the Main supplies the complete matching durable activation and binding fingerprint. Each side SHALL validate the complete activation inventory before committing lifecycle state or invoking materialization callbacks. A higher transport epoch SHALL NOT by itself clear a persistence-unavailable latch or promote a draining activation back to active. A Main-authorized teardown SHALL treat an authenticated `not active` response for the same exact target as an idempotent success without weakening ordinary active-component drain validation.
 
 #### Scenario: Result completes while disconnected
 - **WHEN** a task using `finish-and-buffer` completes after its session disconnects
@@ -71,6 +71,18 @@ The protocol SHALL reconcile running attempts, buffered terminal results, Worker
 #### Scenario: Replacement Main completes retained Worker teardown
 - **WHEN** a Worker retains a draining component binding and reconnects to a replacement authoritative Main
 - **THEN** the Worker reports that exact non-accepting state and the Main retains a non-transferable teardown candidate that accepts only an exact stop with the Main-derived durable target and binding fingerprint
+
+#### Scenario: Replacement Main terminates a pre-drain active activation
+- **WHEN** authority transfers after an old component binding is durably retained but before its Worker activation enters draining
+- **THEN** the replacement Main adopts the complete exact durable activation only for teardown, rejects task and capability admission, and sends the exact binding fingerprint on drain and stop
+
+#### Scenario: Concurrent teardown already removed the exact activation
+- **WHEN** a Main-authorized termination retry reaches an authenticated Worker after the exact activation was already stopped
+- **THEN** the missing exact target satisfies the teardown postcondition while a missing or mismatched target still fails ordinary active-component lifecycle operations
+
+#### Scenario: Historical task result survives component teardown
+- **WHEN** a buffered remote attempt completes while its historical component activation is being stopped
+- **THEN** Main observes or resumes that existing exact attempt through a non-admitting recovery executor without submitting a new attempt or exposing capability admission
 
 #### Scenario: Rejected inventory has no lifecycle side effects
 - **WHEN** either peer receives an activation inventory containing a later duplicate, conflict, invalid target, or invalid lifecycle state

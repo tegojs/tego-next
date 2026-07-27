@@ -171,6 +171,21 @@ A non-essential component failure does not stop the kernel. An essential
 deployment that is not ready makes application readiness false while kernel
 liveness and diagnostics remain available.
 
+Before any local or remote component materialization, the reconciler persists
+the exact execution binding in the component instance checkpoint. That binding,
+not current deployment or Worker state, is the authority for every later
+drain/stop. After Main restart or authority transfer, an obsolete, disabled, or
+partially terminating instance is reconstructed from its historical
+installation plus that immutable binding as a non-accepting teardown session.
+It cannot accept new tasks or capability calls.
+
+Remote teardown restoration may adopt an exact Worker activation only from the
+Main's durable target and binding fingerprint. The adopted entry is never
+published as active and is never replayed to another Worker. Drain and stop are
+idempotent: an authenticated Worker response that the exact target is already
+absent satisfies the teardown postcondition only for this Main-authorized
+termination path.
+
 ### Task lifecycle
 
 The persisted task record normally moves through:
@@ -271,6 +286,11 @@ complete inventory before lifecycle mutation or materialization. Neither
 direction may promote `draining` back to `active`. Worker connect mode rotates
 through its bounded URL set when an authenticated follower rejects registration
 as non-authoritative, while authentication failures remain terminal.
+
+An unfinished task remains recoverable after its component stops. Main creates
+a target-scoped, non-admitting recovery executor from the task's durable target
+and execution binding. That executor may observe, resume, or cancel the existing
+attempt; it cannot submit a new attempt or invoke component capabilities.
 
 ## Failure, indeterminate, and recovery semantics
 
