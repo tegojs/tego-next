@@ -346,9 +346,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/starting-checkpoint-real-
     })) {
       interruptedInstances.push(record);
     }
-    const checkpoint = interruptedInstances.find(
-      (record) => record.value.lifecycle === "starting",
-    );
+    const checkpoint = interruptedInstances.find((record) => record.value.lifecycle === "starting");
     assert.ok(checkpoint);
     assert.equal(startDeliveries.length, 1);
 

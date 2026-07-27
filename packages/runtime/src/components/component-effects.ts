@@ -47,6 +47,8 @@ export interface ValidatedComponentDeployment {
   readonly artifact: Pick<ValidatedPluginArtifact, "digest" | "manifest">;
 }
 
+type StartEffect = ReconcileEffect & { readonly kind: "start" };
+
 interface CachedOperation {
   readonly fingerprint: string;
   readonly result: Promise<void>;
@@ -291,6 +293,42 @@ export class ComponentEffects implements ComponentEffectExecutor {
     try {
       parseActivation(instance.activation);
       const effect = this.#restorationEffect(instance, "stop");
+      this.#assertCurrentAuthority(effect, authority);
+      return this.#prepare(effect, authority);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  restoreStarting(effect: StartEffect): Promise<void> {
+    if (effect.kind !== "start") {
+      return Promise.reject(new TypeError("Only a start effect can restore a starting checkpoint"));
+    }
+    try {
+      parseActivation(effect.activation);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!this.supportedExecutors.includes(effect.executor)) {
+      return Promise.reject(
+        effectError(
+          "LIFECYCLE_EXECUTOR_UNSUPPORTED",
+          "Starting checkpoint selected an unsupported executor",
+          effect,
+        ),
+      );
+    }
+    const authority = this.#authority();
+    if (this.#closingAuthorities.has(this.#restorationAuthorityPrefix(authority))) {
+      return Promise.reject(
+        effectError(
+          "LIFECYCLE_COMPONENT_HOST_UNAVAILABLE",
+          "Component restoration authority is closing",
+          effect,
+        ),
+      );
+    }
+    try {
       this.#assertCurrentAuthority(effect, authority);
       return this.#prepare(effect, authority);
     } catch (error) {

@@ -1296,7 +1296,9 @@ test("starting checkpoint lifecycle interruption restores exact effect across Me
 
     assert.deepEqual(effects.startingRestored, [start.effect]);
     assert.deepEqual(
-      effects.calls.filter((effect) => effect.kind === "start"),
+      effects.calls
+        .filter((effect) => effect.kind === "start")
+        .map((effect) => Object.fromEntries(Object.entries(effect))),
       [start.effect],
     );
     const ready = await readOnlyInstance(state, start.instanceId);

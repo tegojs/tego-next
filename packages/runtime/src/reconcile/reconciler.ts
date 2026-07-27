@@ -76,6 +76,7 @@ export interface ComponentEffectExecutor {
   readonly supportedExecutors: readonly ExecutorKind[];
   perform(effect: ReconcileEffect): Promise<void>;
   restore?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  restoreStarting?(effect: ReconcileEffect & { readonly kind: "start" }): Promise<void>;
   restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   isLive?(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
   close?(authority?: RuntimeAuthority): Promise<void>;
@@ -120,6 +121,7 @@ type RecoveryEffectAuthorization = "abandoned" | "authorized" | "retry" | "super
 
 interface ComponentLifecycleExecutor {
   restore(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
+  restoreStarting?(effect: ReconcileEffect & { readonly kind: "start" }): Promise<void>;
   restoreTermination?(instance: ComponentInstance, authority?: RuntimeAuthority): Promise<void>;
   isLive(instance: ComponentInstance, authority?: RuntimeAuthority): boolean;
   close(authority?: RuntimeAuthority): Promise<void>;
@@ -128,7 +130,7 @@ interface ComponentLifecycleExecutor {
 function componentLifecycle(
   effects: ComponentEffectExecutor,
 ): ComponentLifecycleExecutor | undefined {
-  const { close, isLive, restore, restoreTermination } = effects;
+  const { close, isLive, restore, restoreStarting, restoreTermination } = effects;
   if (restore === undefined && isLive === undefined && close === undefined) return undefined;
   if (restore === undefined || isLive === undefined || close === undefined) {
     throw new TypeError(
@@ -137,6 +139,7 @@ function componentLifecycle(
   }
   return {
     restore: restore.bind(effects),
+    ...(restoreStarting === undefined ? {} : { restoreStarting: restoreStarting.bind(effects) }),
     ...(restoreTermination === undefined
       ? {}
       : { restoreTermination: restoreTermination.bind(effects) }),
@@ -169,6 +172,36 @@ function restorationOperationId(
     ...(instance.legacyActivation === true ? [] : [instance.activation]),
   ).operationId;
   return parseOperationId(`${prepareOperationId.slice(0, -"prepare".length)}restore`);
+}
+
+function startingEffect(instance: ComponentInstance): ReconcileEffect & { readonly kind: "start" } {
+  if (instance.lifecycle !== "starting" || instance.artifactDigest === undefined) {
+    throw new TypeError("Only an exact persisted starting checkpoint can be reconstructed");
+  }
+  const identity = (
+    instance.legacyActivation === true ? legacyReconcileEffectIdentities : reconcileEffectIdentities
+  )(
+    {
+      applicationId: instance.applicationId,
+      generation: instance.deploymentGeneration,
+      pluginId: instance.pluginId,
+    },
+    instance.componentId,
+    "start",
+    ...(instance.legacyActivation === true ? [] : [instance.activation]),
+  );
+  return {
+    kind: "start",
+    activation: instance.activation,
+    ...identity,
+    applicationId: instance.applicationId,
+    pluginId: instance.pluginId,
+    componentId: instance.componentId,
+    deploymentGeneration: instance.deploymentGeneration,
+    artifactDigest: instance.artifactDigest,
+    executor: instance.executor,
+    ...(instance.workerId === undefined ? {} : { workerId: instance.workerId }),
+  };
 }
 
 export interface ReconcilerOptions {
@@ -2035,6 +2068,7 @@ export class Reconciler {
       .filter(
         (instance) =>
           (instance.lifecycle === "preparing" ||
+            instance.lifecycle === "starting" ||
             instance.lifecycle === "ready" ||
             instance.lifecycle === "degraded" ||
             instance.lifecycle === "draining" ||
@@ -2096,6 +2130,16 @@ export class Reconciler {
         instance.executor === "remote" &&
         !(await this.#isPersistedRemotePlacementEligible(instance, deployments, installations))
       ) {
+        continue;
+      }
+      if (instance.lifecycle === "starting") {
+        if (this.#componentLifecycle.restoreStarting === undefined) continue;
+        try {
+          await this.#componentLifecycle.restoreStarting(startingEffect(instance));
+          await this.#clearRestorationFailure(instance);
+        } catch (error) {
+          await this.#recordRestorationFailure(instance, error);
+        }
         continue;
       }
       if (
