@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { createNodeRuntimeHost, packPlugin, StateRemoteAttemptStore } from "@tegojs/cli";
 import {
   createExecutionBinding,
@@ -18,7 +19,7 @@ import {
   parseWorkerId,
 } from "@tegojs/contracts";
 import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import { PostgresStateStore } from "@tegojs/drivers-postgres";
+import { createPostgresDrivers, PostgresStateStore } from "@tegojs/drivers-postgres";
 import { ComponentEffects, ComponentRegistry, Reconciler } from "@tegojs/runtime";
 import { eventually, FakeClock } from "@tegojs/testkit";
 import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tegojs/transport-websocket";
@@ -374,6 +375,11 @@ async function cleanupPostgresFaultNamespace(connectionString, namespace) {
       "tego_records",
       "tego_fences",
       "tego_state_revisions",
+      "tego_coordination_changes",
+      "tego_coordination_records",
+      "tego_coordination_leases",
+      "tego_coordination_epochs",
+      "tego_coordination_revisions",
     ]) {
       await pool.query(`DELETE FROM ${table} WHERE driver_namespace = $1`, [namespace]);
     }
@@ -534,6 +540,105 @@ test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
   } finally {
     try {
       await state.close();
+    } finally {
+      await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
+    }
+  }
+});
+
+test("@spec:plugin-deployment/idempotent-reconciliation/postgres-cluster-time-takeover", {
+  skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
+}, async () => {
+  const namespace = `cluster_time_${process.pid}_${Date.now()}`;
+  const drivers = createPostgresDrivers({
+    connectionString: process.env.TEGO_POSTGRES_URL,
+    namespace,
+  });
+  const createEffects = (failStart) => ({
+    supportedExecutors: ["thread"],
+    calls: [],
+    async perform(effect) {
+      this.calls.push(effect);
+      if (failStart && effect.kind === "start") throw new Error("cluster retry fault");
+    },
+  });
+  const farClock = (now) => ({
+    now: () => new Date(now),
+    sleep: (_delayMs, signal) =>
+      new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+  });
+  await Promise.all([drivers.state.open(), drivers.coordination.open()]);
+  let first;
+  let replacement;
+  try {
+    const resource = "runtime/app";
+    const firstAuthority = {
+      resource,
+      epoch: await drivers.coordination.nextEpoch(resource),
+    };
+    const firstEffects = createEffects(true);
+    first = new Reconciler({
+      artifactGate: { validate: async () => artifact() },
+      authority: firstAuthority,
+      clock: farClock("2099-01-01T00:00:00.000Z"),
+      clusterTime: drivers.clusterTime,
+      effects: firstEffects,
+      owner: "leader-a",
+      state: drivers.state,
+      loadDeployments: async () => [deployment()],
+      loadInstallations: async () => [installation()],
+    });
+
+    const databaseBeforeFailure = await drivers.clusterTime.now();
+    await first.start();
+    const instanceId = firstEffects.calls.find((effect) => effect.kind === "start")?.instanceId;
+    assert.ok(instanceId);
+    const failed = await drivers.state.read({
+      namespace: "tego",
+      collection: "component-instances",
+      id: instanceId,
+    });
+    const retryAt = failed?.value.retryAt;
+    assert.equal(typeof retryAt, "string");
+    assert.ok(Date.parse(retryAt) >= Date.parse(databaseBeforeFailure) + 1_000);
+    assert.ok(Date.parse(retryAt) < Date.parse(databaseBeforeFailure) + 3_000);
+    assert.ok(Date.parse(retryAt) < Date.parse("2030-01-01T00:00:00.000Z"));
+    await first.stop();
+    first = undefined;
+
+    const replacementAuthority = {
+      resource,
+      epoch: await drivers.coordination.nextEpoch(resource),
+    };
+    const remaining = Date.parse(retryAt) - Date.parse(await drivers.clusterTime.now());
+    if (remaining > 0) await delay(remaining + 100);
+    const replacementEffects = createEffects(false);
+    replacement = new Reconciler({
+      artifactGate: { validate: async () => artifact() },
+      authority: replacementAuthority,
+      clock: farClock("2001-01-01T00:00:00.000Z"),
+      clusterTime: drivers.clusterTime,
+      effects: replacementEffects,
+      owner: "leader-b",
+      state: drivers.state,
+      loadDeployments: async () => [deployment()],
+      loadInstallations: async () => [installation()],
+    });
+
+    await replacement.start();
+
+    assert.deepEqual(
+      replacementEffects.calls.map((effect) => effect.kind),
+      ["start"],
+    );
+    assert.equal(replacement.applicationReady(), true);
+  } finally {
+    await replacement?.stop();
+    await first?.stop();
+    try {
+      await Promise.all([drivers.coordination.close(), drivers.state.close()]);
     } finally {
       await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
     }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   type ArtifactDigest,
+  type ClusterTime,
   type Clock,
   compareOperationJournalCursors,
   DiagnosticError,
@@ -92,6 +93,38 @@ class ManualClock implements Clock {
 
   advance(milliseconds: number): void {
     this.#now += milliseconds;
+  }
+}
+
+class ManualClusterTime implements ClusterTime {
+  #now: number;
+
+  constructor(now = "2026-07-23T00:00:00.000Z") {
+    this.#now = Date.parse(now);
+  }
+
+  async now(): Promise<string> {
+    return new Date(this.#now).toISOString();
+  }
+
+  advance(milliseconds: number): void {
+    this.#now += milliseconds;
+  }
+}
+
+class FixedClock implements Clock {
+  readonly #now: Date;
+
+  constructor(now: string) {
+    this.#now = new Date(now);
+  }
+
+  now(): Date {
+    return new Date(this.#now);
+  }
+
+  sleep(): Promise<void> {
+    return new Promise(() => undefined);
   }
 }
 
@@ -5445,6 +5478,83 @@ test("failed lifecycle effects wake automatically when retryAt becomes due", asy
   );
   assert.equal(reconciler.applicationReady(), true);
   await reconciler.stop();
+});
+
+test("retry deadlines follow authoritative cluster time across a skewed authority takeover", async () => {
+  const stateClock = new ManualClock();
+  const state = await createHarnessStore(stateClock);
+  const clusterTime = new ManualClusterTime();
+  const firstEffects = new RecordingEffects();
+  firstEffects.failStart = true;
+  const first = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    authority: { resource: "runtime/app", epoch: parseFencingEpoch("1") },
+    clock: new FixedClock("2099-01-01T00:00:00.000Z"),
+    clusterTime,
+    effects: firstEffects,
+    owner: "leader-a",
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await first.start();
+  const instanceId = firstEffects.calls.find((effect) => effect.kind === "start")?.instanceId;
+  assert.ok(instanceId);
+  const failed = await state.read({
+    namespace: "tego",
+    collection: "component-instances",
+    id: instanceId,
+  });
+  const retryAt = (failed?.value as { readonly retryAt?: string } | undefined)?.retryAt;
+  assert.equal(typeof retryAt, "string");
+  assert.ok(Date.parse(retryAt as string) >= Date.parse("2026-07-23T00:00:01.000Z"));
+  assert.ok(Date.parse(retryAt as string) < Date.parse("2026-07-23T00:00:02.000Z"));
+  await first.stop();
+
+  const untilRetry = Date.parse(retryAt as string) - Date.parse(await clusterTime.now());
+  stateClock.advance(untilRetry);
+  clusterTime.advance(untilRetry);
+  const replacementEffects = new RecordingEffects();
+  const replacement = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    authority: { resource: "runtime/app", epoch: parseFencingEpoch("2") },
+    clock: new FixedClock("2001-01-01T00:00:00.000Z"),
+    clusterTime,
+    effects: replacementEffects,
+    owner: "leader-b",
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await replacement.start();
+
+  assert.deepEqual(
+    replacementEffects.calls.map((effect) => effect.kind),
+    ["start"],
+  );
+  assert.equal(replacement.applicationReady(), true);
+  await replacement.stop();
+});
+
+test("invalid cluster time fails retry persistence closed", async () => {
+  const stateClock = new ManualClock();
+  const state = await createHarnessStore(stateClock);
+  const effects = new RecordingEffects();
+  effects.failStart = true;
+  const reconciler = new Reconciler({
+    artifactGate: { validate: async () => gate().artifact },
+    clock: new FixedClock("2099-01-01T00:00:00.000Z"),
+    clusterTime: { now: async () => "2026-07-23T00:00:00Z" },
+    effects,
+    state,
+    loadDeployments: async () => [deployment()],
+    loadInstallations: async () => [installation()],
+  });
+
+  await assert.rejects(reconciler.start(), /canonical UTC timestamp/u);
+  assert.equal(reconciler.kernelRunning, false);
 });
 
 test("deferred scheduler failure is observable and fails the reconciler closed", async () => {
