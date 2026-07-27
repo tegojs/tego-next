@@ -752,7 +752,6 @@ const executionRequestSchema = {
     taskId: { $ref: "#/$defs/identity" },
     attemptId: { $ref: "#/$defs/identity" },
     target: taskExecutionTargetSchema,
-    bindingTarget: taskExecutionTargetSchema,
     applicationId: { $ref: "#/$defs/identity" },
     pluginId: { $ref: "#/$defs/identity" },
     componentId: { $ref: "#/$defs/identity" },
@@ -1303,30 +1302,12 @@ export function parseExecutionRequest(input: unknown): ExecutionRequest {
     { kind: "executor", id: "request" },
   );
   const target = parseTaskExecutionTarget(parsed.target);
-  const bindingTarget =
-    parsed.bindingTarget === undefined ? target : parseTaskExecutionTarget(parsed.bindingTarget);
-  if (
-    parsed.bindingTarget !== undefined &&
-    (bindingTarget.instanceId !== target.instanceId ||
-      bindingTarget.deploymentGeneration !== target.deploymentGeneration ||
-      bindingTarget.artifactDigest !== target.artifactDigest ||
-      bindingTarget.executor.type !== "remote" ||
-      target.executor.type === "remote")
-  ) {
-    throw new DiagnosticError(
-      runtimeDiagnostic({
-        code: "PROTOCOL_EXECUTION_BINDING_INVALID",
-        message: "Execution binding target transformation is invalid",
-        source: { kind: "executor", id: "execution-binding" },
-      }),
-    );
-  }
   assertExecutionBindingMatches(
     {
       applicationId: parseApplicationId(parsed.applicationId),
       pluginId: parsePluginId(parsed.pluginId),
       componentId: parseComponentId(parsed.componentId),
-      target: bindingTarget,
+      target,
     },
     parsed.binding,
   );

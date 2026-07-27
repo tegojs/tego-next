@@ -114,7 +114,12 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
             executorOptions: {
               id: target.executor.id,
               clock: this.#options.clock,
-              resolveComponent: async () => component,
+              resolveComponent: async (request) => ({
+                ...component,
+                configuration: structuredClone(request.binding.configuration),
+                permissionGrants: structuredClone(request.binding.permissionGrants),
+                capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
+              }),
               secretProvider: this.#options.secretProvider,
             },
           })
@@ -126,7 +131,12 @@ export class LocalComponentSessionHost implements ComponentLifecycleHost {
               id: target.executor.id,
               clock: this.#options.clock,
               processHost: this.#options.processHost,
-              resolveComponent: async () => component,
+              resolveComponent: async (request) => ({
+                ...component,
+                configuration: structuredClone(request.binding.configuration),
+                permissionGrants: structuredClone(request.binding.permissionGrants),
+                capabilityDefinitions: structuredClone(request.binding.capabilityDefinitions),
+              }),
               secretProvider: this.#options.secretProvider,
             },
           });

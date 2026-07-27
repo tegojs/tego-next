@@ -157,7 +157,6 @@ export interface ExecutionRequest extends JsonObject {
   readonly taskId: TaskId;
   readonly attemptId: AttemptId;
   readonly target: TaskExecutionTarget;
-  readonly bindingTarget?: TaskExecutionTarget;
   readonly applicationId: ApplicationId;
   readonly pluginId: PluginId;
   readonly componentId: ComponentId;

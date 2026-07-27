@@ -125,6 +125,7 @@ export interface ThreadExecutorOptions {
   readonly workerEntrypoint?: string;
   readonly workerFactory?: ThreadWorkerFactory;
   readonly permissionBoundary?: ComponentPermissionBoundary;
+  readonly remoteWorkerIsolation?: boolean;
   readonly capabilityBoundary?: ComponentCapabilityBoundary;
   readonly secretProvider?: SecretProvider;
   readonly logger?: ThreadExecutorLogger;
@@ -1174,8 +1175,14 @@ export class ThreadExecutor implements Executor {
     const target = parseTaskExecutionTarget(resolved.target);
     const artifactDigest = parseArtifactDigest(resolved.artifactDigest);
     const manifest = parsePluginManifest(resolved.manifest);
+    const workerRemoteTarget =
+      this.#options.remoteWorkerIsolation === true &&
+      request.target.executor.type === "remote" &&
+      target.instanceId === request.target.instanceId &&
+      target.deploymentGeneration === request.target.deploymentGeneration &&
+      target.artifactDigest === request.target.artifactDigest;
     if (
-      !taskExecutionTargetsEqual(target, request.target) ||
+      (!taskExecutionTargetsEqual(target, request.target) && !workerRemoteTarget) ||
       target.executor.type !== "thread" ||
       target.executor.id !== this.id ||
       target.artifactDigest !== artifactDigest
@@ -1221,7 +1228,10 @@ export class ThreadExecutor implements Executor {
         this.#clock.now(),
       );
     }
-    const authoritativeExecutor = request.bindingTarget?.executor.type ?? "thread";
+    const authoritativeExecutor =
+      this.#options.remoteWorkerIsolation === true && request.target.executor.type === "remote"
+        ? "remote"
+        : "thread";
     const threadGranted = resolved.permissionGrants.some(
       (permission) =>
         permission.kind === "executor" && permission.executors.includes(authoritativeExecutor),

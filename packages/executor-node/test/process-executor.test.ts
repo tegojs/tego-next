@@ -2157,14 +2157,15 @@ test("process component session owns one child across same-target attempts and r
       ...second.target,
       artifactDigest: parseArtifactDigest(`sha256:${"c".repeat(64)}`),
     };
+    const persistedFingerprint = second.binding.fingerprint;
     await assert.rejects(
       session.submit({
         ...second,
         target: mismatchedTarget,
-        binding: createExecutionBinding({ ...second, target: mismatchedTarget }, second.binding),
       }),
-      (error: unknown) => diagnosticCode(error) === "EXECUTOR_REQUEST_TARGET_MISMATCH",
+      (error: unknown) => diagnosticCode(error) === "PROTOCOL_EXECUTION_BINDING_INVALID",
     );
+    assert.equal(second.binding.fingerprint, persistedFingerprint);
     assert.equal((await (await session.submit(second)).result).status, "succeeded");
     const canonicalFirst = request(
       { mode: "echo", value: { alpha: 1, nested: { left: true, right: false } } },

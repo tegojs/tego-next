@@ -42,7 +42,10 @@ export {
 
 export interface PreparedArtifactSelection {
   readonly digests: readonly ArtifactDigest[];
-  resolveComponent(request: ExecutionRequest): ResolvedThreadComponent;
+  resolveComponent(
+    request: ExecutionRequest,
+    executor?: { readonly id: string; readonly type: "process" | "thread" },
+  ): ResolvedThreadComponent;
   selectExecutorKind(request: ExecutionRequest): "process" | "thread";
   validateAssignment(request: ExecutionRequest): WorkerAssignmentRejection | undefined;
 }
@@ -51,27 +54,11 @@ function createWorkerLocalExecutor(executor: Executor): Executor {
   if (executor.type !== "process" && executor.type !== "thread") {
     throw new TypeError("Worker local executor must use process or thread isolation");
   }
-  const localType = executor.type;
   const local: Executor = {
     id: executor.id,
-    type: localType,
+    type: executor.type,
     probe: () => executor.probe(),
-    submit: (request) =>
-      executor.submit(
-        parseExecutionRequest({
-          ...request,
-          bindingTarget: request.target,
-          target: {
-            instanceId: request.target.instanceId,
-            deploymentGeneration: request.target.deploymentGeneration,
-            artifactDigest: request.target.artifactDigest,
-            executor: {
-              id: executor.id,
-              type: localType,
-            },
-          },
-        }),
-      ),
+    submit: (request) => executor.submit(parseExecutionRequest(request)),
     observe: (taskId, attemptId) => executor.observe(taskId, attemptId),
     cancel: (taskId, attemptId) => executor.cancel(taskId, attemptId),
     drain: (options) => executor.drain(options),
@@ -163,10 +150,19 @@ export function createPreparedArtifactSelection(
       const { component } = select(request);
       return component.executors.includes("thread") ? "thread" : "process";
     },
-    resolveComponent(request: ExecutionRequest) {
+    resolveComponent(
+      request: ExecutionRequest,
+      executor?: { readonly id: string; readonly type: "process" | "thread" },
+    ) {
       const { artifact } = select(request);
       return {
-        target: request.target,
+        target:
+          executor === undefined
+            ? request.target
+            : {
+                ...request.target,
+                executor,
+              },
         artifactDigest: artifact.digest,
         artifactRoot: artifact.root,
         manifest: artifact.manifest,
@@ -380,14 +376,18 @@ export async function runWorkerProcess(
     thread = new ThreadExecutor({
       id: `${workerId}:thread`,
       clock: drivers.clock,
-      resolveComponent: (request) => selection.resolveComponent(request),
+      resolveComponent: (request) =>
+        selection.resolveComponent(request, { id: `${workerId}:thread`, type: "thread" }),
+      remoteWorkerIsolation: true,
       secretProvider: drivers.secrets,
     });
     processExecutor = new ProcessExecutor({
       id: `${workerId}:process`,
       clock: drivers.clock,
       processHost: drivers.processHost,
-      resolveComponent: (request) => selection.resolveComponent(request),
+      resolveComponent: (request) =>
+        selection.resolveComponent(request, { id: `${workerId}:process`, type: "process" }),
+      remoteWorkerIsolation: true,
       secretProvider: drivers.secrets,
     });
     const executors = new Map<"process" | "thread", Executor>([

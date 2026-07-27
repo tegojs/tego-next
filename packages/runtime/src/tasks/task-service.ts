@@ -612,6 +612,15 @@ export class TaskService implements RuntimeTaskLifecycle {
     record: TaskRecord,
     authority: RuntimeAuthority = this.#requireAuthority(),
   ): Promise<void> {
+    if (record.binding === undefined) {
+      await this.#settleUncertain(
+        record,
+        this.#invalidResult(record.taskId, "Task execution binding is missing"),
+        authority,
+        true,
+      );
+      return;
+    }
     if (record.target === undefined) {
       await this.#settleUncertain(
         record,
@@ -909,7 +918,8 @@ export class TaskService implements RuntimeTaskLifecycle {
     const specificDiagnostic =
       _error instanceof DiagnosticError &&
       (_error.diagnostic.code === "EXECUTOR_TARGET_MISMATCH" ||
-        _error.diagnostic.code === "EXECUTOR_TARGET_UNAVAILABLE")
+        _error.diagnostic.code === "EXECUTOR_TARGET_UNAVAILABLE" ||
+        _error.diagnostic.code === "EXECUTOR_RESULT_INVALID")
         ? { ..._error.diagnostic, retryable: false, observedAt: timestamp }
         : undefined;
     const indeterminate = parseTaskRecord({
