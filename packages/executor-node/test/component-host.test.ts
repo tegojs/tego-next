@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  createExecutionBinding,
   type JsonValue,
   type PluginManifest,
   parseApplicationId,
@@ -1688,6 +1689,14 @@ test("secret values cannot cross the capability request boundary or diagnostic s
         close: async () => {},
         get: async () => secret,
       },
+      permissionBoundary: {
+        validateGrant: (_requested, granted) => ({
+          allowed: true,
+          diagnostics: [],
+          granted,
+        }),
+        authorize: () => ({ allowed: true, diagnostics: [] }),
+      },
       capabilityBoundary: {
         register: () => ({ ok: true, diagnostics: [] }),
         request: (_identity: unknown, input: JsonValue) => ({
@@ -1708,9 +1717,22 @@ test("secret values cannot cross the capability request boundary or diagnostic s
       },
     }),
   );
-  await host.handle(prepareCommand(fixture));
-  await host.handle(command("import", "secret-capability-import", { artifactDigest: digest }));
-  await host.handle(command("start", "secret-capability-start", { artifactDigest: digest }));
+  const prepared = await host.handle(prepareCommand(fixture));
+  assert.equal(prepared.ok, true, JSON.stringify(prepared.diagnostics));
+  const imported = await host.handle(
+    command("import", "secret-capability-import", { artifactDigest: digest }),
+  );
+  assert.equal(imported.ok, true, JSON.stringify(imported.diagnostics));
+  const started = await host.handle(
+    command("start", "secret-capability-start", { artifactDigest: digest }),
+  );
+  assert.equal(started.ok, true, JSON.stringify(started.diagnostics));
+  const executionIdentity = {
+    applicationId: parseApplicationId("app-01"),
+    pluginId: parsePluginId("org.example.component"),
+    componentId: parseComponentId("component"),
+    target: componentTarget,
+  };
 
   const result = await host.handle(
     command("run", "secret-capability-run", {
@@ -1718,10 +1740,13 @@ test("secret values cannot cross the capability request boundary or diagnostic s
       execution: {
         taskId: parseTaskId("task-secret-capability"),
         attemptId: parseAttemptId("attempt-secret-capability"),
-        target: componentTarget,
-        applicationId: parseApplicationId("app-01"),
-        pluginId: parsePluginId("org.example.component"),
-        componentId: parseComponentId("component"),
+        ...executionIdentity,
+        binding: createExecutionBinding(executionIdentity, {
+          configuration: { greeting: "hello" },
+          permissionGrants: fixture.manifest.permissions,
+          capabilityDefinitions: [],
+          capabilityBindings: [],
+        }),
         input: null,
         deadline: futureDeadline,
         orphanPolicy: "cancel",

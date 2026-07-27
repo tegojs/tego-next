@@ -486,11 +486,21 @@ export class ComponentHost {
       throw this.#lifecycleError("import", "prepared");
     }
     this.#assertDigest(command.payload.artifactDigest);
-    this.#definition = await loadPreparedComponent({
+    const definition = await loadPreparedComponent({
       prepared: this.#prepared.artifact,
       entrypoint: this.#prepared.entrypoint,
       expectedKind: this.#prepared.kind,
     });
+    const declaresCapabilityProvider = this.#prepared.manifest.capabilities.provides.some(
+      (provision) => provision.componentId === this.#prepared?.payload.componentId,
+    );
+    if (declaresCapabilityProvider && definition.invokeCapability === undefined) {
+      throw this.#diagnosticError(
+        "EXECUTOR_COMPONENT_DEFINITION_INVALID",
+        "Declared task capability provider must define an invokeCapability hook",
+      );
+    }
+    this.#definition = definition;
     this.#state = "imported";
     return this.#success(command, { status: "imported" });
   }
