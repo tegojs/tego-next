@@ -48,16 +48,54 @@ async function settleBeforeDeadline(operation, stage, deadline, timeoutMs) {
   });
 }
 
-function releaseClient(client, errors) {
+function reportLateError(onLateCleanupError, error) {
   try {
-    const released = client.release(true);
-    if (released?.then !== undefined) {
-      return Promise.resolve(released).catch((error) => errors.push(error));
-    }
-  } catch (error) {
-    errors.push(error);
+    Promise.resolve(onLateCleanupError(error)).catch(() => undefined);
+  } catch {
+    // A diagnostic sink must not create an unhandled cleanup failure.
   }
-  return Promise.resolve();
+}
+
+async function releaseClientBeforeDeadline({
+  client,
+  deadline,
+  destroy,
+  onLateCleanupError,
+  stage,
+  timeoutMs,
+}) {
+  let detached = false;
+  let rejection;
+  const release = Promise.resolve()
+    .then(() => client.release(destroy))
+    .catch((error) => {
+      rejection = error;
+      if (detached) reportLateError(onLateCleanupError, error);
+      throw error;
+    });
+  release.catch(() => undefined);
+  try {
+    return await settleBeforeDeadline(() => release, stage, deadline, timeoutMs);
+  } catch (error) {
+    if (error?.message?.startsWith(`POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:${stage}:`) === true) {
+      detached = true;
+      if (rejection !== undefined) reportLateError(onLateCleanupError, rejection);
+    }
+    throw error;
+  }
+}
+
+function releaseClientAfterReturn(client, onLateCleanupError) {
+  Promise.resolve()
+    .then(() => client.release(true))
+    .catch((error) => reportLateError(onLateCleanupError, error));
+}
+
+function observeAcquisitionAfterReturn(acquisition, onLateCleanupError) {
+  acquisition.then(
+    (client) => releaseClientAfterReturn(client, onLateCleanupError),
+    (error) => reportLateError(onLateCleanupError, error),
+  );
 }
 
 function beginAcquisition(pool) {
@@ -79,6 +117,7 @@ export async function cleanupPostgresNamespace({
   timeoutMs = 5_000,
   cleanupGraceMs = 100,
   createPool = (options) => new Pool(options),
+  onLateCleanupError = () => undefined,
 }) {
   assertDisposablePostgresNamespace(namespace);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
@@ -141,15 +180,22 @@ export async function cleanupPostgresNamespace({
       }
     }
   } finally {
+    const poolEnd = Promise.resolve().then(() => pool.end());
+    poolEnd.catch(() => undefined);
     if (client !== undefined) {
       try {
-        client.release(destroyClient);
+        await releaseClientBeforeDeadline({
+          client,
+          deadline: cleanupDeadline,
+          destroy: destroyClient,
+          onLateCleanupError,
+          stage: "release",
+          timeoutMs,
+        });
       } catch (releaseError) {
         errors.push(releaseError);
       }
     }
-    const poolEnd = Promise.resolve().then(() => pool.end());
-    poolEnd.catch(() => undefined);
     if (acquisitionTimedOut) {
       try {
         const lateClient = await settleBeforeDeadline(
@@ -158,9 +204,22 @@ export async function cleanupPostgresNamespace({
           cleanupDeadline,
           timeoutMs,
         );
-        await releaseClient(lateClient, errors);
+        try {
+          await releaseClientBeforeDeadline({
+            client: lateClient,
+            deadline: cleanupDeadline,
+            destroy: true,
+            onLateCleanupError,
+            stage: "late-release",
+            timeoutMs,
+          });
+        } catch (releaseError) {
+          errors.push(releaseError);
+        }
       } catch (lateError) {
-        if (!lateError.message.startsWith("POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:late-connect")) {
+        if (lateError.message.startsWith("POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:late-connect")) {
+          observeAcquisitionAfterReturn(acquisition, onLateCleanupError);
+        } else {
           errors.push(lateError);
         }
       }

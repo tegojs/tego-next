@@ -197,3 +197,65 @@ runtime fault suite: 19/19 passed
 real multi-Main E2E: 1/1 passed
 Biome and git diff --check: clean
 ```
+
+## Final lifecycle re-review
+
+The final review found four narrower ownership gaps. New RED tests demonstrated each before the
+implementation changed:
+
+```text
+fast exit during capture: PROCESS_STILL_RUNNING
+late Windows descendant: expected [101, 202], actual [101]
+helper kill false/no close: promise did not settle boundedly
+never-settling release: primary error returned without release timeout
+post-return acquisition: client.release(true) was never called
+```
+
+The final implementation now constructs `ManagedProcess` immediately after `spawn()` and installs
+the spawn/error/exit/close and stream listeners synchronously. Identity capture is an instance-owned
+promise. A capture failure uses the same managed stream finalization and bounded reap path, and a
+fast exit during capture is retained and finalized rather than lost.
+
+Windows ownership refreshes and merges recursive PID + CreationDate tokens before stdin EOF, on
+every termination, and on every proof. When the original leader has exited, each still-live owned
+descendant becomes a discovery root, so a later grandchild is either discovered and terminated or
+a failed snapshot/proof rejects cleanup. Every reached descendant PID is validated as a positive
+safe integer before it can become a helper argument. PID 0 may remain in the unrelated system-wide
+CIM snapshot but can never become owned or targeted.
+
+The accepted Windows limitation for Task 9 documentation is explicit: this implementation uses
+`taskkill /T` plus repeatedly refreshed CIM PID + CreationDate ownership tokens; it does not use a
+native Job Object launcher. There remains a theoretical validate-to-numeric-termination PID reuse
+TOCTOU window. The human approved this as a non-blocking Phase 1 limitation to verify empirically in
+Windows CI. The implementation minimizes the window, never targets an unvalidated descendant PID,
+and fails closed whenever tree discovery or termination proof cannot complete.
+
+All PowerShell, CIM, `taskkill`, and `ps` helpers remain bounded by an absolute deadline. After a
+helper deadline, SIGKILL is attempted and only a small reap grace is awaited; even `kill()` returning
+false with no later `close` cannot hang cleanup. Stdio/listeners are detached safely and eventual
+error/close events remain observed.
+
+PostgreSQL client release is now an owned cleanup operation for both ordinary and late clients.
+Synchronous and promise-returning injectable releases are awaited through the global cleanup
+deadline, with timeout/error ordering preserved as primary, rollback, release, then pool end. If
+acquisition settles only after cleanup returns, its client is still destroyed and all rejection
+paths are observed. Such truly post-return errors cannot be retroactively added to the already
+returned `AggregateError`; they are delivered to the injected `onLateCleanupError` diagnostic sink.
+
+### Final RED to GREEN verification
+
+Disposable Homebrew PostgreSQL 16 root `/tmp/tego-task6-final-pg16.yOw1i9`, port 55464, was created
+with `mktemp`, stopped after verification, and removed after validating its exact prefix. Port 5432
+and Docker were untouched.
+
+```text
+process harness: 31/31 passed
+single-Main helpers: 5/5 passed
+runtime fault suite with real PostgreSQL: 21/21 passed
+real multi-Main E2E: 1/1 passed
+focused combined unit/integration run: 49 passed, 3 environment-gated skipped
+Biome and git diff --check: clean
+```
+
+Self-review found no remaining Critical, Important, or Minor issue within the approved practical
+Windows scope.

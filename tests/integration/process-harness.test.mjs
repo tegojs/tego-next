@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFile, writeFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
   createPosixTreeStrategy,
@@ -538,7 +540,7 @@ test("assertClean rejects a live grandchild after its direct parent exits", asyn
 
   await assert.rejects(
     child.assertClean({ timeoutMs: 100 }),
-    /PROCESS_(?:TREE_STILL_RUNNING|CLEANUP_TIMEOUT)/u,
+    /PROCESS_(?:TREE_STILL_RUNNING|CLEANUP_TIMEOUT|TREE_ADAPTER_TIMEOUT)/u,
   );
   assert.equal(isProcessAlive(spawned.pid), true);
   await child.stop({ timeoutMs: 2_000 });
@@ -649,6 +651,59 @@ test("managed process rejects unsafe child PIDs before creating tree ownership",
   assert.equal(strategyCalled, false);
 });
 
+test("fast process exit during ownership capture is still finalized", async () => {
+  const artifacts = await createRunArtifacts("fast-exit-during-capture");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: ["--eval", "process.exit(0)"],
+    name: "fast-exit-child",
+    processTreeStrategy: {
+      async capture(pid) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { pid };
+      },
+      async snapshot() {},
+      async probe() {
+        return true;
+      },
+      async terminate() {
+        return true;
+      },
+    },
+  });
+
+  await assert.doesNotReject(child.assertClean({ timeoutMs: 500 }));
+  assert.equal(await child.artifactsExist(), true);
+});
+
+test("ownership capture failure uses managed cleanup and reaps the child", async () => {
+  const artifacts = await createRunArtifacts("capture-failure-cleanup");
+  let childPid;
+  await assert.rejects(
+    spawnManagedProcess({
+      artifacts,
+      command: process.execPath,
+      args: ["--eval", "setInterval(() => {}, 1_000)"],
+      name: "capture-failure-child",
+      processTreeStrategy: {
+        async capture(pid) {
+          childPid = pid;
+          throw new Error("capture failed");
+        },
+      },
+    }),
+    /capture failed/u,
+  );
+  assert.equal(isProcessAlive(childPid), false);
+  assert.equal(
+    await readFile(artifacts.cleanup("capture-failure-child"), "utf8").then(
+      (contents) => contents.length > 0,
+    ),
+    true,
+  );
+});
+
 test("Windows default strategy terminates a cached descendant after graceful leader exit", async () => {
   const live = new Map([
     [101, "leader-created"],
@@ -676,6 +731,90 @@ test("Windows default strategy terminates a cached descendant after graceful lea
   assert.equal(await strategy.terminate(ownership, "SIGTERM", Date.now() + 1_000), true);
   assert.equal(await strategy.probe(ownership, Date.now() + 1_000), true);
   assert.deepEqual(terminated, [{ pid: 202, force: false }]);
+});
+
+test("Windows strategy refreshes a late descendant immediately before termination", async () => {
+  let processes = [{ pid: 101, parentPid: 0, creationDate: "leader-created" }];
+  const terminated = [];
+  const strategy = createWindowsTreeStrategy({
+    async readProcesses() {
+      return processes;
+    },
+    async terminatePid(pid) {
+      terminated.push(pid);
+      processes = processes.filter((process_) => process_.pid !== pid);
+      return true;
+    },
+  });
+  const ownership = await strategy.capture(101, Date.now() + 1_000);
+  await strategy.snapshot(ownership, Date.now() + 1_000);
+  processes.push({ pid: 202, parentPid: 101, creationDate: "late-created" });
+
+  assert.equal(await strategy.terminate(ownership, "SIGTERM", Date.now() + 1_000), true);
+  assert.deepEqual(terminated, [101, 202]);
+  assert.equal(await strategy.probe(ownership, Date.now() + 1_000), true);
+});
+
+test("Windows strategy discovers descendants through a previously owned live parent", async () => {
+  let processes = [
+    { pid: 101, parentPid: 0, creationDate: "leader-created" },
+    { pid: 202, parentPid: 101, creationDate: "child-created" },
+  ];
+  const terminated = [];
+  const strategy = createWindowsTreeStrategy({
+    async readProcesses() {
+      return processes;
+    },
+    async terminatePid(pid) {
+      terminated.push(pid);
+      processes = processes.filter((process_) => process_.pid !== pid);
+      return true;
+    },
+  });
+  const ownership = await strategy.capture(101, Date.now() + 1_000);
+  await strategy.snapshot(ownership, Date.now() + 1_000);
+  processes = [
+    { pid: 202, parentPid: 1, creationDate: "child-created" },
+    { pid: 303, parentPid: 202, creationDate: "grandchild-created" },
+  ];
+
+  assert.equal(await strategy.terminate(ownership, "SIGKILL", Date.now() + 1_000), true);
+  assert.deepEqual(terminated, [202, 303]);
+  assert.equal(await strategy.probe(ownership, Date.now() + 1_000), true);
+});
+
+test("Windows strategy rejects unsafe descendant PIDs before helper invocation", async () => {
+  let terminateCalled = false;
+  const strategy = createWindowsTreeStrategy({
+    async readProcesses() {
+      return [
+        { pid: 101, parentPid: 0, creationDate: "leader-created" },
+        { pid: -2, parentPid: 101, creationDate: "invalid-created" },
+      ];
+    },
+    async terminatePid() {
+      terminateCalled = true;
+      return true;
+    },
+  });
+  const ownership = await strategy.capture(101, Date.now() + 1_000);
+  await assert.rejects(
+    strategy.snapshot(ownership, Date.now() + 1_000),
+    /INVALID_MANAGED_PROCESS_PID:-2/u,
+  );
+  assert.equal(terminateCalled, false);
+});
+
+test("Windows strategy ignores an unrelated system PID zero", async () => {
+  const strategy = createWindowsTreeStrategy({
+    async readProcesses() {
+      return [
+        { pid: 0, parentPid: 0, creationDate: "system-idle" },
+        { pid: 101, parentPid: 0, creationDate: "leader-created" },
+      ];
+    },
+  });
+  await assert.doesNotReject(strategy.capture(101, Date.now() + 1_000));
 });
 
 test("process tree adapter calls are bounded by the absolute stop deadline", async () => {
@@ -717,6 +856,24 @@ test("bounded process helper kills and reaps a real hanging helper", async () =>
     /PROCESS_TREE_HELPER_TIMEOUT/u,
   );
   assert.ok(Date.now() - startedAt < 500);
+});
+
+test("bounded process helper rejects when kill returns false and close never arrives", async () => {
+  const helper = new EventEmitter();
+  helper.stdout = new PassThrough();
+  helper.stderr = new PassThrough();
+  helper.stdin = new PassThrough();
+  helper.kill = () => false;
+  const startedAt = Date.now();
+  await assert.rejects(
+    runBoundedProcessHelper("ignored", [], Date.now() + 20, {
+      reapGraceMs: 20,
+      spawnProcess: () => helper,
+    }),
+    /PROCESS_TREE_HELPER_TIMEOUT/u,
+  );
+  assert.ok(Date.now() - startedAt < 500);
+  assert.doesNotThrow(() => helper.emit("error", new Error("eventual helper error")));
 });
 
 test("POSIX identity mutation fails closed without signaling a recycled group", async () => {

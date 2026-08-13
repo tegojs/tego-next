@@ -81,29 +81,78 @@ async function beforeDeadline(operation, deadline, stage) {
   });
 }
 
-export async function runBoundedProcessHelper(command, args, deadline) {
+export async function runBoundedProcessHelper(
+  command,
+  args,
+  deadline,
+  { reapGraceMs = 100, spawnProcess = spawn } = {},
+) {
   return new Promise((resolve, reject) => {
     const output = [];
-    const helper = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    let helper;
+    try {
+      helper = spawnProcess(command, args, {
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const remaining = Math.max(0, deadline - Date.now());
     let timedOut = false;
+    let settled = false;
+    let reapTimer;
+    const timeoutError = new Error(`PROCESS_TREE_HELPER_TIMEOUT:${command}`);
+    const onData = (chunk) => output.push(chunk);
+    const observeEventualEvents = () => {
+      helper.removeListener("error", onError);
+      helper.removeListener("close", onClose);
+      helper.stdout?.removeListener("data", onData);
+      helper.on("error", () => undefined);
+      helper.once("close", () => undefined);
+    };
+    const finish = (operation) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(reapTimer);
+      operation();
+    };
+    const forceDetach = () => {
+      helper.stdin?.destroy();
+      helper.stdout?.destroy();
+      helper.stderr?.destroy();
+      observeEventualEvents();
+      finish(() => reject(timeoutError));
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      helper.kill("SIGKILL");
-    }, remaining);
-    helper.stdout.on("data", (chunk) => output.push(chunk));
-    helper.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    helper.once("close", (status) => {
-      clearTimeout(timer);
-      if (timedOut) {
-        reject(new Error(`PROCESS_TREE_HELPER_TIMEOUT:${command}`));
-      } else {
-        resolve({ status, stdout: Buffer.concat(output).toString("utf8") });
+      try {
+        helper.kill("SIGKILL");
+      } catch {
+        // The bounded reap grace below remains authoritative.
       }
-    });
+      reapTimer = setTimeout(forceDetach, reapGraceMs);
+    }, remaining);
+    helper.stdout.on("data", onData);
+    const onError = (error) => {
+      if (timedOut) {
+        observeEventualEvents();
+        finish(() => reject(timeoutError));
+        return;
+      }
+      finish(() => reject(error));
+    };
+    const onClose = (status) => {
+      if (timedOut) {
+        finish(() => reject(timeoutError));
+      } else {
+        finish(() => resolve({ status, stdout: Buffer.concat(output).toString("utf8") }));
+      }
+    };
+    helper.once("error", onError);
+    helper.once("close", onClose);
   });
 }
 
@@ -140,18 +189,47 @@ function tokenKey(process_) {
   return `${process_.pid}:${process_.creationDate}`;
 }
 
-function recursiveDescendants(processes, rootPid) {
-  const result = [];
-  const pending = [rootPid];
+function validateWindowsProcess(process_) {
+  assertProcessId(process_.pid);
+  if (!Number.isSafeInteger(process_.parentPid) || process_.parentPid < 0) {
+    throw new Error(`INVALID_MANAGED_PROCESS_PARENT_PID:${String(process_.parentPid)}`);
+  }
+  return process_;
+}
+
+function recursiveDescendants(processes, rootPids) {
+  const result = new Map();
+  const pending = [...rootPids];
+  const visitedParents = new Set();
   while (pending.length > 0) {
     const parentPid = pending.pop();
+    if (visitedParents.has(parentPid)) continue;
+    visitedParents.add(parentPid);
     for (const process_ of processes) {
       if (process_.parentPid !== parentPid) continue;
-      result.push(process_);
+      validateWindowsProcess(process_);
+      result.set(tokenKey(process_), process_);
       pending.push(process_.pid);
     }
   }
   return result;
+}
+
+function refreshWindowsOwnership(ownership, processes) {
+  const live = new Map(processes.map((process_) => [tokenKey(process_), process_]));
+  const leader = live.get(tokenKey(ownership.leader));
+  const reusedLeader = processes.some((process_) => process_.pid === ownership.processId);
+  if (leader === undefined && reusedLeader) {
+    throw new Error(`PROCESS_TREE_LEADER_IDENTITY_CHANGED:${ownership.processId}`);
+  }
+  const liveOwned = [...ownership.descendants]
+    .filter(([key]) => live.has(key))
+    .map(([, process_]) => process_.pid);
+  const roots = leader === undefined ? liveOwned : [leader.pid, ...liveOwned];
+  for (const [key, process_] of recursiveDescendants(processes, roots)) {
+    ownership.descendants.set(key, process_);
+  }
+  return live;
 }
 
 export function createWindowsTreeStrategy({
@@ -164,41 +242,20 @@ export function createWindowsTreeStrategy({
       const leader = processes.find((process_) => process_.pid === processId);
       if (leader === undefined)
         throw new Error(`PROCESS_TREE_LEADER_IDENTITY_MISSING:${processId}`);
-      return { processId, leader, descendants: new Map() };
+      return { processId, leader: validateWindowsProcess(leader), descendants: new Map() };
     },
     async snapshot(ownership, deadline) {
-      const processes = await readProcesses(deadline);
-      const leader = processes.find(
-        (process_) => tokenKey(process_) === tokenKey(ownership.leader),
-      );
-      const reusedLeader = processes.some((process_) => process_.pid === ownership.processId);
-      if (leader === undefined && reusedLeader) {
-        throw new Error(`PROCESS_TREE_LEADER_IDENTITY_CHANGED:${ownership.processId}`);
-      }
-      if (leader === undefined && ownership.descendants.size > 0) return;
-      if (leader === undefined) {
-        ownership.descendants.clear();
-        return;
-      }
-      ownership.descendants = new Map(
-        recursiveDescendants(processes, ownership.processId).map((process_) => [
-          tokenKey(process_),
-          process_,
-        ]),
-      );
+      refreshWindowsOwnership(ownership, await readProcesses(deadline));
     },
     async probe(ownership, deadline) {
-      const live = new Map(
-        (await readProcesses(deadline)).map((process_) => [tokenKey(process_), process_]),
-      );
+      const live = refreshWindowsOwnership(ownership, await readProcesses(deadline));
       return (
         !live.has(tokenKey(ownership.leader)) &&
         [...ownership.descendants.keys()].every((key) => !live.has(key))
       );
     },
     async terminate(ownership, signal, deadline) {
-      const processes = await readProcesses(deadline);
-      const live = new Map(processes.map((process_) => [tokenKey(process_), process_]));
+      const live = refreshWindowsOwnership(ownership, await readProcesses(deadline));
       const leaderLive = live.has(tokenKey(ownership.leader));
       let successful = true;
       if (leaderLive) {
@@ -328,16 +385,6 @@ export async function spawnManagedProcess({
   windowsTreeStrategy,
 }) {
   await artifacts.initialize(name);
-  const child = spawn(command, args, {
-    detached: platform !== "win32",
-    env: { ...process.env, ...env },
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  if (child.pid === undefined) {
-    return new ManagedProcess({ artifacts, child, name, spawnPending: true });
-  }
-  assertProcessId(child.pid);
   const strategy =
     processTreeStrategy ??
     (windowsTreeStrategy === undefined
@@ -345,19 +392,26 @@ export async function spawnManagedProcess({
         ? createWindowsTreeStrategy()
         : createPosixTreeStrategy()
       : wrapLegacyWindowsStrategy(windowsTreeStrategy));
-  const captureDeadline = Date.now() + 2_000;
-  let ownership;
+  const child = spawn(command, args, {
+    detached: platform !== "win32",
+    env: { ...process.env, ...env },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const managed = new ManagedProcess({
+    artifacts,
+    child,
+    name,
+    processTreeStrategy: strategy,
+    spawnPending: child.pid === undefined,
+  });
+  if (child.pid === undefined) return managed;
   try {
-    ownership = await beforeDeadline(
-      () => strategy.capture(child.pid, captureDeadline),
-      captureDeadline,
-      "capture",
-    );
+    await managed.initializeOwnership({ timeoutMs: 2_000 });
   } catch (error) {
-    child.kill("SIGKILL");
-    throw error;
+    await managed.cleanupAfterOwnershipFailure(error, { timeoutMs: 2_000 });
   }
-  return new ManagedProcess({ artifacts, child, name, ownership, processTreeStrategy: strategy });
+  return managed;
 }
 
 export class ManagedProcess {
@@ -370,6 +424,7 @@ export class ManagedProcess {
   #finalized = deferred();
   #finalizationStarted = false;
   #name;
+  #ownershipInitialization;
   #processingErrors = [];
   #readyListeners = new Set();
   #spawnError;
@@ -379,14 +434,14 @@ export class ManagedProcess {
   #streams;
   #treeOwnership;
 
-  constructor({ artifacts, child, name, ownership, processTreeStrategy, spawnPending = false }) {
+  constructor({ artifacts, child, name, processTreeStrategy, spawnPending = false }) {
     if (!spawnPending) assertProcessId(child.pid);
     this.#artifacts = artifacts;
     this.#child = child;
     this.#name = name;
     this.#treeOwnership = spawnPending
       ? { closed: true, identity: undefined, strategy: undefined }
-      : { closed: false, identity: ownership, strategy: processTreeStrategy };
+      : { closed: false, identity: undefined, strategy: processTreeStrategy };
     this.#streams = {
       stdout: createWriteStream(artifacts.stdout(name), { flags: "a" }),
       stderr: createWriteStream(artifacts.stderr(name), { flags: "a" }),
@@ -397,11 +452,7 @@ export class ManagedProcess {
     for (const [streamName, stream] of Object.entries(this.#streams)) {
       stream.on("error", (error) => this.#recordStreamError(streamName, error));
     }
-    if (!spawnPending) {
-      // Tree identity capture happens only after spawn succeeds, so the spawn
-      // event may already have fired before this wrapper is constructed.
-      this.#spawnState.resolve({ kind: "spawned" });
-    }
+    child.once("spawn", () => this.#spawnState.resolve({ kind: "spawned" }));
     child.on("error", (error) => {
       if (!this.#spawnState.settled) {
         this.#spawnError = error;
@@ -422,6 +473,48 @@ export class ManagedProcess {
 
   get pid() {
     return this.#child.pid;
+  }
+
+  async initializeOwnership({ timeoutMs }) {
+    if (this.#treeOwnership.closed) return;
+    const deadline = Date.now() + timeoutMs;
+    this.#ownershipInitialization ??= beforeDeadline(
+      () => this.#treeOwnership.strategy.capture(this.pid, deadline),
+      deadline,
+      "capture",
+    ).then((identity) => {
+      this.#treeOwnership.identity = identity;
+    });
+    await this.#ownershipInitialization;
+  }
+
+  async cleanupAfterOwnershipFailure(primaryError, { timeoutMs }) {
+    const errors = [primaryError];
+    this.#treeOwnership.closed = true;
+    const deadline = Date.now() + timeoutMs;
+    try {
+      this.#stopActions.push("stdin:end");
+      this.#child.stdin.end();
+      if (
+        !this.#exit.settled &&
+        !(await settleWithin(this.#exit.promise, Math.min(50, Math.max(1, timeoutMs / 4))))
+      ) {
+        this.#stopActions.push("signal:SIGKILL:ownership-failure");
+        this.#child.kill("SIGKILL");
+      }
+      const remaining = Math.max(0, deadline - Date.now());
+      if (!this.#exit.settled && !(await settleWithin(this.#exit.promise, remaining))) {
+        throw new Error(`PROCESS_STOP_TIMEOUT:${this.#name}:${this.pid}`);
+      }
+      await this.#waitForFinalization(Math.max(1, deadline - Date.now()));
+    } catch (cleanupError) {
+      errors.push(cleanupError);
+    }
+    if (errors.length === 1) throw errors[0];
+    throw new AggregateError(
+      errors,
+      `Managed process ownership initialization failed:${this.#name}`,
+    );
   }
 
   async ready(predicate, { timeoutMs }) {

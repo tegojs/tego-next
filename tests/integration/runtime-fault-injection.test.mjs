@@ -580,6 +580,79 @@ test("namespace cleanup aggregates primary rollback release and pool errors in o
   );
 });
 
+test("namespace cleanup bounds and reports a never-settling release promise", async () => {
+  const primaryError = new Error("query failed before release");
+  let queryIndex = 0;
+  const startedAt = Date.now();
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_release_timeout",
+      timeoutMs: 30,
+      cleanupGraceMs: 30,
+      createPool: () => ({
+        async connect() {
+          return {
+            async query() {
+              queryIndex += 1;
+              if (queryIndex === 4) throw primaryError;
+            },
+            release() {
+              return new Promise(() => {});
+            },
+          };
+        },
+        async end() {},
+      }),
+    }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0], primaryError);
+      assert.match(error.errors[1].message, /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:release/u);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 500);
+});
+
+test("namespace cleanup releases an acquisition that settles after return and reports its error", async () => {
+  const lateReleaseError = new Error("post-return late release failed");
+  const lateErrors = [];
+  let resolveConnect;
+  let releaseCalled = false;
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_post_return_release",
+      timeoutMs: 20,
+      cleanupGraceMs: 20,
+      onLateCleanupError(error) {
+        lateErrors.push(error);
+      },
+      createPool: () => ({
+        connect() {
+          return new Promise((resolve) => {
+            resolveConnect = resolve;
+          });
+        },
+        async end() {},
+      }),
+    }),
+    /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:connect/u,
+  );
+
+  resolveConnect({
+    release(destroy) {
+      assert.equal(destroy, true);
+      releaseCalled = true;
+      return Promise.reject(lateReleaseError);
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(releaseCalled, true);
+  assert.deepEqual(lateErrors, [lateReleaseError]);
+});
+
 test("namespace cleanup deletes one exact namespace and preserves another byte-for-byte", {
   skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
 }, async () => {
