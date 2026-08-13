@@ -22,6 +22,8 @@ const integrationReporterCommand = `node scripts/run-ci-test.mjs --name integrat
 const singleMainReporterCommand = `node scripts/run-ci-test.mjs --name single-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:single-main`;
 const multiMainReporterCommand = `node scripts/run-ci-test.mjs --name multi-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:multi-main`;
 const deterministicPackageCommand = "node scripts/verify-release.mjs --deterministic-package";
+const windowsControlTestCommand =
+  'node --test --test-name-pattern="Windows pipe hardening drains connections|windows-pipe-access-cleanup-contract" packages/cli/dist/test/control.test.js';
 const actionPins = {
   checkout: {
     reference: "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
@@ -124,8 +126,9 @@ function validateJobShape(errors, jobName, job) {
     errors.push(`${jobName} must be a job mapping`);
     return false;
   }
-  if (job["runs-on"] !== "ubuntu-latest" || job["timeout-minutes"] !== 15) {
-    errors.push(`${jobName} must run on ubuntu-latest with a 15 minute bound`);
+  const expectedRunner = jobName === "windows-control" ? "windows-2025" : "ubuntu-latest";
+  if (job["runs-on"] !== expectedRunner || job["timeout-minutes"] !== 15) {
+    errors.push(`${jobName} must run on ${expectedRunner} with a 15 minute bound`);
   }
   if (
     job.if !== undefined ||
@@ -230,6 +233,8 @@ function validateActionVersionComments(errors, workflow, jobs, ranges) {
   for (const [jobName, stepName, pin] of [
     ["quality", "Check out repository", actionPins.checkout],
     ["quality", "Set up Node.js", actionPins.setupNode],
+    ["windows-control", "Check out repository", actionPins.checkout],
+    ["windows-control", "Set up Node.js", actionPins.setupNode],
     ["integration", "Check out repository", actionPins.checkout],
     ["integration", "Set up Node.js", actionPins.setupNode],
     ["integration", "Upload integration diagnostics", actionPins.uploadArtifact],
@@ -255,16 +260,19 @@ export function validateWorkflowContract(workflow) {
   }
   const { document, ranges } = parsed;
   const jobs = workflowJobs(document);
-  const expectedJobs = ["quality", "integration", "system-e2e"];
+  const expectedJobs = ["quality", "windows-control", "integration", "system-e2e"];
   if (
     jobs.size !== expectedJobs.length ||
     expectedJobs.some((jobName, index) => [...jobs.keys()][index] !== jobName)
   ) {
-    errors.push("jobs must be exactly quality, integration, and system-e2e in that order");
+    errors.push(
+      "jobs must be exactly quality, windows-control, integration, and system-e2e in that order",
+    );
     return errors;
   }
 
   const quality = jobs.get("quality");
+  const windowsControl = jobs.get("windows-control");
   const integration = jobs.get("integration");
   const system = jobs.get("system-e2e");
   if (
@@ -303,6 +311,30 @@ export function validateWorkflowContract(workflow) {
     { name: "Typecheck", run: "npm run typecheck" },
     { name: "Run unit and architecture tests", run: "npm test" },
     { name: "Validate OpenSpec", run: "npm run openspec:validate" },
+  ]);
+  validateRequiredSteps(errors, "windows-control", windowsControl, [
+    {
+      name: "Check out repository",
+      uses: actionPins.checkout.reference,
+    },
+    {
+      name: "Set up Node.js",
+      uses: actionPins.setupNode.reference,
+      with: { "node-version-file": ".node-version", cache: "npm" },
+    },
+    {
+      name: "Verify Node.js version",
+      run: 'if ((node --version) -ne "v26.5.0") { throw "Unexpected Node.js version" }',
+    },
+    { name: "Install pinned npm", run: "npm install --global npm@11.13.0" },
+    {
+      name: "Verify npm version",
+      run: 'if ((npm --version) -ne "11.13.0") { throw "Unexpected npm version" }',
+    },
+    { name: "Install dependencies", run: "npm ci" },
+    { name: "Build CLI", run: "npm run build --workspace @tego/cli" },
+    { name: "Typecheck CLI", run: "npm run typecheck --workspace @tego/cli" },
+    { name: "Run Windows control security test", run: windowsControlTestCommand },
   ]);
   const reporterEnvironment = {
     TEGO_POSTGRES_URL: `postgresql://tego_test:tego_test@127.0.0.1:${postgresPort}/tego_next_test`,

@@ -67,7 +67,7 @@ test("TypeScript workspaces reference every internal build dependency", async ()
   }
 });
 
-test("GitHub CI declares quality, integration, and system E2E gates", async () => {
+test("GitHub CI declares quality, Windows control, integration, and system E2E gates", async () => {
   assert.equal(existsSync(workflowUrl), true, "CI workflow must exist");
   const workflow = await readFile(workflowUrl, "utf8");
   const { parseWorkflowJobs, validateWorkflowContract } = await import(
@@ -81,6 +81,7 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "workflow_dispatch:",
     "contents: read",
     "quality:",
+    "windows-control:",
     "integration:",
     "system-e2e:",
     "timeout-minutes:",
@@ -94,7 +95,10 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
     "npm run typecheck",
     "npm test",
     "npm run build",
+    'if ((node --version) -ne "v26.5.0") { throw "Unexpected Node.js version" }',
+    'if ((npm --version) -ne "11.13.0") { throw "Unexpected npm version" }',
     "node scripts/verify-release.mjs --deterministic-package",
+    'node --test --test-name-pattern="Windows pipe hardening drains connections|windows-pipe-access-cleanup-contract" packages/cli/dist/test/control.test.js',
     "postgres:16.14-alpine",
     "TEGO_POSTGRES_URL:",
     "TEGO_TEST_ARTIFACTS_DIR:",
@@ -115,18 +119,22 @@ test("GitHub CI declares quality, integration, and system E2E gates", async () =
   );
 
   const qualityJob = jobs.get("quality");
+  const windowsControlJob = jobs.get("windows-control");
   const integrationJob = jobs.get("integration");
   const processE2eJob = jobs.get("system-e2e");
   assert.ok(qualityJob);
+  assert.ok(windowsControlJob);
   assert.ok(integrationJob);
   assert.ok(processE2eJob);
   for (const [name, job] of [
     ["quality", qualityJob],
+    ["Windows control", windowsControlJob],
     ["PostgreSQL integration", integrationJob],
     ["process E2E", processE2eJob],
   ]) {
     assert.equal(job["timeout-minutes"], 15, `${name} CI must have a bounded job timeout`);
   }
+  assert.equal(windowsControlJob["runs-on"], "windows-2025");
   for (const [name, job] of [
     ["PostgreSQL integration", integrationJob],
     ["process E2E", processE2eJob],

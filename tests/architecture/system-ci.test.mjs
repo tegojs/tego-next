@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,6 +33,17 @@ const requiredStepsByJob = {
     "Typecheck",
     "Run unit and architecture tests",
     "Validate OpenSpec",
+  ],
+  "windows-control": [
+    "Check out repository",
+    "Set up Node.js",
+    "Verify Node.js version",
+    "Install pinned npm",
+    "Verify npm version",
+    "Install dependencies",
+    "Build CLI",
+    "Typecheck CLI",
+    "Run Windows control security test",
   ],
   "system-e2e": [
     "Check out repository",
@@ -128,7 +139,7 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/workflow-gates
   );
   const jobs = verifier.parseWorkflowJobs(workflow);
 
-  assert.deepEqual([...jobs.keys()], ["quality", "integration", "system-e2e"]);
+  assert.deepEqual([...jobs.keys()], ["quality", "windows-control", "integration", "system-e2e"]);
   assert.deepEqual(verifier.validateWorkflowContract(workflow), []);
 });
 
@@ -252,6 +263,7 @@ test("CI workflow validation rejects every disabled, soft-fail, misplaced, no-op
     integration: "system-e2e",
     quality: "integration",
     "system-e2e": "quality",
+    "windows-control": "quality",
   };
 
   for (const [jobName, stepNames] of Object.entries(requiredStepsByJob)) {

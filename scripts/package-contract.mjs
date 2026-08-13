@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,7 @@ const npmCli = resolveNpmCli();
 const forbiddenPackedPath =
   /\.tsbuildinfo$|(^|\/)(?:test|tests|__tests__)\/|\.(?:test|spec)\.(?:[cm]?js|d\.ts)(?:\.map)?$|(?<!\.d)\.ts$/u;
 const allowedPackedPath =
-  /^package\/(?:LICENSE|README\.md|package\.json|dist\/src\/.+\.(?:d\.ts(?:\.map)?|js(?:\.map)?))$/u;
+  /^package\/(?:LICENSE|README\.md|package\.json|dist\/src\/.+\.(?:d\.ts(?:\.map)?|js(?:\.map)?)|dist\/src\/control\/windows-pipe-security\.ps1)$/u;
 const releaseVersion = "2.0.0-alpha.1";
 const expectedPackages = [
   {
@@ -161,6 +161,9 @@ export function assertPackedFiles(name, files, entryPoint) {
   if (name === "@tego/cli") {
     const executable = files.find((file) => file.path === "package/dist/src/bin.js");
     if (executable?.mode !== 0o755) throw new Error(`${name} CLI binary must have mode 0755`);
+    if (!files.some((file) => file.path === "package/dist/src/control/windows-pipe-security.ps1")) {
+      throw new Error(`${name} omits the Windows pipe-security helper`);
+    }
   }
 }
 

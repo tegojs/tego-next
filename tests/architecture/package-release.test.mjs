@@ -90,12 +90,26 @@ test("packed public packages contain only consumer assets and install cleanly", 
         const executable = workspace.files.find((file) => file.path === "package/dist/src/bin.js");
         assert.ok(executable, "CLI binary must be packed");
         assert.equal(executable.mode, 0o755, "packed CLI binary must be executable");
+        assert.ok(
+          workspace.files.some(
+            (file) => file.path === "package/dist/src/control/windows-pipe-security.ps1",
+          ),
+          "CLI package must include the fixed Windows pipe-security helper",
+        );
       }
     }
     await verifyPackedConsumer(packed, directory);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
+});
+
+test("Windows pipe-security helper owns a bounded fail-fast watchdog", async () => {
+  const helper = await readFile(join(root, "scripts", "windows-pipe-security.ps1"), "utf8");
+
+  assert.match(helper, /Environment\.FailFast\(/u);
+  assert.match(helper, /StartWatchdog\(9000\)/u);
+  assert.match(helper, /\$watchdog\.Dispose\(\)/u);
 });
 
 test("workspace inspection rejects duplicate public names and non-alpha versions", async () => {

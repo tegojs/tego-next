@@ -26,6 +26,7 @@
     "dist/src/**/*.js.map",
     "dist/src/**/*.d.ts",
     "dist/src/**/*.d.ts.map",
+    "dist/src/**/*.ps1",
     "README.md",
     "LICENSE"
   ],
@@ -40,7 +41,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && node ../../scripts/copy-windows-pipe-security.mjs",
     "test:unit": "npm run build && node --test dist/test/*.test.js",
     "typecheck": "tsc -b --pretty false"
   },

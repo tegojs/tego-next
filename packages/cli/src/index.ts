@@ -17,6 +17,19 @@ export {
   startControlServer,
 } from "./control/server.js";
 export {
+  createWindowsPipeSecurityAdapter,
+  parseWindowsPipeSecurityHelperOutput,
+  validateWindowsPipeSecurityDescriptor,
+  WINDOWS_PIPE_ADMISSION_BARRIER_ACK,
+  WINDOWS_PIPE_ADMISSION_BARRIER_FRAME,
+  type WindowsPipeSecurityAccessRule,
+  type WindowsPipeSecurityAdapter,
+  type WindowsPipeSecurityDescriptor,
+  type WindowsPipeSecurityHelperSpawner,
+  type WindowsPipeSecurityInspection,
+  type WindowsPipeSecurityInspector,
+} from "./control/windows-pipe-security.js";
+export {
   type DefaultControlEndpointOptions,
   defaultControlEndpoint,
   defaultDataDirectory,

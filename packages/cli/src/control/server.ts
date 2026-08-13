@@ -26,6 +26,13 @@ import {
   sanitizeControlValue,
   UNKNOWN_CONTROL_REQUEST_ID,
 } from "./protocol.js";
+import {
+  createWindowsPipeSecurityAdapter,
+  validateWindowsPipeSecurityDescriptor,
+  WINDOWS_PIPE_ADMISSION_BARRIER_ACK,
+  WINDOWS_PIPE_ADMISSION_BARRIER_FRAME,
+  type WindowsPipeSecurityAdapter,
+} from "./windows-pipe-security.js";
 
 export interface LocalArtifactIngress {
   putPath(artifactPath: string): Promise<ArtifactDigest>;
@@ -46,6 +53,8 @@ export interface ControlServerOptions {
   readonly maxOutstandingRequests?: number;
   readonly readTimeoutMs?: number;
   readonly setEndpointPermissions?: (endpoint: string) => Promise<void>;
+  readonly windowsPipeCurrentUserSid?: string;
+  readonly windowsPipeSecurityAdapter?: WindowsPipeSecurityAdapter;
   readonly onServerError?: (error: Error) => void;
 }
 
@@ -74,6 +83,7 @@ interface EndpointParentIdentity {
 }
 
 const CONTROL_CLOSE_DRAIN_TIMEOUT_MS = 2_000;
+const WINDOWS_PIPE_ADMISSION_READ_TIMEOUT_MS = 11_000;
 
 function controlInitializationAbortError(): DOMException {
   return new DOMException("Control server initialization aborted", "AbortError");
@@ -81,6 +91,12 @@ function controlInitializationAbortError(): DOMException {
 
 function assertControlInitializationActive(signal?: AbortSignal): void {
   if (signal?.aborted === true) throw controlInitializationAbortError();
+}
+
+function windowsControlEndpointUnsafe(): DiagnosticError {
+  return new DiagnosticError(
+    protocolDiagnostic("PROTOCOL_CONTROL_ENDPOINT_UNSAFE", "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"),
+  );
 }
 
 async function awaitControlInitialization<T>(
@@ -389,6 +405,12 @@ export async function startControlServer(options: ControlServerOptions): Promise
   if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 1) {
     throw new RangeError("readTimeoutMs must be a positive safe integer");
   }
+  if (
+    options.windowsPipeSecurityAdapter !== undefined &&
+    options.windowsPipeCurrentUserSid === undefined
+  ) {
+    throw windowsControlEndpointUnsafe();
+  }
   await assertPrivateEndpointParent(options.endpoint);
   assertControlInitializationActive(options.signal);
 
@@ -398,8 +420,35 @@ export async function startControlServer(options: ControlServerOptions): Promise
   const pendingAdmissionSockets = new Set<Socket>();
   let reservations = 0;
   let closing = false;
-  let endpointReady = process.platform === "win32";
+  const requiresWindowsPipeSecurity =
+    process.platform === "win32" || options.windowsPipeSecurityAdapter !== undefined;
+  let endpointReady = false;
+  let windowsAdmissionBarrierActive = false;
   let terminalError: Error | undefined;
+  const beginWindowsAdmissionBarrier = (socket: Socket) => {
+    const expected = Buffer.from(WINDOWS_PIPE_ADMISSION_BARRIER_FRAME);
+    const received = Buffer.allocUnsafe(expected.byteLength);
+    let bytes = 0;
+    const timer = setTimeout(() => socket.destroy(), WINDOWS_PIPE_ADMISSION_READ_TIMEOUT_MS);
+    timer.unref();
+    socket.once("close", () => clearTimeout(timer));
+    socket.on("data", (chunk: Buffer) => {
+      if (!windowsAdmissionBarrierActive || socket.destroyed) return;
+      if (bytes + chunk.byteLength > expected.byteLength) {
+        socket.destroy();
+        return;
+      }
+      chunk.copy(received, bytes);
+      bytes += chunk.byteLength;
+      if (bytes !== expected.byteLength) return;
+      if (!received.equals(expected)) {
+        socket.destroy();
+        return;
+      }
+      socket.end(WINDOWS_PIPE_ADMISSION_BARRIER_ACK);
+    });
+    socket.resume();
+  };
   const beginControlConnection = (socket: Socket) => {
     if (closing || reservations >= maxOutstanding) {
       void writeResponse(
@@ -521,23 +570,21 @@ export async function startControlServer(options: ControlServerOptions): Promise
       );
     });
   };
-  const server: Server = createServer(
-    { pauseOnConnect: process.platform !== "win32" },
-    (socket) => {
-      sockets.add(socket);
-      socket.on("close", () => {
-        sockets.delete(socket);
-        pendingAdmissionSockets.delete(socket);
-      });
-      socket.on("error", () => undefined);
-      if (!endpointReady) {
-        pendingAdmissionSockets.add(socket);
-        return;
-      }
-      beginControlConnection(socket);
-      socket.resume();
-    },
-  );
+  const server: Server = createServer({ pauseOnConnect: true }, (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => {
+      sockets.delete(socket);
+      pendingAdmissionSockets.delete(socket);
+    });
+    socket.on("error", () => undefined);
+    if (!endpointReady) {
+      pendingAdmissionSockets.add(socket);
+      if (windowsAdmissionBarrierActive) beginWindowsAdmissionBarrier(socket);
+      return;
+    }
+    beginControlConnection(socket);
+    socket.resume();
+  });
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -564,7 +611,19 @@ export async function startControlServer(options: ControlServerOptions): Promise
         onAbort();
         return;
       }
-      server.listen(options.endpoint);
+      const previousPendingInstances = process.env.NODE_PENDING_PIPE_INSTANCES;
+      if (process.platform === "win32") process.env.NODE_PENDING_PIPE_INSTANCES = "1";
+      try {
+        server.listen({ exclusive: true, path: options.endpoint });
+      } finally {
+        if (process.platform === "win32") {
+          if (previousPendingInstances === undefined) {
+            delete process.env.NODE_PENDING_PIPE_INSTANCES;
+          } else {
+            process.env.NODE_PENDING_PIPE_INSTANCES = previousPendingInstances;
+          }
+        }
+      }
     });
     server.on("error", (error) => {
       terminalError ??= error;
@@ -579,7 +638,29 @@ export async function startControlServer(options: ControlServerOptions): Promise
       for (const socket of sockets) socket.destroy();
     });
 
-    if (process.platform !== "win32") {
+    if (requiresWindowsPipeSecurity) {
+      try {
+        assertControlInitializationActive(options.signal);
+        const adapter = options.windowsPipeSecurityAdapter ?? createWindowsPipeSecurityAdapter();
+        if (process.platform === "win32" && adapter.usesAdmissionBarrier !== true) {
+          throw windowsControlEndpointUnsafe();
+        }
+        windowsAdmissionBarrierActive = true;
+        for (const socket of pendingAdmissionSockets) beginWindowsAdmissionBarrier(socket);
+        const descriptor = await adapter.harden(options.endpoint, options.signal);
+        assertControlInitializationActive(options.signal);
+        if (options.windowsPipeCurrentUserSid !== undefined) {
+          validateWindowsPipeSecurityDescriptor(descriptor, options.windowsPipeCurrentUserSid);
+        }
+      } catch (error) {
+        if (options.signal?.aborted === true) throw error;
+        throw windowsControlEndpointUnsafe();
+      } finally {
+        windowsAdmissionBarrierActive = false;
+      }
+      for (const socket of pendingAdmissionSockets) socket.destroy();
+      pendingAdmissionSockets.clear();
+    } else {
       const endpointIdentity = await awaitControlInitialization(
         () => controlEndpointIdentity(options.endpoint),
         options.signal,
