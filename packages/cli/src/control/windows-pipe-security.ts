@@ -51,7 +51,7 @@ export type WindowsPipeSecurityHelperSpawner = (
   args: readonly string[],
 ) => ChildProcessByStdio<null, Readable, Readable>;
 
-type WindowsPipeSecurityHelperFailureBaseStage =
+export type WindowsPipeSecurityHelperFailureStage =
   | "TEGO_WINDOWS_PIPE_SECURITY_APPLY_DESCRIPTOR_FAILED"
   | "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_IO_FAILED"
   | "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_OPEN_FAILED"
@@ -62,14 +62,8 @@ type WindowsPipeSecurityHelperFailureBaseStage =
   | "TEGO_WINDOWS_PIPE_SECURITY_IDENTITY_FAILED"
   | "TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED";
 
-type WindowsPipeSecurityHelperWin32Code = 2 | 5 | 87 | 123 | 231;
-
-export type WindowsPipeSecurityHelperFailureStage =
-  | WindowsPipeSecurityHelperFailureBaseStage
-  | `${WindowsPipeSecurityHelperFailureBaseStage}:${WindowsPipeSecurityHelperWin32Code}`;
-
 const WINDOWS_PIPE_SECURITY_HELPER_FAILURE =
-  /^TEGO_WINDOWS_PIPE_SECURITY_(?:APPLY_DESCRIPTOR|BARRIER_IO|BARRIER_OPEN|BARRIER_WAIT|DESCRIPTOR_PARSE|DESCRIPTOR_READ|DESCRIPTOR_SIZE|IDENTITY|INITIAL_OPEN)_FAILED(?::(?:2|5|87|123|231))?\r?\n$/u;
+  /^TEGO_WINDOWS_PIPE_SECURITY_(?:APPLY_DESCRIPTOR|BARRIER_IO|BARRIER_OPEN|BARRIER_WAIT|DESCRIPTOR_PARSE|DESCRIPTOR_READ|DESCRIPTOR_SIZE|IDENTITY|INITIAL_OPEN)_FAILED\r?\n$/u;
 
 class WindowsPipeSecurityHelperFailure extends Error {
   readonly stage: WindowsPipeSecurityHelperFailureStage;

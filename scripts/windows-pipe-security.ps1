@@ -6,14 +6,7 @@ param(
   [string]$Operation = "harden",
 
   [ValidateRange(0, 64)]
-  [int]$BarrierCount = 0,
-
-  [Parameter(DontShow = $true)]
-  [switch]$ProbeOnly,
-
-  [Parameter(DontShow = $true)]
-  [ValidateSet("RW", "RWRC", "RWRCD")]
-  [string]$ProbeAccess = "RW"
+  [int]$BarrierCount = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,24 +89,16 @@ $barrierHandle = $null
 $barrierStream = $null
 $reader = $null
 $failureStage = $null
-$failureWin32Code = $null
-$allowedWin32Codes = @(2, 5, 87, 123, 231)
 $stage = "INITIAL_OPEN"
 
 try {
   $watchdog = [TegoWindowsPipeSecurityNative]::StartWatchdog(9000)
 
   $desiredAccess =
-    [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
-    [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite
-  if (-not $ProbeOnly -or $ProbeAccess -in @("RWRC", "RWRCD")) {
-    $desiredAccess = $desiredAccess -bor
-      [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl
-  }
-  if (-not $ProbeOnly -or $ProbeAccess -eq "RWRCD") {
-    $desiredAccess = $desiredAccess -bor
-      [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac
-  }
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite -bor
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl -bor
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac
   $barrierDesiredAccess =
     [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
     [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite
@@ -138,15 +123,7 @@ try {
 
   if ($handle.IsInvalid) {
     $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-    if ($allowedWin32Codes -contains [int]$errorCode) {
-      $failureWin32Code = [int]$errorCode
-    }
     throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open the named pipe")
-  }
-
-  if ($ProbeOnly) {
-    [Console]::Out.WriteLine("TEGO_WINDOWS_PIPE_ACCESS_${ProbeAccess}_OK")
-    return
   }
 
   $stage = "IDENTITY"
@@ -308,8 +285,6 @@ try {
 }
 
 if ($null -ne $failureStage) {
-  $failureDiagnostic = "TEGO_WINDOWS_PIPE_SECURITY_${failureStage}_FAILED"
-  if ($null -ne $failureWin32Code) { $failureDiagnostic += ":$failureWin32Code" }
-  [Console]::Error.WriteLine($failureDiagnostic)
+  [Console]::Error.WriteLine("TEGO_WINDOWS_PIPE_SECURITY_${failureStage}_FAILED")
   exit 1
 }

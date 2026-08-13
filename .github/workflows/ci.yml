@@ -17,7 +17,6 @@ concurrency:
 jobs:
   quality:
     name: Quality
-    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -58,7 +57,7 @@ jobs:
         run: npm run openspec:validate
 
   windows-control:
-    name: Temporary Windows pipe diagnostic
+    name: Windows control-pipe security
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
@@ -79,12 +78,13 @@ jobs:
         run: npm ci
       - name: Build CLI
         run: npm run build --workspace @tego/cli
-      - name: Probe Windows pipe access modes
-        run: node scripts/run-windows-pipe-access-diagnostic.mjs
+      - name: Typecheck CLI
+        run: npm run typecheck --workspace @tego/cli
+      - name: Run Windows control security test
+        run: node scripts/run-windows-control-gate.mjs
 
   integration:
     name: PostgreSQL integration
-    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -136,7 +136,6 @@ jobs:
 
   system-e2e:
     name: Main and Worker process E2E
-    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:

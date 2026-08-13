@@ -1509,7 +1509,7 @@ test("Windows pipe helper exposes only fixed failure stages", async () => {
     spawnHelper() {
       queueMicrotask(() => {
         fixed.stdout.end();
-        fixed.stderr.end("TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED:5\n");
+        fixed.stderr.end("TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED\n");
         (fixed.child as unknown as EventEmitter).emit("close", 1, null);
       });
       return fixed.child;
@@ -1523,7 +1523,7 @@ test("Windows pipe helper exposes only fixed failure stages", async () => {
       error.diagnostic.code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&
       error.message === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
   );
-  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED:5"]);
+  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED"]);
 
   const unsafe = fakeWindowsPipeSecurityHelperProcess();
   const unsafeAdapter = createWindowsPipeSecurityAdapter({
@@ -1531,7 +1531,7 @@ test("Windows pipe helper exposes only fixed failure stages", async () => {
     spawnHelper() {
       queueMicrotask(() => {
         unsafe.stdout.end();
-        unsafe.stderr.end("TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED:999\n");
+        unsafe.stderr.end("sensitive helper detail: \\\\.\\pipe\\private-endpoint\n");
         (unsafe.child as unknown as EventEmitter).emit("close", 1, null);
       });
       return unsafe.child;
@@ -1546,9 +1546,9 @@ test("Windows pipe helper exposes only fixed failure stages", async () => {
   if (!outcome.ok) {
     assert.ok(outcome.error instanceof DiagnosticError);
     assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-    assert.doesNotMatch(JSON.stringify(outcome.error), /999/u);
+    assert.doesNotMatch(JSON.stringify(outcome.error), /sensitive|private-endpoint/u);
   }
-  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED:5"]);
+  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED"]);
 });
 
 test("Windows pipe helper abort waits for observed child close", async () => {

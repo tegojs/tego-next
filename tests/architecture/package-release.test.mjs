@@ -140,12 +140,6 @@ test("Windows pipe-security helper owns a bounded fail-fast watchdog through ear
     /\$watchdog = \$null[\s\S]*try \{[\s\S]*\$watchdog = \[TegoWindowsPipeSecurityNative\]::StartWatchdog\(9000\)[\s\S]*\$handle = \[TegoWindowsPipeSecurityNative\]::CreateFile\([\s\S]*\} finally \{[\s\S]*Close-TegoResource \$handle[\s\S]*Close-TegoResource \$watchdog/u,
   );
   assert.match(helper, /TEGO_WINDOWS_PIPE_SECURITY_\$\{failureStage\}_FAILED/u);
-  assert.match(helper, /\$allowedWin32Codes = @\(2, 5, 87, 123, 231\)/u);
-  assert.match(
-    helper,
-    /if \(\$handle\.IsInvalid\) \{[\s\S]*GetLastWin32Error\(\)[\s\S]*\$failureWin32Code = \[int\]\$errorCode[\s\S]*throw/u,
-  );
-  assert.match(helper, /\[Console\]::Error\.WriteLine\(\$failureDiagnostic\)/u);
   assert.doesNotMatch(helper, /\[Console\]::Error\.WriteLine\(\$_.+\)/u);
 });
 
@@ -178,24 +172,6 @@ test("Windows control gate emits fixed diagnostics without exception details", a
 
   assert.match(gate, /TEGO_WINDOWS_CONTROL_GATE_FAILED/u);
   assert.doesNotMatch(gate, /error\.(?:message|stack)|String\(error\)/u);
-});
-
-test("temporary Windows pipe access probe is isolated and bounded per case", async () => {
-  const runner = await readFile(
-    join(root, "scripts", "run-windows-pipe-access-diagnostic.mjs"),
-    "utf8",
-  );
-  const workflow = await readFile(
-    join(root, ".github", "workflows", "windows-pipe-diagnostic.yml"),
-    "utf8",
-  );
-
-  assert.match(runner, /\["RW", "RWRC", "RWRCD"\]/u);
-  assert.match(runner, /timeout:\s*3_000/u);
-  assert.match(runner, /shell:\s*false/u);
-  assert.match(runner, /-ProbeOnly/u);
-  assert.match(workflow, /workflow_dispatch:/u);
-  assert.doesNotMatch(workflow, /pull_request:|push:/u);
 });
 
 test("workspace inspection rejects duplicate public names and non-alpha versions", async () => {
