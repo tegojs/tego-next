@@ -29,6 +29,9 @@ export function createPostgresDrivers(options: CreatePostgresDriversOptions): Po
     coordination: new PostgresCoordinationProvider(options),
     artifacts: new PostgresArtifactStore({
       connectionString: options.connectionString,
+      ...(options.connectionTimeoutMillis === undefined
+        ? {}
+        : { connectionTimeoutMillis: options.connectionTimeoutMillis }),
       namespace: options.namespace,
       ...(options.artifactLimits === undefined ? {} : { limits: options.artifactLimits }),
     }),

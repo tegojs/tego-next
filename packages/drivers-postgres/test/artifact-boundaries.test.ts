@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { diagnosticCode, parseArtifactDigest } from "@tego/contracts";
-import { Pool } from "pg";
+import { DiagnosticError, diagnosticCode, parseArtifactDigest } from "@tego/contracts";
+import { Pool, type PoolClient } from "pg";
 import { PostgresArtifactStore } from "../src/postgres-artifact-store.js";
 
 const connectionString =
@@ -22,9 +22,10 @@ async function* source(...chunks: readonly Uint8Array[]): AsyncIterable<Uint8Arr
 }
 
 test("an oversized source chunk is rejected before its bytes are copied", async () => {
+  const storeNamespace = namespace("artifact_source_limit");
   const store = new PostgresArtifactStore({
     connectionString,
-    namespace: namespace("artifact_source_limit"),
+    namespace: storeNamespace,
     limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
   });
   const oversized = new Proxy(new Uint8Array(1), {
@@ -47,10 +48,18 @@ test("an oversized source chunk is rejected before its bytes are copied", async 
   };
   await store.open();
   try {
-    await assert.rejects(
-      store.put(digest(new Uint8Array()), source),
-      (error: unknown) => diagnosticCode(error) === "ARTIFACT_SIZE_LIMIT_EXCEEDED",
-    );
+    await assert.rejects(store.put(digest(new Uint8Array()), source), (error: unknown) => {
+      assert.ok(error instanceof DiagnosticError);
+      assert.equal(error.diagnostic.code, "ARTIFACT_SIZE_LIMIT_EXCEEDED");
+      assert.deepEqual(error.diagnostic.details, {
+        digest: digest(new Uint8Array()),
+        namespace: storeNamespace,
+        artifactBytes: "5",
+        maximumBytes: "4",
+      });
+      assert.doesNotThrow(() => JSON.stringify(error.diagnostic));
+      return true;
+    });
   } finally {
     await store.close();
   }
@@ -383,3 +392,193 @@ test("closing a store lets an already-committing artifact transaction settle suc
     await observer.end();
   }
 });
+
+test("a lost COMMIT acknowledgement is reconciled as success while close waits", async () => {
+  const storeNamespace = namespace("artifact_commit_ack_lost");
+  const content = Buffer.from("data");
+  const artifactDigest = digest(content);
+  const commitApplied = Promise.withResolvers<void>();
+  let rejectAcknowledgement = true;
+  const injectedFailure = new Error("injected lost COMMIT acknowledgement");
+  const store = new PostgresArtifactStore(
+    {
+      connectionString,
+      namespace: storeNamespace,
+      limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    },
+    {
+      commitTransaction: async (client: PoolClient) => {
+        await client.query("COMMIT");
+        if (!rejectAcknowledgement) return;
+        rejectAcknowledgement = false;
+        commitApplied.resolve();
+        await Promise.resolve();
+        throw injectedFailure;
+      },
+    },
+  );
+  const observer = new Pool({ connectionString });
+  await store.open();
+  try {
+    const write = store.put(artifactDigest, source(content));
+    await commitApplied.promise;
+    await Promise.all([write, store.close()]);
+
+    const durable = await observer.query<{
+      artifacts: string;
+      committed_bytes: string;
+    }>(
+      `SELECT
+         count(a.digest)::text AS artifacts,
+         u.committed_bytes::text
+       FROM tego_artifact_namespace_usage u
+       LEFT JOIN tego_artifacts a USING (driver_namespace)
+       WHERE u.driver_namespace = $1
+       GROUP BY u.committed_bytes`,
+      [storeNamespace],
+    );
+    assert.deepEqual(durable.rows[0], { artifacts: "1", committed_bytes: "4" });
+  } finally {
+    await Promise.all([store.close(), observer.end()]);
+  }
+});
+
+test("inconsistent state after a lost COMMIT acknowledgement is retryably indeterminate", async () => {
+  const storeNamespace = namespace("artifact_commit_indeterminate");
+  const content = Buffer.from("data");
+  const artifactDigest = digest(content);
+  const observer = new Pool({ connectionString });
+  let rejectAcknowledgement = true;
+  const store = new PostgresArtifactStore(
+    {
+      connectionString,
+      namespace: storeNamespace,
+      limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    },
+    {
+      commitTransaction: async (client: PoolClient) => {
+        await client.query("COMMIT");
+        if (!rejectAcknowledgement) return;
+        rejectAcknowledgement = false;
+        await observer.query(
+          `UPDATE tego_artifact_namespace_usage
+              SET committed_bytes = committed_bytes + 1
+            WHERE driver_namespace = $1`,
+          [storeNamespace],
+        );
+        throw new Error("injected lost COMMIT acknowledgement");
+      },
+    },
+  );
+  await store.open();
+  try {
+    await assert.rejects(store.put(artifactDigest, source(content)), (error: unknown) => {
+      assert.ok(error instanceof DiagnosticError);
+      assert.equal(error.diagnostic.code, "ARTIFACT_COMMIT_INDETERMINATE");
+      assert.equal(error.diagnostic.retryable, true);
+      assert.deepEqual(error.diagnostic.details, {
+        digest: artifactDigest,
+        namespace: storeNamespace,
+        candidateBytes: "4",
+        limitBytes: "4",
+      });
+      assert.doesNotThrow(() => JSON.stringify(error.diagnostic));
+      return true;
+    });
+  } finally {
+    await Promise.all([store.close(), observer.end()]);
+  }
+});
+
+test("a definitively absent artifact after COMMIT failure preserves the original error", async () => {
+  const storeNamespace = namespace("artifact_commit_absent");
+  const content = Buffer.from("data");
+  const injectedFailure = new Error("injected pre-COMMIT connection failure");
+  const store = new PostgresArtifactStore(
+    {
+      connectionString,
+      namespace: storeNamespace,
+      limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    },
+    {
+      commitTransaction: async (client: PoolClient) => {
+        await client.query("ROLLBACK");
+        throw injectedFailure;
+      },
+    },
+  );
+  const observer = new Pool({ connectionString });
+  await store.open();
+  try {
+    await assert.rejects(
+      store.put(digest(content), source(content)),
+      (error: unknown) => error === injectedFailure,
+    );
+    const durable = await observer.query<{ artifacts: string; usage: string }>(
+      `SELECT
+         (SELECT count(*)::text FROM tego_artifacts WHERE driver_namespace = $1) AS artifacts,
+         (SELECT count(*)::text FROM tego_artifact_namespace_usage WHERE driver_namespace = $1)
+           AS usage`,
+      [storeNamespace],
+    );
+    assert.deepEqual(durable.rows[0], { artifacts: "0", usage: "0" });
+  } finally {
+    await Promise.all([store.close(), observer.end()]);
+  }
+});
+
+for (const blockedAcquisition of ["preflight", "transaction"] as const) {
+  test(`close cancels a never-resolving ${blockedAcquisition} client acquisition and destroys a late client`, async () => {
+    const storeNamespace = namespace(`artifact_${blockedAcquisition}_acquire_close`);
+    const content = Buffer.from("data");
+    const artifactDigest = digest(content);
+    const acquisitionStarted = Promise.withResolvers<void>();
+    const lateAcquisition = Promise.withResolvers<PoolClient>();
+    const observer = new Pool({ connectionString });
+    let calls = 0;
+    const store = new PostgresArtifactStore(
+      {
+        connectionString,
+        namespace: storeNamespace,
+        limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+        connectionTimeoutMillis: 5_000,
+      },
+      {
+        connectClient: async (pool: Pool) => {
+          calls += 1;
+          if (blockedAcquisition === "transaction" && calls === 1) return pool.connect();
+          acquisitionStarted.resolve();
+          return lateAcquisition.promise;
+        },
+      },
+    );
+    await store.open();
+    try {
+      const write = store.put(artifactDigest, source(content));
+      await acquisitionStarted.promise;
+      await Promise.race([
+        store.close(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Artifact store close did not cancel client acquisition")),
+            2_000,
+          ),
+        ),
+      ]);
+      await assert.rejects(
+        write,
+        (error: unknown) => diagnosticCode(error) === "ARTIFACT_STORE_CLOSED",
+      );
+
+      const lateClient = await observer.connect();
+      lateAcquisition.resolve(lateClient);
+      const deadline = Date.now() + 2_000;
+      while (observer.totalCount !== 0) {
+        if (Date.now() >= deadline) throw new Error("Late PostgreSQL client was not destroyed");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      await Promise.all([store.close(), observer.end()]);
+    }
+  });
+}

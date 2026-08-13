@@ -19,6 +19,7 @@ export interface PostgresClientMonitor {
 
 export interface PostgresConnectionOptions {
   readonly connectionString: string;
+  readonly connectionTimeoutMillis?: number;
   readonly namespace: string;
 }
 
@@ -36,6 +37,7 @@ export function createPool(options: PostgresConnectionOptions, component: string
   const pool = new Pool({
     application_name: `tego:${options.namespace}:${component}`,
     connectionString: options.connectionString,
+    connectionTimeoutMillis: options.connectionTimeoutMillis,
     max,
   });
   pool.on("error", (error: Error) => {

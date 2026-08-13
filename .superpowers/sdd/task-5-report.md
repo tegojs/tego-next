@@ -100,3 +100,70 @@ Final verdict: **Ready — yes**, with no Critical, Important, or Minor findings
 
 None. The test cluster is disposable and is stopped with `pg_ctl -m fast` before removing only its
 validated `/tmp/tego-task5-pg.*` root.
+
+## Follow-up lifecycle and accounting hardening
+
+An adversarial follow-up review identified three races plus inconsistent byte-detail types. The
+store now treats COMMIT acknowledgement loss as an unknown outcome: it destroys the failed
+transaction client, obtains an independent client, serializes reconciliation on the namespace
+usage row, and compares the exact artifact bytes/metadata with exact aggregate accounting. A fully
+committed artifact returns success even if close began; a definitively absent artifact preserves
+the original error; any inconsistent or unreadable outcome returns retryable
+`ARTIFACT_COMMIT_INDETERMINATE`. Reconciliation and acquisition are bounded.
+
+Both preflight and transaction client acquisition now race the operation abort signal and the
+configured `connectionTimeoutMillis`. A late client is destroyed, and late rejection is observed;
+close no longer waits on a connector that never settles. Close protects and waits for bounded
+reconciliation just as it protects a COMMIT already past its linearization point.
+
+Before reserving new ingress, the store refreshes which locally reserved digests have become
+durable. Those reservations stop charging local capacity but their callers still consume and hash
+their complete sources. This admits artifact B exactly when another pool has durably published the
+stalled local duplicate A and durable A+B equals the quota. PostgreSQL byte diagnostics now use
+decimal strings consistently for artifact/candidate, committed, reserved, and limit values.
+
+### Follow-up RED
+
+The new fault-injection tests initially failed to compile because no injectable acquisition or
+COMMIT boundary existed:
+
+```text
+test/artifact-boundaries.test.ts(...): error TS2554: Expected 1 arguments, but got 2.
+```
+
+The duplicate-promotion and decimal-string assertions were also written against the old behavior
+before implementation.
+
+### Follow-up GREEN
+
+A second isolated cluster was created with the same commands, using the validated root
+`/tmp/tego-task5-followup-pg.cBW78j`, port 55432, and URL
+`postgresql://tego_test@127.0.0.1:55432/tego_next_test`. It reported:
+
+```text
+postgres (PostgreSQL) 16.14 (Homebrew)
+```
+
+Fresh final verification:
+
+```sh
+TEGO_POSTGRES_URL=postgresql://tego_test@127.0.0.1:55432/tego_next_test \
+  npm run test:integration --workspace @tego/drivers-postgres
+npm run build
+npm run typecheck
+npx biome check packages/drivers-postgres/src/postgres-artifact-store.ts \
+  packages/drivers-postgres/src/shared.ts \
+  packages/drivers-postgres/src/create-postgres-drivers.ts \
+  packages/drivers-postgres/test/postgres-drivers.test.ts \
+  packages/drivers-postgres/test/artifact-boundaries.test.ts
+git diff --check
+```
+
+Result: PostgreSQL integration **85/85 passed**. Workspace build and typecheck, focused Biome, and
+diff-check all passed. The focused fault set covers acknowledged-after-commit failure, inconsistent
+commit outcome, definitively absent outcome, never-resolving preflight acquisition,
+never-resolving transaction acquisition, late-client destruction, and durable duplicate
+promotion.
+
+Independent follow-up review verdict: **READY**, with no Critical, Important, or Minor findings.
+The reviewer separately passed diff-check, focused Biome, and the PostgreSQL workspace typecheck.

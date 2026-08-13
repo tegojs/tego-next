@@ -3,9 +3,12 @@ import {
   type ArtifactDigest,
   type ArtifactStorageLimits,
   type ArtifactStore,
+  DiagnosticError,
   type DriverHealth,
   parseArtifactDigest,
   parseArtifactStorageLimits,
+  runtimeDiagnostic,
+  serializeCause,
 } from "@tego/contracts";
 import type { Pool, PoolClient } from "pg";
 import {
@@ -20,9 +23,18 @@ import {
 /** @deprecated Configure `limits.maxArtifactBytes` when constructing the store. */
 export const POSTGRES_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
+const DEFAULT_CONNECTION_TIMEOUT_MILLIS = 5_000;
+const DEFAULT_RECONCILIATION_TIMEOUT_MILLIS = 5_000;
 
 export interface PostgresArtifactStoreOptions extends PostgresConnectionOptions {
   readonly limits?: Partial<ArtifactStorageLimits>;
+}
+
+/** @internal Injectable PostgreSQL actions used by lifecycle fault tests. */
+export interface PostgresArtifactStoreDependencies {
+  readonly commitTransaction?: (client: PoolClient) => Promise<void>;
+  readonly connectClient?: (pool: Pool) => Promise<PoolClient>;
+  readonly reconciliationTimeoutMillis?: number;
 }
 
 interface IngressReservation {
@@ -30,6 +42,7 @@ interface IngressReservation {
   readonly digest: ArtifactDigest;
   readonly id: symbol;
   bytes: number;
+  charged: boolean;
 }
 
 export class PostgresArtifactStore implements ArtifactStore {
@@ -37,21 +50,41 @@ export class PostgresArtifactStore implements ArtifactStore {
   readonly #namespace: string;
   readonly #limits: ArtifactStorageLimits;
   readonly #pool: Pool;
+  readonly #connectClient: (pool: Pool) => Promise<PoolClient>;
+  readonly #commitTransaction: (client: PoolClient) => Promise<void>;
+  readonly #connectionTimeoutMillis: number;
+  readonly #reconciliationTimeoutMillis: number;
   readonly #operations = new Set<Promise<unknown>>();
+  readonly #clientAcquisitions = new Set<Promise<PoolClient>>();
   readonly #activeClients = new Set<PoolClient>();
   readonly #committingClients = new Set<PoolClient>();
+  readonly #reconcilingClients = new Set<PoolClient>();
   readonly #releasedClients = new WeakSet<PoolClient>();
   readonly #writeControllers = new Set<AbortController>();
-  readonly #ingress = new Map<ArtifactDigest, Map<symbol, number>>();
+  readonly #ingress = new Map<ArtifactDigest, Map<symbol, IngressReservation>>();
   #ingressBytes = 0n;
   #lifecycle: "closed" | "created" | "open" | "opening" = "created";
   #openPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
 
-  constructor(options: PostgresArtifactStoreOptions) {
+  constructor(
+    options: PostgresArtifactStoreOptions,
+    dependencies: PostgresArtifactStoreDependencies = {},
+  ) {
     this.#namespace = options.namespace;
     this.#limits = parseArtifactStorageLimits(options.limits);
+    this.#connectionTimeoutMillis = this.#positiveTimeout(
+      options.connectionTimeoutMillis ?? DEFAULT_CONNECTION_TIMEOUT_MILLIS,
+      "connectionTimeoutMillis",
+    );
+    this.#reconciliationTimeoutMillis = this.#positiveTimeout(
+      dependencies.reconciliationTimeoutMillis ?? DEFAULT_RECONCILIATION_TIMEOUT_MILLIS,
+      "reconciliationTimeoutMillis",
+    );
     this.#pool = createPool(options, "artifacts");
+    this.#connectClient = dependencies.connectClient ?? ((pool) => pool.connect());
+    this.#commitTransaction =
+      dependencies.commitTransaction ?? (async (client) => client.query("COMMIT").then(() => {}));
   }
 
   open(): Promise<void> {
@@ -131,9 +164,10 @@ export class PostgresArtifactStore implements ArtifactStore {
       for (const controller of this.#writeControllers) controller.abort(this.#closedError());
       await this.#openPromise?.catch(() => undefined);
       for (const client of [...this.#activeClients]) {
-        if (!this.#committingClients.has(client)) this.#releaseClient(client, true);
+        if (!this.#committingClients.has(client) && !this.#reconcilingClients.has(client)) {
+          this.#releaseClient(client, true);
+        }
       }
-      this.#activeClients.clear();
       await Promise.allSettled([...this.#operations]);
       await this.#pool.end();
     })();
@@ -146,15 +180,16 @@ export class PostgresArtifactStore implements ArtifactStore {
     source: AsyncIterable<Uint8Array>,
     signal: AbortSignal,
   ): Promise<void> {
-    const status = await this.#artifactStatus(digest);
+    const status = await this.#artifactStatus(digest, signal);
     if (signal.aborted || this.#lifecycle !== "open") throw this.#closedError();
+    this.#promoteDurableIngress(status.durableDigests);
     const reservation = status.exists
       ? undefined
       : this.#reserveIngress(digest, status.committedBytes);
     try {
       const content = await this.#bufferAndVerify(digest, source, signal, reservation);
       if (signal.aborted || this.#lifecycle !== "open") throw this.#closedError();
-      await this.#commitArtifact(digest, content);
+      await this.#commitArtifact(digest, content, signal);
     } finally {
       if (reservation !== undefined) this.#releaseIngress(reservation);
     }
@@ -236,11 +271,14 @@ export class PostgresArtifactStore implements ArtifactStore {
     }
   }
 
-  async #commitArtifact(digest: ArtifactDigest, content: Buffer): Promise<void> {
-    const client = await this.#pool.connect();
-    this.#releasedClients.delete(client);
-    this.#activeClients.add(client);
+  async #commitArtifact(
+    digest: ArtifactDigest,
+    content: Buffer,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const client = await this.#trackedClient(signal);
     const monitor = monitorPostgresClient(client, this.#pool);
+    let commitStarted = false;
     let transactionStarted = false;
     try {
       this.#assertOpen();
@@ -306,7 +344,8 @@ export class PostgresArtifactStore implements ArtifactStore {
             { digest },
           );
         }
-        await this.#commit(client);
+        commitStarted = true;
+        await this.#commitAndReconcile(client, digest, content);
         transactionStarted = false;
         return;
       }
@@ -320,10 +359,10 @@ export class PostgresArtifactStore implements ArtifactStore {
           {
             digest,
             namespace: this.#namespace,
-            artifactBytes: content.byteLength,
+            artifactBytes: content.byteLength.toString(),
             committedBytes: committedBytes.toString(),
-            reservedBytes: content.byteLength,
-            maximumBytes: this.#limits.maxNamespaceBytes,
+            reservedBytes: content.byteLength.toString(),
+            maximumBytes: this.#limits.maxNamespaceBytes.toString(),
           },
         );
       }
@@ -339,13 +378,14 @@ export class PostgresArtifactStore implements ArtifactStore {
         [this.#namespace, content.byteLength.toString()],
       );
       this.#assertOpen();
-      await this.#commit(client);
+      commitStarted = true;
+      await this.#commitAndReconcile(client, digest, content);
       transactionStarted = false;
     } catch (error) {
-      if (transactionStarted && !this.#releasedClients.has(client)) {
+      if (transactionStarted && !commitStarted && !this.#releasedClients.has(client)) {
         await client.query("ROLLBACK").catch(() => undefined);
       }
-      if (this.#lifecycle === "closed") throw this.#closedError();
+      if (!commitStarted && this.#lifecycle === "closed") throw this.#closedError();
       throw error;
     } finally {
       this.#activeClients.delete(client);
@@ -357,24 +397,29 @@ export class PostgresArtifactStore implements ArtifactStore {
   }
 
   #reserveIngress(digest: ArtifactDigest, committedBytes: bigint): IngressReservation {
-    const reservation = { committedBytes, digest, id: Symbol(digest), bytes: 0 };
-    const digestReservations = this.#ingress.get(digest) ?? new Map<symbol, number>();
-    digestReservations.set(reservation.id, 0);
+    const reservation = { committedBytes, digest, id: Symbol(digest), bytes: 0, charged: true };
+    const digestReservations = this.#ingress.get(digest) ?? new Map<symbol, IngressReservation>();
+    digestReservations.set(reservation.id, reservation);
     this.#ingress.set(digest, digestReservations);
     return reservation;
   }
 
   #resizeIngress(reservation: IngressReservation, bytes: number): void {
+    if (!reservation.charged) {
+      reservation.bytes = bytes;
+      return;
+    }
     const digestReservations = this.#ingress.get(reservation.digest);
     if (digestReservations === undefined || !digestReservations.has(reservation.id)) {
       throw new Error("Artifact ingress reservation is no longer active");
     }
+    const previousBytes = reservation.bytes;
     const previousMaximum = this.#maximumReservation(digestReservations);
-    digestReservations.set(reservation.id, bytes);
+    reservation.bytes = bytes;
     const nextMaximum = this.#maximumReservation(digestReservations);
     const projected = this.#ingressBytes - BigInt(previousMaximum) + BigInt(nextMaximum);
     if (reservation.committedBytes + projected > BigInt(this.#limits.maxNamespaceBytes)) {
-      digestReservations.set(reservation.id, reservation.bytes);
+      reservation.bytes = previousBytes;
       throw postgresError(
         "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
         "Artifact namespace exceeds the configured storage quota",
@@ -382,18 +427,18 @@ export class PostgresArtifactStore implements ArtifactStore {
         {
           digest: reservation.digest,
           namespace: this.#namespace,
-          artifactBytes: bytes,
+          artifactBytes: bytes.toString(),
           committedBytes: reservation.committedBytes.toString(),
           reservedBytes: projected.toString(),
-          maximumBytes: this.#limits.maxNamespaceBytes,
+          maximumBytes: this.#limits.maxNamespaceBytes.toString(),
         },
       );
     }
-    reservation.bytes = bytes;
     this.#ingressBytes = projected;
   }
 
   #releaseIngress(reservation: IngressReservation): void {
+    if (!reservation.charged) return;
     const digestReservations = this.#ingress.get(reservation.digest);
     if (digestReservations === undefined || !digestReservations.has(reservation.id)) return;
     const previousMaximum = this.#maximumReservation(digestReservations);
@@ -403,10 +448,22 @@ export class PostgresArtifactStore implements ArtifactStore {
     if (digestReservations.size === 0) this.#ingress.delete(reservation.digest);
   }
 
-  #maximumReservation(reservations: ReadonlyMap<symbol, number>): number {
+  #maximumReservation(reservations: ReadonlyMap<symbol, IngressReservation>): number {
     let maximum = 0;
-    for (const bytes of reservations.values()) maximum = Math.max(maximum, bytes);
+    for (const reservation of reservations.values()) {
+      maximum = Math.max(maximum, reservation.bytes);
+    }
     return maximum;
+  }
+
+  #promoteDurableIngress(digests: readonly string[]): void {
+    for (const digest of digests) {
+      const reservations = this.#ingress.get(digest as ArtifactDigest);
+      if (reservations === undefined) continue;
+      this.#ingressBytes -= BigInt(this.#maximumReservation(reservations));
+      this.#ingress.delete(digest as ArtifactDigest);
+      for (const reservation of reservations.values()) reservation.charged = false;
+    }
   }
 
   #assertOpen(): void {
@@ -415,11 +472,21 @@ export class PostgresArtifactStore implements ArtifactStore {
 
   async #artifactStatus(
     digest: ArtifactDigest,
-  ): Promise<{ readonly committedBytes: bigint; readonly exists: boolean }> {
-    const client = await this.#trackedClient();
+    signal: AbortSignal,
+  ): Promise<{
+    readonly committedBytes: bigint;
+    readonly durableDigests: readonly string[];
+    readonly exists: boolean;
+  }> {
+    const reservedDigests = [...this.#ingress.keys()];
+    const client = await this.#trackedClient(signal);
     const monitor = monitorPostgresClient(client, this.#pool);
     try {
-      const result = await client.query<{ committed_bytes: string; exists: boolean }>(
+      const result = await client.query<{
+        committed_bytes: string;
+        durable_digests: string[];
+        exists: boolean;
+      }>(
         `SELECT
            EXISTS(
              SELECT 1
@@ -430,13 +497,20 @@ export class PostgresArtifactStore implements ArtifactStore {
              SELECT committed_bytes::text
              FROM tego_artifact_namespace_usage
              WHERE driver_namespace = $1
-           ), '0') AS committed_bytes`,
-        [this.#namespace, digest],
+           ), '0') AS committed_bytes,
+           ARRAY(
+             SELECT durable.digest
+             FROM tego_artifacts durable
+             WHERE durable.driver_namespace = $1
+               AND durable.digest = ANY($3::text[])
+           ) AS durable_digests`,
+        [this.#namespace, digest, reservedDigests],
       );
       const row = result.rows[0];
       if (this.#lifecycle !== "open") throw this.#closedError();
       return {
         committedBytes: this.#databaseBytes(row?.committed_bytes, "artifact namespace usage"),
+        durableDigests: row?.durable_digests ?? [],
         exists: row?.exists === true,
       };
     } catch (error) {
@@ -480,7 +554,7 @@ export class PostgresArtifactStore implements ArtifactStore {
         "ARTIFACT_SIZE_LIMIT_EXCEEDED",
         "Stored artifact exceeds the configured per-artifact limit",
         "artifact",
-        { digest, maximumBytes: this.#limits.maxArtifactBytes },
+        { digest, maximumBytes: this.#limits.maxArtifactBytes.toString() },
       );
     }
     if (contentBytes !== declaredBytes || row.content === null) {
@@ -514,7 +588,7 @@ export class PostgresArtifactStore implements ArtifactStore {
         digest,
         namespace: this.#namespace,
         artifactBytes,
-        maximumBytes: this.#limits.maxArtifactBytes,
+        maximumBytes: this.#limits.maxArtifactBytes.toString(),
       },
     );
   }
@@ -528,22 +602,240 @@ export class PostgresArtifactStore implements ArtifactStore {
   async #commit(client: PoolClient): Promise<void> {
     this.#committingClients.add(client);
     try {
-      await client.query("COMMIT");
+      await this.#commitTransaction(client);
     } finally {
       this.#committingClients.delete(client);
     }
   }
 
-  async #trackedClient(): Promise<PoolClient> {
-    const client = await this.#pool.connect();
+  async #trackedClient(
+    signal?: AbortSignal,
+    options: {
+      readonly allowClosed?: boolean;
+      readonly reconcile?: boolean;
+      readonly timeoutMillis?: number;
+    } = {},
+  ): Promise<PoolClient> {
+    if (signal?.aborted) throw this.#closedError();
+    if (options.allowClosed !== true) this.#assertOpen();
+    let abandoned = false;
+    const acquisition = Promise.resolve().then(() => this.#connectClient(this.#pool));
+    this.#clientAcquisitions.add(acquisition);
+    const removeAcquisition = () => this.#clientAcquisitions.delete(acquisition);
+    void acquisition.then(removeAcquisition, removeAcquisition);
+    const guardedAcquisition = acquisition.then((client) => {
+      if (abandoned) {
+        this.#releasedClients.delete(client);
+        this.#releaseClient(client, true);
+      }
+      return client;
+    });
+    let removeAbort = () => {};
+    let timeout: NodeJS.Timeout | undefined;
+    const interrupted = new Promise<never>((_, reject) => {
+      if (signal !== undefined) {
+        const onAbort = () => reject(this.#closedError());
+        signal.addEventListener("abort", onAbort, { once: true });
+        removeAbort = () => signal.removeEventListener("abort", onAbort);
+      }
+      timeout = setTimeout(
+        () => reject(this.#acquisitionTimeoutError(options.timeoutMillis)),
+        options.timeoutMillis ?? this.#connectionTimeoutMillis,
+      );
+      timeout.unref();
+    });
+    let client: PoolClient;
+    try {
+      client = await Promise.race([guardedAcquisition, interrupted]);
+    } catch (error) {
+      abandoned = true;
+      throw error;
+    } finally {
+      removeAbort();
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
     this.#releasedClients.delete(client);
     this.#activeClients.add(client);
-    if (this.#lifecycle !== "open") {
+    if (options.reconcile === true) this.#reconcilingClients.add(client);
+    if (options.allowClosed !== true && this.#lifecycle !== "open") {
       this.#activeClients.delete(client);
       this.#releaseClient(client, true);
       throw this.#closedError();
     }
     return client;
+  }
+
+  async #commitAndReconcile(
+    client: PoolClient,
+    digest: ArtifactDigest,
+    content: Buffer,
+  ): Promise<void> {
+    try {
+      await this.#commit(client);
+    } catch (error) {
+      this.#activeClients.delete(client);
+      this.#releaseClient(client, true);
+      const committed = await this.#reconcileCommit(digest, content, error);
+      if (!committed) throw error;
+    }
+  }
+
+  async #reconcileCommit(
+    digest: ArtifactDigest,
+    content: Buffer,
+    commitError: unknown,
+  ): Promise<boolean> {
+    let client: PoolClient | undefined;
+    let destroy = false;
+    try {
+      client = await this.#trackedClient(undefined, {
+        allowClosed: true,
+        reconcile: true,
+        timeoutMillis: this.#reconciliationTimeoutMillis,
+      });
+      const reconciliation = (async () => {
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO tego_artifact_namespace_usage(driver_namespace, committed_bytes)
+           VALUES ($1, 0)
+           ON CONFLICT(driver_namespace) DO NOTHING`,
+          [this.#namespace],
+        );
+        await client.query(
+          `SELECT committed_bytes
+             FROM tego_artifact_namespace_usage
+            WHERE driver_namespace = $1
+            FOR UPDATE`,
+          [this.#namespace],
+        );
+        const result = await client.query<{
+          committed_bytes: string | null;
+          content: Buffer | null;
+          content_bytes: string | null;
+          namespace_bytes: string;
+          size_bytes: string | null;
+        }>(
+          `SELECT
+             CASE
+               WHEN target.size_bytes <= $3::bigint
+                 AND octet_length(target.content) <= $3::bigint
+                 AND target.size_bytes = octet_length(target.content)
+               THEN target.content
+               ELSE NULL
+             END AS content,
+             octet_length(target.content)::text AS content_bytes,
+             target.size_bytes::text,
+             usage.committed_bytes::text,
+             COALESCE(total.namespace_bytes, 0)::text AS namespace_bytes
+           FROM (SELECT $1::text AS driver_namespace, $2::text AS digest) requested
+           LEFT JOIN tego_artifacts target USING (driver_namespace, digest)
+           LEFT JOIN tego_artifact_namespace_usage usage USING (driver_namespace)
+           LEFT JOIN LATERAL (
+             SELECT COALESCE(sum(octet_length(content)), 0)::bigint AS namespace_bytes
+             FROM tego_artifacts
+             WHERE driver_namespace = requested.driver_namespace
+           ) total ON true`,
+          [this.#namespace, digest, this.#limits.maxArtifactBytes.toString()],
+        );
+        await client.query("ROLLBACK");
+        return result;
+      })();
+      const result = await this.#bounded(reconciliation, this.#reconciliationTimeoutMillis, () => {
+        if (client !== undefined) this.#releaseClient(client, true);
+      });
+      const row = result.rows[0];
+      if (row?.content_bytes === null || row?.content_bytes === undefined) return false;
+      const contentBytes = this.#databaseBytes(row.content_bytes, "artifact content size");
+      const declaredBytes = this.#databaseBytes(row.size_bytes, "artifact declared size");
+      const committedBytes = this.#databaseBytes(row.committed_bytes, "artifact namespace usage");
+      const namespaceBytes = this.#databaseBytes(row.namespace_bytes, "artifact namespace total");
+      if (
+        contentBytes === BigInt(content.byteLength) &&
+        declaredBytes === contentBytes &&
+        row.content !== null &&
+        Buffer.from(row.content).equals(content) &&
+        committedBytes === namespaceBytes
+      ) {
+        return true;
+      }
+      throw this.#commitIndeterminateError(digest, content.byteLength, commitError);
+    } catch (error) {
+      if (
+        error instanceof DiagnosticError &&
+        error.diagnostic.code === "ARTIFACT_COMMIT_INDETERMINATE"
+      ) {
+        throw error;
+      }
+      destroy = true;
+      throw this.#commitIndeterminateError(digest, content.byteLength, commitError, error);
+    } finally {
+      if (client !== undefined) {
+        this.#activeClients.delete(client);
+        this.#reconcilingClients.delete(client);
+        this.#releaseClient(client, destroy);
+      }
+    }
+  }
+
+  async #bounded<T>(promise: Promise<T>, timeoutMillis: number, onTimeout: () => void): Promise<T> {
+    let timeout: NodeJS.Timeout | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        onTimeout();
+        reject(new Error("PostgreSQL reconciliation timed out"));
+      }, timeoutMillis);
+      timeout.unref();
+    });
+    try {
+      return await Promise.race([promise, expired]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
+
+  #commitIndeterminateError(
+    digest: ArtifactDigest,
+    candidateBytes: number,
+    commitError: unknown,
+    reconciliationError?: unknown,
+  ): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ARTIFACT_COMMIT_INDETERMINATE",
+        message: "PostgreSQL artifact commit outcome could not be determined",
+        source: { kind: "artifact", id: "postgres-artifact" },
+        retryable: true,
+        details: {
+          digest,
+          namespace: this.#namespace,
+          candidateBytes: candidateBytes.toString(),
+          limitBytes: this.#limits.maxNamespaceBytes.toString(),
+          ...(reconciliationError === undefined
+            ? {}
+            : { reconciliationFailure: serializeCause(reconciliationError) }),
+        },
+        cause: serializeCause(commitError),
+      }),
+    );
+  }
+
+  #acquisitionTimeoutError(timeoutMillis = this.#connectionTimeoutMillis): DiagnosticError {
+    return new DiagnosticError(
+      runtimeDiagnostic({
+        code: "ARTIFACT_BACKEND_UNAVAILABLE",
+        message: "Timed out acquiring a PostgreSQL artifact client",
+        source: { kind: "artifact", id: "postgres-artifact" },
+        retryable: true,
+        details: { timeoutMillis: timeoutMillis.toString() },
+      }),
+    );
+  }
+
+  #positiveTimeout(value: number, field: string): number {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new TypeError(`${field} must be a positive safe integer`);
+    }
+    return value;
   }
 
   #closedError() {

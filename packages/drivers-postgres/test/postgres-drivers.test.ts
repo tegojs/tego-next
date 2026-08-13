@@ -570,10 +570,10 @@ test("PostgreSQL ArtifactStore persists quota usage across restart and validates
         assert.deepEqual(error.diagnostic.details, {
           digest: nextDigest,
           namespace: storeNamespace,
-          artifactBytes: 4,
+          artifactBytes: "4",
           committedBytes: "4",
           reservedBytes: "4",
-          maximumBytes: 6,
+          maximumBytes: "6",
         });
         assert.doesNotThrow(() => JSON.stringify(error.diagnostic));
         return true;
@@ -791,6 +791,49 @@ test("two PostgreSQL ArtifactStore pools serialize concurrent first use of a nam
   } finally {
     if (blocked) await blocker.query("ROLLBACK").catch(() => undefined);
     blocker.release();
+    await Promise.all([left.close(), right.close(), observer.end()]);
+  }
+});
+
+test("a durable duplicate releases local ingress before another artifact is admitted", async () => {
+  const storeNamespace = namespace("artifact_quota_duplicate_promotion");
+  const limits = { maxArtifactBytes: 4, maxNamespaceBytes: 6 };
+  const left = new PostgresArtifactStore({ connectionString, namespace: storeNamespace, limits });
+  const right = new PostgresArtifactStore({ connectionString, namespace: storeNamespace, limits });
+  const observer = new Pool({ connectionString });
+  const artifactA = Buffer.from("aaaa");
+  const artifactB = Buffer.from("bb");
+  const buffered = Promise.withResolvers<void>();
+  const releaseSource = Promise.withResolvers<void>();
+  async function* stalledSource(): AsyncIterable<Uint8Array> {
+    yield artifactA;
+    buffered.resolve();
+    await releaseSource.promise;
+  }
+
+  await Promise.all([left.open(), right.open()]);
+  try {
+    const stalledDuplicate = left.put(digest(artifactA), stalledSource());
+    await buffered.promise;
+    await right.put(digest(artifactA), source(artifactA));
+
+    await left.put(digest(artifactB), source(artifactB));
+    releaseSource.resolve();
+    await stalledDuplicate;
+
+    const durable = await observer.query<{ artifacts: string; committed_bytes: string }>(
+      `SELECT
+         count(a.digest)::text AS artifacts,
+         u.committed_bytes::text
+       FROM tego_artifact_namespace_usage u
+       LEFT JOIN tego_artifacts a USING (driver_namespace)
+       WHERE u.driver_namespace = $1
+       GROUP BY u.committed_bytes`,
+      [storeNamespace],
+    );
+    assert.deepEqual(durable.rows[0], { artifacts: "2", committed_bytes: "6" });
+  } finally {
+    releaseSource.resolve();
     await Promise.all([left.close(), right.close(), observer.end()]);
   }
 });
