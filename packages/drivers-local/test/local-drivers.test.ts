@@ -9,6 +9,7 @@ import {
   open,
   readdir,
   readFile,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -450,6 +451,69 @@ test("retry repairs directory durability after fsync fails following rename", as
   await store.close();
 });
 
+test("close at each publication await cannot acknowledge or uncharge a renamed target", async (context) => {
+  for (const phase of ["rename", "shard-sync", "parent-sync"] as const) {
+    await context.test(phase, async () => {
+      const rootDirectory = await temporaryDirectory(`artifact-quota-close-${phase}`);
+      const content = Buffer.alloc(4, phase.charCodeAt(0));
+      const expected = digest(content);
+      const paused = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let pausePublication = false;
+      let syncCalls = 0;
+      const store = new FilesystemArtifactStore({
+        rootDirectory,
+        namespace: artifactNamespace,
+        limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+        platform: "darwin",
+        renameArtifact: async (source, target) => {
+          await rename(source, target);
+          if (phase === "rename") {
+            paused.resolve();
+            await release.promise;
+          }
+        },
+        syncDirectory: async () => {
+          if (!pausePublication) return;
+          syncCalls += 1;
+          if (
+            (phase === "shard-sync" && syncCalls === 1) ||
+            (phase === "parent-sync" && syncCalls === 2)
+          ) {
+            paused.resolve();
+            await release.promise;
+          }
+        },
+      });
+      await store.open();
+      pausePublication = true;
+      const putting = store.put(expected, bytesSource(content));
+      await paused.promise;
+      assert.deepEqual(await readFile(store.pathFor(expected)), content);
+
+      const closing = store.close();
+      release.resolve();
+      await assert.rejects(
+        putting,
+        (error: unknown) => diagnosticCode(error) === "ARTIFACT_CLOSED",
+      );
+      await within(closing, `Timed out closing during ${phase}`, 500);
+
+      const reopened = new FilesystemArtifactStore({
+        rootDirectory,
+        namespace: artifactNamespace,
+        limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+      });
+      await reopened.open();
+      await assert.rejects(
+        reopened.put(digest(Buffer.alloc(1, 0x77)), bytesSource(Buffer.alloc(1, 0x77))),
+        (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+      );
+      await reopened.close();
+    });
+  }
+});
+
 test("artifact quota startup ignores temporary and malformed unexpected paths", async () => {
   const rootDirectory = await temporaryDirectory("artifact-quota-unexpected-paths");
   const artifactDirectory = join(rootDirectory, "artifacts");
@@ -605,6 +669,74 @@ test("direct quota commit cannot shrink same-digest pending durability occupancy
   );
   assert.equal(await quota.committedBytes(), 0);
   await smaller.release();
+  await quota.close();
+});
+
+test("indeterminate post-rename target inspection retains conservative quota occupancy", async () => {
+  const quota = new LocalArtifactQuota({
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    clock: new FakeClock(new Date("2026-08-13T00:00:00.000Z")),
+  });
+  const renamedDigest = digest(Buffer.from("renamed"));
+  const reservation = await quota.reserve(renamedDigest, 4);
+  const syncError = new Error("directory sync failed after rename");
+  const inspectError = new Error("target inspection failed transiently");
+  await assert.rejects(
+    quota.publish(
+      reservation,
+      async () => false,
+      async (duplicate: boolean, progress: { renamed(): void }) => {
+        assert.equal(duplicate, false);
+        progress.renamed();
+        throw syncError;
+      },
+      async () => {
+        throw inspectError;
+      },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.deepEqual(error.errors, [syncError, inspectError]);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    quota.reserve(digest(Buffer.from("distinct")), 1),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+  );
+  await quota.close();
+});
+
+test("undefined target inspection rejection still retains occupancy and aggregates", async () => {
+  const quota = new LocalArtifactQuota({
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    clock: new FakeClock(new Date("2026-08-13T00:00:00.000Z")),
+  });
+  const reservation = await quota.reserve(digest(Buffer.from("renamed-undefined")), 4);
+  const syncError = new Error("directory sync failed after rename");
+  await assert.rejects(
+    quota.publish(
+      reservation,
+      async () => false,
+      async (_duplicate, progress) => {
+        progress.renamed();
+        throw syncError;
+      },
+      async () => Promise.reject(undefined),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.deepEqual(error.errors, [syncError, undefined]);
+      return true;
+    },
+  );
+  await assert.rejects(
+    quota.reserve(digest(Buffer.from("distinct-undefined")), 1),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+  );
   await quota.close();
 });
 

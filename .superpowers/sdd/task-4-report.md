@@ -114,11 +114,20 @@ Follow-up review also covered two second-order boundaries: synchronous `iterator
 are now contained so they cannot replace the authoritative write/close diagnostic, and direct quota
 commits treat pending-durability bytes as occupied authoritative size rather than shrinking them.
 
+A final race review added explicit publication progress rather than inferring rename from a fallible
+target lookup. Close/abort is checked after rename, after every directory sync, and before quota
+promotion/success, so close after irreversible rename rejects the put while retaining conservative
+occupancy. If post-failure target inspection is indeterminate, pending occupancy is retained and the
+publication plus inspection errors are aggregated; only a definitive absent result may release it.
+The lifecycle regression pauses independently inside rename, shard sync, and parent sync. Target
+inspection failure uses an explicit sentinel, so even rejection with `undefined` remains
+indeterminate, charged, and aggregated.
+
 Focused review-fix suite result after implementation:
 
 ```text
-tests 41
-pass 41
+tests 47
+pass 47
 fail 0
 ```
 

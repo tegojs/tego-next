@@ -18,6 +18,10 @@ export interface LocalArtifactQuotaOptions {
   readonly clock: Clock;
 }
 
+export interface ArtifactPublishProgress {
+  renamed(): void;
+}
+
 class LocalReservation implements ArtifactQuotaReservation {
   readonly quota: LocalArtifactQuota;
   readonly digest: ArtifactDigest;
@@ -106,7 +110,8 @@ export class LocalArtifactQuota {
   publish(
     reservation: ArtifactQuotaReservation,
     targetExists: () => Promise<boolean>,
-    operation: (duplicate: boolean) => Promise<void>,
+    operation: (duplicate: boolean, progress: ArtifactPublishProgress) => Promise<void>,
+    inspectAfterFailure: () => Promise<boolean> = targetExists,
   ): Promise<void> {
     return this.#serialized(async () => {
       const local = this.#localReservation(reservation);
@@ -114,13 +119,29 @@ export class LocalArtifactQuota {
       this.#assertActive(local);
       const duplicate = await targetExists();
       if (!duplicate) this.#assertPublishCapacity(local);
+      let renamed = false;
       try {
-        await operation(duplicate);
+        await operation(duplicate, { renamed: () => (renamed = true) });
       } catch (error) {
-        if (!duplicate && (await targetExists().catch(() => false))) {
+        let inspectionError: unknown;
+        let inspectionFailed = false;
+        let targetPresent = false;
+        try {
+          targetPresent = await inspectAfterFailure();
+        } catch (inspectionFailure) {
+          inspectionFailed = true;
+          inspectionError = inspectionFailure;
+        }
+        if (!duplicate && (renamed || targetPresent || inspectionFailed)) {
           this.#pending.set(local.digest, local.bytes);
           local.state = "released";
           this.#reservations.delete(local);
+        }
+        if (inspectionFailed) {
+          throw new AggregateError(
+            [error, inspectionError],
+            "Artifact publication and target inspection failed",
+          );
         }
         throw error;
       }

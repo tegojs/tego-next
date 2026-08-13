@@ -37,6 +37,7 @@ export interface FilesystemArtifactStoreOptions {
   ) => Promise<ArtifactWriteHandle>;
   readonly removeTemporary?: (path: string) => Promise<void>;
   readonly removeEmptyDirectory?: (path: string) => Promise<void>;
+  readonly renameArtifact?: (source: string, target: string) => Promise<void>;
   readonly syncDirectory?: (path: string) => Promise<void>;
   readonly platform?: NodeJS.Platform;
 }
@@ -181,6 +182,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
   ) => Promise<ArtifactWriteHandle>;
   readonly #removeTemporary: (path: string) => Promise<void>;
   readonly #removeEmptyDirectory: (path: string) => Promise<void>;
+  readonly #renameArtifact: (source: string, target: string) => Promise<void>;
   readonly #platform: NodeJS.Platform;
   readonly #syncDirectoryAction: (path: string) => Promise<void>;
   readonly #operations = new Set<Promise<unknown>>();
@@ -206,6 +208,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
       options.openWriteHandle ?? ((path, flags, mode) => open(path, flags, mode));
     this.#removeTemporary = options.removeTemporary ?? removeIfPresent;
     this.#removeEmptyDirectory = options.removeEmptyDirectory ?? removeIfEmpty;
+    this.#renameArtifact = options.renameArtifact ?? rename;
     this.#platform = options.platform ?? process.platform;
     this.#syncDirectoryAction = options.syncDirectory ?? ((path) => this.#syncDirectory(path));
     this.#quota = new LocalArtifactQuota({
@@ -409,14 +412,18 @@ export class FilesystemArtifactStore implements ArtifactStore {
       await this.#quota.publish(
         reservation,
         () => this.#fileMatches(targetPath, digest),
-        async (duplicate) => {
+        async (duplicate, progress) => {
           this.#assertWriteOpen(signal);
           if (!duplicate) {
             await publishTempFileAtomically({
               platform: this.#platform,
               temporaryPath,
               targetPath,
-              rename,
+              rename: async (source, target) => {
+                await this.#renameArtifact(source, target);
+                progress.renamed();
+                this.#assertWriteOpen(signal);
+              },
               targetMatches: async () => this.#fileMatches(targetPath, digest),
               removeTemporary: async () => this.#removeTemporary(temporaryPath),
             });
@@ -427,9 +434,12 @@ export class FilesystemArtifactStore implements ArtifactStore {
             shardCreated,
           })) {
             await this.#syncDirectoryAction(directory);
+            this.#assertWriteOpen(signal);
           }
+          this.#assertWriteOpen(signal);
         },
       );
+      this.#assertWriteOpen(signal);
     } catch (primaryError) {
       throw await this.#cleanupWrite(
         primaryError,
