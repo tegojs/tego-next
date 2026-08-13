@@ -83,6 +83,49 @@ function diagnostic(code, message, details = {}) {
   return { level: "error", code, message, ...details };
 }
 
+export function parseRecordedReleaseEvidence(contents) {
+  if (typeof contents !== "string") throw new TypeError("release evidence must be text");
+  const match = /```release-evidence\s*\n([\s\S]*?)\n```/u.exec(contents);
+  if (match === null) throw new Error("release evidence block is missing");
+  let evidence;
+  try {
+    evidence = JSON.parse(match[1]);
+  } catch (error) {
+    throw new Error(
+      `release evidence block is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) {
+    throw new Error("release evidence must be a JSON object");
+  }
+  return evidence;
+}
+
+export function validateRecordedReleaseEvidence(evidence, gitSha) {
+  const errors = [];
+  if (typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) {
+    return ["release evidence is missing"];
+  }
+  if (!/^[0-9a-f]{40}$/u.test(gitSha)) errors.push("release HEAD must be a full Git SHA");
+  if (evidence.gitSha !== gitSha) errors.push("local verification Git SHA does not match HEAD");
+  if (evidence.localVerification !== "passed")
+    errors.push("local release verification is not passed");
+  const ci = evidence.authoritativeCi;
+  if (typeof ci !== "object" || ci === null || Array.isArray(ci)) {
+    errors.push("authoritative CI evidence is missing");
+  } else {
+    if (ci.status !== "passed") errors.push("authoritative CI is not passed");
+    if (ci.gitSha !== gitSha) errors.push("authoritative CI Git SHA does not match HEAD");
+    if (
+      typeof ci.url !== "string" ||
+      !/^https:\/\/github\.com\/tegojs\/tego-next\/actions\//u.test(ci.url)
+    ) {
+      errors.push("authoritative CI URL is invalid");
+    }
+  }
+  return errors;
+}
+
 function parseWorkflow(workflow) {
   try {
     const openNodes = [];

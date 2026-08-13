@@ -231,7 +231,12 @@ export async function packWorkspaceSet(root, outputDirectory) {
     );
     const packed = {
       ...inspection,
+      integrity: result.integrity,
+      dependencies: packedManifest.dependencies ?? {},
+      devDependencies: packedManifest.devDependencies ?? {},
       files: result.files.map((file) => ({ ...file, path: `package/${file.path}` })),
+      optionalDependencies: packedManifest.optionalDependencies ?? {},
+      peerDependencies: packedManifest.peerDependencies ?? {},
       tarball,
     };
     assertPackedFiles(packed.name, packed.files, packed.entryPoint);

@@ -71,6 +71,11 @@ test("packed public packages contain only consumer assets and install cleanly", 
     const packed = await packWorkspaceSet(root, join(directory, "tarballs"));
     assert.equal(packed.length, publicDirectories.length);
     for (const workspace of packed) {
+      assert.match(workspace.integrity, /^sha512-[A-Za-z0-9+/]+={0,2}$/u);
+      assert.equal(typeof workspace.dependencies, "object");
+      assert.equal(typeof workspace.devDependencies, "object");
+      assert.equal(typeof workspace.optionalDependencies, "object");
+      assert.equal(typeof workspace.peerDependencies, "object");
       for (const file of workspace.files) {
         assert.doesNotMatch(file.path, forbiddenPackedPath, `${workspace.name}: ${file.path}`);
       }
@@ -172,4 +177,20 @@ test("clean-consumer verification rejects broad targets before deletion", async 
   );
   await assert.rejects(verifyPackedConsumer([], tmpdir()), /safe consumer directory/u);
   await assert.rejects(verifyPackedConsumer([], root), /safe consumer directory/u);
+});
+
+test("root exposes only the explicit alpha release modes", async () => {
+  const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  assert.equal(manifest.scripts["release:alpha"], "node scripts/publish-alpha.mjs");
+
+  const { parseRecordedReleaseEvidence, validateRecordedReleaseEvidence } = await import(
+    new URL("../../scripts/verify-release.mjs", import.meta.url)
+  );
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const evidence = parseRecordedReleaseEvidence(`before\n\`\`\`release-evidence
+{"gitSha":"${sha}","localVerification":"passed","authoritativeCi":{"status":"passed","gitSha":"${sha}","url":"https://github.com/tegojs/tego-next/actions/runs/1"}}
+\`\`\`\nafter\n`);
+  assert.deepEqual(validateRecordedReleaseEvidence(evidence, sha), []);
+  evidence.authoritativeCi.status = "failed";
+  assert.match(validateRecordedReleaseEvidence(evidence, sha).join("\n"), /authoritative/u);
 });
