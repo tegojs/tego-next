@@ -84,10 +84,11 @@ function preflightAdapters(overrides = {}) {
     nodeVersion: "v26.5.0",
     packages: releasePackages(),
     releaseEvidence: {
-      gitSha: head,
-      localVerification: "passed",
+      schemaVersion: 1,
+      targetSha: head,
+      localVerification: { status: "passed", sourceSha: head },
       authoritativeCi: {
-        gitSha: head,
+        sourceSha: head,
         status: "passed",
         url: "https://github.com/tegojs/tego-next/actions/runs/123",
       },
@@ -232,9 +233,16 @@ for (const scenario of [
     name: "failed release evidence",
     override: {
       releaseEvidence: {
-        gitSha: "1234567890abcdef1234567890abcdef12345678",
-        localVerification: "failed",
-        authoritativeCi: { status: "failed" },
+        schemaVersion: 1,
+        targetSha: "1234567890abcdef1234567890abcdef12345678",
+        localVerification: {
+          status: "failed",
+          sourceSha: "1234567890abcdef1234567890abcdef12345678",
+        },
+        authoritativeCi: {
+          status: "failed",
+          sourceSha: "1234567890abcdef1234567890abcdef12345678",
+        },
       },
     },
     pattern: /release evidence/u,
@@ -335,8 +343,7 @@ test("publisher uses explicit safe npm flags, skips exact matches, and never inv
   const commandCalls = [];
   const published = [];
 
-  const result = await publishAlpha({
-    preflight: { ok: true },
+  const { adapters } = preflightAdapters({
     packages,
     async registryState(name) {
       return state.get(name) ?? null;
@@ -351,6 +358,9 @@ test("publisher uses explicit safe npm flags, skips exact matches, and never inv
       return { exitCode: 0, stdout: "", stderr: "" };
     },
   });
+  const preflight = await preflightRelease(adapters);
+  adapters.preflightReceipt = preflight.receipt;
+  const result = await publishAlpha(adapters);
 
   assert.deepEqual(result.skipped, ["@tego/contracts"]);
   assert.equal(result.published.length, 8);
@@ -381,9 +391,54 @@ test("publisher fails before registry access when a preflight result is missing"
         return null;
       },
     }),
-    /successful preflight/u,
+    /preflight receipt/u,
   );
   assert.equal(registryQueries, 0);
+});
+
+test("publisher rejects forged, cross-session, cross-manifest, and consumed preflight receipts", async () => {
+  for (const kind of ["forged", "cross-session", "mutated-session", "cross-manifest", "consumed"]) {
+    const packages = releasePackages();
+    let publishCalls = 0;
+    let registryQueries = 0;
+    const { adapters } = preflightAdapters({
+      packages,
+      async registryState() {
+        registryQueries += 1;
+        return null;
+      },
+      async publish() {
+        publishCalls += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    const preflight = await preflightRelease(adapters);
+    adapters.preflightReceipt = preflight.receipt;
+
+    if (kind === "forged") adapters.preflightReceipt = { ok: true };
+    if (kind === "cross-session") {
+      await assert.rejects(
+        publishAlpha({ ...adapters, preflightReceipt: preflight.receipt }),
+        /preflight receipt/u,
+      );
+    } else if (kind === "mutated-session") {
+      adapters.registryState = async () => null;
+      await assert.rejects(publishAlpha(adapters), /preflight receipt/u);
+    } else if (kind === "cross-manifest") {
+      adapters.packages = structuredClone(packages);
+      adapters.packages[0].integrity = "sha512-tampered";
+      await assert.rejects(publishAlpha(adapters), /preflight receipt/u);
+    } else if (kind === "consumed") {
+      adapters.packages = [];
+      await assert.rejects(publishAlpha(adapters), /release manifests/u);
+      adapters.packages = packages;
+      await assert.rejects(publishAlpha(adapters), /preflight receipt/u);
+    } else {
+      await assert.rejects(publishAlpha(adapters), /preflight receipt/u);
+    }
+    assert.equal(publishCalls, 0, `${kind}: no upload`);
+    assert.equal(registryQueries, 9, `${kind}: only preflight registry inspection`);
+  }
 });
 
 test("registry verification requires exact identities, dependencies, integrity, and tags", async () => {
@@ -442,11 +497,12 @@ test("release manifest records Git SHA and computed SHA-512 without credentials"
   try {
     const result = await createReleaseManifest({
       artifactDirectory: directory,
-      gitSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      targetSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
       packages,
     });
     const persisted = JSON.parse(await readFile(result.manifestPath, "utf8"));
-    assert.equal(persisted.gitSha, "abcdefabcdefabcdefabcdefabcdefabcdefabcd");
+    assert.equal(persisted.targetSha, "abcdefabcdefabcdefabcdefabcdefabcdefabcd");
+    assert.equal(Object.hasOwn(persisted, "gitSha"), false);
     assert.equal(persisted.packages.length, 9);
     for (const releasePackage of persisted.packages) {
       assert.match(releasePackage.integrity, /^sha512-[A-Za-z0-9+/]+={0,2}$/u);
@@ -473,7 +529,7 @@ test("release manifest reload rejects a changed tarball and wrong registry", asy
   try {
     const { manifestPath } = await createReleaseManifest({
       artifactDirectory: directory,
-      gitSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      targetSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
       packages,
     });
     const loaded = await loadReleaseManifest(manifestPath);

@@ -186,11 +186,96 @@ test("root exposes only the explicit alpha release modes", async () => {
   const { parseRecordedReleaseEvidence, validateRecordedReleaseEvidence } = await import(
     new URL("../../scripts/verify-release.mjs", import.meta.url)
   );
-  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const targetSha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
   const evidence = parseRecordedReleaseEvidence(`before\n\`\`\`release-evidence
-{"gitSha":"${sha}","localVerification":"passed","authoritativeCi":{"status":"passed","gitSha":"${sha}","url":"https://github.com/tegojs/tego-next/actions/runs/1"}}
+{"schemaVersion":1,"targetSha":"${targetSha}","localVerification":{"status":"passed","sourceSha":"${targetSha}"},"authoritativeCi":{"status":"passed","sourceSha":"${targetSha}","url":"https://github.com/tegojs/tego-next/actions/runs/1"}}
 \`\`\`\nafter\n`);
-  assert.deepEqual(validateRecordedReleaseEvidence(evidence, sha), []);
+  assert.deepEqual(validateRecordedReleaseEvidence(evidence), []);
   evidence.authoritativeCi.status = "failed";
-  assert.match(validateRecordedReleaseEvidence(evidence, sha).join("\n"), /authoritative/u);
+  assert.match(validateRecordedReleaseEvidence(evidence).join("\n"), /authoritative/u);
+});
+
+test("release evidence separates tested target from later evidence commit", async () => {
+  const { validateReleaseEvidenceTarget } = await import(
+    new URL("../../scripts/verify-release.mjs", import.meta.url)
+  );
+  const targetSha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const evidenceSha = "fedcbafedcbafedcbafedcbafedcbafedcbafedc";
+  const headSha = "1234567890abcdef1234567890abcdef12345678";
+  const calls = [];
+  const evidence = {
+    schemaVersion: 1,
+    targetSha,
+    localVerification: { status: "passed", sourceSha: targetSha },
+    authoritativeCi: {
+      status: "passed",
+      sourceSha: evidenceSha,
+      url: "https://github.com/tegojs/tego-next/actions/runs/1",
+    },
+  };
+  const run = async (command, args) => {
+    calls.push({ command, args });
+    if (args[0] === "merge-base") return { exitCode: 0, stdout: "", stderr: "" };
+    if (args[0] === "rev-list") return { exitCode: 0, stdout: "2\n", stderr: "" };
+    if (args[0] === "diff") {
+      return {
+        exitCode: 0,
+        stdout:
+          "openspec/changes/runtime-kernel-phase-1/verification-report.md\nopenspec/changes/runtime-kernel-phase-1/.comet.yaml\n",
+        stderr: "",
+      };
+    }
+    throw new Error(`unexpected ${command} ${args.join(" ")}`);
+  };
+  assert.deepEqual(await validateReleaseEvidenceTarget({ evidence, headSha, run }), {
+    targetSha,
+    commitsAfterTarget: 2,
+  });
+  assert.equal(
+    calls.every(({ command }) => command === "git"),
+    true,
+  );
+
+  const unrelated = async (command, args) => {
+    const result = await run(command, args);
+    if (args[0] === "diff") return { ...result, stdout: "packages/runtime/src/index.ts\n" };
+    return result;
+  };
+  await assert.rejects(
+    validateReleaseEvidenceTarget({ evidence, headSha, run: unrelated }),
+    /unrelated.*packages\/runtime/u,
+  );
+
+  const nonAncestor = async (_command, args) => ({
+    exitCode: args[0] === "merge-base" ? 1 : 0,
+    stdout: "",
+    stderr: "",
+  });
+  await assert.rejects(
+    validateReleaseEvidenceTarget({ evidence, headSha, run: nonAncestor }),
+    /ancestor/u,
+  );
+
+  const tooDistant = async (command, args) => {
+    const result = await run(command, args);
+    if (args[0] === "rev-list") return { ...result, stdout: "3\n" };
+    return result;
+  };
+  await assert.rejects(
+    validateReleaseEvidenceTarget({ evidence, headSha, run: tooDistant }),
+    /more than two/u,
+  );
+
+  evidence.localVerification.sourceSha = "0000000000000000000000000000000000000000";
+  const tamperedSource = async (command, args) => {
+    const result = await run(command, args);
+    if (args[0] === "merge-base" && args.includes(evidence.localVerification.sourceSha)) {
+      return { ...result, exitCode: 1 };
+    }
+    return result;
+  };
+  await assert.rejects(
+    validateReleaseEvidenceTarget({ evidence, headSha, run: tamperedSource }),
+    /source SHA.*evidence-only/u,
+  );
 });

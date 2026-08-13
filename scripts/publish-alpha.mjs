@@ -10,6 +10,7 @@ import { resolveNpmCli } from "./run-ci-test.mjs";
 import {
   parseRecordedReleaseEvidence,
   validateRecordedReleaseEvidence,
+  validateReleaseEvidenceTarget,
 } from "./verify-release.mjs";
 
 export const ALPHA_VERSION = "2.0.0-alpha.1";
@@ -39,6 +40,7 @@ const INTERNAL_DEPENDENCY_FIELDS = Object.freeze([
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
 const npmCli = resolveNpmCli();
+const preflightReceipts = new WeakMap();
 
 function fail(message) {
   throw new Error(message);
@@ -309,9 +311,35 @@ function validateScopeAccess(output) {
   }
 }
 
-function validateEvidence(evidence, head) {
-  const errors = validateRecordedReleaseEvidence(evidence, head);
+function validateEvidence(evidence) {
+  const errors = validateRecordedReleaseEvidence(evidence);
   if (errors.length > 0) fail(`release evidence is not green for HEAD: ${errors.join("; ")}`);
+}
+
+function releaseFingerprint(packages, targetSha) {
+  return JSON.stringify({
+    targetSha,
+    packages: releaseOrder(packages).map((expected) => ({
+      name: expected.name,
+      version: expected.version,
+      integrity: expected.integrity,
+      tarball: expected.tarball,
+      internalDependencies: dependenciesFor(expected),
+    })),
+  });
+}
+
+function adapterSession(adapters) {
+  return {
+    publish: adapters.publish,
+    registryState: adapters.registryState,
+    registryTags: adapters.registryTags,
+    run: adapters.run,
+  };
+}
+
+function sameAdapterSession(actual, expected) {
+  return Object.keys(expected).every((field) => actual[field] === expected[field]);
 }
 
 async function validateTagAndReleaseState(adapters, head) {
@@ -392,7 +420,13 @@ export async function preflightRelease(adapters) {
     "could not resolve Git HEAD",
   );
   if (!/^[0-9a-f]{40}$/u.test(head)) fail("Git HEAD must be a full commit SHA");
-  validateEvidence(adapters.releaseEvidence, head);
+  validateEvidence(adapters.releaseEvidence);
+  const targetSha = adapters.releaseEvidence.targetSha;
+  if (typeof adapters.validateEvidenceTarget === "function") {
+    await adapters.validateEvidenceTarget(adapters.releaseEvidence, head);
+  } else if (targetSha !== head) {
+    fail("release evidence target SHA differs from HEAD without ancestry validation");
+  }
 
   const identity = requireSuccess(
     await run(adapters, "npm", ["whoami", "--registry", NPM_REGISTRY]),
@@ -426,15 +460,29 @@ export async function preflightRelease(adapters) {
     fail(`registry preflight failed:\n${registryFailures.join("\n")}`);
   }
   await validateTagAndReleaseState(adapters, head);
-  return { gitSha: head, identity, packages: decisions };
+  const receipt = Object.freeze({});
+  preflightReceipts.set(receipt, {
+    adapters,
+    fingerprint: releaseFingerprint(packages, targetSha),
+    session: adapterSession(adapters),
+    targetSha,
+  });
+  return { targetSha, identity, packages: decisions, receipt };
 }
 
 export async function publishAlpha(adapters) {
-  if (adapters.preflight?.ok !== true) {
-    fail("npm publication requires a successful preflight result from the same invocation");
-  }
+  const receiptState = preflightReceipts.get(adapters.preflightReceipt);
+  preflightReceipts.delete(adapters.preflightReceipt);
   const packages = releaseOrder(adapters.packages);
   assertCompleteReleaseSet(packages);
+  if (
+    receiptState === undefined ||
+    receiptState.adapters !== adapters ||
+    !sameAdapterSession(adapters, receiptState.session) ||
+    receiptState.fingerprint !== releaseFingerprint(packages, receiptState.targetSha)
+  ) {
+    fail("npm publication requires an unforgeable preflight receipt from the same invocation");
+  }
   const published = [];
   const skipped = [];
   for (const expected of packages) {
@@ -506,9 +554,9 @@ async function sha512(path) {
     .digest("base64")}`;
 }
 
-export async function createReleaseManifest({ artifactDirectory, gitSha, packages }) {
+export async function createReleaseManifest({ artifactDirectory, targetSha, packages }) {
   const absoluteArtifactDirectory = safeArtifactDirectory(artifactDirectory);
-  if (!/^[0-9a-f]{40}$/u.test(gitSha)) fail("release manifest requires a full Git SHA");
+  if (!/^[0-9a-f]{40}$/u.test(targetSha)) fail("release manifest requires a full target SHA");
   await mkdir(absoluteArtifactDirectory, { recursive: true });
   const ordered = releaseOrder(packages);
   assertCompleteReleaseSet(ordered);
@@ -534,7 +582,7 @@ export async function createReleaseManifest({ artifactDirectory, gitSha, package
     schemaVersion: 1,
     version: ALPHA_VERSION,
     registry: NPM_REGISTRY,
-    gitSha,
+    targetSha,
     packages: records,
   };
   const manifestPath = join(absoluteArtifactDirectory, RELEASE_MANIFEST);
@@ -553,7 +601,7 @@ export async function loadReleaseManifest(manifestPath) {
     manifest.schemaVersion !== 1 ||
     manifest.version !== ALPHA_VERSION ||
     manifest.registry !== NPM_REGISTRY ||
-    !/^[0-9a-f]{40}$/u.test(manifest.gitSha) ||
+    !/^[0-9a-f]{40}$/u.test(manifest.targetSha) ||
     !Array.isArray(manifest.packages)
   ) {
     fail("release manifest does not match the official npm registry and alpha release contract");
@@ -583,11 +631,7 @@ async function packedManifest(tarball) {
   return parseJson(stdout, `${tarball} package.json`);
 }
 
-async function packRelease(artifactDirectory, adapters) {
-  const gitSha = requireSuccess(
-    await run(adapters, "git", ["rev-parse", "HEAD"]),
-    "could not resolve Git HEAD",
-  );
+async function packRelease(artifactDirectory, targetSha) {
   const packed = await packWorkspaceSet(root, artifactDirectory);
   const packages = [];
   for (const workspace of packed) {
@@ -599,7 +643,7 @@ async function packRelease(artifactDirectory, adapters) {
       ),
     });
   }
-  return createReleaseManifest({ artifactDirectory, gitSha, packages });
+  return createReleaseManifest({ artifactDirectory, targetSha, packages });
 }
 
 async function readReleaseEvidence() {
@@ -672,7 +716,13 @@ async function main() {
     nodeVersion: process.version,
     run: defaultRun,
   };
-  const { manifestPath } = await packRelease(artifactDirectory, adapters);
+  const headSha = requireSuccess(
+    await run(adapters, "git", ["rev-parse", "HEAD"]),
+    "could not resolve Git HEAD",
+  );
+  const releaseEvidence = mode === "--pack" ? undefined : await readReleaseEvidence();
+  const targetSha = releaseEvidence?.targetSha ?? headSha;
+  const { manifestPath } = await packRelease(artifactDirectory, targetSha);
   const { packages } = await loadReleaseManifest(manifestPath);
 
   if (mode === "--pack") {
@@ -683,27 +733,28 @@ async function main() {
     const result = await preflightRelease({
       ...adapters,
       packages,
-      releaseEvidence: await readReleaseEvidence(),
+      releaseEvidence,
+      validateEvidenceTarget: async (evidence, head) =>
+        validateReleaseEvidenceTarget({ evidence, headSha: head, run: defaultRun }),
     });
+    const { receipt: _receipt, ...summary } = result;
     process.stdout.write(
-      `${JSON.stringify({ ok: true, mode: "preflight", manifestPath, ...result })}\n`,
+      `${JSON.stringify({ ok: true, mode: "preflight", manifestPath, ...summary })}\n`,
     );
     return;
   }
   if (mode === "--publish") {
-    const preflight = await preflightRelease({
-      ...adapters,
-      packages,
-      releaseEvidence: await readReleaseEvidence(),
-    });
-    const publication = await publishAlpha({
-      ...adapters,
-      packages,
-      preflight: { ok: true, gitSha: preflight.gitSha },
-    });
+    adapters.packages = packages;
+    adapters.releaseEvidence = releaseEvidence;
+    adapters.validateEvidenceTarget = async (evidence, head) =>
+      validateReleaseEvidenceTarget({ evidence, headSha: head, run: defaultRun });
+    const preflight = await preflightRelease(adapters);
+    adapters.preflightReceipt = preflight.receipt;
+    const publication = await publishAlpha(adapters);
     const verification = await verifyRegistryRelease({ ...adapters, packages });
+    const { receipt: _receipt, ...preflightSummary } = preflight;
     process.stdout.write(
-      `${JSON.stringify({ ok: true, mode: "publish", manifestPath, preflight, publication, verification })}\n`,
+      `${JSON.stringify({ ok: true, mode: "publish", manifestPath, preflight: preflightSummary, publication, verification })}\n`,
     );
     return;
   }

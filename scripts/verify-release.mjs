@@ -101,21 +101,30 @@ export function parseRecordedReleaseEvidence(contents) {
   return evidence;
 }
 
-export function validateRecordedReleaseEvidence(evidence, gitSha) {
+export function validateRecordedReleaseEvidence(evidence) {
   const errors = [];
   if (typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) {
     return ["release evidence is missing"];
   }
-  if (!/^[0-9a-f]{40}$/u.test(gitSha)) errors.push("release HEAD must be a full Git SHA");
-  if (evidence.gitSha !== gitSha) errors.push("local verification Git SHA does not match HEAD");
-  if (evidence.localVerification !== "passed")
-    errors.push("local release verification is not passed");
+  if (evidence.schemaVersion !== 1) errors.push("release evidence schema version is invalid");
+  if (!/^[0-9a-f]{40}$/u.test(evidence.targetSha)) {
+    errors.push("release evidence target SHA must be a full Git SHA");
+  }
+  const local = evidence.localVerification;
+  if (typeof local !== "object" || local === null || Array.isArray(local)) {
+    errors.push("local release verification evidence is missing");
+  } else {
+    if (local.status !== "passed") errors.push("local release verification is not passed");
+    if (!/^[0-9a-f]{40}$/u.test(local.sourceSha))
+      errors.push("local release verification source SHA is invalid");
+  }
   const ci = evidence.authoritativeCi;
   if (typeof ci !== "object" || ci === null || Array.isArray(ci)) {
     errors.push("authoritative CI evidence is missing");
   } else {
     if (ci.status !== "passed") errors.push("authoritative CI is not passed");
-    if (ci.gitSha !== gitSha) errors.push("authoritative CI Git SHA does not match HEAD");
+    if (!/^[0-9a-f]{40}$/u.test(ci.sourceSha))
+      errors.push("authoritative CI source SHA is invalid");
     if (
       typeof ci.url !== "string" ||
       !/^https:\/\/github\.com\/tegojs\/tego-next\/actions\//u.test(ci.url)
@@ -124,6 +133,78 @@ export function validateRecordedReleaseEvidence(evidence, gitSha) {
     }
   }
   return errors;
+}
+
+function evidenceCommandResult(result, label) {
+  if (typeof result !== "object" || result === null) throw new Error(`${label} returned no result`);
+  return {
+    exitCode: result.exitCode,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+  };
+}
+
+export async function validateReleaseEvidenceTarget({ evidence, headSha, run }) {
+  const errors = validateRecordedReleaseEvidence(evidence);
+  if (!/^[0-9a-f]{40}$/u.test(headSha)) errors.push("evidence HEAD must be a full Git SHA");
+  if (errors.length > 0) throw new Error(`release evidence is invalid: ${errors.join("; ")}`);
+  if (typeof run !== "function")
+    throw new TypeError("release evidence command adapter is required");
+  const { targetSha } = evidence;
+  const ancestor = evidenceCommandResult(
+    await run("git", ["merge-base", "--is-ancestor", targetSha, headSha]),
+    "git merge-base",
+  );
+  if (ancestor.exitCode !== 0)
+    throw new Error("release evidence target SHA is not an ancestor of HEAD");
+  for (const [label, sourceSha] of [
+    ["local release verification", evidence.localVerification.sourceSha],
+    ["authoritative CI", evidence.authoritativeCi.sourceSha],
+  ]) {
+    const sourceAfterTarget = evidenceCommandResult(
+      await run("git", ["merge-base", "--is-ancestor", targetSha, sourceSha]),
+      `git merge-base ${label}`,
+    );
+    const sourceBeforeHead = evidenceCommandResult(
+      await run("git", ["merge-base", "--is-ancestor", sourceSha, headSha]),
+      `git merge-base ${label} HEAD`,
+    );
+    if (sourceAfterTarget.exitCode !== 0 || sourceBeforeHead.exitCode !== 0) {
+      throw new Error(`${label} source SHA is not on the target-to-HEAD evidence-only chain`);
+    }
+  }
+  const count = evidenceCommandResult(
+    await run("git", ["rev-list", "--count", `${targetSha}..${headSha}`]),
+    "git rev-list",
+  );
+  if (count.exitCode !== 0 || !/^\d+\s*$/u.test(count.stdout)) {
+    throw new Error("could not count release evidence commits");
+  }
+  const commitsAfterTarget = Number.parseInt(count.stdout.trim(), 10);
+  if (commitsAfterTarget > 2) {
+    throw new Error(
+      "release evidence HEAD is more than two evidence-only commits after target SHA",
+    );
+  }
+  if (commitsAfterTarget > 0) {
+    const diff = evidenceCommandResult(
+      await run("git", ["diff", "--name-only", targetSha, headSha]),
+      "git diff",
+    );
+    if (diff.exitCode !== 0) throw new Error("could not inspect release evidence commit paths");
+    const allowed = new Set([
+      "openspec/changes/runtime-kernel-phase-1/verification-report.md",
+      "openspec/changes/runtime-kernel-phase-1/.comet.yaml",
+    ]);
+    const unrelated = diff.stdout
+      .trim()
+      .split("\n")
+      .filter((path) => path !== "" && !allowed.has(path));
+    if (unrelated.length > 0) {
+      throw new Error(`release evidence commits contain unrelated paths: ${unrelated.join(", ")}`);
+    }
+  }
+  return { targetSha, commitsAfterTarget };
 }
 
 function parseWorkflow(workflow) {
