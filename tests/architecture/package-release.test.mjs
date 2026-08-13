@@ -174,6 +174,20 @@ test("Windows control gate emits fixed diagnostics without exception details", a
   assert.doesNotMatch(gate, /error\.(?:message|stack)|String\(error\)/u);
 });
 
+test("temporary Windows pipe access probe is asynchronous and isolated per case", async () => {
+  const runner = await readFile(
+    join(root, "scripts", "run-windows-pipe-access-diagnostic.mjs"),
+    "utf8",
+  );
+
+  assert.match(runner, /\["RW", "RC", "WD", "RCWD"\]/u);
+  assert.match(runner, /spawn\(/u);
+  assert.doesNotMatch(runner, /spawnSync/u);
+  assert.match(runner, /setTimeout\([\s\S]*3_000/u);
+  assert.match(runner, /server\.close/u);
+  assert.match(runner, /child\.once\("close"/u);
+});
+
 test("workspace inspection rejects duplicate public names and non-alpha versions", async () => {
   const { inspectWorkspacePackages } = await import(
     new URL("../../scripts/package-contract.mjs", import.meta.url)
