@@ -6,14 +6,7 @@ param(
   [string]$Operation = "harden",
 
   [ValidateRange(0, 64)]
-  [int]$BarrierCount = 0,
-
-  [Parameter(DontShow = $true)]
-  [switch]$ProbeOnly,
-
-  [Parameter(DontShow = $true)]
-  [ValidateSet("RW", "RC", "WD", "RCWD")]
-  [string]$ProbeAccess = "RW"
+  [int]$BarrierCount = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,26 +94,11 @@ $stage = "INITIAL_OPEN"
 try {
   $watchdog = [TegoWindowsPipeSecurityNative]::StartWatchdog(9000)
 
-  if ($ProbeOnly) {
-    $desiredAccess = switch ($ProbeAccess) {
-      "RW" {
-        [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
-          [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite
-      }
-      "RC" { [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl }
-      "WD" { [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac }
-      "RCWD" {
-        [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl -bor
-          [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac
-      }
-    }
-  } else {
-    $desiredAccess =
-      [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
-      [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite -bor
-      [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl -bor
-      [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac
-  }
+  $desiredAccess =
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite -bor
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl -bor
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac
   $barrierDesiredAccess =
     [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
     [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite
@@ -145,16 +123,7 @@ try {
 
   if ($handle.IsInvalid) {
     $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-    if ($ProbeOnly) {
-      [Console]::Out.WriteLine("TEGO_WINDOWS_PIPE_ACCESS_${ProbeAccess}_FAILED:$errorCode")
-      return
-    }
     throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open the named pipe")
-  }
-
-  if ($ProbeOnly) {
-    [Console]::Out.WriteLine("TEGO_WINDOWS_PIPE_ACCESS_${ProbeAccess}_OK")
-    return
   }
 
   $stage = "IDENTITY"
