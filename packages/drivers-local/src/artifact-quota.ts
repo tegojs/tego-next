@@ -44,6 +44,7 @@ export class LocalArtifactQuota {
   readonly #limits: ArtifactStorageLimits;
   readonly #clock: Clock;
   readonly #committed = new Map<ArtifactDigest, number>();
+  readonly #pending = new Map<ArtifactDigest, number>();
   readonly #reservations = new Set<LocalReservation>();
   #closed = false;
   #tail: Promise<void> = Promise.resolve();
@@ -77,6 +78,7 @@ export class LocalArtifactQuota {
         throw this.#namespaceError(undefined, 0, total, 0);
       }
       this.#committed.clear();
+      this.#pending.clear();
       for (const [digest, bytes] of artifacts) this.#committed.set(digest, bytes);
     });
   }
@@ -116,13 +118,16 @@ export class LocalArtifactQuota {
         await operation(duplicate);
       } catch (error) {
         if (!duplicate && (await targetExists().catch(() => false))) {
-          this.#committed.set(local.digest, local.bytes);
-          local.state = "committed";
+          this.#pending.set(local.digest, local.bytes);
+          local.state = "released";
           this.#reservations.delete(local);
         }
         throw error;
       }
-      if (!duplicate) this.#committed.set(local.digest, local.bytes);
+      if (!duplicate || this.#pending.has(local.digest)) {
+        this.#committed.set(local.digest, this.#pending.get(local.digest) ?? local.bytes);
+        this.#pending.delete(local.digest);
+      }
       local.state = "committed";
       this.#reservations.delete(local);
     });
@@ -136,7 +141,41 @@ export class LocalArtifactQuota {
     return this.#serialized(() => {
       this.#assertOwned(reservation);
       if (reservation.state !== "active") return;
+      const committedBytesForDigest = this.#committed.get(reservation.digest);
+      const pendingBytesForDigest = this.#pending.get(reservation.digest);
+      const existingBytes = committedBytesForDigest ?? pendingBytesForDigest;
+      if (existingBytes !== undefined && existingBytes !== reservation.bytes) {
+        const committedBytes = this.#occupiedTotal() - existingBytes;
+        if (committedBytes + reservation.bytes > this.#limits.maxNamespaceBytes) {
+          throw this.#namespaceError(
+            reservation.digest,
+            reservation.bytes,
+            committedBytes,
+            reservation.bytes,
+          );
+        }
+        throw this.#error(
+          "ARTIFACT_DIGEST_MISMATCH",
+          "Artifact digest is already committed with a different byte size",
+          {
+            digest: reservation.digest,
+            namespace: this.#namespace,
+            committedBytes: existingBytes,
+            reservationBytes: reservation.bytes,
+          },
+        );
+      }
+      const committedBytes = this.#occupiedTotal() - (existingBytes ?? 0);
+      if (committedBytes + reservation.bytes > this.#limits.maxNamespaceBytes) {
+        throw this.#namespaceError(
+          reservation.digest,
+          reservation.bytes,
+          committedBytes,
+          reservation.bytes,
+        );
+      }
       this.#committed.set(reservation.digest, reservation.bytes);
+      this.#pending.delete(reservation.digest);
       reservation.state = "committed";
       this.#reservations.delete(reservation);
     });
@@ -175,17 +214,18 @@ export class LocalArtifactQuota {
         },
       );
     }
-    if (this.#committed.has(reservation.digest)) return;
+    if (this.#committed.has(reservation.digest) || this.#pending.has(reservation.digest)) return;
     const reservedBytes = this.#reservedTotal(reservation, bytes);
-    const committedBytes = this.#committedTotal();
+    const committedBytes = this.#occupiedTotal();
     if (committedBytes + reservedBytes > this.#limits.maxNamespaceBytes) {
       throw this.#namespaceError(reservation.digest, bytes, committedBytes, reservedBytes);
     }
   }
 
   #assertPublishCapacity(reservation: LocalReservation): void {
-    const previous = this.#committed.get(reservation.digest) ?? 0;
-    const committedBytes = this.#committedTotal() - previous;
+    const previous =
+      this.#committed.get(reservation.digest) ?? this.#pending.get(reservation.digest) ?? 0;
+    const committedBytes = this.#occupiedTotal() - previous;
     const reservedBytes = this.#reservedTotalForOtherDigests(reservation.digest);
     const projectedBytes = committedBytes + reservedBytes + reservation.bytes;
     if (projectedBytes > this.#limits.maxNamespaceBytes) {
@@ -201,14 +241,14 @@ export class LocalArtifactQuota {
   #reservedTotal(replacement: LocalReservation, replacementBytes: number): number {
     const maximumByDigest = new Map<ArtifactDigest, number>();
     for (const reservation of this.#reservations) {
-      if (reservation.state !== "active" || this.#committed.has(reservation.digest)) continue;
+      if (reservation.state !== "active" || this.#hasOccupiedDigest(reservation.digest)) continue;
       const bytes = reservation === replacement ? replacementBytes : reservation.bytes;
       maximumByDigest.set(
         reservation.digest,
         Math.max(maximumByDigest.get(reservation.digest) ?? 0, bytes),
       );
     }
-    if (!this.#reservations.has(replacement) && !this.#committed.has(replacement.digest)) {
+    if (!this.#reservations.has(replacement) && !this.#hasOccupiedDigest(replacement.digest)) {
       maximumByDigest.set(
         replacement.digest,
         Math.max(maximumByDigest.get(replacement.digest) ?? 0, replacementBytes),
@@ -225,7 +265,7 @@ export class LocalArtifactQuota {
       if (
         reservation.state !== "active" ||
         reservation.digest === digest ||
-        this.#committed.has(reservation.digest)
+        this.#hasOccupiedDigest(reservation.digest)
       ) {
         continue;
       }
@@ -243,6 +283,18 @@ export class LocalArtifactQuota {
     let total = 0;
     for (const bytes of this.#committed.values()) total += bytes;
     return total;
+  }
+
+  #occupiedTotal(): number {
+    let total = this.#committedTotal();
+    for (const [digest, bytes] of this.#pending) {
+      if (!this.#committed.has(digest)) total += bytes;
+    }
+    return total;
+  }
+
+  #hasOccupiedDigest(digest: ArtifactDigest): boolean {
+    return this.#committed.has(digest) || this.#pending.has(digest);
   }
 
   #localReservation(reservation: ArtifactQuotaReservation): LocalReservation {

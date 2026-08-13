@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -18,6 +28,7 @@ import {
   createLocalDrivers,
   FilesystemArtifactStore,
   hashArtifactHandle,
+  LocalArtifactQuota,
   LocalCoordinationProvider,
   NodeProcessHost,
   publishTempFileAtomically,
@@ -404,6 +415,41 @@ test("artifact quota scan restores committed stable bytes after restart", async 
   await reopened.close();
 });
 
+test("retry repairs directory durability after fsync fails following rename", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-fsync-retry");
+  const artifactDirectory = join(rootDirectory, "artifacts");
+  const content = Buffer.alloc(4, 0x71);
+  const expected = digest(content);
+  const shardDirectory = join(
+    artifactDirectory,
+    expected.slice("sha256:".length, "sha256:".length + 2),
+  );
+  const syncs: string[] = [];
+  let failParentSync = true;
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    platform: "darwin",
+    syncDirectory: async (directory: string) => {
+      syncs.push(directory);
+      if (directory === artifactDirectory && failParentSync) {
+        failParentSync = false;
+        throw new Error("injected parent fsync failure");
+      }
+    },
+  });
+  await store.open();
+
+  await assert.rejects(store.put(expected, bytesSource(content)), /injected parent fsync failure/u);
+  assert.deepEqual(await readFile(store.pathFor(expected)), content);
+  const syncCountAfterFailure = syncs.length;
+
+  await store.put(expected, bytesSource(content));
+  assert.deepEqual(syncs.slice(syncCountAfterFailure), [shardDirectory, artifactDirectory]);
+  await store.close();
+});
+
 test("artifact quota startup ignores temporary and malformed unexpected paths", async () => {
   const rootDirectory = await temporaryDirectory("artifact-quota-unexpected-paths");
   const artifactDirectory = join(rootDirectory, "artifacts");
@@ -443,6 +489,38 @@ test("artifact quota startup fails closed when stable files already exceed the n
   await store.close();
 });
 
+test("artifact quota startup fails closed for an unsafe canonical file size", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-unsafe-size");
+  const content = Buffer.from("canonical");
+  const expected = digest(content);
+  const hexadecimal = expected.slice("sha256:".length);
+  const targetPath = join(
+    rootDirectory,
+    "artifacts",
+    hexadecimal.slice(0, 2),
+    `${hexadecimal}.tego`,
+  );
+  await mkdir(join(rootDirectory, "artifacts", hexadecimal.slice(0, 2)), { recursive: true });
+  await writeFile(targetPath, content);
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 16, maxNamespaceBytes: 16 },
+    lstatArtifact: async (path: string) => {
+      const metadata = await lstat(path);
+      return path === targetPath
+        ? { isFile: () => true, size: Number.MAX_SAFE_INTEGER + 1 }
+        : metadata;
+    },
+  });
+
+  await assert.rejects(
+    store.open(),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_SIZE_LIMIT_EXCEEDED",
+  );
+  await store.close();
+});
+
 test("simultaneous same-digest writes validate each source without double charging quota", async () => {
   const rootDirectory = await temporaryDirectory("artifact-quota-same-digest");
   const content = Buffer.alloc(4, 0x65);
@@ -475,6 +553,61 @@ test("simultaneous same-digest writes validate each source without double chargi
   await store.close();
 });
 
+test("same-digest quota commits cannot shrink shared charging and later exceed capacity", async () => {
+  const quota = new LocalArtifactQuota({
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 6 },
+    clock: new FakeClock(new Date("2026-08-13T00:00:00.000Z")),
+  });
+  const digestA = digest(Buffer.from("A"));
+  const digestB = digest(Buffer.from("B"));
+  const a4 = await quota.reserve(digestA, 4);
+  const a2 = await quota.reserve(digestA, 2);
+  await Promise.all([a2.commit(), a2.commit(), a2.release()]);
+  const b4 = await quota.reserve(digestB, 4);
+  await Promise.all([b4.commit(), b4.commit(), b4.release()]);
+
+  await assert.rejects(
+    a4.commit(),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+  );
+  assert.equal(await quota.committedBytes(), 6);
+  await Promise.all([a4.release(), a4.release()]);
+  assert.equal(await quota.committedBytes(), 6);
+  await quota.close();
+});
+
+test("direct quota commit cannot shrink same-digest pending durability occupancy", async () => {
+  const quota = new LocalArtifactQuota({
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 6 },
+    clock: new FakeClock(new Date("2026-08-13T00:00:00.000Z")),
+  });
+  const digestA = digest(Buffer.from("pending-A"));
+  const pending = await quota.reserve(digestA, 4);
+  let targetExists = false;
+  await assert.rejects(
+    quota.publish(
+      pending,
+      async () => targetExists,
+      async () => {
+        targetExists = true;
+        throw new Error("directory sync failed after rename");
+      },
+    ),
+    /directory sync failed after rename/u,
+  );
+  const smaller = await quota.reserve(digestA, 2);
+
+  await assert.rejects(
+    smaller.commit(),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
+  );
+  assert.equal(await quota.committedBytes(), 0);
+  await smaller.release();
+  await quota.close();
+});
+
 test("failed and closing artifact writes release quota and remove temporary files", async () => {
   const rootDirectory = await temporaryDirectory("artifact-quota-cleanup");
   const expected = digest(Buffer.alloc(4, 0x67));
@@ -495,10 +628,7 @@ test("failed and closing artifact writes release quota and remove temporary file
   await yielded.promise;
   const closing = first.close();
   release.resolve();
-  await assert.rejects(
-    putting,
-    (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
-  );
+  await assert.rejects(putting, (error: unknown) => diagnosticCode(error) === "ARTIFACT_CLOSED");
   await closing;
   assert.deepEqual(await readdir(join(rootDirectory, "artifacts"), { recursive: true }), []);
 
@@ -510,6 +640,143 @@ test("failed and closing artifact writes release quota and remove temporary file
   await reopened.open();
   await reopened.put(expected, bytesSource(Buffer.alloc(4, 0x67)));
   await reopened.close();
+});
+
+test("close aborts a suspended artifact source without publishing or leaking quota", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-suspended-close");
+  const content = Buffer.alloc(4, 0x72);
+  const expected = digest(content);
+  const yielded = Promise.withResolvers<void>();
+  let returned = false;
+  let nextCalls = 0;
+  const source: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          nextCalls += 1;
+          if (nextCalls === 1) {
+            yielded.resolve();
+            return { done: false, value: content };
+          }
+          return new Promise<IteratorResult<Uint8Array>>(() => {});
+        },
+        async return() {
+          returned = true;
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+  });
+  await store.open();
+  const putting = store.put(expected, source);
+  await yielded.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  await within(store.close(), "Timed out closing a store with suspended artifact ingress", 500);
+  await assert.rejects(putting, (error: unknown) => diagnosticCode(error) === "ARTIFACT_CLOSED");
+  assert.equal(returned, true);
+  await assert.rejects(access(store.pathFor(expected)));
+  assert.deepEqual(await readdir(join(rootDirectory, "artifacts"), { recursive: true }), []);
+
+  const reopened = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+  });
+  await reopened.open();
+  await reopened.put(expected, bytesSource(content));
+  await reopened.close();
+});
+
+test("synchronous iterator return failure cannot replace the close diagnostic", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-return-throws");
+  const content = Buffer.alloc(4, 0x75);
+  const yielded = Promise.withResolvers<void>();
+  let nextCalls = 0;
+  const source: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          nextCalls += 1;
+          if (nextCalls === 1) {
+            yielded.resolve();
+            return { done: false, value: content };
+          }
+          return new Promise<IteratorResult<Uint8Array>>(() => {});
+        },
+        return() {
+          throw new Error("synchronous iterator return failed");
+        },
+      };
+    },
+  };
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
+  await store.open();
+  const putting = store.put(digest(content), source);
+  await yielded.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  await within(store.close(), "Timed out closing after synchronous iterator return failure", 500);
+  await assert.rejects(putting, (error: unknown) => diagnosticCode(error) === "ARTIFACT_CLOSED");
+});
+
+test("artifact write cleanup attempts every action and preserves primary plus cleanup failures", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-cleanup-errors");
+  const firstBytes = Buffer.alloc(4, 0x73);
+  const secondBytes = Buffer.alloc(4, 0x74);
+  const primaryError = new Error("source failed");
+  const closeError = new Error("temporary handle close failed");
+  const removeError = new Error("temporary removal failed");
+  const directoryError = new Error("empty shard removal failed");
+  const cleanupAttempts: string[] = [];
+  let failCleanup = true;
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    openWriteHandle: async (path: string, flags: "wx", mode: number) => {
+      const handle = await open(path, flags, mode);
+      return {
+        write: handle.write.bind(handle),
+        sync: handle.sync.bind(handle),
+        async close() {
+          cleanupAttempts.push("close");
+          await handle.close();
+          if (failCleanup) throw closeError;
+        },
+      };
+    },
+    removeTemporary: async (path: string) => {
+      cleanupAttempts.push("remove-temporary");
+      await rm(path, { force: true });
+      if (failCleanup) throw removeError;
+    },
+    removeEmptyDirectory: async () => {
+      cleanupAttempts.push("remove-directory");
+      if (failCleanup) throw directoryError;
+    },
+  });
+  await store.open();
+  async function* failedSource(): AsyncIterable<Uint8Array> {
+    yield firstBytes;
+    throw primaryError;
+  }
+
+  await assert.rejects(store.put(digest(firstBytes), failedSource()), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.deepEqual(error.errors, [primaryError, closeError, removeError, directoryError]);
+    return true;
+  });
+  assert.deepEqual(cleanupAttempts, ["close", "remove-temporary", "remove-directory"]);
+
+  failCleanup = false;
+  await store.put(digest(secondBytes), bytesSource(secondBytes));
+  await store.close();
 });
 
 test("Windows publish collision handling preserves a completed target deterministically", async () => {

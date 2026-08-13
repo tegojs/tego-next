@@ -1,16 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import {
-  access,
-  type FileHandle,
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  readFile,
-  rename,
-  rm,
-  rmdir,
-} from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -40,6 +29,15 @@ export interface FilesystemArtifactStoreOptions {
   readonly limits?: Partial<ArtifactStorageLimits>;
   readonly clock?: Clock;
   readonly openReadHandle?: (path: string) => Promise<ArtifactReadHandle>;
+  readonly lstatArtifact?: (path: string) => Promise<ArtifactFileMetadata>;
+  readonly openWriteHandle?: (
+    path: string,
+    flags: "wx",
+    mode: number,
+  ) => Promise<ArtifactWriteHandle>;
+  readonly removeTemporary?: (path: string) => Promise<void>;
+  readonly removeEmptyDirectory?: (path: string) => Promise<void>;
+  readonly syncDirectory?: (path: string) => Promise<void>;
   readonly platform?: NodeJS.Platform;
 }
 
@@ -104,7 +102,7 @@ async function removeIfEmpty(path: string): Promise<void> {
   }
 }
 
-async function writeChunk(handle: FileHandle, chunk: Uint8Array): Promise<void> {
+async function writeChunk(handle: ArtifactWriteHandle, chunk: Uint8Array): Promise<void> {
   let offset = 0;
   while (offset < chunk.byteLength) {
     const { bytesWritten } = await handle.write(chunk, offset, chunk.byteLength - offset);
@@ -126,6 +124,21 @@ export interface ArtifactRandomAccessReader {
 
 export interface ArtifactReadHandle extends ArtifactRandomAccessReader {
   close(): Promise<void>;
+}
+
+export interface ArtifactWriteHandle {
+  write(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+  ): Promise<{ readonly bytesWritten: number }>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface ArtifactFileMetadata {
+  readonly size: number;
+  isFile(): boolean;
 }
 
 const ARTIFACT_READ_CHUNK_BYTES = 64 * 1024;
@@ -160,9 +173,19 @@ export class FilesystemArtifactStore implements ArtifactStore {
   readonly #limits: ArtifactStorageLimits;
   readonly #namespace: string;
   readonly #openReadHandle: (path: string) => Promise<ArtifactReadHandle>;
+  readonly #lstatArtifact: (path: string) => Promise<ArtifactFileMetadata>;
+  readonly #openWriteHandle: (
+    path: string,
+    flags: "wx",
+    mode: number,
+  ) => Promise<ArtifactWriteHandle>;
+  readonly #removeTemporary: (path: string) => Promise<void>;
+  readonly #removeEmptyDirectory: (path: string) => Promise<void>;
   readonly #platform: NodeJS.Platform;
+  readonly #syncDirectoryAction: (path: string) => Promise<void>;
   readonly #operations = new Set<Promise<unknown>>();
   readonly #readHandles = new Set<ArtifactReadHandle>();
+  readonly #writeControllers = new Set<AbortController>();
   readonly #quota: LocalArtifactQuota;
   #openPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
@@ -178,7 +201,13 @@ export class FilesystemArtifactStore implements ArtifactStore {
     this.#limits = parseArtifactStorageLimits(options.limits);
     this.#namespace = options.namespace;
     this.#openReadHandle = options.openReadHandle ?? ((path) => open(path, "r"));
+    this.#lstatArtifact = options.lstatArtifact ?? lstat;
+    this.#openWriteHandle =
+      options.openWriteHandle ?? ((path, flags, mode) => open(path, flags, mode));
+    this.#removeTemporary = options.removeTemporary ?? removeIfPresent;
+    this.#removeEmptyDirectory = options.removeEmptyDirectory ?? removeIfEmpty;
     this.#platform = options.platform ?? process.platform;
+    this.#syncDirectoryAction = options.syncDirectory ?? ((path) => this.#syncDirectory(path));
     this.#quota = new LocalArtifactQuota({
       namespace: this.#namespace,
       limits: this.#limits,
@@ -210,7 +239,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
     try {
       const created = await mkdir(this.#artifactDirectory, { recursive: true });
       if (created !== undefined) {
-        await this.#syncDirectory(this.#rootDirectory);
+        await this.#syncDirectoryAction(this.#rootDirectory);
       }
       await this.#quota.restore(await this.#scanStableArtifacts());
       if (this.#lifecycle !== "opening") {
@@ -233,8 +262,14 @@ export class FilesystemArtifactStore implements ArtifactStore {
 
   async put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void> {
     this.#assertOpen();
-    const operation = this.#put(parseArtifactDigest(digest), source);
-    return this.#track(operation);
+    const controller = new AbortController();
+    this.#writeControllers.add(controller);
+    const operation = this.#put(parseArtifactDigest(digest), source, controller.signal);
+    try {
+      return await this.#track(operation);
+    } finally {
+      this.#writeControllers.delete(controller);
+    }
   }
 
   async *read(digest: ArtifactDigest): AsyncIterable<Uint8Array> {
@@ -309,6 +344,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
 
   async #closeStore(): Promise<void> {
     this.#lifecycle = "closing";
+    for (const controller of this.#writeControllers) controller.abort();
     await this.#openPromise?.catch(() => undefined);
     await Promise.allSettled([...this.#operations]);
     await Promise.allSettled([...this.#readHandles].map((handle) => handle.close()));
@@ -317,19 +353,31 @@ export class FilesystemArtifactStore implements ArtifactStore {
     this.#lifecycle = "closed";
   }
 
-  async #put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void> {
+  async #put(
+    digest: ArtifactDigest,
+    source: AsyncIterable<Uint8Array>,
+    signal: AbortSignal,
+  ): Promise<void> {
     const targetPath = this.pathFor(digest);
     const targetDirectory = join(this.#artifactDirectory, digestHex(digest).slice(0, 2));
     const shardCreated = (await mkdir(targetDirectory, { recursive: true })) !== undefined;
     const temporaryPath = join(targetDirectory, `.${digestHex(digest)}.${randomUUID()}.temporary`);
     const hash = createHash("sha256");
     let bytes = 0;
-    let handle: FileHandle | undefined;
+    let handle: ArtifactWriteHandle | undefined;
     let reservation: ArtifactQuotaReservation | undefined;
+    const iterator = source[Symbol.asyncIterator]();
+    let sourceComplete = false;
     try {
       reservation = await this.#quota.reserve(digest, 0);
-      handle = await open(temporaryPath, "wx", 0o600);
-      for await (const chunk of source) {
+      handle = await this.#openWriteHandle(temporaryPath, "wx", 0o600);
+      while (true) {
+        const result = await this.#nextWriteChunk(iterator, signal);
+        if (result.done) {
+          sourceComplete = true;
+          break;
+        }
+        const chunk = result.value;
         if (!(chunk instanceof Uint8Array)) {
           throw this.#artifactError(
             "ARTIFACT_SOURCE_INVALID",
@@ -347,6 +395,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
         hash.update(stableChunk);
         await writeChunk(handle, stableChunk);
       }
+      this.#assertWriteOpen(signal);
       await handle.sync();
       await handle.close();
       handle = undefined;
@@ -355,38 +404,106 @@ export class FilesystemArtifactStore implements ArtifactStore {
       if (actual !== digest) {
         throw this.#digestMismatch(digest, actual);
       }
+      this.#assertWriteOpen(signal);
 
       await this.#quota.publish(
         reservation,
         () => this.#fileMatches(targetPath, digest),
         async (duplicate) => {
-          if (duplicate) {
-            await removeIfPresent(temporaryPath);
-            return;
+          this.#assertWriteOpen(signal);
+          if (!duplicate) {
+            await publishTempFileAtomically({
+              platform: this.#platform,
+              temporaryPath,
+              targetPath,
+              rename,
+              targetMatches: async () => this.#fileMatches(targetPath, digest),
+              removeTemporary: async () => this.#removeTemporary(temporaryPath),
+            });
           }
-          await publishTempFileAtomically({
-            platform: this.#platform,
-            temporaryPath,
-            targetPath,
-            rename,
-            targetMatches: async () => this.#fileMatches(targetPath, digest),
-            removeTemporary: async () => removeIfPresent(temporaryPath),
-          });
           for (const directory of artifactPublishSyncDirectories({
             artifactDirectory: this.#artifactDirectory,
             shardDirectory: targetDirectory,
             shardCreated,
           })) {
-            await this.#syncDirectory(directory);
+            await this.#syncDirectoryAction(directory);
           }
         },
       );
+    } catch (primaryError) {
+      throw await this.#cleanupWrite(
+        primaryError,
+        reservation,
+        handle,
+        temporaryPath,
+        targetDirectory,
+      );
     } finally {
-      await reservation?.release();
-      await handle?.close();
-      await removeIfPresent(temporaryPath);
-      await removeIfEmpty(targetDirectory);
+      if (!sourceComplete && iterator.return !== undefined) {
+        void Promise.resolve()
+          .then(() => iterator.return?.())
+          .catch(() => undefined);
+      }
     }
+    const cleanupError = await this.#cleanupWrite(
+      undefined,
+      reservation,
+      handle,
+      temporaryPath,
+      targetDirectory,
+    );
+    if (cleanupError !== undefined) throw cleanupError;
+  }
+
+  async #cleanupWrite(
+    primaryError: unknown | undefined,
+    reservation: ArtifactQuotaReservation | undefined,
+    handle: ArtifactWriteHandle | undefined,
+    temporaryPath: string,
+    targetDirectory: string,
+  ): Promise<unknown | undefined> {
+    const errors: unknown[] = [];
+    for (const cleanup of [
+      () => reservation?.release(),
+      () => handle?.close(),
+      () => this.#removeTemporary(temporaryPath),
+      () => this.#removeEmptyDirectory(targetDirectory),
+    ]) {
+      try {
+        await cleanup();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 0) return primaryError;
+    return new AggregateError(
+      primaryError === undefined ? errors : [primaryError, ...errors],
+      primaryError === undefined
+        ? "Filesystem artifact write cleanup failed"
+        : "Filesystem artifact write and cleanup failed",
+    );
+  }
+
+  async #nextWriteChunk(
+    iterator: AsyncIterator<Uint8Array>,
+    signal: AbortSignal,
+  ): Promise<IteratorResult<Uint8Array>> {
+    this.#assertWriteOpen(signal);
+    let abortListener: (() => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      abortListener = () => reject(this.#closedError());
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) abortListener();
+    });
+    try {
+      return await Promise.race([iterator.next(), aborted]);
+    } finally {
+      if (abortListener !== undefined) signal.removeEventListener("abort", abortListener);
+    }
+  }
+
+  #assertWriteOpen(signal: AbortSignal): void {
+    if (signal.aborted || this.#lifecycle !== "open") throw this.#closedError();
   }
 
   async #scanStableArtifacts(): Promise<ReadonlyMap<ArtifactDigest, number>> {
@@ -400,8 +517,11 @@ export class FilesystemArtifactStore implements ArtifactStore {
         const match = artifactPattern.exec(artifact.name);
         if (!artifact.isFile() || match === null || !match[1]?.startsWith(shard.name)) continue;
         const digest = parseArtifactDigest(`sha256:${match[1]}`);
-        const metadata = await lstat(join(shardDirectory, artifact.name));
-        if (!metadata.isFile() || !Number.isSafeInteger(metadata.size)) continue;
+        const metadata = await this.#lstatArtifact(join(shardDirectory, artifact.name));
+        if (!metadata.isFile()) continue;
+        if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
+          throw this.#artifactSizeError(digest, metadata.size);
+        }
         artifacts.set(digest, metadata.size);
       }
     }

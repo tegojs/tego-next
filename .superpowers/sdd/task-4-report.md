@@ -89,3 +89,37 @@ Independent concurrency/storage review found no actionable Critical, Important, 
 - fail-closed startup for pre-existing over-limit committed files;
 - digest failure and close cleanup of reservations and temporary files;
 - required namespace propagation through local driver and CLI call sites.
+
+## Review Fixes
+
+Follow-up review identified five storage/lifecycle boundaries. Each was reproduced with a failing
+test before implementation:
+
+- a directory fsync failure after rename left a visible target that a retry treated as already
+  durable;
+- `close()` waited indefinitely for a source suspended in `AsyncIterator.next()`;
+- the exported quota API could commit a smaller same-digest reservation, admit another digest,
+  then overwrite the first committed size past the namespace limit;
+- canonical stable files with unsafe metadata sizes were silently excluded from startup usage;
+- sequential write cleanup stopped at the first cleanup failure and could leak later resources.
+
+The fixes now keep renamed-but-not-directory-durable bytes in pending occupied capacity and require
+retry to sync both directories before promotion; abort active ingress on close and reject any
+post-close publication; atomically re-admit or reject inconsistent same-digest commits while keeping
+commit/release idempotent; fail closed on unsafe canonical sizes; and aggregate the primary error
+with every cleanup failure after attempting reservation, handle, temporary-file, and empty-directory
+cleanup.
+
+Follow-up review also covered two second-order boundaries: synchronous `iterator.return()` throws
+are now contained so they cannot replace the authoritative write/close diagnostic, and direct quota
+commits treat pending-durability bytes as occupied authoritative size rather than shrinking them.
+
+Focused review-fix suite result after implementation:
+
+```text
+tests 41
+pass 41
+fail 0
+```
+
+Local integration remained green with `134/136` passing and the same two PostgreSQL-only skips.
