@@ -52,7 +52,10 @@ async function persistDeployment(directory, value) {
 }
 
 async function persistRecords(directory, records) {
-  const drivers = await createLocalDrivers({ dataDirectory: directory });
+  const drivers = await createLocalDrivers({
+    dataDirectory: directory,
+    namespace: "integration-runtime",
+  });
   await drivers.state.open();
   await drivers.state.transact({}, async (transaction) => {
     for (const record of records) {
@@ -95,7 +98,10 @@ test("@spec:runtime-bootstrap/essential-readiness/recovered-SQLite-deployments",
         await persistDeployment(directory, scenario.value);
         const runtime = createRuntime(
           configuration,
-          await createLocalDrivers({ dataDirectory: directory }),
+          await createLocalDrivers({
+            dataDirectory: directory,
+            namespace: "integration-runtime",
+          }),
         );
         await runtime.start();
         const status = await runtime.status();
@@ -162,7 +168,10 @@ test("live SQLite status scans noncanonical keys and deduplicates the current ge
     ]);
     const runtime = createRuntime(
       configuration,
-      await createLocalDrivers({ dataDirectory: directory }),
+      await createLocalDrivers({
+        dataDirectory: directory,
+        namespace: "integration-runtime",
+      }),
     );
     await runtime.start();
     const status = await runtime.status();
@@ -183,7 +192,10 @@ test("invalid persisted deployment data fails recovery structurally", async () =
     });
     const runtime = createRuntime(
       configuration,
-      await createLocalDrivers({ dataDirectory: directory }),
+      await createLocalDrivers({
+        dataDirectory: directory,
+        namespace: "integration-runtime",
+      }),
     );
     await assert.rejects(
       runtime.start(),
@@ -226,7 +238,10 @@ test("terminal status preserves a live reader failure instead of exposing STATE_
     ]);
     const runtime = createRuntime(
       configuration,
-      await createLocalDrivers({ dataDirectory: directory }),
+      await createLocalDrivers({
+        dataDirectory: directory,
+        namespace: "integration-runtime",
+      }),
     );
     await runtime.start();
     await assert.rejects(
@@ -252,7 +267,10 @@ test("concurrent SQLite stop and status calls share one terminal durable snapsho
     await persistDeployment(directory, deployment({ essential: false, state: "active" }));
     const runtime = createRuntime(
       configuration,
-      await createLocalDrivers({ dataDirectory: directory }),
+      await createLocalDrivers({
+        dataDirectory: directory,
+        namespace: "integration-runtime",
+      }),
     );
     await runtime.start();
     const stopping = runtime.stop();

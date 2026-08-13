@@ -1,26 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   access,
+  type FileHandle,
+  lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   rename,
   rm,
   rmdir,
-  type FileHandle,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  DiagnosticError,
-  parseArtifactDigest,
-  runtimeDiagnostic,
   type ArtifactDigest,
+  type ArtifactStorageLimits,
   type ArtifactStore,
   type Clock,
+  DiagnosticError,
   type DriverHealth,
   type JsonValue,
+  parseArtifactDigest,
+  parseArtifactStorageLimits,
+  runtimeDiagnostic,
 } from "@tego/contracts";
+import { type ArtifactQuotaReservation, LocalArtifactQuota } from "./artifact-quota.js";
 
 const systemClock: Clock = {
   now: () => new Date(),
@@ -31,6 +36,8 @@ const systemClock: Clock = {
 
 export interface FilesystemArtifactStoreOptions {
   readonly rootDirectory: string;
+  readonly namespace: string;
+  readonly limits?: Partial<ArtifactStorageLimits>;
   readonly clock?: Clock;
   readonly openReadHandle?: (path: string) => Promise<ArtifactReadHandle>;
   readonly platform?: NodeJS.Platform;
@@ -150,20 +157,33 @@ export class FilesystemArtifactStore implements ArtifactStore {
   readonly #rootDirectory: string;
   readonly #artifactDirectory: string;
   readonly #clock: Clock;
+  readonly #limits: ArtifactStorageLimits;
+  readonly #namespace: string;
   readonly #openReadHandle: (path: string) => Promise<ArtifactReadHandle>;
   readonly #platform: NodeJS.Platform;
   readonly #operations = new Set<Promise<unknown>>();
   readonly #readHandles = new Set<ArtifactReadHandle>();
+  readonly #quota: LocalArtifactQuota;
   #openPromise: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #lifecycle: "closed" | "closing" | "created" | "open" | "opening" = "created";
 
   constructor(options: FilesystemArtifactStoreOptions) {
+    if (options.namespace.trim().length === 0) {
+      throw new TypeError("namespace must not be empty");
+    }
     this.#rootDirectory = options.rootDirectory;
     this.#artifactDirectory = join(options.rootDirectory, "artifacts");
     this.#clock = options.clock ?? systemClock;
+    this.#limits = parseArtifactStorageLimits(options.limits);
+    this.#namespace = options.namespace;
     this.#openReadHandle = options.openReadHandle ?? ((path) => open(path, "r"));
     this.#platform = options.platform ?? process.platform;
+    this.#quota = new LocalArtifactQuota({
+      namespace: this.#namespace,
+      limits: this.#limits,
+      clock: this.#clock,
+    });
   }
 
   open(): Promise<void> {
@@ -192,6 +212,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
       if (created !== undefined) {
         await this.#syncDirectory(this.#rootDirectory);
       }
+      await this.#quota.restore(await this.#scanStableArtifacts());
       if (this.#lifecycle !== "opening") {
         throw this.#closedError();
       }
@@ -292,6 +313,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
     await Promise.allSettled([...this.#operations]);
     await Promise.allSettled([...this.#readHandles].map((handle) => handle.close()));
     this.#readHandles.clear();
+    await this.#quota.close();
     this.#lifecycle = "closed";
   }
 
@@ -301,8 +323,11 @@ export class FilesystemArtifactStore implements ArtifactStore {
     const shardCreated = (await mkdir(targetDirectory, { recursive: true })) !== undefined;
     const temporaryPath = join(targetDirectory, `.${digestHex(digest)}.${randomUUID()}.temporary`);
     const hash = createHash("sha256");
+    let bytes = 0;
     let handle: FileHandle | undefined;
+    let reservation: ArtifactQuotaReservation | undefined;
     try {
+      reservation = await this.#quota.reserve(digest, 0);
       handle = await open(temporaryPath, "wx", 0o600);
       for await (const chunk of source) {
         if (!(chunk instanceof Uint8Array)) {
@@ -313,6 +338,12 @@ export class FilesystemArtifactStore implements ArtifactStore {
           );
         }
         const stableChunk = Buffer.from(chunk);
+        const nextBytes = bytes + stableChunk.byteLength;
+        if (!Number.isSafeInteger(nextBytes)) {
+          throw this.#artifactSizeError(digest, nextBytes);
+        }
+        await this.#quota.resize(reservation, nextBytes);
+        bytes = nextBytes;
         hash.update(stableChunk);
         await writeChunk(handle, stableChunk);
       }
@@ -325,26 +356,56 @@ export class FilesystemArtifactStore implements ArtifactStore {
         throw this.#digestMismatch(digest, actual);
       }
 
-      await publishTempFileAtomically({
-        platform: this.#platform,
-        temporaryPath,
-        targetPath,
-        rename,
-        targetMatches: async () => this.#fileMatches(targetPath, digest),
-        removeTemporary: async () => removeIfPresent(temporaryPath),
-      });
-      for (const directory of artifactPublishSyncDirectories({
-        artifactDirectory: this.#artifactDirectory,
-        shardDirectory: targetDirectory,
-        shardCreated,
-      })) {
-        await this.#syncDirectory(directory);
-      }
+      await this.#quota.publish(
+        reservation,
+        () => this.#fileMatches(targetPath, digest),
+        async (duplicate) => {
+          if (duplicate) {
+            await removeIfPresent(temporaryPath);
+            return;
+          }
+          await publishTempFileAtomically({
+            platform: this.#platform,
+            temporaryPath,
+            targetPath,
+            rename,
+            targetMatches: async () => this.#fileMatches(targetPath, digest),
+            removeTemporary: async () => removeIfPresent(temporaryPath),
+          });
+          for (const directory of artifactPublishSyncDirectories({
+            artifactDirectory: this.#artifactDirectory,
+            shardDirectory: targetDirectory,
+            shardCreated,
+          })) {
+            await this.#syncDirectory(directory);
+          }
+        },
+      );
     } finally {
+      await reservation?.release();
       await handle?.close();
       await removeIfPresent(temporaryPath);
       await removeIfEmpty(targetDirectory);
     }
+  }
+
+  async #scanStableArtifacts(): Promise<ReadonlyMap<ArtifactDigest, number>> {
+    const artifacts = new Map<ArtifactDigest, number>();
+    const shardPattern = /^[0-9a-f]{2}$/u;
+    const artifactPattern = /^([0-9a-f]{64})\.tego$/u;
+    for (const shard of await readdir(this.#artifactDirectory, { withFileTypes: true })) {
+      if (!shard.isDirectory() || !shardPattern.test(shard.name)) continue;
+      const shardDirectory = join(this.#artifactDirectory, shard.name);
+      for (const artifact of await readdir(shardDirectory, { withFileTypes: true })) {
+        const match = artifactPattern.exec(artifact.name);
+        if (!artifact.isFile() || match === null || !match[1]?.startsWith(shard.name)) continue;
+        const digest = parseArtifactDigest(`sha256:${match[1]}`);
+        const metadata = await lstat(join(shardDirectory, artifact.name));
+        if (!metadata.isFile() || !Number.isSafeInteger(metadata.size)) continue;
+        artifacts.set(digest, metadata.size);
+      }
+    }
+    return artifacts;
   }
 
   async #openVerified(digest: ArtifactDigest): Promise<ArtifactReadHandle> {
@@ -411,6 +472,19 @@ export class FilesystemArtifactStore implements ArtifactStore {
     );
   }
 
+  #artifactSizeError(digest: ArtifactDigest, artifactBytes: number): DiagnosticError {
+    return this.#artifactError(
+      "ARTIFACT_SIZE_LIMIT_EXCEEDED",
+      "Artifact exceeds the configured per-artifact limit",
+      {
+        digest,
+        namespace: this.#namespace,
+        artifactBytes,
+        maximumBytes: this.#limits.maxArtifactBytes,
+      },
+    );
+  }
+
   #artifactError(code: `ARTIFACT_${string}`, message: string, details: JsonValue): DiagnosticError {
     return new DiagnosticError(
       runtimeDiagnostic({
@@ -426,6 +500,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
   #closedError(): DiagnosticError {
     return this.#artifactError("ARTIFACT_CLOSED", "Filesystem artifact store is closed", {
       lifecycle: this.#lifecycle,
+      namespace: this.#namespace,
       rootDirectory: this.#rootDirectory,
     });
   }

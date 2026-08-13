@@ -1,12 +1,12 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Clock, RuntimeDrivers } from "@tego/contracts";
+import type { ArtifactStorageLimits, Clock, RuntimeDrivers } from "@tego/contracts";
+import { DevelopmentSecretProvider } from "./development-secret-provider.js";
 import { FilesystemArtifactStore } from "./filesystem-artifact-store.js";
 import { LocalCoordinationProvider } from "./local-coordination.js";
 import { NodeProcessHost } from "./node-process-host.js";
 import { SqliteStateStore } from "./sqlite/sqlite-state-store.js";
-import { DevelopmentSecretProvider } from "./development-secret-provider.js";
 
 const systemClock: Clock = {
   now: () => new Date(),
@@ -17,6 +17,8 @@ const systemClock: Clock = {
 
 export interface CreateLocalDriversOptions {
   readonly dataDirectory: string;
+  readonly namespace: string;
+  readonly artifactLimits?: Partial<ArtifactStorageLimits>;
   readonly clock?: Clock;
   readonly developmentSecrets?: Readonly<Record<string, string>>;
 }
@@ -37,6 +39,8 @@ export async function createLocalDrivers(
     coordination: new LocalCoordinationProvider({ clock }),
     artifacts: new FilesystemArtifactStore({
       rootDirectory: options.dataDirectory,
+      namespace: options.namespace,
+      ...(options.artifactLimits === undefined ? {} : { limits: options.artifactLimits }),
       clock,
     }),
     processHost: new NodeProcessHost({ clock }),

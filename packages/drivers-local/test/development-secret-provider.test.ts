@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { diagnosticCode, type Clock, type SecretProvider } from "@tego/contracts";
+import { type Clock, diagnosticCode, type SecretProvider } from "@tego/contracts";
 import {
   createLocalDrivers,
-  DevelopmentSecretProvider,
   DEVELOPMENT_SECRET_PROVIDER_NOTICE,
+  DevelopmentSecretProvider,
 } from "../src/index.js";
 
 const clock: Clock = {
@@ -75,6 +75,7 @@ test("local driver composition includes the explicit development secret bootstra
   const drivers = await createLocalDrivers({
     clock,
     dataDirectory: root,
+    namespace: "test-runtime",
     developmentSecrets: { API_TOKEN: "secret-value" },
   });
 

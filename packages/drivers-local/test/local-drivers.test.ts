@@ -1,19 +1,18 @@
 import assert from "node:assert/strict";
 import { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp } from "node:fs/promises";
 import { after, test } from "node:test";
 import { setTimeout as deadline } from "node:timers/promises";
 import {
+  type ArtifactDigest,
   diagnosticCode,
   parseArtifactDigest,
   parseFencingEpoch,
-  type ArtifactDigest,
 } from "@tego/contracts";
-import { FakeClock } from "@tego/testkit";
+import { defineArtifactStoreSuite, FakeClock } from "@tego/testkit";
 import {
   artifactPublishSyncDirectories,
   createLocalDrivers,
@@ -25,6 +24,7 @@ import {
 } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
+const artifactNamespace = "test-runtime";
 
 after(async () => {
   await Promise.all(
@@ -56,6 +56,14 @@ async function within<T>(promise: Promise<T>, message: string, timeoutMs = 2_000
     }),
   ]);
 }
+
+defineArtifactStoreSuite(async (options) => ({
+  store: new FilesystemArtifactStore({
+    rootDirectory: await temporaryDirectory("artifact-conformance"),
+    ...options,
+  }),
+  dispose: async () => {},
+}));
 
 test("@spec:coordination-provider/single-main-authority/local-authority-is-immediate", async () => {
   const clock = new FakeClock(new Date("2026-07-23T10:00:00.000Z"));
@@ -116,7 +124,7 @@ test("@spec:coordination-provider/fenced-leadership/local-close-returns-ownershi
 
 test("artifact digest mismatch removes the staged file", async () => {
   const rootDirectory = await temporaryDirectory("digest-mismatch");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
 
   const expected = digest(Buffer.from("expected"));
@@ -133,7 +141,7 @@ test("artifact digest mismatch removes the staged file", async () => {
 
 test("artifact publish is invisible until the complete file is durable", async () => {
   const rootDirectory = await temporaryDirectory("atomic");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
   const firstChunk = Buffer.from("first-");
   const secondChunk = Buffer.from("second");
@@ -163,7 +171,7 @@ test("artifact publish is invisible until the complete file is durable", async (
 
 test("artifact reads verify all bytes before yielding any content", async () => {
   const rootDirectory = await temporaryDirectory("read-verification");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
   const content = Buffer.from("verified");
   const expected = digest(content);
@@ -185,7 +193,7 @@ test("artifact reads verify all bytes before yielding any content", async () => 
 
 test("closing the store reclaims suspended verified reads", async () => {
   const rootDirectory = await temporaryDirectory("active-read-close");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
   const content = Buffer.alloc(128 * 1024, 0x61);
   const expected = digest(content);
@@ -201,7 +209,7 @@ test("closing the store reclaims suspended verified reads", async () => {
 
 test("closing during verification terminates the read before its first yield", async () => {
   const rootDirectory = await temporaryDirectory("verify-yield-close");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
   const content = Buffer.alloc(128 * 1024, 0x61);
   const expected = digest(content);
@@ -223,6 +231,7 @@ test("artifact read handle cleanup preserves primary errors", async (context) =>
     let closeCalls = 0;
     const store = new FilesystemArtifactStore({
       rootDirectory,
+      namespace: artifactNamespace,
       openReadHandle: async () => ({
         async read() {
           throw verificationError;
@@ -250,6 +259,7 @@ test("artifact read handle cleanup preserves primary errors", async (context) =>
     let closeCalls = 0;
     const store = new FilesystemArtifactStore({
       rootDirectory,
+      namespace: artifactNamespace,
       openReadHandle: async () => ({
         async read(buffer: Uint8Array, offset: number, length: number, position: number) {
           if (verificationComplete) throw readError;
@@ -283,6 +293,7 @@ test("artifact read handle cleanup preserves primary errors", async (context) =>
     let closeCalls = 0;
     const store = new FilesystemArtifactStore({
       rootDirectory,
+      namespace: artifactNamespace,
       openReadHandle: async () => ({
         async read(buffer: Uint8Array, offset: number, length: number, position: number) {
           if (position >= content.byteLength) {
@@ -332,7 +343,7 @@ test("artifact verification uses a bounded reusable buffer and streams bounded c
   assert.ok(largestRead <= 64 * 1024);
 
   const rootDirectory = await temporaryDirectory("bounded-read");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
   const expected = digest(content);
   await store.put(expected, bytesSource(content));
@@ -347,7 +358,7 @@ test("artifact verification uses a bounded reusable buffer and streams bounded c
 
 test("artifact publish cannot accept bytes mutated during an asynchronous write", async () => {
   const rootDirectory = await temporaryDirectory("mutable-source");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
   await store.open();
   const mutableChunk = Buffer.alloc(64 * 1024 * 1024, 0x61);
   const expected = digest(mutableChunk);
@@ -365,6 +376,140 @@ test("artifact publish cannot accept bytes mutated during an asynchronous write"
   await mutationFinished.promise;
   assert.equal(digest(await readFile(store.pathFor(expected))), expected);
   await store.close();
+});
+
+test("artifact quota scan restores committed stable bytes after restart", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-restart");
+  const limits = { maxArtifactBytes: 4, maxNamespaceBytes: 6 };
+  const firstBytes = Buffer.alloc(4, 0x61);
+  const first = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits,
+  });
+  await first.open();
+  await first.put(digest(firstBytes), bytesSource(firstBytes));
+  await first.close();
+
+  const reopened = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits,
+  });
+  await reopened.open();
+  await assert.rejects(
+    reopened.put(digest(Buffer.alloc(3, 0x62)), bytesSource(Buffer.alloc(3, 0x62))),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+  );
+  await reopened.close();
+});
+
+test("artifact quota startup ignores temporary and malformed unexpected paths", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-unexpected-paths");
+  const artifactDirectory = join(rootDirectory, "artifacts");
+  await mkdir(join(artifactDirectory, "not-a-shard", "nested"), { recursive: true });
+  await writeFile(join(artifactDirectory, "not-a-shard", "malformed.tego"), Buffer.alloc(32));
+  await writeFile(join(artifactDirectory, ".orphan.temporary"), Buffer.alloc(32));
+
+  const content = Buffer.alloc(4, 0x63);
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+  });
+  await store.open();
+  await store.put(digest(content), bytesSource(content));
+  await store.close();
+});
+
+test("artifact quota startup fails closed when stable files already exceed the namespace limit", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-overfull");
+  for (const content of [Buffer.alloc(4, 0x64), Buffer.alloc(4, 0x65)]) {
+    const hexadecimal = digest(content).slice("sha256:".length);
+    const shardDirectory = join(rootDirectory, "artifacts", hexadecimal.slice(0, 2));
+    await mkdir(shardDirectory, { recursive: true });
+    await writeFile(join(shardDirectory, `${hexadecimal}.tego`), content);
+  }
+
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 6 },
+  });
+  await assert.rejects(
+    store.open(),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+  );
+  await store.close();
+});
+
+test("simultaneous same-digest writes validate each source without double charging quota", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-same-digest");
+  const content = Buffer.alloc(4, 0x65);
+  const expected = digest(content);
+  const store = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+  });
+  await store.open();
+
+  const firstYielded = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  async function* delayedSource(): AsyncIterable<Uint8Array> {
+    yield content;
+    firstYielded.resolve();
+    await releaseFirst.promise;
+  }
+  const first = store.put(expected, delayedSource());
+  await firstYielded.promise;
+  const second = store.put(expected, bytesSource(content));
+  await second;
+  releaseFirst.resolve();
+  await first;
+
+  await assert.rejects(
+    store.put(expected, bytesSource(Buffer.alloc(4, 0x66))),
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
+  );
+  await store.close();
+});
+
+test("failed and closing artifact writes release quota and remove temporary files", async () => {
+  const rootDirectory = await temporaryDirectory("artifact-quota-cleanup");
+  const expected = digest(Buffer.alloc(4, 0x67));
+  const first = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+  });
+  await first.open();
+  const yielded = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  async function* mismatchedSource(): AsyncIterable<Uint8Array> {
+    yield Buffer.alloc(4, 0x68);
+    yielded.resolve();
+    await release.promise;
+  }
+  const putting = first.put(expected, mismatchedSource());
+  await yielded.promise;
+  const closing = first.close();
+  release.resolve();
+  await assert.rejects(
+    putting,
+    (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
+  );
+  await closing;
+  assert.deepEqual(await readdir(join(rootDirectory, "artifacts"), { recursive: true }), []);
+
+  const reopened = new FilesystemArtifactStore({
+    rootDirectory,
+    namespace: artifactNamespace,
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+  });
+  await reopened.open();
+  await reopened.put(expected, bytesSource(Buffer.alloc(4, 0x67)));
+  await reopened.close();
 });
 
 test("Windows publish collision handling preserves a completed target deterministically", async () => {
@@ -488,7 +633,11 @@ test("retry after a transient parent fsync failure still syncs the parent", asyn
 test("createLocalDrivers composes durable state, local authority, and filesystem artifacts", async () => {
   const dataDirectory = await temporaryDirectory("factory");
   const clock = new FakeClock(new Date("2026-07-23T12:00:00.000Z"));
-  const drivers = await createLocalDrivers({ dataDirectory, clock });
+  const drivers = await createLocalDrivers({
+    dataDirectory,
+    namespace: artifactNamespace,
+    clock,
+  });
 
   assert.equal(drivers.clock, clock);
   assert.ok(drivers.state instanceof Object);
@@ -626,7 +775,7 @@ test("NodeProcessHost bounds SIGKILL settlement when the child never reports exi
 
 test("close racing with open cannot resurrect filesystem artifact access", async () => {
   const rootDirectory = await temporaryDirectory("artifact-open-close-race");
-  const store = new FilesystemArtifactStore({ rootDirectory });
+  const store = new FilesystemArtifactStore({ rootDirectory, namespace: artifactNamespace });
 
   const opening = store.open();
   const closing = store.close();

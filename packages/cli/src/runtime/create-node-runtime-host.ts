@@ -217,7 +217,10 @@ export async function createNodeRuntimeHost(
     throw new TypeError("Worker listener credential is invalid");
   }
   await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
-  const local = await createLocalDrivers({ dataDirectory: options.dataDirectory });
+  const local = await createLocalDrivers({
+    dataDirectory: options.dataDirectory,
+    namespace: options.runtimeId,
+  });
   let drivers: RuntimeDrivers = local;
   let clusterTime: ClusterTime | undefined;
   if (options.postgresUrl !== undefined) {

@@ -473,7 +473,10 @@ export async function runWorkerProcess(
 ): Promise<void> {
   await mkdir(command.dataDirectory, { recursive: true, mode: 0o700 });
   const workerId = parseWorkerId(command.workerId);
-  const drivers = await createLocalDrivers({ dataDirectory: command.dataDirectory });
+  const drivers = await createLocalDrivers({
+    dataDirectory: command.dataDirectory,
+    namespace: `worker-${workerId}`,
+  });
   let prepared: Awaited<ReturnType<typeof prepareArtifacts>> | undefined;
   let runtime: WorkerRuntime | undefined;
   let endpoint: ReturnType<typeof createWorkerEndpoint> | undefined;
