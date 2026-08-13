@@ -22,6 +22,7 @@ import { parseRuntimeSnapshotResponse } from "@tego/contracts";
 import { Pool } from "pg";
 import { requestControl } from "../../packages/cli/dist/src/control/client.js";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
+import { cleanupPostgresNamespace } from "../support/postgres-namespace.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
 import { collectSemanticSnapshot, settleWithCleanup } from "../support/single-main-process.mjs";
 
@@ -619,7 +620,7 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
   const uniqueRun = `${Date.now()}-${process.pid}`;
   const directory = await mkdtemp(join(tmpdir(), "tego-two-main-postgres-"));
   const artifacts = await createRunArtifacts("two-main-postgres");
-  const runtimeId = `runtime-postgres-${uniqueRun}`;
+  const runtimeId = `test_runtime_${process.pid}_${Date.now()}`;
   const credential = `worker-credential-${uniqueRun}`;
   const workerId = `worker-postgres-${uniqueRun}`;
   const artifactPath = join(directory, "echo.tego");
@@ -664,12 +665,14 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
         },
         name: configuration.name,
       });
+      const ownedMain = { configuration, handle };
+      mains.push(ownedMain);
       const ready = await handle.ready((event) => event.type === "main.ready", {
         timeoutMs: processDeadlineMs,
       });
       assert.equal(ready.pid, handle.pid);
       assert.equal(typeof ready.workerUrl, "string");
-      mains.push({ configuration, handle, workerUrl: new URL(ready.workerUrl).href });
+      ownedMain.workerUrl = new URL(ready.workerUrl).href;
     }
 
     const elected = await eventually(async () => {
@@ -973,6 +976,16 @@ test("@spec:coordination-provider/fenced-leadership/real-two-main-postgres-worke
       ...mainConfigurations.map(
         (configuration) => async () => rm(configuration.endpoint, { force: true }),
       ),
+      async () => {
+        for (const name of [...mainConfigurations.map(({ name }) => name), "worker-leader"]) {
+          const cleanupPath = artifacts.cleanup(name);
+          if (!(await exists(cleanupPath))) continue;
+          const cleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
+          assert.deepEqual(cleanup.streamErrors ?? [], []);
+          assert.deepEqual(cleanup.processingErrors ?? [], []);
+        }
+      },
+      async () => cleanupPostgresNamespace({ connectionString: postgresUrl, namespace: runtimeId }),
       async () => removeTreeWithReadOnlyDirectories(directory),
       async () => rm(pluginWorkspace, { force: true, recursive: true }),
       async () => artifacts.dispose(),

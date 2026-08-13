@@ -55,6 +55,7 @@ function processSpawnDiagnostic(error, name) {
 export async function spawnManagedProcess({ artifacts, command, args, env = {}, name }) {
   await artifacts.initialize(name);
   const child = spawn(command, args, {
+    detached: process.platform !== "win32",
     env: { ...process.env, ...env },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -161,21 +162,21 @@ export class ManagedProcess {
       await this.#waitForFinalization(timeoutMs);
       return;
     }
-    if (this.#exit.settled) {
+    if (this.#exit.settled && !this.#processTreeAlive()) {
       await this.#waitForFinalization(timeoutMs);
       return;
     }
 
     this.#stopActions.push("stdin:end");
     this.#child.stdin.end();
-    if (!(await settleWithin(this.#exit.promise, timeoutMs))) {
+    if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
       this.#stopActions.push("signal:SIGTERM");
-      this.#child.kill("SIGTERM");
+      this.#signalProcessTree("SIGTERM");
     }
-    if (!(await settleWithin(this.#exit.promise, timeoutMs))) {
+    if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
       this.#stopActions.push("signal:SIGKILL");
-      this.#child.kill("SIGKILL");
-      if (!(await settleWithin(this.#exit.promise, timeoutMs))) {
+      this.#signalProcessTree("SIGKILL");
+      if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
         throw new Error(`PROCESS_STOP_TIMEOUT:${this.#name}:${this.pid}`);
       }
     }
@@ -316,6 +317,37 @@ export class ManagedProcess {
     this.#child.stdout.destroy();
     this.#child.stderr.destroy();
     for (const stream of Object.values(this.#streams)) stream.destroy();
+  }
+
+  #processTreeAlive() {
+    if (this.pid === undefined) return !this.#exit.settled;
+    try {
+      process.kill(process.platform === "win32" ? this.pid : -this.pid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") return false;
+      if (error?.code === "EPERM") return !this.#exit.settled;
+      throw error;
+    }
+  }
+
+  #signalProcessTree(signal) {
+    if (this.pid === undefined) return;
+    try {
+      if (process.platform === "win32") this.#child.kill(signal);
+      else process.kill(-this.pid, signal);
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+  }
+
+  async #waitForProcessTreeExit(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!this.#processTreeAlive()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return !this.#processTreeAlive();
   }
 
   async #waitForFinalization(timeoutMs) {

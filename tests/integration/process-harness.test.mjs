@@ -3,6 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
+import { usingManagedProcess } from "../support/single-main-process.mjs";
 import { registerTestCleanup, useTempWorkspace } from "../support/temp-workspace.mjs";
 
 function registerCleanup(t, child) {
@@ -296,7 +297,7 @@ test("managed process bounds stalled stream finalization", async (t) => {
   const parent = [
     "const { spawn } = require('node:child_process');",
     `const spawned = spawn(process.execPath, ['--eval', ${JSON.stringify(grandchild)}],`,
-    "{ stdio: ['ignore', 'inherit', 'inherit'] });",
+    "{ detached: true, stdio: ['ignore', 'inherit', 'inherit'] });",
     "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: spawned.pid }));",
     "process.once('SIGTERM', () => process.exit(0));",
     "console.log(JSON.stringify({ type: 'ready', pid: process.pid }));",
@@ -372,9 +373,14 @@ test("managed process surfaces readiness listener processing errors", async (t) 
 });
 
 test("teardown kills a spawned grandchild when readiness fails", async (t) => {
+  let childPid;
   let grandchildPid;
+  let cleanupPath;
+  let workspace;
   await t.test("failure before grandchild readiness", async (t) => {
     const artifacts = await createRunArtifacts("spawned-before-ready");
+    workspace = await useTempWorkspace(t, "spawned-before-ready");
+    cleanupPath = artifacts.cleanup("before-ready-child");
     const grandchild = [
       "const net = require('node:net');",
       "const server = net.createServer();",
@@ -389,32 +395,84 @@ test("teardown kills a spawned grandchild when readiness fails", async (t) => {
       "process.once('SIGTERM', () => process.exit(0));",
       "process.stdin.resume();",
     ].join(" ");
-    const terminateGrandchild = async () => {
-      grandchildPid ??= await processPidFromStdout(artifacts, "before-ready-child", [
-        "grandchild-spawned",
-      ]);
-      if (grandchildPid === undefined || !isProcessAlive(grandchildPid)) return;
-      process.kill(grandchildPid, "SIGTERM");
-      await waitForPidDeath(grandchildPid, { timeoutMs: 2_000 });
-    };
-    const child = await spawnManagedProcess({
-      artifacts,
-      command: process.execPath,
-      args: ["--input-type=commonjs", "--eval", parent],
-      name: "before-ready-child",
-    });
-    registerExpectedDiagnosticCleanup(t, child, /PROCESS_CLEANUP_TIMEOUT/u, terminateGrandchild);
-    const spawned = await child.ready((event) => event.type === "grandchild-spawned", {
-      timeoutMs: 2_000,
-    });
-    grandchildPid = spawned.pid;
     await assert.rejects(
-      child.ready((event) => event.type === "grandchild-ready", { timeoutMs: 20 }),
+      usingManagedProcess(
+        async (child) => {
+          childPid = child.pid;
+          const spawned = await child.ready((event) => event.type === "grandchild-spawned", {
+            timeoutMs: 2_000,
+          });
+          grandchildPid = spawned.pid;
+          await child.ready((event) => event.type === "grandchild-ready", { timeoutMs: 20 });
+        },
+        {
+          artifacts,
+          command: process.execPath,
+          args: ["--input-type=commonjs", "--eval", parent],
+          name: "before-ready-child",
+        },
+      ),
       /PROCESS_READY_TIMEOUT/u,
     );
-    await assert.rejects(child.stop({ timeoutMs: 20 }), /PROCESS_CLEANUP_TIMEOUT/u);
+    assert.equal(await readFile(cleanupPath, "utf8").then((value) => value !== "{}\n"), true);
+    await workspace.assertExists();
   });
+  assert.equal(isProcessAlive(childPid), false);
   assert.equal(isProcessAlive(grandchildPid), false);
+  await assert.doesNotReject(readFile(cleanupPath, "utf8"));
+  await workspace.assertRemoved();
+});
+
+test("throwing readiness predicate cleans the whole process tree and preserves the predicate error", async () => {
+  const artifacts = await createRunArtifacts("predicate-tree-cleanup");
+  const grandchild = "process.once('SIGTERM', () => process.exit(0)); process.stdin.resume();";
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    `const spawned = spawn(process.execPath, ['--eval', ${JSON.stringify(grandchild)}],`,
+    "{ stdio: ['ignore', 'inherit', 'inherit'] });",
+    "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: spawned.pid }));",
+    "process.once('SIGTERM', () => process.exit(0));",
+    "process.stdin.resume();",
+  ].join(" ");
+  let childPid;
+  let grandchildPid;
+  const predicateError = new Error("predicate ownership failure");
+
+  await assert.rejects(
+    usingManagedProcess(
+      async (child) => {
+        childPid = child.pid;
+        const spawned = await child.ready((event) => event.type === "grandchild-spawned", {
+          timeoutMs: 2_000,
+        });
+        grandchildPid = spawned.pid;
+        await child.ready(
+          () => {
+            throw predicateError;
+          },
+          { timeoutMs: 2_000 },
+        );
+      },
+      {
+        artifacts,
+        command: process.execPath,
+        args: ["--input-type=commonjs", "--eval", parent],
+        name: "predicate-tree-child",
+      },
+    ),
+    (error) =>
+      error instanceof AggregateError
+        ? error.errors[0] === predicateError
+        : error === predicateError,
+  );
+  assert.equal(isProcessAlive(childPid), false);
+  assert.equal(isProcessAlive(grandchildPid), false);
+  assert.equal(
+    await readFile(artifacts.cleanup("predicate-tree-child"), "utf8").then(
+      (value) => value !== "{}\n",
+    ),
+    true,
+  );
 });
 
 test("artifact event predicate errors surface immediately", async () => {

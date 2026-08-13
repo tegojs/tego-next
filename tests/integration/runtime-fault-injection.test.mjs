@@ -26,6 +26,10 @@ import { eventually, FakeClock } from "@tego/testkit";
 import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tego/transport-websocket";
 import { Pool } from "pg";
 import { DeterministicRemoteSession } from "../fixtures/runtime-fault-session.mjs";
+import {
+  assertDisposablePostgresNamespace,
+  cleanupPostgresNamespace,
+} from "../support/postgres-namespace.mjs";
 
 const applicationId = parseApplicationId("app");
 const pluginId = parsePluginId("org.example.fault");
@@ -427,9 +431,39 @@ async function withRestartableFaultStateStores(t, run) {
   });
 }
 
-async function cleanupPostgresFaultNamespace(connectionString, namespace) {
-  const pool = new Pool({ connectionString, max: 1 });
-  try {
+test("namespace cleanup rejects unsafe targets before opening PostgreSQL", async () => {
+  for (const namespace of ["", "tego", "public", "*", "%", "../x", "runtime-default"]) {
+    assert.throws(
+      () => assertDisposablePostgresNamespace(namespace),
+      /UNSAFE_POSTGRES_TEST_NAMESPACE/u,
+    );
+    await assert.rejects(
+      cleanupPostgresNamespace({ connectionString: "not a PostgreSQL URL", namespace }),
+      /UNSAFE_POSTGRES_TEST_NAMESPACE/u,
+    );
+  }
+  for (const namespace of ["test_fault_1", "test_a_b", "test_123_a_b_c"]) {
+    assert.doesNotThrow(() => assertDisposablePostgresNamespace(namespace));
+  }
+});
+
+test("namespace cleanup deletes one exact namespace and preserves another byte-for-byte", {
+  skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
+}, async () => {
+  const run = `${process.pid}_${Date.now()}`;
+  const removedNamespace = `test_cleanup_${run}`;
+  const preservedNamespace = `test_preserved_${run}`;
+  const removed = new PostgresStateStore({
+    connectionString: process.env.TEGO_POSTGRES_URL,
+    namespace: removedNamespace,
+  });
+  const preserved = new PostgresStateStore({
+    connectionString: process.env.TEGO_POSTGRES_URL,
+    namespace: preservedNamespace,
+  });
+  const observer = new Pool({ connectionString: process.env.TEGO_POSTGRES_URL, max: 1 });
+  const snapshot = async (namespace) => {
+    const rows = [];
     for (const table of [
       "tego_operation_history",
       "tego_operations",
@@ -444,13 +478,59 @@ async function cleanupPostgresFaultNamespace(connectionString, namespace) {
       "tego_coordination_leases",
       "tego_coordination_epochs",
       "tego_coordination_revisions",
+      "tego_artifacts",
+      "tego_artifact_namespace_usage",
     ]) {
-      await pool.query(`DELETE FROM ${table} WHERE driver_namespace = $1`, [namespace]);
+      const result = await observer.query(
+        `SELECT to_jsonb(contents)::text AS contents
+           FROM ${table} AS contents
+          WHERE driver_namespace = $1
+          ORDER BY to_jsonb(contents)::text`,
+        [namespace],
+      );
+      rows.push(...result.rows.map(({ contents }) => ({ table, contents })));
     }
+    return rows;
+  };
+  try {
+    await Promise.all([removed.open(), preserved.open()]);
+    await removed.transact({}, async (transaction) => {
+      await transaction.put(
+        { namespace: "fault", collection: "cleanup", id: "removed" },
+        { owner: "removed", bytes: [1, 2, 3] },
+        {},
+      );
+      return null;
+    });
+    await preserved.transact({}, async (transaction) => {
+      await transaction.put(
+        { namespace: "fault", collection: "cleanup", id: "preserved" },
+        { owner: "preserved", bytes: [4, 5, 6] },
+        {},
+      );
+      return null;
+    });
+    await Promise.all([removed.close(), preserved.close()]);
+    const before = await snapshot(preservedNamespace);
+    await cleanupPostgresNamespace({
+      connectionString: process.env.TEGO_POSTGRES_URL,
+      namespace: removedNamespace,
+    });
+    assert.deepEqual(await snapshot(removedNamespace), []);
+    assert.deepEqual(await snapshot(preservedNamespace), before);
   } finally {
-    await pool.end();
+    await Promise.allSettled([removed.close(), preserved.close()]);
+    await cleanupPostgresNamespace({
+      connectionString: process.env.TEGO_POSTGRES_URL,
+      namespace: removedNamespace,
+    });
+    await cleanupPostgresNamespace({
+      connectionString: process.env.TEGO_POSTGRES_URL,
+      namespace: preservedNamespace,
+    });
+    await observer.end();
   }
-}
+});
 
 test("@spec:plugin-deployment/idempotent-reconciliation/fault-after-effect-before-commit", async (t) => {
   await withRestartableFaultStateStores(t, async (initialState, clock, reopen) => {
@@ -593,7 +673,7 @@ test("@spec:coordination-provider/fenced-leadership/stale-epoch-fault", async (t
 test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault", {
   skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
 }, async () => {
-  const namespace = `fault_${process.pid}_${Date.now()}`;
+  const namespace = `test_fault_${process.pid}_${Date.now()}`;
   const state = new PostgresStateStore({
     connectionString: process.env.TEGO_POSTGRES_URL,
     namespace,
@@ -605,7 +685,10 @@ test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
     try {
       await state.close();
     } finally {
-      await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
+      await cleanupPostgresNamespace({
+        connectionString: process.env.TEGO_POSTGRES_URL,
+        namespace,
+      });
     }
   }
 });
@@ -613,7 +696,7 @@ test("@spec:coordination-provider/fenced-leadership/postgres-stale-epoch-fault",
 test("@spec:plugin-deployment/idempotent-reconciliation/postgres-cluster-time-takeover", {
   skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
 }, async () => {
-  const namespace = `cluster_time_${process.pid}_${Date.now()}`;
+  const namespace = `test_cluster_time_${process.pid}_${Date.now()}`;
   const drivers = createPostgresDrivers({
     connectionString: process.env.TEGO_POSTGRES_URL,
     namespace,
@@ -716,7 +799,10 @@ test("@spec:plugin-deployment/idempotent-reconciliation/postgres-cluster-time-ta
     try {
       await Promise.all([drivers.coordination.close(), drivers.state.close()]);
     } finally {
-      await cleanupPostgresFaultNamespace(process.env.TEGO_POSTGRES_URL, namespace);
+      await cleanupPostgresNamespace({
+        connectionString: process.env.TEGO_POSTGRES_URL,
+        namespace,
+      });
     }
   }
 });

@@ -1,304 +1,99 @@
-# Task 6 Report: Secure Plugin Artifacts
+# Task 6 Report: Deterministic Readiness and PostgreSQL Cleanup
 
-## Outcome
+## Status
 
-Task 6 implements a usable plugin artifact pipeline across `@tegojs/runtime`,
-`@tegojs/cli`, and `@tegojs/testkit`.
+Implemented and verified. Readiness timeout and predicate failure now clean an immediately owned
+process group, preserve diagnostic stream finalization, retain the primary failure ahead of any
+cleanup failures, and leave no child or grandchild behind. PostgreSQL test cleanup is exact,
+guarded, parameterized, transaction-bounded, and includes the Phase 1 artifact usage table.
 
-The delivered vertical slice:
+## Delivered behavior
 
-- compiles plugins with the exact workspace TypeScript 7 compiler through a
-  shell-free child process;
-- packages declared JavaScript ESM into deterministic POSIX ustar `.tego`
-  archives;
-- computes SHA-256 over the final archive bytes;
-- signs raw SHA-256 digest bytes with Ed25519;
-- performs bounded, data-only runtime preflight without extracting, importing,
-  or evaluating component code;
-- validates schema, Node, Tego contract, module format, platform, and
-  architecture compatibility;
-- verifies optional or required signatures against explicit trust keys;
-- registers an immutable `PluginInstallation` transactionally.
+- `spawnManagedProcess()` starts a detached process group on POSIX. `ManagedProcess.stop()` keeps
+  the existing stdin EOF, SIGTERM, and SIGKILL phases but applies signals to the whole group and
+  waits boundedly for the group to disappear before finalizing streams.
+- `usingManagedProcess()` creates and owns the handle before invoking its callback. Its `finally`
+  path always attempts stop and `assertClean`; `settleWithCleanup()` keeps a callback/readiness
+  error first in any `AggregateError`.
+- The two-Main E2E stores each Main handle in its cleanup collection immediately after spawn and
+  before `ready()`. Its final cleanup validates per-process artifacts, cleans the exact database
+  namespace, then removes the workspace and artifacts.
+- `assertDisposablePostgresNamespace()` accepts only
+  `/^test_[a-z0-9]+_[a-z0-9_]+$/u`. The seven unsafe values in the brief are rejected synchronously,
+  before constructing a PostgreSQL pool.
+- `cleanupPostgresNamespace()` uses one client, one transaction, local five-second statement and
+  lock timeouts, a fixed Phase 1 table allowlist, and `driver_namespace = $1` for every delete. It
+  does not modify `tego_schema_migrations` or any global schema object.
+- Fault-test and E2E namespaces now use the destructive-test prefix. Cleanup covers state,
+  coordination, artifacts, and `tego_artifact_namespace_usage` while preserving every row of a
+  neighboring namespace byte-for-byte.
 
-## TDD Ledger
+## TDD evidence
 
-| Cycle | RED | GREEN |
-| --- | --- | --- |
-| Secure archive and CLI contract | `16201b9` | `6b0d15c` |
-| Immutable installation | `4e2fed6` | `bb82fd6` |
-| Reusable plugin fixtures | `8c41114` | `bdbb621` |
-| Cross-platform path ambiguity | `e2c6e5e` | `a16fad6` |
-| Installation triple identity | `c3d3185` | `63ccdd7` |
-| Partial compatibility ranges | `001ba12` | `8cf0cc9` |
+### RED
 
-Every RED was observed failing for the intended missing behavior before its
-implementation was written.
-
-## Public API
-
-`@tegojs/runtime` now exports:
-
-- `ArtifactService.validate`
-- `ArtifactService.install`
-- `ArtifactSignatureEnvelope`
-- `ArtifactTrustConfiguration`
-- `ArtifactCompatibility`
-- deterministic archive codec helpers used by the CLI
-
-`@tegojs/cli` now exports:
-
-- `buildPlugin`
-- `packPlugin`
-- `signArtifact`
-
-`@tegojs/testkit` now exports:
-
-- `createPluginManifestFixture`
-- `artifactDigest`
-- `artifactBytesSource`
-
-All returned metadata and signature envelopes are JSON-safe. Private keys are
-command inputs and are never persisted in artifact metadata.
-
-## Security Boundaries
-
-The runtime preflight:
-
-- streams through a bounded reader with archive, entry-size, and entry-count
-  limits;
-- captures only `manifest.json` and `metadata/files.json`;
-- hashes all archive entries while streaming;
-- rejects malformed/truncated headers, checksum mismatches, non-zero padding,
-  data after the tar terminator, and unsupported tar variants;
-- rejects PAX/GNU overrides, links, directories, devices, and FIFOs;
-- rejects absolute, drive, UNC, backslash, traversal, repeated-separator,
-  non-NFC, control-character, Windows device, trailing-dot/space, colon, and
-  alternate-stream paths;
-- rejects duplicate entries, undeclared files, missing files, file digest/size
-  mismatches, missing SBOM metadata, and missing/unsafe entrypoints;
-- parses the manifest as data and never imports or extracts executable files.
-
-The echo fixture contains an observable top-level side-effect trap. Invalid
-manifest validation proves that the component is not evaluated.
-
-Signatures use:
+The process tests were written first and failed at module instantiation because the scoped owner
+did not exist:
 
 ```text
-Ed25519.sign(raw 32-byte SHA-256 digest)
+SyntaxError: The requested module '../support/managed-process.mjs' does not provide an export named
+'usingManagedProcess'
 ```
 
-The envelope carries the algorithm, key ID, digest, and canonical base64
-signature. Required signatures, unknown keys, digest disagreement, malformed
-signatures, and tampering are rejected before installation.
+The namespace guard and isolation tests were written before the helper and failed with:
 
-## Installation Model
+```text
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'tests/support/postgres-namespace.mjs'
+```
 
-One `StateStore` transaction writes:
+### GREEN
 
-1. a version index at `(pluginId, version)`;
-2. an immutable installation at `(pluginId, version, digest)`.
+The process regression proves both the direct PID and a real grandchild PID are dead after a
+readiness timeout, that `cleanup.json` is finalized while the workspace still exists, and that the
+workspace is removed afterward. A second regression makes the readiness predicate throw and proves
+the same tree cleanup while preserving the predicate error as the primary failure.
 
-The version index prevents a second digest from replacing an already-installed
-plugin version. Reinstalling the same digest is idempotent. A concurrent
-conditional-write race is resolved by rereading durable state and applying the
-same conflict rule.
+The PostgreSQL test seeds two unique namespaces, snapshots all known Phase 1 tables as JSON text,
+cleans one namespace, proves it is empty, and compares the untouched namespace snapshot exactly.
 
-## Verification Evidence
+## Disposable PostgreSQL environment
 
-Executed with Node.js `26.5.0`:
+Verification used Homebrew PostgreSQL 16 in a validated `mktemp` root:
 
-- focused build for contracts, testkit, runtime, local drivers, and CLI: PASS;
-- combined contracts/runtime/CLI/testkit/local-driver suite: 134/134 PASS;
-- runtime focused suite: 54/54 PASS;
-- CLI focused suite: 3/3 PASS;
-- testkit focused suite: 3/3 PASS;
-- architecture suite: 18/18 PASS;
-- targeted typecheck for all implemented workspaces: PASS;
-- Biome format: PASS;
-- Biome lint: PASS;
-- `git diff --check`: PASS;
-- SQLite restart smoke: packed an echo plugin, stored it through
-  `FilesystemArtifactStore`, installed it through `ArtifactService`, reopened
-  `SqliteStateStore`, and verified the immutable installation survived.
+```text
+root: /tmp/tego-task6-pg16.aVWkgu
+URL:  postgresql://127.0.0.1:55461/postgres
+```
 
-The repository-wide `npm run typecheck` still reaches four future placeholder
-workspaces that have no `tsconfig.json`:
+The cluster used its own data directory, socket directory, and non-default TCP port. Port 5432 and
+Docker were not contacted.
 
-- `@tegojs/drivers-postgres`
-- `@tegojs/executor-node`
-- `@tegojs/plugin-sdk`
-- `@tegojs/transport-websocket`
+## Verification
 
-The implemented Task 6 workspaces all typecheck. The placeholder workspace gap
-predates Task 6 and is assigned to later plan tasks.
+Fresh focused verification:
 
-## Deliberate Limits
+```sh
+node --test tests/integration/process-harness.test.mjs
+node --test tests/e2e/single-main-process-helpers.test.mjs
+TEGO_POSTGRES_URL=postgresql://127.0.0.1:55461/postgres \
+  node --test tests/integration/runtime-fault-injection.test.mjs
+TEGO_POSTGRES_URL=postgresql://127.0.0.1:55461/postgres npm run test:e2e:multi-main
+npx biome check tests/support/managed-process.mjs tests/support/postgres-namespace.mjs \
+  tests/support/single-main-process.mjs tests/integration/process-harness.test.mjs \
+  tests/integration/runtime-fault-injection.test.mjs tests/e2e/single-main-process.test.mjs
+git diff --check
+```
 
-- The archive reader accepts the auditable regular-file POSIX ustar subset and
-  rejects extension records rather than interpreting them.
-- Compatibility ranges support exact, partial, wildcard, comparison, caret,
-  tilde, whitespace intersection, and `||` alternatives. They intentionally do
-  not claim complete npm-semver grammar.
-- Runtime validation buffers only the bounded manifest and files metadata.
-  The local `ArtifactStore` remains the authority for verifying the full
-  content-addressed archive digest before bytes are exposed.
+Observed results: process harness 16/16, helper suite 5/5, runtime fault suite 15/15, and real
+multi-Main E2E 1/1 passed.
 
-## Formal Review Remediation
+## Self-review
 
-The formal and security review returned `REQUEST CHANGES`. The findings were
-reproduced with failing tests before implementation changes:
+- Primary errors are first; cleanup continues across all steps and aggregates failures.
+- Whole-tree stop preserves the established escalation and stream-finalization paths.
+- No callback can receive a process without the scoped helper already owning it.
+- PostgreSQL values are never interpolated. Only fixed source-code table names are interpolated.
+- Artifacts are checked before database cleanup; database cleanup precedes workspace removal.
+- Migration metadata and global schema are untouched.
 
-| Review cycle | RED | GREEN |
-| --- | --- | --- |
-| Runtime identity, range, collision, and archive limits | `65665d4` | `b30ad44` |
-| Bounded local artifact verification | `246b649` | `6b90f2c` |
-| Build and pack confinement | `183d643` | `e027eff` |
-| Mixed invalid ranges and fake Node built-ins | `cf1cbfb` | `a6bc3e2` |
-| Symlinked build-configuration ancestors | `fad0d78` | `d644ee4` |
-
-The remediation closes all seven requested findings:
-
-- build and pack paths are canonicalized, confined below the real plugin root,
-  checked for symlink ancestors, and read with no-follow descriptor checks plus
-  post-read identity verification;
-- build output is emitted into a private temporary directory below the plugin
-  root and removed on success and failure;
-- unsupported comparators invalidate the complete compatibility expression,
-  including otherwise-satisfiable `||` alternatives;
-- artifact verification uses a reusable 64 KiB buffer and yields bounded chunks
-  only after the complete file digest is verified;
-- archive and metadata paths reject case-folding, Unicode-normalization, and
-  portable Windows-device collisions, including COM/LPT superscript forms;
-- `ArtifactService` independently hashes the complete stream and compares the
-  observed digest with the requested content address;
-- packaging rejects bare third-party imports and fake `node:` built-ins, records
-  audited built-in runtime imports in the SBOM, and enforces entry count,
-  per-entry size, and total archive-size limits before concatenation.
-
-Ed25519 signatures now also require canonical base64 with the exact encoded
-length. The earlier statement that the local `ArtifactStore` is the sole
-authority for complete-stream digest verification is superseded: both the
-filesystem store and `ArtifactService` now verify the content address at their
-respective trust boundaries.
-
-Final review verification, executed with Node.js `26.5.0`:
-
-- combined contracts, testkit, runtime, local-driver, and CLI matrix: 166/166
-  PASS;
-- runtime artifact and bootstrap suite: 72/72 PASS;
-- CLI plugin-pack suite: 16/16 PASS;
-- 8 MiB verification probe: maximum read and yielded chunk size remained at or
-  below 64 KiB;
-- targeted typecheck for all implemented workspaces: PASS;
-- architecture suite: 18/18 PASS;
-- Biome format and lint: PASS;
-- `git diff --check`: PASS;
-- SQLite restart smoke: a freshly built echo plugin was packed, persisted
-  through `FilesystemArtifactStore`, installed through `ArtifactService`, then
-  recovered by immutable `(pluginId, version, digest)` identity after reopening
-  `SqliteStateStore`.
-
-## Re-review Remediation
-
-The Task 6 re-review identified two additional Important regressions. Both were
-handled as isolated RED-to-GREEN cycles:
-
-| Re-review cycle | RED | GREEN |
-| --- | --- | --- |
-| Iterator and verified-file-handle cleanup | `3a8e0af` | `082e295` |
-| JavaScript lexical module audit | `ff4a9b6` | `53911fb` |
-
-The resource-lifecycle correction adds an idempotent close operation to the
-bounded archive reader and invokes the source iterator's `return()` after both
-successful parsing and every failure. Cleanup errors do not replace the primary
-parse diagnostic. `FilesystemArtifactStore` now tracks verified read handles
-after verification and across the verification-to-first-yield race. Closing the
-store best-effort closes every tracked handle, and suspended or racing reads
-terminate without yielding additional bytes. The regression suite reproduced
-the prior Node.js garbage-collection FileHandle error before the fix and
-completed without asynchronous resource warnings after it.
-
-The module-audit correction replaces the string/regular-expression checks with
-a dependency-free, nesting-bounded lexical scanner. It distinguishes division
-from regular-expression literals, skips comments and inert string, regex, and
-template text, and recursively audits `${...}` template expressions. Actual
-static imports, export-from declarations, dynamic imports, and CommonJS
-expressions remain detectable. The accepted runtime API surface is now exactly:
-
-- relative `./` and `../` imports;
-- real `node:` built-ins;
-- `@tegojs/plugin-sdk`.
-
-Other bare packages and fake `node:` names remain rejected. Accepted runtime
-imports, including the plugin SDK path, are recorded in the generated SBOM.
-
-Supporting formatting and explicit cleanup-control-flow commits are `b61b5ec`
-and `93b5fca`.
-
-Fresh re-review verification with Node.js `26.5.0`:
-
-- iterator and active-handle regression tests: 5/5 PASS;
-- runtime plus local-driver focused suites: 137/137 PASS;
-- CLI focused suite: 30/30 PASS;
-- combined contracts, testkit, runtime, local-driver, and CLI matrix: 185/185
-  PASS;
-- architecture suite: 18/18 PASS;
-- targeted typecheck for all implemented workspaces: PASS;
-- Biome format and lint: PASS;
-- `git diff --check`: PASS;
-- SQLite restart smoke: PASS for pack, content-addressed persistence, install,
-  close, reopen, and immutable installation recovery.
-
-## Final Review Correctness Remediation
-
-The final review identified four Important blockers, resolved in three bounded
-TDD cycles:
-
-| Final-review cycle | RED | GREEN |
-| --- | --- | --- |
-| Module lexical state, grammar position, and linear work | `c7854aa` | `9cf9d58` |
-| Empty artifact stream chunks | `955e4e2` | `f8db4a1` |
-| FileHandle close-error precedence | `58e8abc` | `69f60f1` |
-
-The module scanner now maintains explicit `expressionAllowed` state and a
-parenthesis-context stack. Postfix `++` and `--` therefore leave `/` in division
-mode, while the closing parenthesis of `if`, `for`, `while`, `switch`, `with`,
-and `catch` permits a regular-expression statement body. Dynamic imports and
-CommonJS calls can no longer hide between division slashes.
-
-Static import and export declarations are parsed once from their grammar
-position. Named-binding braces are matched before accepting `from`, so
-`import { from as value } from "./local.js"` is valid and a contextual binding
-cannot be mistaken for the module-specifier marker. The audit advances past
-each processed declaration and shares a deterministic work budget between
-lexing and token inspection. A proportional budget passes 500 semicolonless
-imports followed by 500 semicolonless exports; an intentionally insufficient
-budget fails with `ARTIFACT_MODULE_AUDIT_LIMIT`.
-
-`BoundedStreamReader` now rejects the first empty byte chunk with a structured
-`ARTIFACT_ARCHIVE_MALFORMED` diagnostic. It does not poll the source again and
-still invokes the iterator's `return()`, eliminating the zero-progress stream
-livelock.
-
-`FilesystemArtifactStore` accepts an injectable read-handle opener for
-deterministic failure testing. Verification and streaming paths both preserve
-their primary read error when handle closure also fails. A close error is still
-reported when reading and verification otherwise complete successfully. Active
-handle tracking and store-close best-effort cleanup remain unchanged.
-
-Fresh final-review verification with Node.js `26.5.0`:
-
-- scanner regression selection: 27/27 PASS;
-- empty-chunk and iterator-cleanup selection: 4/4 PASS;
-- injected handle-close and active-close selection: 6/6 PASS;
-- runtime focused suite: 76/76 PASS;
-- local-driver focused suites: 66/66 PASS;
-- CLI focused suite: 37/37 PASS;
-- combined contracts, testkit, runtime, local-driver, and CLI matrix: 197/197
-  PASS;
-- architecture suite: 18/18 PASS;
-- targeted typecheck for all implemented workspaces: PASS;
-- Biome format and lint: PASS;
-- `git diff --check`: PASS;
-- SQLite restart smoke: PASS for pack, content-addressed persistence, install,
-  close, reopen, and immutable installation recovery.
+No Critical, Important, or Minor findings remain.

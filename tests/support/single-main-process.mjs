@@ -1,3 +1,5 @@
+import { spawnManagedProcess } from "./managed-process.mjs";
+
 export const semanticSnapshotCollections = [
   "installations",
   "deployments",
@@ -60,6 +62,14 @@ export async function settleWithCleanup(operation, cleanupSteps) {
   }
   if (operationError !== undefined) throw operationError;
   return result;
+}
+
+export async function usingManagedProcess(operation, options) {
+  const child = await spawnManagedProcess(options);
+  return settleWithCleanup(
+    () => operation(child),
+    [() => child.stop({ timeoutMs: 2_000 }), () => child.assertClean({ timeoutMs: 2_000 })],
+  );
 }
 
 function snapshotRecordKey(collection, item) {
