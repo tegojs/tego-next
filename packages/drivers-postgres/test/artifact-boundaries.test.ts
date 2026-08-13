@@ -527,6 +527,119 @@ test("a definitively absent artifact after COMMIT failure preserves the original
   }
 });
 
+test("an absent artifact with stale usage after COMMIT failure is retryably indeterminate", async () => {
+  const storeNamespace = namespace("artifact_commit_absent_stale_usage");
+  const content = Buffer.from("data");
+  const artifactDigest = digest(content);
+  const observer = new Pool({ connectionString });
+  const store = new PostgresArtifactStore(
+    {
+      connectionString,
+      namespace: storeNamespace,
+      limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
+    },
+    {
+      commitTransaction: async (client: PoolClient) => {
+        await client.query("COMMIT");
+        await observer.query(
+          "DELETE FROM tego_artifacts WHERE driver_namespace = $1 AND digest = $2",
+          [storeNamespace, artifactDigest],
+        );
+        throw new Error("injected lost COMMIT acknowledgement");
+      },
+    },
+  );
+  await store.open();
+  try {
+    await assert.rejects(store.put(artifactDigest, source(content)), (error: unknown) => {
+      assert.ok(error instanceof DiagnosticError);
+      assert.equal(error.diagnostic.code, "ARTIFACT_COMMIT_INDETERMINATE");
+      assert.equal(error.diagnostic.retryable, true);
+      assert.deepEqual(error.diagnostic.details, {
+        digest: artifactDigest,
+        namespace: storeNamespace,
+        candidateBytes: "4",
+        limitBytes: "4",
+      });
+      return true;
+    });
+  } finally {
+    await Promise.all([store.close(), observer.end()]);
+  }
+});
+
+for (const connectionTimeoutMillis of [undefined, 137] as const) {
+  test(`PostgreSQL artifact pool receives the ${connectionTimeoutMillis ?? "default"} acquisition timeout`, async () => {
+    let observedTimeout: number | undefined;
+    const store = new PostgresArtifactStore(
+      {
+        connectionString,
+        namespace: namespace("artifact_pool_timeout"),
+        ...(connectionTimeoutMillis === undefined ? {} : { connectionTimeoutMillis }),
+      },
+      {
+        createConnectionPool: (options, component, max) => {
+          observedTimeout = options.connectionTimeoutMillis;
+          assert.equal(component, "artifacts");
+          assert.equal(max, undefined);
+          return new Pool({ connectionString: options.connectionString });
+        },
+      },
+    );
+    try {
+      assert.equal(observedTimeout, connectionTimeoutMillis ?? 5_000);
+    } finally {
+      await store.close();
+    }
+  });
+}
+
+test("a saturated real pool times out acquisition and still closes cleanly", async () => {
+  const storeNamespace = namespace("artifact_real_pool_timeout");
+  let artifactPool: Pool | undefined;
+  const store = new PostgresArtifactStore(
+    {
+      connectionString,
+      connectionTimeoutMillis: 30,
+      namespace: storeNamespace,
+    },
+    {
+      createConnectionPool: (options, component) => {
+        artifactPool = new Pool({
+          application_name: `tego:${options.namespace}:${component}`,
+          connectionString: options.connectionString,
+          connectionTimeoutMillis: options.connectionTimeoutMillis,
+          max: 1,
+        });
+        return artifactPool;
+      },
+    },
+  );
+  await store.open();
+  assert.ok(artifactPool !== undefined);
+  const heldClient = await artifactPool.connect();
+  try {
+    await assert.rejects(
+      store.put(digest(Buffer.from("data")), source(Buffer.from("data"))),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_BACKEND_UNAVAILABLE");
+        assert.equal(error.diagnostic.retryable, true);
+        assert.deepEqual(error.diagnostic.details, { timeoutMillis: "30" });
+        return true;
+      },
+    );
+  } finally {
+    heldClient.release();
+  }
+  await Promise.race([
+    store.close(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("PostgreSQL pool did not end after timeout")), 2_000),
+    ),
+  ]);
+});
+
 for (const blockedAcquisition of ["preflight", "transaction"] as const) {
   test(`close cancels a never-resolving ${blockedAcquisition} client acquisition and destroys a late client`, async () => {
     const storeNamespace = namespace(`artifact_${blockedAcquisition}_acquire_close`);

@@ -167,3 +167,27 @@ promotion.
 
 Independent follow-up review verdict: **READY**, with no Critical, Important, or Minor findings.
 The reviewer separately passed diff-check, focused Biome, and the PostgreSQL workspace typecheck.
+
+## Final re-review corrections
+
+The final re-review tightened two boundaries. An absent target is now considered definitive only
+after reconciliation proves namespace usage equals the exact aggregate bytes of all durable
+artifacts. A real PostgreSQL fault regression deletes the just-committed target while leaving stale
+usage and receives retryable `ARTIFACT_COMMIT_INDETERMINATE`; the clean rollback case with
+consistent zero usage still preserves the original COMMIT error.
+
+Pool construction now receives the resolved acquisition timeout rather than the raw optional
+configuration: 5000 milliseconds by default or the caller's positive safe-integer override.
+Adapter assertions observe both values at the pool factory, and a real saturated one-connection
+pool proves a 30-millisecond acquisition timeout produces retryable `ARTIFACT_BACKEND_UNAVAILABLE`
+and that `pool.end()` settles after the held client is released.
+
+Final re-review RED was the missing `createConnectionPool` seam (`TS2353` and `TS7006`), plus the
+new stale-accounting behavior test written before the absence decision was corrected. Final GREEN
+used isolated root `/tmp/tego-task5-rereview-pg.VIqe7c`, PostgreSQL 16.14 (Homebrew), port 55432,
+and the same explicit disposable database URL. PostgreSQL integration passed **89/89**; workspace
+build and typecheck, focused Biome, and diff-check passed.
+
+Final focused re-review verdict: **READY**, with no Critical, Important, or Minor findings. The
+reviewer independently passed diff-check from `a223ecd`, focused Biome, and the PostgreSQL
+workspace typecheck.

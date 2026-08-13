@@ -34,6 +34,7 @@ export interface PostgresArtifactStoreOptions extends PostgresConnectionOptions 
 export interface PostgresArtifactStoreDependencies {
   readonly commitTransaction?: (client: PoolClient) => Promise<void>;
   readonly connectClient?: (pool: Pool) => Promise<PoolClient>;
+  readonly createConnectionPool?: typeof createPool;
   readonly reconciliationTimeoutMillis?: number;
 }
 
@@ -81,7 +82,11 @@ export class PostgresArtifactStore implements ArtifactStore {
       dependencies.reconciliationTimeoutMillis ?? DEFAULT_RECONCILIATION_TIMEOUT_MILLIS,
       "reconciliationTimeoutMillis",
     );
-    this.#pool = createPool(options, "artifacts");
+    const createConnectionPool = dependencies.createConnectionPool ?? createPool;
+    this.#pool = createConnectionPool(
+      { ...options, connectionTimeoutMillis: this.#connectionTimeoutMillis },
+      "artifacts",
+    );
     this.#connectClient = dependencies.connectClient ?? ((pool) => pool.connect());
     this.#commitTransaction =
       dependencies.commitTransaction ?? (async (client) => client.query("COMMIT").then(() => {}));
@@ -744,17 +749,19 @@ export class PostgresArtifactStore implements ArtifactStore {
         if (client !== undefined) this.#releaseClient(client, true);
       });
       const row = result.rows[0];
+      const committedBytes = this.#databaseBytes(row?.committed_bytes, "artifact namespace usage");
+      const namespaceBytes = this.#databaseBytes(row?.namespace_bytes, "artifact namespace total");
+      if (committedBytes !== namespaceBytes) {
+        throw this.#commitIndeterminateError(digest, content.byteLength, commitError);
+      }
       if (row?.content_bytes === null || row?.content_bytes === undefined) return false;
       const contentBytes = this.#databaseBytes(row.content_bytes, "artifact content size");
       const declaredBytes = this.#databaseBytes(row.size_bytes, "artifact declared size");
-      const committedBytes = this.#databaseBytes(row.committed_bytes, "artifact namespace usage");
-      const namespaceBytes = this.#databaseBytes(row.namespace_bytes, "artifact namespace total");
       if (
         contentBytes === BigInt(content.byteLength) &&
         declaredBytes === contentBytes &&
         row.content !== null &&
-        Buffer.from(row.content).equals(content) &&
-        committedBytes === namespaceBytes
+        Buffer.from(row.content).equals(content)
       ) {
         return true;
       }
