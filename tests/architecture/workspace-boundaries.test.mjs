@@ -33,7 +33,6 @@ const IMMUTABLE_SDD_ARTIFACTS = new Set([
   "phase1-task-13-fault-report.md",
   "phase1-task-9-report.md",
   "progress.md",
-  "review-7b909e3..9417d8b.diff",
   "single-main-cleanup-fix-report.md",
   "task-1-brief.md",
   "task-1-report.md",
@@ -44,6 +43,13 @@ const IMMUTABLE_SDD_ARTIFACTS = new Set([
   "task-8-brief.md",
   "task-8-report.md",
 ]);
+
+function isImmutableSddArtifact(relativePath, fileName) {
+  return (
+    relativePath === ".superpowers/sdd/" &&
+    (IMMUTABLE_SDD_ARTIFACTS.has(fileName) || /^review-[\da-f]+\.\.[\da-f]+\.diff$/u.test(fileName))
+  );
+}
 
 async function activeFiles(directory, relativePath = "") {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -60,7 +66,7 @@ async function activeFiles(directory, relativePath = "") {
       }
       files.push(...(await activeFiles(new URL(`${entry.name}/`, directory), `${nextRelativePath}/`)));
     } else if (entry.isFile()) {
-      if (relativePath === ".superpowers/sdd/" && IMMUTABLE_SDD_ARTIFACTS.has(entry.name)) {
+      if (isImmutableSddArtifact(relativePath, entry.name)) {
         continue;
       }
       files.push(new URL(entry.name, directory));
@@ -69,6 +75,27 @@ async function activeFiles(directory, relativePath = "") {
 
   return files;
 }
+
+test("legacy namespace scan excludes immutable SDD review diffs but scans active SDD files", async () => {
+  const directory = await mkdtemp(
+    new URL("tego-namespace-scan-", pathToFileURL(`${tmpdir()}/`)),
+  );
+  const root = pathToFileURL(`${directory}/`);
+  const sdd = new URL(".superpowers/sdd/", root);
+  const legacyScope = "@tego" + "js/";
+
+  try {
+    await mkdir(sdd, { recursive: true });
+    await writeFile(new URL("review-abc123..def456.diff", sdd), legacyScope);
+    await writeFile(new URL("active-note.md", sdd), legacyScope);
+
+    const scannedFiles = await activeFiles(root);
+    assert.equal(scannedFiles.some((file) => file.pathname.endsWith("review-abc123..def456.diff")), false);
+    assert.equal(scannedFiles.some((file) => file.pathname.endsWith("active-note.md")), true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("public workspace namespace and alpha release metadata are exact", async () => {
   const root = new URL("../../", import.meta.url);
