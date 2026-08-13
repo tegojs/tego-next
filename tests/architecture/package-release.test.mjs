@@ -140,6 +140,8 @@ test("Windows pipe-security helper owns a bounded fail-fast watchdog through ear
     /\$watchdog = \$null[\s\S]*try \{[\s\S]*\$watchdog = \[TegoWindowsPipeSecurityNative\]::StartWatchdog\(9000\)[\s\S]*\$handle = \[TegoWindowsPipeSecurityNative\]::CreateFile\([\s\S]*\} finally \{[\s\S]*Close-TegoResource \$handle[\s\S]*Close-TegoResource \$watchdog/u,
   );
   assert.match(helper, /TEGO_WINDOWS_PIPE_SECURITY_\$\{failureStage\}_FAILED/u);
+  assert.match(helper, /\$allowedWin32Codes = @\(2, 5, 87, 123, 231\)/u);
+  assert.match(helper, /\[Console\]::Error\.WriteLine\(\$failureDiagnostic\)/u);
   assert.doesNotMatch(helper, /\[Console\]::Error\.WriteLine\(\$_.+\)/u);
 });
 

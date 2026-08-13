@@ -89,6 +89,8 @@ $barrierHandle = $null
 $barrierStream = $null
 $reader = $null
 $failureStage = $null
+$failureWin32Code = $null
+$allowedWin32Codes = @(2, 5, 87, 123, 231)
 $stage = "INITIAL_OPEN"
 
 try {
@@ -276,6 +278,12 @@ try {
   [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress -Depth 5))
 } catch {
   $failureStage = $stage
+  if ($_.Exception -is [ComponentModel.Win32Exception]) {
+    $candidateWin32Code = [int]$_.Exception.NativeErrorCode
+    if ($allowedWin32Codes -contains $candidateWin32Code) {
+      $failureWin32Code = $candidateWin32Code
+    }
+  }
 } finally {
   Close-TegoResource $reader
   Close-TegoResource $barrierStream
@@ -285,6 +293,8 @@ try {
 }
 
 if ($null -ne $failureStage) {
-  [Console]::Error.WriteLine("TEGO_WINDOWS_PIPE_SECURITY_${failureStage}_FAILED")
+  $failureDiagnostic = "TEGO_WINDOWS_PIPE_SECURITY_${failureStage}_FAILED"
+  if ($null -ne $failureWin32Code) { $failureDiagnostic += ":$failureWin32Code" }
+  [Console]::Error.WriteLine($failureDiagnostic)
   exit 1
 }
