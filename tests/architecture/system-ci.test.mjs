@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,8 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const workflowPath = join(root, ".github", "workflows", "ci.yml");
+const windowsControlGateMarker = "TEGO_WINDOWS_CONTROL_GATE_OK";
+const windowsControlGateRunner = join(root, "scripts", "run-windows-control-gate.mjs");
 const requiredStepsByJob = {
   integration: [
     "Check out repository",
@@ -141,6 +144,49 @@ test("@spec:runtime-operations/ci-authoritative-system-acceptance/workflow-gates
 
   assert.deepEqual([...jobs.keys()], ["quality", "windows-control", "integration", "system-e2e"]);
   assert.deepEqual(verifier.validateWorkflowContract(workflow), []);
+});
+
+test("Windows control gate rejects non-Windows, skipped, missing, and failed execution", async () => {
+  assert.equal(existsSync(windowsControlGateRunner), true, "Windows gate runner must exist");
+  if (!existsSync(windowsControlGateRunner)) return;
+  const { assertWindowsControlGateResult } = await import(
+    new URL(`../../scripts/run-windows-control-gate.mjs?contract=${Date.now()}`, import.meta.url)
+  );
+  const success = {
+    error: undefined,
+    signal: null,
+    status: 0,
+    stderr: "",
+    stdout: `${windowsControlGateMarker}\n`,
+  };
+
+  assert.throws(() => assertWindowsControlGateResult("darwin", success), /requires Windows/u);
+  assert.throws(
+    () => assertWindowsControlGateResult("win32", { ...success, stdout: "" }),
+    /completion marker/u,
+  );
+  assert.throws(
+    () =>
+      assertWindowsControlGateResult("win32", {
+        ...success,
+        stdout: "ℹ tests 1\nℹ pass 0\nℹ skipped 1\n",
+      }),
+    /completion marker/u,
+  );
+  assert.throws(
+    () => assertWindowsControlGateResult("win32", { ...success, status: 1 }),
+    /failed/u,
+  );
+  assert.doesNotThrow(() => assertWindowsControlGateResult("win32", success));
+
+  if (process.platform !== "win32") {
+    const result = spawnSync(process.execPath, [windowsControlGateRunner], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stdout, new RegExp(windowsControlGateMarker, "u"));
+  }
 });
 
 test("release verification is strict, complete, and non-recursive", async () => {
@@ -286,6 +332,51 @@ test("CI workflow validation rejects every disabled, soft-fail, misplaced, no-op
         });
       }
     }
+  }
+});
+
+test("CI workflow validation rejects removal, replacement, or no-op of the Windows gate", async () => {
+  const workflow = await readFile(workflowPath, "utf8");
+  const oldPatternCommand =
+    'node --test --test-name-pattern="Windows pipe hardening drains connections|windows-pipe-access-cleanup-contract" packages/cli/dist/test/control.test.js';
+  const { validateReleasePreflight } = await import(
+    new URL(`../../scripts/verify-release.mjs?windows-gate=${Date.now()}`, import.meta.url)
+  );
+  const base = {
+    gitStatus: "",
+    nodeVersion: "v26.5.0",
+    npmVersion: "11.13.0",
+    postgresUrl: "postgresql://localhost/tego",
+  };
+  assert.deepEqual(validateReleasePreflight({ ...base, workflow }), []);
+
+  const step = stepRanges(workflow, "windows-control").find(
+    ({ name }) => name === "Run Windows control security test",
+  );
+  assert.ok(step);
+  const mutations = [
+    `${workflow.slice(0, step.start)}${workflow.slice(step.end)}`,
+    mutateStepField(
+      workflow,
+      "windows-control",
+      "Run Windows control security test",
+      "run",
+      oldPatternCommand,
+    ),
+    mutateStepField(
+      workflow,
+      "windows-control",
+      "Run Windows control security test",
+      "run",
+      `node -e 'console.log("${windowsControlGateMarker}")'`,
+    ),
+  ];
+  for (const mutation of mutations) {
+    const diagnostics = validateReleasePreflight({ ...base, workflow: mutation });
+    assert.equal(
+      diagnostics.some(({ code }) => code === "ci_contract_incomplete"),
+      true,
+    );
   }
 });
 

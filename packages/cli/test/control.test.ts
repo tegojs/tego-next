@@ -25,7 +25,6 @@ import {
   validateWindowsPipeSecurityDescriptor,
   type WindowsPipeSecurityHelperSpawner,
 } from "../src/control/windows-pipe-security.js";
-import { defaultControlEndpoint } from "../src/parse-command.js";
 
 const TEST_WINDOWS_USER_SID = "S-1-5-21-1000-1000-1000-1001";
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
@@ -1578,43 +1577,4 @@ test("Windows pipe startup waits for adapter abort cleanup before rollback settl
     assert.equal(settledBeforeCleanup, false);
     await assert.rejects(connect(endpoint));
   });
-});
-
-test("@spec:runtime-operations/local-runtime-operations/windows-pipe-access-cleanup-contract", async (context) => {
-  if (process.platform !== "win32") {
-    context.skip("Windows named-pipe contract runs on Windows");
-    return;
-  }
-  const directory = await mkdtemp(join(tmpdir(), "tego-windows-control-"));
-  const endpoint = defaultControlEndpoint(directory, {
-    platform: "win32",
-    runtimeScope: "main",
-    userScope: process.env.USERNAME ?? "current-user",
-  });
-  const productionAdapter = createWindowsPipeSecurityAdapter();
-  const server = await startControlServer({ endpoint, operations: fakeOperations() });
-  try {
-    const hardenedDescriptor = await productionAdapter.inspect(endpoint);
-    const { accessRules: _accessRules, ...publicDescriptor } = hardenedDescriptor;
-    assert.deepEqual(
-      validateWindowsPipeSecurityDescriptor(hardenedDescriptor, hardenedDescriptor.ownerSid),
-      publicDescriptor,
-    );
-    assert.deepEqual(
-      new Set(hardenedDescriptor.accessSids),
-      new Set([hardenedDescriptor.ownerSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID]),
-    );
-    assert.equal(hardenedDescriptor.protectedDacl, true);
-    const response = await requestControl({
-      endpoint,
-      operation: "runtime.status",
-      input: {},
-      timeoutMs: 1_000,
-    });
-    assert.equal(response.ok, true);
-  } finally {
-    await server.close();
-    await rm(directory, { force: true, recursive: true });
-  }
-  await assert.rejects(connect(endpoint));
 });

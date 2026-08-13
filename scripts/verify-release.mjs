@@ -22,8 +22,7 @@ const integrationReporterCommand = `node scripts/run-ci-test.mjs --name integrat
 const singleMainReporterCommand = `node scripts/run-ci-test.mjs --name single-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:single-main`;
 const multiMainReporterCommand = `node scripts/run-ci-test.mjs --name multi-main --artifacts "${runnerTemp}/tego-test-artifacts" --timeout-ms 420000 -- npm run test:e2e:multi-main`;
 const deterministicPackageCommand = "node scripts/verify-release.mjs --deterministic-package";
-const windowsControlTestCommand =
-  'node --test --test-name-pattern="Windows pipe hardening drains connections|windows-pipe-access-cleanup-contract" packages/cli/dist/test/control.test.js';
+const windowsControlTestCommand = "node scripts/run-windows-control-gate.mjs";
 const actionPins = {
   checkout: {
     reference: "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",

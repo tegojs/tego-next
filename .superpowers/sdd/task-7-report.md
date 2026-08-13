@@ -22,12 +22,13 @@
 - The helper is copied beside the compiled module, included in the `@tego/cli` npm artifact, and
   exercised through clean-consumer package verification. The production adapter resolves this
   installed, colocated asset rather than relying on a repository-only script path.
-- The real Windows test inspects the descriptor without applying it a second time, makes a
-  current-user status request, closes the server, and proves reconnection fails.
+- A dedicated real Windows gate program inspects the descriptor without applying it a second
+  time, makes a current-user status request, closes the server, proves reconnection fails, and
+  emits its unique success marker only after every assertion completes.
 - Added a required `windows-control` job on `windows-2025` with pinned actions, exact Node.js
-  26.5.0 and npm 11.13.0 checks, clean install, CLI build/typecheck, the injected admission-race
-  test, and the real Windows ACL/cleanup contract. Workflow mutation tests reject removal,
-  disabling, soft failure, relocation, no-op replacement, or reordering of any required step.
+  26.5.0 and npm 11.13.0 checks, clean install, CLI build/typecheck, and the fail-closed real
+  Windows gate. Workflow mutation tests reject removal, disabling, soft failure, relocation,
+  no-op replacement, old name-pattern replacement, or reordering of any required step.
 
 ## Admission Boundary
 
@@ -64,14 +65,25 @@ rollback, deterministic two-connection admission cutover, LocalSystem de-duplica
 one-line helper parsing, fixed shell-free helper arguments, abort cleanup ordering, query-only
 inspection, installed helper packaging, watchdog retention, and the exact Windows CI contract.
 
+A post-review TDD slice closed a fail-open CI selection issue:
+
+- RED proved Node.js exits successfully when `--test-name-pattern` matches no tests and records
+  the selection as skipped; three architecture failures then captured the unsafe workflow command,
+  missing dedicated runner, and validator acceptance of the old pattern command.
+- GREEN replaced name filtering with a directly executed Windows-only contract and bounded parent
+  runner. Non-Windows execution, missing target execution, any child failure/timeout/signal,
+  stderr, extra output, or missing exact completion marker now fails the gate. Architecture
+  mutations prove the gate cannot be removed or replaced by the old pattern or a marker-printing
+  no-op.
+
 ## Verification
 
 All local verification used Node.js 26.5.0:
 
 - `npm run build --workspace @tego/cli` passed;
 - `npm run typecheck --workspace @tego/cli` passed;
-- CLI control suite: 44 passed, 0 failed, 1 Windows-only test skipped;
-- project/system CI architecture suite: 216/216 passed;
+- CLI control suite: 44/44 passed with no skipped tests;
+- project/system CI architecture suite: 218/218 passed;
 - package-release suite: 15/15 passed;
 - Biome check passed for all changed TypeScript, JavaScript, and test files;
 - the built and source PowerShell helpers are byte-identical;
@@ -84,9 +96,9 @@ All local verification used Node.js 26.5.0:
 
 The real named-pipe ACL gate is intentionally not claimed as locally verified. This host is macOS,
 and `pwsh` is unavailable, so neither Windows ACL behavior nor a local PowerShell parser run was
-possible. The Windows-only test remains skipped here and is configured to fail, not skip, on
-Windows if PowerShell, ACL application, inspection, admission cutover, current-user access, or
-cleanup is unavailable.
+possible. The dedicated gate fails immediately on this host instead of skipping. On Windows it
+cannot succeed unless the standalone contract executes fully and emits exactly one completion
+marker after PowerShell ACL application/inspection, current-user access, and cleanup all pass.
 
 Per the task boundary, no branch was pushed and no release action was taken. Task 10 must push the
 branch and require the real `windows-control` job to pass. If that job cannot apply and inspect the

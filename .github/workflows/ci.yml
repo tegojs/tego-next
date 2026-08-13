@@ -81,7 +81,7 @@ jobs:
       - name: Typecheck CLI
         run: npm run typecheck --workspace @tego/cli
       - name: Run Windows control security test
-        run: node --test --test-name-pattern="Windows pipe hardening drains connections|windows-pipe-access-cleanup-contract" packages/cli/dist/test/control.test.js
+        run: node scripts/run-windows-control-gate.mjs
 
   integration:
     name: PostgreSQL integration

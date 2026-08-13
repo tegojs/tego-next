@@ -98,7 +98,7 @@ test("GitHub CI declares quality, Windows control, integration, and system E2E g
     'if ((node --version) -ne "v26.5.0") { throw "Unexpected Node.js version" }',
     'if ((npm --version) -ne "11.13.0") { throw "Unexpected npm version" }',
     "node scripts/verify-release.mjs --deterministic-package",
-    'node --test --test-name-pattern="Windows pipe hardening drains connections|windows-pipe-access-cleanup-contract" packages/cli/dist/test/control.test.js',
+    "node scripts/run-windows-control-gate.mjs",
     "postgres:16.14-alpine",
     "TEGO_POSTGRES_URL:",
     "TEGO_TEST_ARTIFACTS_DIR:",
