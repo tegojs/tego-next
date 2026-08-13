@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -335,6 +336,7 @@ function adapterSession(adapters) {
     registryState: adapters.registryState,
     registryTags: adapters.registryTags,
     run: adapters.run,
+    snapshotCheckpoint: adapters.snapshotCheckpoint,
   };
 }
 
@@ -494,22 +496,46 @@ export async function publishAlpha(adapters) {
     if (typeof expected.tarball !== "string" || expected.tarball === "") {
       fail(`${expected.name} has no packed tarball`);
     }
-    const args = [
-      "publish",
-      expected.tarball,
-      "--registry",
-      NPM_REGISTRY,
-      "--access",
-      "public",
-      "--tag",
-      "alpha",
-    ];
-    const result =
-      typeof adapters.publish === "function"
-        ? commandResult(await adapters.publish(expected, "npm", args), `${expected.name} publish`)
-        : await run(adapters, "npm", args);
-    requireSuccess(result, `could not publish ${expected.name}`);
-    published.push(expected.name);
+    const snapshotDirectory = await createPrivateDirectory("tego-alpha-publish-");
+    let primaryError;
+    try {
+      const snapshot = await createPublishSnapshot(
+        expected,
+        snapshotDirectory,
+        adapters.snapshotCheckpoint,
+      );
+      const args = [
+        "publish",
+        snapshot,
+        "--registry",
+        NPM_REGISTRY,
+        "--access",
+        "public",
+        "--tag",
+        "alpha",
+      ];
+      const result =
+        typeof adapters.publish === "function"
+          ? commandResult(await adapters.publish(expected, "npm", args), `${expected.name} publish`)
+          : await run(adapters, "npm", args);
+      requireSuccess(result, `could not publish ${expected.name}`);
+      published.push(expected.name);
+    } catch (error) {
+      primaryError = error;
+    }
+    let cleanupError;
+    try {
+      await rm(snapshotDirectory, { force: true, recursive: true });
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (primaryError !== undefined) {
+      if (primaryError instanceof Error && cleanupError !== undefined) {
+        primaryError.cleanupError = cleanupError;
+      }
+      throw primaryError;
+    }
+    if (cleanupError !== undefined) throw cleanupError;
   }
   return { published, skipped };
 }
@@ -540,6 +566,46 @@ function safeArtifactDirectory(directory) {
   return absolute;
 }
 
+function permissionBits(stats) {
+  return Number(stats.mode) & 0o777;
+}
+
+async function secureArtifactDirectory(directory) {
+  const absolute = safeArtifactDirectory(directory);
+  await mkdir(absolute, { mode: 0o700, recursive: true });
+  let handle;
+  try {
+    handle = await open(
+      absolute,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const before = await handle.stat({ bigint: true });
+    if (!before.isDirectory()) fail("artifact directory must be a real directory, not a symlink");
+    await handle.chmod(0o700);
+    const after = await handle.stat({ bigint: true });
+    if (!after.isDirectory() || permissionBits(after) !== 0o700) {
+      fail("artifact directory must be an owner-only real directory");
+    }
+    await verifyPathStillNamesDirectory(absolute, after);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("artifact directory")) throw error;
+    fail("artifact directory must be an owner-only real directory, not a symlink");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  return absolute;
+}
+
+async function createPrivateDirectory(prefix) {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  try {
+    return await secureArtifactDirectory(directory);
+  } catch (error) {
+    await rm(directory, { force: true, recursive: true });
+    throw error;
+  }
+}
+
 function relativeTarball(artifactDirectory, tarball) {
   const path = relative(artifactDirectory, resolve(tarball));
   if (path === "" || path.startsWith("..") || isAbsolute(path) || path !== basename(path)) {
@@ -548,22 +614,220 @@ function relativeTarball(artifactDirectory, tarball) {
   return path;
 }
 
-async function sha512(path) {
-  return `sha512-${createHash("sha512")
-    .update(await readFile(path))
-    .digest("base64")}`;
+function sameFileIdentityAndState(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+async function verifyPathStillNamesDirectory(path, initial) {
+  let current;
+  try {
+    current = await lstat(path, { bigint: true });
+  } catch {
+    fail("artifact directory changed while it was being secured");
+  }
+  if (
+    !current.isDirectory() ||
+    current.dev !== initial.dev ||
+    current.ino !== initial.ino ||
+    permissionBits(current) !== 0o700
+  ) {
+    fail("artifact directory changed or became a symlink while it was being secured");
+  }
+}
+
+async function openRegular(path, label, flags = constants.O_RDONLY) {
+  let handle;
+  try {
+    handle = await open(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stats = await handle.stat({ bigint: true });
+    if (!stats.isFile()) fail(`${label} must be a regular file, not a symlink`);
+    return { handle, stats };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error instanceof Error && error.message.startsWith(label)) throw error;
+    fail(`${label} must be a readable regular file, not a symlink`);
+  }
+}
+
+async function hashHandle(handle, stats, label) {
+  if (stats.size > BigInt(Number.MAX_SAFE_INTEGER)) fail(`${label} is too large to verify safely`);
+  const hash = createHash("sha512");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (position < Number(stats.size)) {
+    const length = Math.min(buffer.length, Number(stats.size) - position);
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    if (bytesRead === 0) fail(`${label} changed while it was being read`);
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return `sha512-${hash.digest("base64")}`;
+}
+
+async function verifyPathStillNamesFile(path, initial, label) {
+  let current;
+  try {
+    current = await lstat(path, { bigint: true });
+  } catch {
+    fail(`${label} changed while it was being verified`);
+  }
+  if (!current.isFile() || !sameFileIdentityAndState(initial, current)) {
+    fail(`${label} changed or became a symlink while it was being verified`);
+  }
+}
+
+async function sha512RegularFile(path, label) {
+  const { handle, stats: before } = await openRegular(path, label);
+  try {
+    const integrity = await hashHandle(handle, before, label);
+    const after = await handle.stat({ bigint: true });
+    if (!sameFileIdentityAndState(before, after)) {
+      fail(`${label} changed while it was being verified`);
+    }
+    await verifyPathStillNamesFile(path, before, label);
+    return integrity;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function copyHandle(source, destination, size, label) {
+  if (size > BigInt(Number.MAX_SAFE_INTEGER)) fail(`${label} is too large to snapshot safely`);
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (position < Number(size)) {
+    const length = Math.min(buffer.length, Number(size) - position);
+    const { bytesRead } = await source.read(buffer, 0, length, position);
+    if (bytesRead === 0) fail(`${label} changed while its snapshot was created`);
+    let written = 0;
+    while (written < bytesRead) {
+      const result = await destination.write(
+        buffer,
+        written,
+        bytesRead - written,
+        position + written,
+      );
+      if (result.bytesWritten === 0) fail(`${label} snapshot could not be written completely`);
+      written += result.bytesWritten;
+    }
+    position += bytesRead;
+  }
+}
+
+async function createPublishSnapshot(expected, directory, checkpoint) {
+  const label = `${expected.name} tarball`;
+  const { handle: source, stats: before } = await openRegular(expected.tarball, label);
+  const snapshot = join(directory, `${expected.name.slice("@tego/".length)}.tgz`);
+  let destination;
+  try {
+    destination = await open(
+      snapshot,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    const destinationStats = await destination.stat({ bigint: true });
+    if (!destinationStats.isFile()) fail(`${label} snapshot is not a regular file`);
+    await copyHandle(source, destination, before.size, label);
+    await destination.sync();
+    if (typeof checkpoint === "function") await checkpoint(expected);
+    const after = await source.stat({ bigint: true });
+    if (!sameFileIdentityAndState(before, after)) {
+      fail(`${label} changed while its snapshot was created`);
+    }
+    await verifyPathStillNamesFile(expected.tarball, before, label);
+    await destination.chmod(0o400);
+  } finally {
+    await destination?.close().catch(() => {});
+    await source.close();
+  }
+  const snapshotStats = await lstat(snapshot);
+  if (
+    !snapshotStats.isFile() ||
+    snapshotStats.isSymbolicLink() ||
+    permissionBits(snapshotStats) !== 0o400
+  ) {
+    fail(`${label} snapshot is not an immutable regular file`);
+  }
+  const integrity = await sha512RegularFile(snapshot, `${label} snapshot`);
+  if (integrity !== expected.integrity) {
+    fail(`${label} snapshot integrity does not match the release manifest`);
+  }
+  return snapshot;
+}
+
+async function writePrivateManifest(path, contents) {
+  let handle;
+  try {
+    try {
+      handle = await open(path, constants.O_WRONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      handle = await open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+    }
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) fail("release manifest must be a regular file, not a symlink");
+    await handle.chmod(0o600);
+    await handle.truncate(0);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    const after = await handle.stat({ bigint: true });
+    if (!after.isFile() || permissionBits(after) !== 0o600) {
+      fail("release manifest must be an owner-only regular file");
+    }
+    await verifyPathStillNamesFile(path, after, "release manifest");
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("release manifest")) throw error;
+    fail("release manifest must be a writable regular file, not a symlink");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function readPrivateManifest(path) {
+  const { handle, stats: before } = await openRegular(path, "release manifest");
+  try {
+    await handle.chmod(0o600);
+    const contents = await handle.readFile("utf8");
+    const after = await handle.stat({ bigint: true });
+    if (
+      !after.isFile() ||
+      permissionBits(after) !== 0o600 ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs
+    ) {
+      fail("release manifest changed or is not owner-only");
+    }
+    await verifyPathStillNamesFile(path, after, "release manifest");
+    return contents;
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function createReleaseManifest({ artifactDirectory, targetSha, packages }) {
-  const absoluteArtifactDirectory = safeArtifactDirectory(artifactDirectory);
+  const absoluteArtifactDirectory = await secureArtifactDirectory(artifactDirectory);
   if (!/^[0-9a-f]{40}$/u.test(targetSha)) fail("release manifest requires a full target SHA");
-  await mkdir(absoluteArtifactDirectory, { recursive: true });
   const ordered = releaseOrder(packages);
   assertCompleteReleaseSet(ordered);
   const records = [];
   for (const expected of ordered) {
     const tarball = relativeTarball(absoluteArtifactDirectory, expected.tarball);
-    const integrity = await sha512(join(absoluteArtifactDirectory, tarball));
+    const integrity = await sha512RegularFile(
+      join(absoluteArtifactDirectory, tarball),
+      `${expected.name} tarball`,
+    );
     if (expected.integrity !== undefined && expected.integrity !== integrity) {
       fail(`${expected.name} npm pack integrity does not match the tarball bytes`);
     }
@@ -586,17 +850,14 @@ export async function createReleaseManifest({ artifactDirectory, targetSha, pack
     packages: records,
   };
   const manifestPath = join(absoluteArtifactDirectory, RELEASE_MANIFEST);
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
-    flag: "w",
-    mode: 0o600,
-  });
+  await writePrivateManifest(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return { manifest, manifestPath };
 }
 
 export async function loadReleaseManifest(manifestPath) {
   const absoluteManifestPath = resolve(manifestPath);
-  const artifactDirectory = safeArtifactDirectory(dirname(absoluteManifestPath));
-  const manifest = parseJson(await readFile(absoluteManifestPath, "utf8"), RELEASE_MANIFEST);
+  const artifactDirectory = await secureArtifactDirectory(dirname(absoluteManifestPath));
+  const manifest = parseJson(await readPrivateManifest(absoluteManifestPath), RELEASE_MANIFEST);
   if (
     manifest.schemaVersion !== 1 ||
     manifest.version !== ALPHA_VERSION ||
@@ -616,7 +877,7 @@ export async function loadReleaseManifest(manifestPath) {
   const ordered = releaseOrder(packages);
   assertCompleteReleaseSet(ordered);
   for (const expected of ordered) {
-    const integrity = await sha512(expected.tarball);
+    const integrity = await sha512RegularFile(expected.tarball, `${expected.name} tarball`);
     if (integrity !== expected.integrity) {
       fail(`${expected.name} release manifest integrity does not match its tarball bytes`);
     }

@@ -216,12 +216,21 @@ test("release evidence separates tested target from later evidence commit", asyn
   const run = async (command, args) => {
     calls.push({ command, args });
     if (args[0] === "merge-base") return { exitCode: 0, stdout: "", stderr: "" };
-    if (args[0] === "rev-list") return { exitCode: 0, stdout: "2\n", stderr: "" };
-    if (args[0] === "diff") {
+    if (args[0] === "rev-list" && args[1] === "--reverse") {
+      return { exitCode: 0, stdout: `${evidenceSha}\n${headSha}\n`, stderr: "" };
+    }
+    if (args[0] === "rev-list" && args[1] === "--parents") {
+      const commit = args.at(-1);
+      const parent = commit === evidenceSha ? targetSha : evidenceSha;
+      return { exitCode: 0, stdout: `${commit} ${parent}\n`, stderr: "" };
+    }
+    if (args[0] === "diff-tree") {
       return {
         exitCode: 0,
         stdout:
-          "openspec/changes/runtime-kernel-phase-1/verification-report.md\nopenspec/changes/runtime-kernel-phase-1/.comet.yaml\n",
+          args.at(-1) === evidenceSha
+            ? "openspec/changes/runtime-kernel-phase-1/verification-report.md\n"
+            : "openspec/changes/runtime-kernel-phase-1/.comet.yaml\n",
         stderr: "",
       };
     }
@@ -238,7 +247,9 @@ test("release evidence separates tested target from later evidence commit", asyn
 
   const unrelated = async (command, args) => {
     const result = await run(command, args);
-    if (args[0] === "diff") return { ...result, stdout: "packages/runtime/src/index.ts\n" };
+    if (args[0] === "diff-tree" && args.at(-1) === evidenceSha) {
+      return { ...result, stdout: "packages/runtime/src/index.ts\n" };
+    }
     return result;
   };
   await assert.rejects(
@@ -258,7 +269,12 @@ test("release evidence separates tested target from later evidence commit", asyn
 
   const tooDistant = async (command, args) => {
     const result = await run(command, args);
-    if (args[0] === "rev-list") return { ...result, stdout: "3\n" };
+    if (args[0] === "rev-list" && args[1] === "--reverse") {
+      return {
+        ...result,
+        stdout: `0000000000000000000000000000000000000001\n${evidenceSha}\n${headSha}\n`,
+      };
+    }
     return result;
   };
   await assert.rejects(
@@ -277,5 +293,30 @@ test("release evidence separates tested target from later evidence commit", asyn
   await assert.rejects(
     validateReleaseEvidenceTarget({ evidence, headSha, run: tamperedSource }),
     /source SHA.*evidence-only/u,
+  );
+
+  evidence.localVerification.sourceSha = targetSha;
+  const changedThenReverted = async (command, args) => {
+    const result = await run(command, args);
+    if (args[0] === "diff-tree" && args.at(-1) === evidenceSha) {
+      return { ...result, stdout: "packages/runtime/src/index.ts\n" };
+    }
+    return result;
+  };
+  await assert.rejects(
+    validateReleaseEvidenceTarget({ evidence, headSha, run: changedThenReverted }),
+    /unrelated.*packages\/runtime/u,
+  );
+
+  const mergeChain = async (command, args) => {
+    const result = await run(command, args);
+    if (args[0] === "rev-list" && args[1] === "--parents" && args.at(-1) === headSha) {
+      return { ...result, stdout: `${headSha} ${evidenceSha} ${targetSha}\n` };
+    }
+    return result;
+  };
+  await assert.rejects(
+    validateReleaseEvidenceTarget({ evidence, headSha, run: mergeChain }),
+    /merge.*evidence/u,
   );
 });

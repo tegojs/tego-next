@@ -173,29 +173,70 @@ export async function validateReleaseEvidenceTarget({ evidence, headSha, run }) 
       throw new Error(`${label} source SHA is not on the target-to-HEAD evidence-only chain`);
     }
   }
-  const count = evidenceCommandResult(
-    await run("git", ["rev-list", "--count", `${targetSha}..${headSha}`]),
+  const revisionList = evidenceCommandResult(
+    await run("git", ["rev-list", "--reverse", "--topo-order", `${targetSha}..${headSha}`]),
     "git rev-list",
   );
-  if (count.exitCode !== 0 || !/^\d+\s*$/u.test(count.stdout)) {
-    throw new Error("could not count release evidence commits");
+  if (revisionList.exitCode !== 0) {
+    throw new Error("could not enumerate release evidence commits");
   }
-  const commitsAfterTarget = Number.parseInt(count.stdout.trim(), 10);
+  const commits = revisionList.stdout.trim() === "" ? [] : revisionList.stdout.trim().split("\n");
+  if (commits.some((commit) => !/^[0-9a-f]{40}$/u.test(commit))) {
+    throw new Error("release evidence commit list contains an invalid Git SHA");
+  }
+  const commitsAfterTarget = commits.length;
   if (commitsAfterTarget > 2) {
     throw new Error(
       "release evidence HEAD is more than two evidence-only commits after target SHA",
     );
   }
-  if (commitsAfterTarget > 0) {
-    const diff = evidenceCommandResult(
-      await run("git", ["diff", "--name-only", targetSha, headSha]),
-      "git diff",
+  if (
+    (commitsAfterTarget === 0 && targetSha !== headSha) ||
+    (commitsAfterTarget > 0 && commits.at(-1) !== headSha)
+  ) {
+    throw new Error("release evidence commit list does not terminate at HEAD");
+  }
+  const chain = new Set([targetSha, ...commits]);
+  for (const [label, sourceSha] of [
+    ["local release verification", evidence.localVerification.sourceSha],
+    ["authoritative CI", evidence.authoritativeCi.sourceSha],
+  ]) {
+    if (!chain.has(sourceSha)) {
+      throw new Error(`${label} source SHA is not on the enumerated evidence-only chain`);
+    }
+  }
+  const allowed = new Set([
+    "openspec/changes/runtime-kernel-phase-1/verification-report.md",
+    "openspec/changes/runtime-kernel-phase-1/.comet.yaml",
+  ]);
+  let parent = targetSha;
+  for (const commit of commits) {
+    const parents = evidenceCommandResult(
+      await run("git", ["rev-list", "--parents", "-n", "1", commit]),
+      "git rev-list --parents",
     );
-    if (diff.exitCode !== 0) throw new Error("could not inspect release evidence commit paths");
-    const allowed = new Set([
-      "openspec/changes/runtime-kernel-phase-1/verification-report.md",
-      "openspec/changes/runtime-kernel-phase-1/.comet.yaml",
-    ]);
+    const ancestry = parents.stdout.trim().split(/\s+/u);
+    if (
+      parents.exitCode !== 0 ||
+      ancestry.length !== 2 ||
+      ancestry[0] !== commit ||
+      ancestry[1] !== parent
+    ) {
+      throw new Error("merge or non-linear commits are not allowed in the release evidence chain");
+    }
+    const diff = evidenceCommandResult(
+      await run("git", [
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "--root",
+        "--diff-filter=ACDMRTUXB",
+        commit,
+      ]),
+      "git diff-tree",
+    );
+    if (diff.exitCode !== 0) throw new Error("could not inspect a release evidence commit");
     const unrelated = diff.stdout
       .trim()
       .split("\n")
@@ -203,6 +244,7 @@ export async function validateReleaseEvidenceTarget({ evidence, headSha, run }) 
     if (unrelated.length > 0) {
       throw new Error(`release evidence commits contain unrelated paths: ${unrelated.join(", ")}`);
     }
+    parent = commit;
   }
   return { targetSha, commitsAfterTarget };
 }

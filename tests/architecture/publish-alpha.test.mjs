@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -61,6 +72,17 @@ function releasePackages() {
     "@tego/transport-websocket": ALPHA_VERSION,
   });
   return [cli, contracts, local, postgres, executor, pluginSdk, runtime, testkit, websocket];
+}
+
+async function releasePackagesOnDisk(directory) {
+  const packages = releasePackages();
+  for (const expected of packages) {
+    const contents = `publish tarball bytes: ${expected.name}`;
+    expected.tarball = join(directory, `${expected.name.slice("@tego/".length)}.tgz`);
+    await writeFile(expected.tarball, contents, { mode: 0o600 });
+    expected.integrity = `sha512-${createHash("sha512").update(contents).digest("base64")}`;
+  }
+  return packages;
 }
 
 function registryRecord(expected) {
@@ -337,7 +359,8 @@ test("registry state accepts npm view's flattened integrity field and dependency
 });
 
 test("publisher uses explicit safe npm flags, skips exact matches, and never invokes git or gh", async () => {
-  const packages = releasePackages();
+  const directory = await mkdtemp(join(tmpdir(), "tego-publish-snapshot-test-"));
+  const packages = await releasePackagesOnDisk(directory);
   const existing = packages.find(({ name }) => name === "@tego/contracts");
   const state = new Map([[existing.name, registryRecord(existing)]]);
   const commandCalls = [];
@@ -354,30 +377,81 @@ test("publisher uses explicit safe npm flags, skips exact matches, and never inv
     async publish(expected, command, args) {
       published.push(expected.name);
       commandCalls.push({ command, args });
+      const source = packages.find(({ name }) => name === expected.name).tarball;
+      assert.notEqual(args[1], source);
+      assert.equal(await readFile(args[1], "utf8"), `publish tarball bytes: ${expected.name}`);
+      const snapshot = await lstat(args[1]);
+      assert.equal(snapshot.isFile(), true);
+      assert.equal(snapshot.mode & 0o777, 0o400);
+      assert.equal((await lstat(dirname(args[1]))).mode & 0o777, 0o700);
       state.set(expected.name, registryRecord(expected));
       return { exitCode: 0, stdout: "", stderr: "" };
     },
   });
-  const preflight = await preflightRelease(adapters);
-  adapters.preflightReceipt = preflight.receipt;
-  const result = await publishAlpha(adapters);
+  try {
+    const preflight = await preflightRelease(adapters);
+    adapters.preflightReceipt = preflight.receipt;
+    const result = await publishAlpha(adapters);
 
-  assert.deepEqual(result.skipped, ["@tego/contracts"]);
-  assert.equal(result.published.length, 8);
-  assert.deepEqual(new Set(result.published), new Set(published));
-  for (const { command, args } of commandCalls) {
-    assert.notEqual(command, "git");
-    assert.notEqual(command, "gh");
-    assert.deepEqual(args, [
-      "publish",
-      packages.find(({ tarball }) => args[1] === tarball).tarball,
-      "--registry",
-      NPM_REGISTRY,
-      "--access",
-      "public",
-      "--tag",
-      "alpha",
-    ]);
+    assert.deepEqual(result.skipped, ["@tego/contracts"]);
+    assert.equal(result.published.length, 8);
+    assert.deepEqual(new Set(result.published), new Set(published));
+    for (const { command, args } of commandCalls) {
+      assert.notEqual(command, "git");
+      assert.notEqual(command, "gh");
+      assert.equal(args[0], "publish");
+      assert.deepEqual(args.slice(2), [
+        "--registry",
+        NPM_REGISTRY,
+        "--access",
+        "public",
+        "--tag",
+        "alpha",
+      ]);
+      await assert.rejects(lstat(args[1]), /ENOENT/u);
+    }
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("publisher rejects symlinks, non-regular tarballs, and path replacement without uploading", async () => {
+  for (const attack of ["symlink", "non-regular", "replace-after-copy"]) {
+    const directory = await mkdtemp(join(tmpdir(), `tego-publish-${attack}-`));
+    try {
+      const packages = await releasePackagesOnDisk(directory);
+      const attacked = packages.find(({ name }) => name === "@tego/contracts");
+      let uploads = 0;
+      const overrides = {
+        packages,
+        async publish() {
+          uploads += 1;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+      if (attack === "replace-after-copy") {
+        overrides.snapshotCheckpoint = async (expected) => {
+          if (expected.name !== attacked.name) return;
+          await rename(attacked.tarball, `${attacked.tarball}.original`);
+          await writeFile(attacked.tarball, "replacement bytes", { mode: 0o600 });
+        };
+      }
+      const { adapters } = preflightAdapters(overrides);
+      const preflight = await preflightRelease(adapters);
+      adapters.preflightReceipt = preflight.receipt;
+      if (attack === "symlink") {
+        await rename(attacked.tarball, `${attacked.tarball}.target`);
+        await symlink(`${attacked.tarball}.target`, attacked.tarball);
+      }
+      if (attack === "non-regular") {
+        await rm(attacked.tarball);
+        await mkdir(attacked.tarball);
+      }
+      await assert.rejects(publishAlpha(adapters), /tarball.*(?:regular|changed|symlink)/u);
+      assert.equal(uploads, 0, attack);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
   }
 });
 
@@ -509,8 +583,66 @@ test("release manifest records Git SHA and computed SHA-512 without credentials"
       assert.equal(releasePackage.tarball, `${releasePackage.directory}.tgz`);
     }
     assert.doesNotMatch(JSON.stringify(persisted), /token|password|_auth/iu);
+    assert.equal((await lstat(result.manifestPath)).mode & 0o777, 0o600);
+
+    await chmod(result.manifestPath, 0o644);
+    await loadReleaseManifest(result.manifestPath);
+    assert.equal((await lstat(result.manifestPath)).mode & 0o777, 0o600);
+    assert.equal((await lstat(directory)).mode & 0o077, 0);
   } finally {
     await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("manifest and artifact loading rejects symlinks and non-regular tarballs", async () => {
+  for (const attack of [
+    "symlink-artifact-directory",
+    "symlink-tarball",
+    "non-regular-tarball",
+    "symlink-manifest",
+  ]) {
+    const parent = await mkdtemp(join(tmpdir(), `tego-manifest-${attack}-`));
+    const directory = join(parent, "artifacts");
+    const realDirectory =
+      attack === "symlink-artifact-directory" ? join(parent, "real-artifacts") : directory;
+    await mkdir(realDirectory, { mode: 0o755 });
+    if (attack === "symlink-artifact-directory") await symlink(realDirectory, directory);
+    try {
+      const packages = (await releasePackagesOnDisk(directory)).map((expected) => ({
+        ...expected,
+        directory: expected.name.slice("@tego/".length),
+      }));
+      const creation = createReleaseManifest({
+        artifactDirectory: directory,
+        targetSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        packages,
+      });
+      if (attack === "symlink-artifact-directory") {
+        await assert.rejects(creation, /artifact directory.*symlink/u);
+        continue;
+      }
+      const { manifestPath } = await creation;
+      assert.equal((await lstat(directory)).mode & 0o077, 0);
+      if (attack === "symlink-manifest") {
+        await rename(manifestPath, `${manifestPath}.target`);
+        await symlink(`${manifestPath}.target`, manifestPath);
+      } else {
+        const attacked = packages.find(({ name }) => name === "@tego/contracts");
+        if (attack === "symlink-tarball") {
+          await rename(attacked.tarball, `${attacked.tarball}.target`);
+          await symlink(`${attacked.tarball}.target`, attacked.tarball);
+        } else {
+          await rm(attacked.tarball);
+          await mkdir(attacked.tarball);
+        }
+      }
+      await assert.rejects(
+        loadReleaseManifest(manifestPath),
+        /(?:manifest|tarball).*(?:regular|symlink)/u,
+      );
+    } finally {
+      await rm(parent, { force: true, recursive: true });
+    }
   }
 });
 
