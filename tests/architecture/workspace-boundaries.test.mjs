@@ -17,6 +17,33 @@ const PUBLIC_PACKAGES = new Set([
   "@tego/testkit",
   "@tego/transport-websocket",
 ]);
+const IMMUTABLE_SDD_ARTIFACTS = new Set([
+  "integration-task-6-report.md",
+  "integration-task-7-report.md",
+  "integration-task-8-report.md",
+  "phase1-contract-task-1-report.md",
+  "phase1-contract-task-2-fix-report.md",
+  "phase1-docs-report.md",
+  "phase1-task-1-fix-report.md",
+  "phase1-task-1-report.md",
+  "phase1-task-12-fix-report.md",
+  "phase1-task-12-fix2-report.md",
+  "phase1-task-12-report.md",
+  "phase1-task-13-fault-fix-report.md",
+  "phase1-task-13-fault-report.md",
+  "phase1-task-9-report.md",
+  "progress.md",
+  "review-7b909e3..9417d8b.diff",
+  "single-main-cleanup-fix-report.md",
+  "task-1-brief.md",
+  "task-1-report.md",
+  "task-4-report.md",
+  "task-5-report.md",
+  "task-6-report.md",
+  "task-7-report.md",
+  "task-8-brief.md",
+  "task-8-report.md",
+]);
 
 async function activeFiles(directory, relativePath = "") {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -27,13 +54,15 @@ async function activeFiles(directory, relativePath = "") {
     if (entry.isDirectory()) {
       if (
         entry.name === ".git" ||
-        entry.name === "node_modules" ||
-        nextRelativePath === ".superpowers/sdd"
+        entry.name === "node_modules"
       ) {
         continue;
       }
       files.push(...(await activeFiles(new URL(`${entry.name}/`, directory), `${nextRelativePath}/`)));
     } else if (entry.isFile()) {
+      if (relativePath === ".superpowers/sdd/" && IMMUTABLE_SDD_ARTIFACTS.has(entry.name)) {
+        continue;
+      }
       files.push(new URL(entry.name, directory));
     }
   }
@@ -44,6 +73,9 @@ async function activeFiles(directory, relativePath = "") {
 test("public workspace namespace and alpha release metadata are exact", async () => {
   const root = new URL("../../", import.meta.url);
   const rootManifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+  const echoManifest = JSON.parse(
+    await readFile(new URL("examples/echo-plugin/package.json", root), "utf8"),
+  );
   const packageDirectories = await readdir(new URL("packages/", root), { withFileTypes: true });
   const manifests = await Promise.all(
     packageDirectories
@@ -53,6 +85,7 @@ test("public workspace namespace and alpha release metadata are exact", async ()
       ),
   );
 
+  assert.equal(rootManifest.name, "@tego/root");
   assert.deepEqual(new Set(manifests.map(({ name }) => name)), PUBLIC_PACKAGES);
   for (const manifest of manifests) {
     assert.equal(manifest.version, RELEASE_VERSION);
@@ -63,6 +96,9 @@ test("public workspace namespace and alpha release metadata are exact", async ()
     }
   }
   assert.deepEqual(rootManifest.volta, { node: "26.5.0", npm: "11.13.0" });
+  assert.equal(echoManifest.name, "@tego/echo-plugin");
+  assert.equal(echoManifest.version, "1.0.0");
+  assert.deepEqual(echoManifest.dependencies, { "@tego/plugin-sdk": RELEASE_VERSION });
 
   const legacyScope = "@tego" + "js/";
   const legacyReferences = [];
