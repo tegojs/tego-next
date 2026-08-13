@@ -52,31 +52,267 @@ function processSpawnDiagnostic(error, name) {
   return new Error(`PROCESS_SPAWN_ERROR:${name}:${error.code ?? "UNKNOWN"}:${error.message}`);
 }
 
-async function taskkill(processId, force) {
-  const result = await new Promise((resolve) => {
-    const killer = spawn("taskkill", ["/pid", String(processId), "/T", ...(force ? ["/F"] : [])], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    killer.once("error", (error) => resolve({ error, status: null }));
-    killer.once("close", (status) => resolve({ status }));
-  });
-  return result.error === undefined && result.status === 0;
+function assertProcessId(processId) {
+  if (!Number.isSafeInteger(processId) || processId <= 0) {
+    throw new Error(`INVALID_MANAGED_PROCESS_PID:${String(processId)}`);
+  }
 }
 
-function createWindowsTreeStrategy() {
-  const provenTerminated = new Set();
+function adapterTimeout(stage) {
+  return new Error(`PROCESS_TREE_ADAPTER_TIMEOUT:${stage}`);
+}
+
+async function beforeDeadline(operation, deadline, stage) {
+  const remaining = Math.max(0, deadline - Date.now());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(adapterTimeout(stage)), remaining);
+    Promise.resolve()
+      .then(operation)
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+  });
+}
+
+export async function runBoundedProcessHelper(command, args, deadline) {
+  return new Promise((resolve, reject) => {
+    const output = [];
+    const helper = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    const remaining = Math.max(0, deadline - Date.now());
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      helper.kill("SIGKILL");
+    }, remaining);
+    helper.stdout.on("data", (chunk) => output.push(chunk));
+    helper.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    helper.once("close", (status) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`PROCESS_TREE_HELPER_TIMEOUT:${command}`));
+      } else {
+        resolve({ status, stdout: Buffer.concat(output).toString("utf8") });
+      }
+    });
+  });
+}
+
+async function readWindowsProcesses(deadline) {
+  const script = [
+    "Get-CimInstance Win32_Process |",
+    "Select-Object ProcessId,ParentProcessId,CreationDate |",
+    "ConvertTo-Json -Compress",
+  ].join(" ");
+  const result = await runBoundedProcessHelper(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", script],
+    deadline,
+  );
+  if (result.status !== 0) throw new Error(`WINDOWS_PROCESS_SNAPSHOT_FAILED:${result.status}`);
+  const parsed = JSON.parse(result.stdout || "[]");
+  return (Array.isArray(parsed) ? parsed : [parsed]).map((process_) => ({
+    pid: Number(process_.ProcessId),
+    parentPid: Number(process_.ParentProcessId),
+    creationDate: String(process_.CreationDate),
+  }));
+}
+
+async function terminateWindowsPid(processId, force, deadline, tree = false) {
+  const result = await runBoundedProcessHelper(
+    "taskkill",
+    ["/pid", String(processId), ...(tree ? ["/T"] : []), ...(force ? ["/F"] : [])],
+    deadline,
+  );
+  return result.status === 0;
+}
+
+function tokenKey(process_) {
+  return `${process_.pid}:${process_.creationDate}`;
+}
+
+function recursiveDescendants(processes, rootPid) {
+  const result = [];
+  const pending = [rootPid];
+  while (pending.length > 0) {
+    const parentPid = pending.pop();
+    for (const process_ of processes) {
+      if (process_.parentPid !== parentPid) continue;
+      result.push(process_);
+      pending.push(process_.pid);
+    }
+  }
+  return result;
+}
+
+export function createWindowsTreeStrategy({
+  readProcesses = readWindowsProcesses,
+  terminatePid = terminateWindowsPid,
+} = {}) {
   return {
-    // taskkill owns only a numeric PID. After the leader closes, PID reuse makes
-    // targeting unsafe, so the default strategy fails closed instead.
-    canTerminateAfterLeaderExit: false,
-    async probe(processId) {
-      return provenTerminated.has(processId);
+    async capture(processId, deadline) {
+      const processes = await readProcesses(deadline);
+      const leader = processes.find((process_) => process_.pid === processId);
+      if (leader === undefined)
+        throw new Error(`PROCESS_TREE_LEADER_IDENTITY_MISSING:${processId}`);
+      return { processId, leader, descendants: new Map() };
     },
-    async terminate(processId, signal) {
-      const terminated = await taskkill(processId, signal === "SIGKILL");
-      if (terminated) provenTerminated.add(processId);
-      return terminated;
+    async snapshot(ownership, deadline) {
+      const processes = await readProcesses(deadline);
+      const leader = processes.find(
+        (process_) => tokenKey(process_) === tokenKey(ownership.leader),
+      );
+      const reusedLeader = processes.some((process_) => process_.pid === ownership.processId);
+      if (leader === undefined && reusedLeader) {
+        throw new Error(`PROCESS_TREE_LEADER_IDENTITY_CHANGED:${ownership.processId}`);
+      }
+      if (leader === undefined && ownership.descendants.size > 0) return;
+      if (leader === undefined) {
+        ownership.descendants.clear();
+        return;
+      }
+      ownership.descendants = new Map(
+        recursiveDescendants(processes, ownership.processId).map((process_) => [
+          tokenKey(process_),
+          process_,
+        ]),
+      );
+    },
+    async probe(ownership, deadline) {
+      const live = new Map(
+        (await readProcesses(deadline)).map((process_) => [tokenKey(process_), process_]),
+      );
+      return (
+        !live.has(tokenKey(ownership.leader)) &&
+        [...ownership.descendants.keys()].every((key) => !live.has(key))
+      );
+    },
+    async terminate(ownership, signal, deadline) {
+      const processes = await readProcesses(deadline);
+      const live = new Map(processes.map((process_) => [tokenKey(process_), process_]));
+      const leaderLive = live.has(tokenKey(ownership.leader));
+      let successful = true;
+      if (leaderLive) {
+        successful = await terminatePid(ownership.processId, signal === "SIGKILL", deadline, true);
+      }
+      for (const [key, descendant] of ownership.descendants) {
+        if (!live.has(key)) continue;
+        successful =
+          (await terminatePid(descendant.pid, signal === "SIGKILL", deadline, false)) && successful;
+      }
+      return successful;
+    },
+  };
+}
+
+async function readPosixProcesses(deadline) {
+  const result = await runBoundedProcessHelper(
+    "ps",
+    ["-axo", "pid=,pgid=,state=,lstart="],
+    deadline,
+  );
+  if (result.status !== 0) throw new Error(`POSIX_PROCESS_SNAPSHOT_FAILED:${result.status}`);
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/u))
+    .filter(Boolean)
+    .map((match) => ({
+      pid: Number(match[1]),
+      groupId: Number(match[2]),
+      state: match[3],
+      startToken: match[4],
+    }))
+    .filter((process_) => !process_.state.startsWith("Z"));
+}
+
+export function createPosixTreeStrategy({
+  readProcesses = readPosixProcesses,
+  signalGroup = (groupId, signal) => process.kill(-groupId, signal),
+} = {}) {
+  return {
+    async capture(processId, deadline) {
+      const leader = (await readProcesses(deadline)).find((process_) => process_.pid === processId);
+      if (leader === undefined || leader.groupId !== processId) {
+        throw new Error(`PROCESS_TREE_LEADER_IDENTITY_MISSING:${processId}`);
+      }
+      return { processId, leader, members: new Map() };
+    },
+    async snapshot(ownership, deadline) {
+      const processes = await readProcesses(deadline);
+      const leader = processes.find(
+        (process_) =>
+          process_.pid === ownership.leader.pid &&
+          process_.startToken === ownership.leader.startToken &&
+          process_.groupId === ownership.processId,
+      );
+      const reusedLeader = processes.some((process_) => process_.pid === ownership.processId);
+      if (leader === undefined && reusedLeader) {
+        throw new Error(`PROCESS_TREE_LEADER_IDENTITY_CHANGED:${ownership.processId}`);
+      }
+      if (leader === undefined && ownership.members.size > 1) return;
+      if (leader === undefined) {
+        ownership.members.clear();
+        return;
+      }
+      ownership.members = new Map(
+        processes
+          .filter((process_) => process_.groupId === ownership.processId)
+          .map((process_) => [`${process_.pid}:${process_.startToken}`, process_]),
+      );
+    },
+    async probe(ownership, deadline) {
+      const live = new Map(
+        (await readProcesses(deadline)).map((process_) => [
+          `${process_.pid}:${process_.startToken}`,
+          process_,
+        ]),
+      );
+      return [...ownership.members.keys()].every((key) => !live.has(key));
+    },
+    async terminate(ownership, signal, deadline) {
+      const processes = await readProcesses(deadline);
+      const leaderLive = processes.some(
+        (process_) =>
+          process_.pid === ownership.leader.pid &&
+          process_.startToken === ownership.leader.startToken &&
+          process_.groupId === ownership.processId,
+      );
+      const memberLive = processes.some((process_) =>
+        ownership.members.has(`${process_.pid}:${process_.startToken}`),
+      );
+      if (!leaderLive && !memberLive) return false;
+      try {
+        signalGroup(ownership.processId, signal);
+        return true;
+      } catch (error) {
+        if (error?.code === "ESRCH") return true;
+        if (error?.code === "EPERM") return false;
+        throw error;
+      }
+    },
+  };
+}
+
+function wrapLegacyWindowsStrategy(strategy) {
+  return {
+    async capture(processId) {
+      return { processId };
+    },
+    async snapshot() {},
+    async probe(ownership, deadline) {
+      return strategy.probe(ownership.processId, deadline);
+    },
+    async terminate(ownership, signal, deadline) {
+      return strategy.terminate(ownership.processId, signal, deadline);
     },
   };
 }
@@ -88,7 +324,8 @@ export async function spawnManagedProcess({
   env = {},
   name,
   platform = process.platform,
-  windowsTreeStrategy = createWindowsTreeStrategy(),
+  processTreeStrategy,
+  windowsTreeStrategy,
 }) {
   await artifacts.initialize(name);
   const child = spawn(command, args, {
@@ -97,7 +334,30 @@ export async function spawnManagedProcess({
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
-  return new ManagedProcess({ artifacts, child, name, platform, windowsTreeStrategy });
+  if (child.pid === undefined) {
+    return new ManagedProcess({ artifacts, child, name, spawnPending: true });
+  }
+  assertProcessId(child.pid);
+  const strategy =
+    processTreeStrategy ??
+    (windowsTreeStrategy === undefined
+      ? platform === "win32"
+        ? createWindowsTreeStrategy()
+        : createPosixTreeStrategy()
+      : wrapLegacyWindowsStrategy(windowsTreeStrategy));
+  const captureDeadline = Date.now() + 2_000;
+  let ownership;
+  try {
+    ownership = await beforeDeadline(
+      () => strategy.capture(child.pid, captureDeadline),
+      captureDeadline,
+      "capture",
+    );
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  }
+  return new ManagedProcess({ artifacts, child, name, ownership, processTreeStrategy: strategy });
 }
 
 export class ManagedProcess {
@@ -119,16 +379,14 @@ export class ManagedProcess {
   #streams;
   #treeOwnership;
 
-  constructor({ artifacts, child, name, platform = process.platform, windowsTreeStrategy }) {
+  constructor({ artifacts, child, name, ownership, processTreeStrategy, spawnPending = false }) {
+    if (!spawnPending) assertProcessId(child.pid);
     this.#artifacts = artifacts;
     this.#child = child;
     this.#name = name;
-    this.#treeOwnership = {
-      closed: false,
-      platform,
-      processId: child.pid,
-      windowsTreeStrategy: windowsTreeStrategy ?? createWindowsTreeStrategy(),
-    };
+    this.#treeOwnership = spawnPending
+      ? { closed: true, identity: undefined, strategy: undefined }
+      : { closed: false, identity: ownership, strategy: processTreeStrategy };
     this.#streams = {
       stdout: createWriteStream(artifacts.stdout(name), { flags: "a" }),
       stderr: createWriteStream(artifacts.stderr(name), { flags: "a" }),
@@ -139,7 +397,11 @@ export class ManagedProcess {
     for (const [streamName, stream] of Object.entries(this.#streams)) {
       stream.on("error", (error) => this.#recordStreamError(streamName, error));
     }
-    child.once("spawn", () => this.#spawnState.resolve({ kind: "spawned" }));
+    if (!spawnPending) {
+      // Tree identity capture happens only after spawn succeeds, so the spawn
+      // event may already have fired before this wrapper is constructed.
+      this.#spawnState.resolve({ kind: "spawned" });
+    }
     child.on("error", (error) => {
       if (!this.#spawnState.settled) {
         this.#spawnError = error;
@@ -165,14 +427,17 @@ export class ManagedProcess {
   async ready(predicate, { timeoutMs }) {
     for (const event of this.#events) {
       try {
-        if (predicate(event)) return event;
+        if (predicate(event)) {
+          await this.#treeAdapterCall("snapshot", Date.now() + timeoutMs);
+          return event;
+        }
       } catch (error) {
         this.#recordProcessingError(error);
         throw error;
       }
     }
 
-    return new Promise((resolve, reject) => {
+    const event = await new Promise((resolve, reject) => {
       const listener = (event) => {
         try {
           if (!predicate(event)) return;
@@ -197,6 +462,8 @@ export class ManagedProcess {
       timer.unref();
       this.#readyListeners.add(listener);
     });
+    await this.#treeAdapterCall("snapshot", Date.now() + timeoutMs);
+    return event;
   }
 
   async stop({ timeoutMs }) {
@@ -212,16 +479,23 @@ export class ManagedProcess {
       return;
     }
 
+    await this.#treeAdapterCall("snapshot", Date.now() + timeoutMs);
     this.#stopActions.push("stdin:end");
     this.#child.stdin.end();
-    if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
+    if (!(await this.#waitForProcessTreeExit(Date.now() + timeoutMs))) {
       this.#stopActions.push("signal:SIGTERM");
-      await this.#signalProcessTree("SIGTERM");
+      const terminateDeadline = Date.now() + timeoutMs;
+      await this.#signalProcessTree("SIGTERM", terminateDeadline);
+      if (await this.#waitForProcessTreeExit(terminateDeadline)) {
+        await this.#waitForFinalization(timeoutMs);
+        return;
+      }
     }
-    if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
+    if (!this.#treeOwnership.closed) {
       this.#stopActions.push("signal:SIGKILL");
-      await this.#signalProcessTree("SIGKILL");
-      if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
+      const killDeadline = Date.now() + timeoutMs;
+      await this.#signalProcessTree("SIGKILL", killDeadline);
+      if (!(await this.#waitForProcessTreeExit(killDeadline))) {
         throw new Error(`PROCESS_STOP_TIMEOUT:${this.#name}:${this.pid}`);
       }
     }
@@ -244,7 +518,7 @@ export class ManagedProcess {
       throw new Error(`PROCESS_STILL_RUNNING:${this.#name}:${this.pid}`);
     }
     const exit = await this.#exit.promise;
-    if (!(await this.#processTreeTerminated())) {
+    if (!(await this.#processTreeTerminated(Date.now() + timeoutMs))) {
       throw new Error(`PROCESS_TREE_STILL_RUNNING:${this.#name}:${this.pid}`);
     }
     if (this.#cleanupError !== undefined) throw this.#cleanupError;
@@ -367,72 +641,40 @@ export class ManagedProcess {
     for (const stream of Object.values(this.#streams)) stream.destroy();
   }
 
-  async #processTreeTerminated() {
+  async #treeAdapterCall(method, deadline, ...args) {
+    const ownership = this.#treeOwnership;
+    return beforeDeadline(
+      () => ownership.strategy[method](ownership.identity, ...args, deadline),
+      deadline,
+      method,
+    );
+  }
+
+  async #processTreeTerminated(deadline) {
     const ownership = this.#treeOwnership;
     if (ownership.closed) return true;
-    if (ownership.processId === undefined) return this.#exit.settled;
-    if (
-      ownership.platform === "win32" &&
-      this.#exit.settled &&
-      ownership.windowsTreeStrategy.canTerminateAfterLeaderExit !== true
-    ) {
-      return false;
-    }
-    if (ownership.platform === "win32") {
-      const terminated = await ownership.windowsTreeStrategy.probe(ownership.processId);
-      if (terminated) ownership.closed = true;
-      return terminated;
-    }
-    // POSIX exposes process groups only by numeric PGID, with no durable kernel
-    // handle. Keep that identity owned only until ESRCH proves the group gone,
-    // then close it permanently. Stop keeps each probe/signal pair adjacent to
-    // minimize the unavoidable reuse window and never signals after closure.
-    try {
-      process.kill(-ownership.processId, 0);
-      return false;
-    } catch (error) {
-      if (error?.code === "ESRCH") {
-        ownership.closed = true;
-        return true;
-      }
-      if (error?.code === "EPERM") return false;
-      throw error;
-    }
+    const terminated = await this.#treeAdapterCall("probe", deadline);
+    if (terminated) ownership.closed = true;
+    return terminated;
   }
 
-  async #signalProcessTree(signal) {
+  async #signalProcessTree(signal, deadline) {
     const ownership = this.#treeOwnership;
-    if (ownership.closed || ownership.processId === undefined) return false;
-    if (
-      ownership.platform === "win32" &&
-      this.#exit.settled &&
-      ownership.windowsTreeStrategy.canTerminateAfterLeaderExit !== true
-    ) {
-      return false;
-    }
-    if (ownership.platform === "win32") {
-      return ownership.windowsTreeStrategy.terminate(ownership.processId, signal);
-    }
-    try {
-      process.kill(-ownership.processId, signal);
-      return true;
-    } catch (error) {
-      if (error?.code === "ESRCH") {
-        ownership.closed = true;
-        return true;
-      }
-      if (error?.code === "EPERM") return false;
-      throw error;
-    }
+    if (ownership.closed) return false;
+    return this.#treeAdapterCall("terminate", deadline, signal);
   }
 
-  async #waitForProcessTreeExit(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (await this.#processTreeTerminated()) return true;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+  async #waitForProcessTreeExit(deadline) {
+    while (deadline - Date.now() > 100) {
+      try {
+        if (await this.#processTreeTerminated(deadline)) return true;
+      } catch (error) {
+        if (error?.message?.startsWith("PROCESS_TREE_ADAPTER_TIMEOUT:") === true) return false;
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    return this.#processTreeTerminated();
+    return false;
   }
 
   async #waitForFinalization(timeoutMs) {

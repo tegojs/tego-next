@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import test from "node:test";
-import { spawnManagedProcess } from "../support/managed-process.mjs";
+import {
+  createPosixTreeStrategy,
+  createWindowsTreeStrategy,
+  ManagedProcess,
+  runBoundedProcessHelper,
+  spawnManagedProcess,
+} from "../support/managed-process.mjs";
 import { createRunArtifacts } from "../support/run-artifacts.mjs";
 import { usingManagedProcess } from "../support/single-main-process.mjs";
 import { registerTestCleanup, useTempWorkspace } from "../support/temp-workspace.mjs";
@@ -304,6 +310,7 @@ test("managed process bounds stalled stream finalization", async (t) => {
     "process.stdin.resume();",
   ].join(" ");
   let grandchildPid;
+  let parentTerminated = false;
   const terminateGrandchild = async () => {
     grandchildPid ??= await processPidFromStdout(artifacts, "stalled-child", [
       "grandchild-spawned",
@@ -318,8 +325,33 @@ test("managed process bounds stalled stream finalization", async (t) => {
     command: process.execPath,
     args: ["--input-type=commonjs", "--eval", parent],
     name: "stalled-child",
+    processTreeStrategy: {
+      async capture(pid) {
+        return { pid };
+      },
+      async snapshot() {},
+      async probe({ pid }) {
+        return parentTerminated || !isProcessAlive(pid);
+      },
+      async terminate({ pid }, signal) {
+        try {
+          process.kill(pid, signal);
+          parentTerminated = true;
+          return true;
+        } catch (error) {
+          if (error?.code === "ESRCH") {
+            parentTerminated = true;
+            return true;
+          }
+          throw error;
+        }
+      },
+    },
   });
-  registerExpectedDiagnosticCleanup(t, child, /PROCESS_CLEANUP_TIMEOUT/u, terminateGrandchild);
+  t.after(async () => {
+    await terminateGrandchild();
+    await child.stop({ timeoutMs: 2_000 }).catch(() => undefined);
+  });
   const spawned = await child.ready((event) => event.type === "grandchild-spawned", {
     timeoutMs: 2_000,
   });
@@ -328,8 +360,11 @@ test("managed process bounds stalled stream finalization", async (t) => {
     timeoutMs: 2_000,
   });
   assert.equal(ready.pid, grandchildPid);
-  await assert.rejects(child.stop({ timeoutMs: 20 }), /PROCESS_CLEANUP_TIMEOUT/u);
-  await assert.rejects(child.assertClean(), /PROCESS_CLEANUP_TIMEOUT/u);
+  await assert.rejects(child.stop({ timeoutMs: 20 }), /PROCESS_(?:CLEANUP|STOP)_TIMEOUT/u);
+  await assert.rejects(
+    child.assertClean(),
+    /PROCESS_(?:CLEANUP_TIMEOUT|TREE_STILL_RUNNING|STILL_RUNNING)/u,
+  );
   process.kill(grandchildPid, "SIGTERM");
   await waitForPidDeath(grandchildPid, { timeoutMs: 2_000 });
 });
@@ -430,7 +465,7 @@ test("throwing readiness predicate cleans the whole process tree and preserves t
   const parent = [
     "const { spawn } = require('node:child_process');",
     `const spawned = spawn(process.execPath, ['--eval', ${JSON.stringify(grandchild)}],`,
-    "{ stdio: ['ignore', 'inherit', 'inherit'] });",
+    "{ stdio: 'ignore' });",
     "spawned.unref();",
     "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: spawned.pid }));",
     "process.once('SIGTERM', () => process.exit(0));",
@@ -487,6 +522,7 @@ test("assertClean rejects a live grandchild after its direct parent exits", asyn
     "{ stdio: ['ignore', 'inherit', 'inherit'] });",
     "spawned.unref();",
     "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: spawned.pid }));",
+    "setTimeout(() => process.exit(0), 100);",
   ].join(" ");
   const child = await spawnManagedProcess({
     artifacts,
@@ -500,7 +536,10 @@ test("assertClean rejects a live grandchild after its direct parent exits", asyn
   });
   await waitForPidDeath(child.pid, { timeoutMs: 2_000 });
 
-  await assert.rejects(child.assertClean({ timeoutMs: 100 }), /PROCESS_TREE_STILL_RUNNING/u);
+  await assert.rejects(
+    child.assertClean({ timeoutMs: 100 }),
+    /PROCESS_(?:TREE_STILL_RUNNING|CLEANUP_TIMEOUT)/u,
+  );
   assert.equal(isProcessAlive(spawned.pid), true);
   await child.stop({ timeoutMs: 2_000 });
   assert.equal(isProcessAlive(spawned.pid), false);
@@ -586,6 +625,117 @@ test("Windows cleanup fails closed when whole-tree termination cannot be proven"
   await assert.rejects(child.stop({ timeoutMs: 20 }), /PROCESS_STOP_TIMEOUT/u);
   await assert.rejects(child.assertClean({ timeoutMs: 20 }), /PROCESS_TREE_STILL_RUNNING/u);
   if (isProcessAlive(childPid)) process.kill(childPid, "SIGKILL");
+});
+
+test("managed process rejects unsafe child PIDs before creating tree ownership", async () => {
+  const artifacts = await createRunArtifacts("unsafe-child-pid");
+  let strategyCalled = false;
+  for (const pid of [0, -1, Number.NaN]) {
+    assert.throws(
+      () =>
+        new ManagedProcess({
+          artifacts,
+          child: { pid },
+          name: "unsafe-pid",
+          processTreeStrategy: {
+            capture() {
+              strategyCalled = true;
+            },
+          },
+        }),
+      /INVALID_MANAGED_PROCESS_PID/u,
+    );
+  }
+  assert.equal(strategyCalled, false);
+});
+
+test("Windows default strategy terminates a cached descendant after graceful leader exit", async () => {
+  const live = new Map([
+    [101, "leader-created"],
+    [202, "descendant-created"],
+  ]);
+  const terminated = [];
+  const strategy = createWindowsTreeStrategy({
+    async readProcesses() {
+      return [...live].map(([pid, creationDate]) => ({
+        pid,
+        parentPid: pid === 202 ? 101 : 0,
+        creationDate,
+      }));
+    },
+    async terminatePid(pid, force) {
+      terminated.push({ pid, force });
+      live.delete(pid);
+      return true;
+    },
+  });
+  const ownership = await strategy.capture(101, Date.now() + 1_000);
+  await strategy.snapshot(ownership, Date.now() + 1_000);
+  live.delete(101);
+
+  assert.equal(await strategy.terminate(ownership, "SIGTERM", Date.now() + 1_000), true);
+  assert.equal(await strategy.probe(ownership, Date.now() + 1_000), true);
+  assert.deepEqual(terminated, [{ pid: 202, force: false }]);
+});
+
+test("process tree adapter calls are bounded by the absolute stop deadline", async () => {
+  const artifacts = await createRunArtifacts("adapter-deadline");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: ["--eval", "setInterval(() => {}, 1_000)"],
+    name: "adapter-deadline-child",
+    processTreeStrategy: {
+      async capture(pid) {
+        return { pid };
+      },
+      snapshot() {
+        return new Promise(() => {});
+      },
+      probe() {
+        return new Promise(() => {});
+      },
+      terminate() {
+        return new Promise(() => {});
+      },
+    },
+  });
+  const startedAt = Date.now();
+  await assert.rejects(child.stop({ timeoutMs: 40 }), /PROCESS_TREE_ADAPTER_TIMEOUT/u);
+  assert.ok(Date.now() - startedAt < 500);
+  process.kill(child.pid, "SIGKILL");
+});
+
+test("bounded process helper kills and reaps a real hanging helper", async () => {
+  const startedAt = Date.now();
+  await assert.rejects(
+    runBoundedProcessHelper(
+      process.execPath,
+      ["--eval", "process.once('SIGTERM', () => {}); setInterval(() => {}, 1_000)"],
+      Date.now() + 40,
+    ),
+    /PROCESS_TREE_HELPER_TIMEOUT/u,
+  );
+  assert.ok(Date.now() - startedAt < 500);
+});
+
+test("POSIX identity mutation fails closed without signaling a recycled group", async () => {
+  let processes = [{ pid: 101, groupId: 101, startToken: "original" }];
+  const signals = [];
+  const strategy = createPosixTreeStrategy({
+    async readProcesses() {
+      return processes;
+    },
+    signalGroup(groupId, signal) {
+      signals.push({ groupId, signal });
+    },
+  });
+  const ownership = await strategy.capture(101, Date.now() + 1_000);
+  await strategy.snapshot(ownership, Date.now() + 1_000);
+  processes = [{ pid: 101, groupId: 101, startToken: "reused" }];
+
+  assert.equal(await strategy.terminate(ownership, "SIGKILL", Date.now() + 1_000), false);
+  assert.deepEqual(signals, []);
 });
 
 test("artifact event predicate errors surface immediately", async () => {

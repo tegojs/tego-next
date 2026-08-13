@@ -151,3 +151,49 @@ real multi-Main E2E: 1/1 passed
 Biome: clean
 git diff --check: clean
 ```
+
+## Final ownership re-review
+
+The final re-review required stable identities for every platform and retention of late PostgreSQL
+acquisition cleanup errors.
+
+New RED tests initially proved the missing contracts:
+
+```text
+createWindowsTreeStrategy was not exported
+unsafe child PID validation did not exist
+late client release error was not returned in AggregateError
+```
+
+The process harness now uses a bounded tree adapter with immutable identity tokens:
+
+- Child PIDs are validated as positive safe integers before strategy capture or any OS call.
+- Windows snapshots `ProcessId`, `ParentProcessId`, and `CreationDate` recursively via bounded
+  PowerShell/CIM. It caches descendant tokens before stdin EOF, uses `taskkill /T` while the exact
+  leader remains live, and validates each cached token before terminating a descendant after the
+  leader exits. Same-PID/different-creation-time processes are never targeted.
+- POSIX snapshots PID, PGID, state, and start time through bounded `ps`. A group signal is sent only
+  while the original leader token or a cached exact member token remains live. A reused leader PID
+  with a different start token fails closed. Zombie identities are excluded from live ownership.
+- Every snapshot, probe, terminate, PowerShell, `ps`, and `taskkill` call receives an absolute
+  deadline. Helper timeout sends SIGKILL and waits for close before rejecting.
+- Default-Windows semantic tests prove a graceful leader exit can leave a cached descendant which
+  is then terminated and proven gone without a test-only post-exit override. Injected never-settling
+  adapters and a real hanging helper prove bounded failure.
+
+PostgreSQL acquisition remains an observed resource through a bounded cleanup grace. `pool.end()`
+starts after the main deadline, then cleanup waits for a late acquisition within that grace. A late
+client is destroyed synchronously (or an injected promise-returning release is observed), and its
+release failure is aggregated after the connect timeout and before the pool-end error. A permanently
+pending acquisition has an observed rejection path and cannot create an unhandled future failure.
+
+Final isolated PostgreSQL 16 verification used
+`/tmp/tego-task6-rereview-pg16.4iDrW5` on port 55463:
+
+```text
+process harness: 24/24 passed
+single-Main helpers: 5/5 passed
+runtime fault suite: 19/19 passed
+real multi-Main E2E: 1/1 passed
+Biome and git diff --check: clean
+```

@@ -492,19 +492,57 @@ test("namespace cleanup destroys a client acquired after its deadline", async ()
       connectionString: "unused",
       namespace: "test_timeout_connect",
       timeoutMs: 20,
+      cleanupGraceMs: 100,
       createPool: () => ({
         connect: () =>
           new Promise((resolve) => {
             resolveConnect = resolve;
+            setTimeout(() => resolve(lateClient), 30);
           }),
         async end() {},
       }),
     }),
     /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:connect/u,
   );
-  resolveConnect(lateClient);
-  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof resolveConnect, "function");
   assert.deepEqual(releaseCalls, [true]);
+});
+
+test("namespace cleanup aggregates a late client destroy error before returning", async () => {
+  const releaseError = new Error("late release failed");
+  let resolveConnect;
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_late_release_error",
+      timeoutMs: 20,
+      cleanupGraceMs: 100,
+      createPool: () => ({
+        connect: () =>
+          new Promise((resolve) => {
+            resolveConnect = resolve;
+            setTimeout(
+              () =>
+                resolve({
+                  release(destroy) {
+                    assert.equal(destroy, true);
+                    throw releaseError;
+                  },
+                }),
+              30,
+            );
+          }),
+        async end() {},
+      }),
+    }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.errors[0].message, /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:connect/u);
+      assert.equal(error.errors[1], releaseError);
+      return true;
+    },
+  );
+  assert.equal(typeof resolveConnect, "function");
 });
 
 test("namespace cleanup aggregates primary rollback release and pool errors in order", async () => {

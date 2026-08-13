@@ -48,23 +48,22 @@ async function settleBeforeDeadline(operation, stage, deadline, timeoutMs) {
   });
 }
 
-async function acquireBeforeDeadline(pool, deadline, timeoutMs) {
-  const acquisition = Promise.resolve().then(() => pool.connect());
+function releaseClient(client, errors) {
   try {
-    return await settleBeforeDeadline(() => acquisition, "connect", deadline, timeoutMs);
+    const released = client.release(true);
+    if (released?.then !== undefined) {
+      return Promise.resolve(released).catch((error) => errors.push(error));
+    }
   } catch (error) {
-    void acquisition.then(
-      (lateClient) => {
-        try {
-          lateClient.release(true);
-        } catch {
-          // The deadline error remains primary; pool.end is independently observed below.
-        }
-      },
-      () => undefined,
-    );
-    throw error;
+    errors.push(error);
   }
+  return Promise.resolve();
+}
+
+function beginAcquisition(pool) {
+  const acquisition = Promise.resolve().then(() => pool.connect());
+  acquisition.catch(() => undefined);
+  return acquisition;
 }
 
 function throwCollectedErrors(errors) {
@@ -78,6 +77,7 @@ export async function cleanupPostgresNamespace({
   connectionString,
   namespace,
   timeoutMs = 5_000,
+  cleanupGraceMs = 100,
   createPool = (options) => new Pool(options),
 }) {
   assertDisposablePostgresNamespace(namespace);
@@ -85,6 +85,7 @@ export async function cleanupPostgresNamespace({
     throw new Error(`INVALID_POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:${String(timeoutMs)}`);
   }
   const deadline = Date.now() + timeoutMs;
+  const cleanupDeadline = deadline + cleanupGraceMs;
   const pool = createPool({
     connectionString,
     connectionTimeoutMillis: timeoutMs,
@@ -95,8 +96,15 @@ export async function cleanupPostgresNamespace({
   let transactionStarted = false;
   let destroyClient = false;
   const errors = [];
+  const acquisition = beginAcquisition(pool);
+  let acquisitionTimedOut = false;
   try {
-    client = await acquireBeforeDeadline(pool, deadline, timeoutMs);
+    try {
+      client = await settleBeforeDeadline(() => acquisition, "connect", deadline, timeoutMs);
+    } catch (error) {
+      acquisitionTimedOut = true;
+      throw error;
+    }
     await settleBeforeDeadline(() => client.query("BEGIN"), "BEGIN", deadline, timeoutMs);
     transactionStarted = true;
     await settleBeforeDeadline(
@@ -140,8 +148,25 @@ export async function cleanupPostgresNamespace({
         errors.push(releaseError);
       }
     }
+    const poolEnd = Promise.resolve().then(() => pool.end());
+    poolEnd.catch(() => undefined);
+    if (acquisitionTimedOut) {
+      try {
+        const lateClient = await settleBeforeDeadline(
+          () => acquisition,
+          "late-connect",
+          cleanupDeadline,
+          timeoutMs,
+        );
+        await releaseClient(lateClient, errors);
+      } catch (lateError) {
+        if (!lateError.message.startsWith("POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:late-connect")) {
+          errors.push(lateError);
+        }
+      }
+    }
     try {
-      await settleBeforeDeadline(() => pool.end(), "pool.end", deadline, timeoutMs);
+      await settleBeforeDeadline(() => poolEnd, "pool.end", cleanupDeadline, timeoutMs);
     } catch (endError) {
       errors.push(endError);
     }
