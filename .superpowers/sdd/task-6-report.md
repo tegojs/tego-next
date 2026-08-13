@@ -259,3 +259,29 @@ Biome and git diff --check: clean
 
 Self-review found no remaining Critical, Important, or Minor issue within the approved practical
 Windows scope.
+
+## Capture-failure and connect-rejection follow-up
+
+A subsequent review found that failure to capture the normal ownership token could degrade cleanup
+to killing only the direct child. A new real regression spawned a parent and grandchild, deliberately
+failed ownership capture after observing the grandchild, and initially proved the grandchild stayed
+alive. The failure path now establishes a fail-safe owner while the stable leader is still live:
+POSIX targets the newly created detached process group; Windows snapshots the exact leader and
+recursive PID + CreationDate descendants, invokes `taskkill /T` only for that live leader, and
+requires every cached token to disappear. Failure to terminate or prove the tree is aggregated
+after the primary capture error. The direct child and real grandchild regression now proves both
+dead and diagnostic artifacts finalized.
+
+An immediate PostgreSQL `connect()` rejection was also incorrectly classified as a timeout and the
+same rejected acquisition was appended twice. Cleanup now enables late-acquisition ownership only
+for the explicit connect-timeout diagnostic. A regression verifies `Error("connect boom")` returns
+as the exact original error unless a distinct cleanup operation fails.
+
+The injected Windows fail-closed test now uses a 200 ms deadline rather than a 20 ms scheduling
+race. Ten consecutive full process-harness runs completed with 32/32 passing each.
+
+The approved non-Job-Object limitation is narrower than complete ownership proof: a Windows
+descendant created after the final successful snapshot, followed by all currently owned parents
+exiting before the next refresh, may no longer be discoverable. This implementation must not be
+described as making that scenario impossible. Windows CI is the empirical gate for the practical
+`taskkill /T` plus continuously refreshed CIM-token strategy.

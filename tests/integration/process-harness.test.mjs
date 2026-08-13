@@ -624,8 +624,8 @@ test("Windows cleanup fails closed when whole-tree termination cannot be proven"
       },
     },
   });
-  await assert.rejects(child.stop({ timeoutMs: 20 }), /PROCESS_STOP_TIMEOUT/u);
-  await assert.rejects(child.assertClean({ timeoutMs: 20 }), /PROCESS_TREE_STILL_RUNNING/u);
+  await assert.rejects(child.stop({ timeoutMs: 200 }), /PROCESS_STOP_TIMEOUT/u);
+  await assert.rejects(child.assertClean({ timeoutMs: 200 }), /PROCESS_TREE_STILL_RUNNING/u);
   if (isProcessAlive(childPid)) process.kill(childPid, "SIGKILL");
 });
 
@@ -698,6 +698,58 @@ test("ownership capture failure uses managed cleanup and reaps the child", async
   assert.equal(isProcessAlive(childPid), false);
   assert.equal(
     await readFile(artifacts.cleanup("capture-failure-child"), "utf8").then(
+      (contents) => contents.length > 0,
+    ),
+    true,
+  );
+});
+
+test("ownership capture failure kills and proves a real child and grandchild tree", async (t) => {
+  const artifacts = await createRunArtifacts("capture-failure-tree-cleanup");
+  let childPid;
+  let grandchildPid;
+  t.after(async () => {
+    for (const pid of [grandchildPid, childPid]) {
+      if (pid === undefined || !isProcessAlive(pid)) continue;
+      process.kill(pid, "SIGKILL");
+      await waitForPidDeath(pid, { timeoutMs: 2_000 }).catch(() => undefined);
+    }
+  });
+  const grandchild = "setInterval(() => {}, 1_000)";
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    `const child = spawn(process.execPath, ['--eval', ${JSON.stringify(grandchild)}], { stdio: 'ignore' });`,
+    "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: child.pid }));",
+    "setInterval(() => {}, 1_000);",
+  ].join(" ");
+
+  await assert.rejects(
+    spawnManagedProcess({
+      artifacts,
+      command: process.execPath,
+      args: ["--input-type=commonjs", "--eval", parent],
+      name: "capture-failure-tree-child",
+      processTreeStrategy: {
+        async capture(pid) {
+          childPid = pid;
+          await waitForArtifactEvent(
+            artifacts.events("capture-failure-tree-child"),
+            (event) => event.type === "grandchild-spawned",
+            { timeoutMs: 1_000 },
+          );
+          throw new Error("tree capture failed");
+        },
+      },
+    }),
+    /tree capture failed/u,
+  );
+  grandchildPid = await processPidFromStdout(artifacts, "capture-failure-tree-child", [
+    "grandchild-spawned",
+  ]);
+  assert.equal(isProcessAlive(childPid), false);
+  assert.equal(isProcessAlive(grandchildPid), false);
+  assert.equal(
+    await readFile(artifacts.cleanup("capture-failure-tree-child"), "utf8").then(
       (contents) => contents.length > 0,
     ),
     true,

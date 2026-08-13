@@ -141,7 +141,8 @@ export async function cleanupPostgresNamespace({
     try {
       client = await settleBeforeDeadline(() => acquisition, "connect", deadline, timeoutMs);
     } catch (error) {
-      acquisitionTimedOut = true;
+      acquisitionTimedOut =
+        error?.message?.startsWith("POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:connect:") === true;
       throw error;
     }
     await settleBeforeDeadline(() => client.query("BEGIN"), "BEGIN", deadline, timeoutMs);

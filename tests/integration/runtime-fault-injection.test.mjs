@@ -447,6 +447,24 @@ test("namespace cleanup rejects unsafe targets before opening PostgreSQL", async
   }
 });
 
+test("namespace cleanup does not duplicate an immediate connect rejection", async () => {
+  const connectError = new Error("connect boom");
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_connect_rejection",
+      timeoutMs: 100,
+      createPool: () => ({
+        async connect() {
+          throw connectError;
+        },
+        async end() {},
+      }),
+    }),
+    (error) => error === connectError,
+  );
+});
+
 test("namespace cleanup bounds a never-settling query and pool end", async () => {
   const releaseCalls = [];
   const client = {

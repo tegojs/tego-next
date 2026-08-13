@@ -374,6 +374,66 @@ function wrapLegacyWindowsStrategy(strategy) {
   };
 }
 
+function createCaptureFailureStrategy(platform) {
+  if (platform === "win32") {
+    return {
+      async snapshot(ownership, deadline) {
+        const processes = await readWindowsProcesses(deadline);
+        if (ownership.leader === undefined) {
+          const leader = processes.find((process_) => process_.pid === ownership.processId);
+          if (leader === undefined) {
+            throw new Error(`PROCESS_TREE_LEADER_IDENTITY_MISSING:${ownership.processId}`);
+          }
+          ownership.leader = validateWindowsProcess(leader);
+          ownership.descendants = new Map();
+        }
+        refreshWindowsOwnership(ownership, processes);
+      },
+      async probe(ownership, deadline) {
+        if (!ownership.treeTerminationSucceeded) return false;
+        const live = new Map(
+          (await readWindowsProcesses(deadline)).map((process_) => [tokenKey(process_), process_]),
+        );
+        return (
+          !live.has(tokenKey(ownership.leader)) &&
+          [...ownership.descendants.keys()].every((key) => !live.has(key))
+        );
+      },
+      async terminate(ownership, signal, deadline) {
+        const processes = await readWindowsProcesses(deadline);
+        if (!processes.some((process_) => tokenKey(process_) === tokenKey(ownership.leader))) {
+          return false;
+        }
+        ownership.treeTerminationSucceeded = await terminateWindowsPid(
+          ownership.processId,
+          signal === "SIGKILL",
+          deadline,
+          true,
+        );
+        return ownership.treeTerminationSucceeded;
+      },
+    };
+  }
+  return {
+    async snapshot() {},
+    async probe(ownership, deadline) {
+      return !(await readPosixProcesses(deadline)).some(
+        (process_) => process_.groupId === ownership.processId,
+      );
+    },
+    async terminate(ownership, signal) {
+      try {
+        process.kill(-ownership.processId, signal);
+        return true;
+      } catch (error) {
+        if (error?.code === "ESRCH") return true;
+        if (error?.code === "EPERM") return false;
+        throw error;
+      }
+    },
+  };
+}
+
 export async function spawnManagedProcess({
   artifacts,
   command,
@@ -400,6 +460,7 @@ export async function spawnManagedProcess({
   });
   const managed = new ManagedProcess({
     artifacts,
+    captureFailureStrategy: createCaptureFailureStrategy(platform),
     child,
     name,
     processTreeStrategy: strategy,
@@ -416,6 +477,7 @@ export async function spawnManagedProcess({
 
 export class ManagedProcess {
   #artifacts;
+  #captureFailureStrategy;
   #child;
   #cleanupAbortController = new AbortController();
   #cleanupError;
@@ -434,9 +496,17 @@ export class ManagedProcess {
   #streams;
   #treeOwnership;
 
-  constructor({ artifacts, child, name, processTreeStrategy, spawnPending = false }) {
+  constructor({
+    artifacts,
+    captureFailureStrategy,
+    child,
+    name,
+    processTreeStrategy,
+    spawnPending = false,
+  }) {
     if (!spawnPending) assertProcessId(child.pid);
     this.#artifacts = artifacts;
+    this.#captureFailureStrategy = captureFailureStrategy;
     this.#child = child;
     this.#name = name;
     this.#treeOwnership = spawnPending
@@ -490,22 +560,28 @@ export class ManagedProcess {
 
   async cleanupAfterOwnershipFailure(primaryError, { timeoutMs }) {
     const errors = [primaryError];
-    this.#treeOwnership.closed = true;
+    this.#treeOwnership = {
+      closed: false,
+      identity: {
+        descendants: new Map(),
+        processId: this.pid,
+        treeTerminationSucceeded: false,
+      },
+      strategy: this.#captureFailureStrategy,
+    };
     const deadline = Date.now() + timeoutMs;
     try {
-      this.#stopActions.push("stdin:end");
-      this.#child.stdin.end();
-      if (
-        !this.#exit.settled &&
-        !(await settleWithin(this.#exit.promise, Math.min(50, Math.max(1, timeoutMs / 4))))
-      ) {
-        this.#stopActions.push("signal:SIGKILL:ownership-failure");
-        this.#child.kill("SIGKILL");
+      await this.#treeAdapterCall("snapshot", deadline);
+      this.#stopActions.push("signal:SIGKILL:ownership-failure-tree");
+      if (!(await this.#signalProcessTree("SIGKILL", deadline))) {
+        throw new Error(`PROCESS_TREE_TERMINATION_UNPROVEN:${this.#name}:${this.pid}`);
+      }
+      if (!(await this.#waitForProcessTreeExit(deadline))) {
+        throw new Error(`PROCESS_TREE_STILL_RUNNING:${this.#name}:${this.pid}`);
       }
       const remaining = Math.max(0, deadline - Date.now());
-      if (!this.#exit.settled && !(await settleWithin(this.#exit.promise, remaining))) {
+      if (!this.#exit.settled && !(await settleWithin(this.#exit.promise, remaining)))
         throw new Error(`PROCESS_STOP_TIMEOUT:${this.#name}:${this.pid}`);
-      }
       await this.#waitForFinalization(Math.max(1, deadline - Date.now()));
     } catch (cleanupError) {
       errors.push(cleanupError);
