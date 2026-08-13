@@ -143,6 +143,27 @@ test("Windows pipe-security helper owns a bounded fail-fast watchdog through ear
   assert.doesNotMatch(helper, /\[Console\]::Error\.WriteLine\(\$_.+\)/u);
 });
 
+test("Windows pipe-security helper requests only the access each handle needs", async () => {
+  const helper = await readFile(join(root, "scripts", "windows-pipe-security.ps1"), "utf8");
+  const access = helper.match(
+    /\$desiredAccess =(?<initial>[\s\S]+?)\$barrierDesiredAccess =(?<barrier>[\s\S]+?)\$openExisting/u,
+  );
+
+  assert.ok(access?.groups);
+  assert.match(access.groups.initial, /GenericRead/u);
+  assert.match(access.groups.initial, /GenericWrite/u);
+  assert.match(access.groups.initial, /ReadControl/u);
+  assert.match(access.groups.initial, /WriteDac/u);
+  assert.doesNotMatch(access.groups.initial, /WriteOwner/u);
+  assert.match(access.groups.barrier, /GenericRead/u);
+  assert.match(access.groups.barrier, /GenericWrite/u);
+  assert.doesNotMatch(access.groups.barrier, /ReadControl|WriteDac|WriteOwner/u);
+  assert.match(
+    helper,
+    /\$setSecurityInformation =\s*\$daclSecurityInformation -bor \$protectedDaclSecurityInformation/u,
+  );
+});
+
 test("Windows control gate emits fixed diagnostics without exception details", async () => {
   const gate = await readFile(
     join(root, "packages", "cli", "test", "windows-control-gate.ts"),

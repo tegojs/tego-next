@@ -98,15 +98,17 @@ try {
   [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
   [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite -bor
   [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl -bor
-  [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac -bor
-  [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteOwner
+  [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac
+  $barrierDesiredAccess =
+    [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
+    [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite
   $openExisting = [uint32]3
   $ownerSecurityInformation = [uint32]0x00000001
   $daclSecurityInformation = [uint32]0x00000004
   $protectedDaclSecurityInformation = [uint32]0x80000000
   $querySecurityInformation = $ownerSecurityInformation -bor $daclSecurityInformation
   $setSecurityInformation =
-    $querySecurityInformation -bor $protectedDaclSecurityInformation
+    $daclSecurityInformation -bor $protectedDaclSecurityInformation
   $barrierRequest = [Text.Encoding]::UTF8.GetBytes("TEGO_WINDOWS_PIPE_SECURITY_BARRIER_V1`n")
   $barrierAck = "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_ACK_V1`n"
   $handle = [TegoWindowsPipeSecurityNative]::CreateFile(
@@ -163,7 +165,7 @@ try {
       $stage = "BARRIER_OPEN"
       $barrierHandle = [TegoWindowsPipeSecurityNative]::CreateFile(
         $Endpoint,
-        $desiredAccess,
+        $barrierDesiredAccess,
         0,
         [IntPtr]::Zero,
         $openExisting,
