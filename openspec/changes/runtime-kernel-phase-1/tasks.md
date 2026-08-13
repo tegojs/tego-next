@@ -102,4 +102,13 @@
 - [x] 12.3 Add an executable release-verification command and authoritative GitHub Actions gates covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, single-Main smoke, and multi-Main takeover (evidence: `tests/architecture/system-ci.test.mjs` and `npm run verify:release -- --preflight`)
 - [x] 12.4 Run mutation or fault-injection checks on lifecycle, fencing, deduplication, and permission gates and close material test gaps (executable evidence is green in `tests/integration/runtime-fault-injection.test.mjs`; final closure awaits review documentation and authoritative GitHub Actions evidence)
 - [x] 12.5 Perform API, architecture, security, concurrency, and failure-recovery review and resolve all blocking findings
-- [x] 12.6 Produce `0.1.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred capabilities
+- [x] 12.6 Produce `2.0.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred Phase 2/3 capabilities
+- [x] 12.7 Migrate all nine public workspaces to `@tego/*@2.0.0-alpha.1`, pin exact internal edges, and verify package metadata, tarball allowlists, clean-consumer imports, and CLI execution
+- [x] 12.8 Define and enforce finite artifact quotas in the local and PostgreSQL stores, including concurrent admission, duplicate, restart, rollback, close, and failure-release evidence
+- [x] 12.9 Make readiness failure process-tree cleanup and exact PostgreSQL test namespace cleanup deterministic and bounded
+- [x] 12.10 Implement fail-closed Windows named-pipe access control and add the mandatory real `windows-control` CI contract (real Windows execution remains Task 10 release evidence)
+- [x] 12.11 Add the dependency-ordered resumable alpha release command and official-registry, integrity, dist-tag, and partial-publication verification contracts
+- [x] 12.12 Update executable documentation contracts and current Phase 1 release evidence without claiming npm/GitHub publication or OpenSpec archive completion
+- [ ] 12.13 Record fresh exact-SHA local and authoritative GitHub Actions release evidence, including real Windows execution
+- [ ] 12.14 Publish all nine npm packages, create and push `v2.0.0-alpha.1`, and create the GitHub prerelease
+- [ ] 12.15 Synchronize delta specs, record immutable release evidence, and archive the Phase 1 OpenSpec change

@@ -27,11 +27,21 @@ npm ci
 npm run build
 ```
 
-The packages are not published. In this checkout, invoke the built CLI as:
+Before the public upload completes, invoke the built CLI from this checkout:
 
 ```sh
 node packages/cli/dist/src/bin.js --help
 ```
+
+After publication, consumers must explicitly select the alpha channel:
+
+```sh
+npm install @tego/runtime@alpha
+```
+
+The expected registry state is `alpha -> 2.0.0-alpha.1` and
+`latest -> absent`; an unqualified install is intentionally not an alpha
+installation.
 
 ## OpenSpec-linked red-green-refactor
 
@@ -90,6 +100,30 @@ TEGO_POSTGRES_URL=postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_tes
 GitHub Actions remains the authoritative phase-one acceptance environment for
 PostgreSQL integration and multi-Main system behavior.
 
+## Alpha release and partial-publication recovery
+
+Use the resumable release tool only against the official registry
+`https://registry.npmjs.org/`:
+
+```sh
+npm run release:alpha -- --preflight
+npm run release:alpha -- --pack
+npm run release:alpha -- --publish
+npm run release:alpha -- --verify-registry
+```
+
+Pack writes a mode-private `release-manifest.json` containing the exact Git SHA,
+all nine package identities and dependency topology, relative tarball paths, and
+SHA-512 integrities. Publish always uses public access and `--tag alpha`; it
+never performs Git or GitHub operations.
+
+If partial publication occurs, retain the unchanged private artifact directory
+and rerun preflight and publish. The release tool skips a package only when its
+version, internal dependencies, SHA-512 integrity, `alpha` tag, and absent
+`latest` tag all match. Any conflict fails closed. Task 11 performs the actual
+npm uploads, Git tag, and GitHub prerelease after Task 10 exact-SHA evidence;
+those operations have not occurred yet.
+
 ## Author a plugin
 
 The repository example is `examples/echo-plugin`. A phase-one plugin project
@@ -97,9 +131,8 @@ contains `package.json`, `tsconfig.json`, `manifest.json`, and TypeScript
 component sources. The packer runs the project's TypeScript build, audits the
 emitted modules, and writes a deterministic `.tego` archive.
 
-The checked-in echo manifest currently demonstrates a future contract range.
-For a plugin installed into this phase-one runtime, use a contract range that
-includes the runtime's current `0.0.0` contract version.
+The checked-in echo manifest uses the Phase 1 contract line. A plugin installed
+into this runtime should use a contract range such as `>=2.0.0 <3.0.0`.
 
 ### Component
 
@@ -131,7 +164,7 @@ execution:
   "schemaVersion": "1.0",
   "pluginId": "org.example.echo",
   "version": "1.0.0",
-  "contractRange": ">=0.0.0 <1.0.0",
+  "contractRange": ">=2.0.0 <3.0.0",
   "nodeRange": ">=26.0.0 <27.0.0",
   "moduleFormat": "esm",
   "components": [
@@ -294,5 +327,6 @@ TEGO_WORKER_CREDENTIAL=replace-me \
   --data-dir .tego/worker-1 --json
 ```
 
-Packages are unpublished and APIs are evolving. Production release remains
-blocked until Node.js 26 enters LTS.
+The npm/GitHub release is pending and APIs are evolving. Production eligibility
+remains blocked until Node.js 26 enters LTS and a fresh production review
+passes. Phase 2 and Phase 3 remain deferred.

@@ -2,6 +2,10 @@
 
 ## Review record
 
+The dated SHAs and GitHub run below are historical Phase 1 evidence. The current
+`2.0.0-alpha.1` closure adds quotas, deterministic cleanup, Windows ACL hardening, and release
+engineering; fresh exact-SHA Task 10 evidence is still pending.
+
 - Review date: 2026-07-27
 - Baseline: `436b1d7b4c2e14259e9a8146555f7d675c637c1a`
 - Reviewed implementation: `a7c4949905a0ff2f9d4988c68cb9bd421ddadde1`
@@ -33,6 +37,11 @@ The final implementation fails closed at the phase-one trust boundaries:
   stale epoch, invalid inventory, and same-ID content equivocation are rejected.
 - Local artifact path ingress is a trusted administrative boundary. A follower may ingest immutable
   content-addressed bytes, but semantic installation and deployment mutations remain leader-fenced.
+- Artifact ingress is bounded by 256 MiB per artifact and 4 GiB per namespace by default, with
+  validated partial overrides. Duplicate, failure, close, restart, and concurrent admission paths
+  are covered for the local and PostgreSQL stores.
+- Windows named pipes fail closed until a protected owner DACL grants full pipe access only to the
+  current user, LocalSystem, and Administrators. Queued pre-cutover sockets never dispatch.
 
 ## Concurrency and recovery conclusions
 
@@ -78,19 +87,22 @@ duplicated, changed to no-ops, or marked `continue-on-error`; actions are pinned
 SHAs; PostgreSQL health settings, bounded reporters, always-upload diagnostics, deterministic
 packaging, pull-request triggers, and `main` push triggers are enforced.
 
-## Accepted non-blocking limitations
+## Current limitations and remaining gates
 
-- The two-Main E2E harness registers a Main handle after readiness. If readiness itself times out,
-  the outer managed process-group cleanup remains the authoritative cleanup path.
-- Local repeated PostgreSQL E2E runs retain unique test namespaces. GitHub service containers are
-  ephemeral; a future local maintenance command may compact these namespaces.
-- Windows named-pipe ACL hardening is not implemented. Windows use is not considered a hardened local
-  administrative boundary in this alpha.
-- A trusted local client can consume artifact storage by submitting immutable bytes even when the
-  contacted Main is a follower. Semantic state is fenced, but storage quotas belong to a later
-  resource-management layer.
+- Readiness ownership now begins immediately after spawn. PostgreSQL test cleanup accepts only
+  `^test_[a-z0-9]+_[a-z0-9_]+$`, deletes exact `driver_namespace = $1` rows from the fixed Phase 1
+  allowlist including `tego_artifact_namespace_usage`, preserves `tego_schema_migrations`, and
+  proves neighboring namespaces unchanged.
+- Windows process-tree cleanup uses bounded `taskkill /T` and refreshed PID + CreationDate tokens;
+  it does not use a native Windows Job Object launcher. The theoretical PID-reuse and final-snapshot
+  orphan limitations are accepted for this alpha and must be exercised empirically in Task 10.
+- A trusted local client may still consume its finite artifact namespace quota through follower
+  ingress. This remains a trusted-boundary denial-of-service consideration, not a fencing bypass.
+- The real `windows-control` job and all other exact-SHA release gates remain pending Task 10. npm
+  publication, Git tag, GitHub prerelease, and OpenSpec archive remain pending Task 11.
 
 ## Verdict
 
-Phase 1 is security-, concurrency-, recovery-, and release-ready for an alpha evaluation. No blocking
-finding remains. Production use remains gated on Node.js 26 entering LTS and a fresh release review.
+Phase 1 is security-, concurrency-, and recovery-ready for final alpha verification. No blocking
+local finding remains. Production use remains gated on Node.js 26 entering LTS and a fresh review;
+`2.0.0-alpha.1` is not yet claimed published or archived.

@@ -2,6 +2,10 @@
 
 ## Review record
 
+This record includes historical July evidence and the current Phase 1 alpha-closure review. The
+historical SHAs and run links below remain provenance; they are not Task 10 exact-SHA release
+evidence for `2.0.0-alpha.1`.
+
 - Review date: 2026-07-27
 - Baseline: `436b1d7b4c2e14259e9a8146555f7d675c637c1a`
 - Reviewed implementation: `a7c4949905a0ff2f9d4988c68cb9bd421ddadde1`
@@ -43,6 +47,14 @@ The final review confirmed these contract properties:
   records on both leaders and followers.
 - Public testkit suites are consumable through package exports and cover manifest, lifecycle,
   executor, Worker, state-store, and coordination-provider contracts.
+- The current public package set is exactly nine `@tego/*@2.0.0-alpha.1` packages with exact
+  internal versions. Consumers opt in with `npm install @tego/runtime@alpha`; registry verification
+  requires `alpha -> 2.0.0-alpha.1` and `latest -> absent`.
+- Artifact quota configuration is topology-neutral. Defaults are 256 MiB per artifact and 4 GiB
+  per namespace, with partial `artifactLimits` overrides. Local enforcement is scoped to one store
+  instance; PostgreSQL stores share transactional namespace accounting.
+- The release command has separate preflight, pack, publish, and verify-registry modes and binds
+  resumable publication to an exact Git SHA, package topology, and SHA-512 tarball integrity.
 
 ## Architecture findings resolved
 
@@ -95,8 +107,14 @@ packaging, type checking, architecture constraints, and strict OpenSpec.
   introduced without changing the reviewed contracts.
 - Layer-two HTTP, application authentication/authorization, datasource, cache, resource, workflow,
   and frontend modules remain outside this release.
+- The exact Node.js 26.5.0 and npm 11.13.0 toolchain is current, but Node.js 26 has not yet
+  satisfied this project's LTS production gate.
+- The new Windows control ACL has local policy/packaging/CI-contract evidence; real Windows
+  execution remains Task 10 evidence and blocks release if it fails.
+- Phase 2 and Phase 3 remain deferred. npm/GitHub publication and OpenSpec archive remain pending.
 
 ## Verdict
 
-Phase 1 is API- and architecture-ready for the `0.1.0-alpha.1` evaluation release. No blocking
-finding remains in the reviewed scope.
+Phase 1 is API- and architecture-ready to enter final verification for the `2.0.0-alpha.1`
+evaluation release. No blocking finding remains in the locally reviewed scope; this is not a claim
+that Task 10 CI, npm/GitHub publication, or OpenSpec archive is complete.

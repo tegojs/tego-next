@@ -62,6 +62,11 @@ allowed. Other first-layer packages may depend on `@tego/contracts`, but not
 on sibling implementations. `@tego/cli` is the composition root and may
 depend on first-layer packages, but not on examples.
 
+All nine public packages use exact version `2.0.0-alpha.1`; published internal
+dependencies are pinned to the same exact version. The alpha channel is
+opt-in: `npm install @tego/runtime@alpha`. It requires
+`alpha -> 2.0.0-alpha.1` and `latest -> absent`.
+
 ## Runtime topology
 
 A Main owns the control plane. It opens explicit drivers, recovers durable
@@ -105,6 +110,24 @@ process isolation boundary.
 The runtime placement preference is process, then thread, then remote. Selection
 still requires manifest support, an explicit permission grant, healthy
 capacity, and sufficient declared resources.
+
+### Artifact storage admission
+
+`@tego/contracts` defines finite defaults of 256 MiB per artifact and 4 GiB per
+namespace through `maxArtifactBytes` and `maxNamespaceBytes`. A driver bundle
+accepts partial construction-time `artifactLimits` overrides; omitted fields
+retain their defaults, values must be positive safe integers, and namespace
+capacity must be at least the per-artifact limit. The stable rejections are
+`ARTIFACT_SIZE_LIMIT_EXCEEDED` and `ARTIFACT_NAMESPACE_QUOTA_EXCEEDED`.
+
+The local driver reconstructs committed bytes from canonical `.tego` files and
+serializes committed-plus-reserved admission within one
+FilesystemArtifactStore instance. It does not claim cross-process filesystem
+coordination. The PostgreSQL driver serializes every writer for the same
+PostgreSQL namespace with a locked `tego_artifact_namespace_usage` row and
+commits accounting in the same transaction as immutable bytes. Duplicate
+digests are free after full stream and digest validation; failed writes release
+non-durable reservations.
 
 ## State machines
 

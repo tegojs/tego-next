@@ -8,7 +8,10 @@ or database.
 
 ## Current support boundary
 
-The packages are unpublished alpha-stage workspace packages. The CLI can start
+The packages are prepared as `@tego/*@2.0.0-alpha.1`; their public npm upload is
+still pending the final release tasks. After publication, install explicitly
+with `npm install @tego/runtime@alpha`; the channel contract is
+`alpha -> 2.0.0-alpha.1` and `latest -> absent`. The CLI can start
 Main processes and operate their private local control endpoints. It can start
 a Worker process, but it does not yet configure the Main side of a Worker
 connection. The process-level system harness composes that listener through
@@ -105,6 +108,18 @@ with the same plugin ID and version does not overwrite the first installation.
 Changing desired deployment state increments its generation. SQLite revisions,
 operation IDs, and stable component instance IDs make restart reconciliation
 idempotent.
+
+Artifact storage defaults to 256 MiB for `maxArtifactBytes` and 4 GiB for
+`maxNamespaceBytes`. Library composition can pass a partial `artifactLimits`
+override to `createLocalDrivers()` or `createPostgresDrivers()`; omitted values
+keep the defaults and the namespace limit must not be smaller than the
+per-artifact limit. Over-limit writes report `ARTIFACT_SIZE_LIMIT_EXCEEDED` or
+`ARTIFACT_NAMESPACE_QUOTA_EXCEEDED`.
+
+Local capacity is atomic within one FilesystemArtifactStore instance and is
+reconstructed from canonical files on restart; separate local store processes
+do not coordinate quota. PostgreSQL stores using the same PostgreSQL namespace
+share transactional capacity through `tego_artifact_namespace_usage`.
 
 `single-main` accepts only local coordination, state, and artifact drivers.
 Supplying PostgreSQL in this mode is rejected before drivers open; PostgreSQL is
@@ -260,6 +275,25 @@ node packages/cli/dist/src/bin.js runtime stop \
   --endpoint .tego/main-b/control.sock --json
 ```
 
+## Deterministic test cleanup
+
+The real-process harness owns each process tree immediately after spawn, before
+readiness. On POSIX it uses stable PID/PGID/start-time observations. On Windows
+it uses bounded `taskkill /T` plus repeatedly refreshed PID + CreationDate
+tokens. The Windows strategy does not use a native Windows Job Object launcher;
+there remains an accepted theoretical PID-reuse window and a descendant created
+after the final snapshot may escape discovery if all known parents exit. It
+never targets an unvalidated descendant and fails closed when discovery or
+termination proof is unavailable. Task 10 must exercise this practical boundary
+in real Windows CI.
+
+PostgreSQL integration cleanup is deliberately destructive only for an exact
+test namespace matching `^test_[a-z0-9]+_[a-z0-9_]+$`. One bounded transaction
+uses `driver_namespace = $1` for a fixed Phase 1 table allowlist including
+`tego_artifact_namespace_usage`. It never changes `tego_schema_migrations`,
+schema objects, or neighboring namespaces. Do not reuse this helper for a
+production namespace.
+
 ## Production gate and deferred deployment capabilities
 
 Production release remains blocked until Node.js 26 enters LTS. Phase one also
@@ -273,6 +307,8 @@ defers:
 - additional coordination providers such as etcd or Consul;
 - OS-grade plugin sandboxing and production secret-manager drivers.
 
-Use `npm run verify:release` and the authoritative GitHub Actions
-`quality`, `integration`, and `system-e2e` jobs as release evidence, not as a
-production-readiness claim.
+Use `npm run verify:release` and the authoritative GitHub Actions `quality`,
+`windows-control`, `integration`, and `system-e2e` jobs as release evidence,
+not as a production-readiness claim. Real Windows ACL and process-tree evidence
+is still pending Task 10. Phase 2 and Phase 3 remain deferred; npm/GitHub
+publication and OpenSpec archive remain pending later release tasks.

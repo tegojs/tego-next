@@ -17,7 +17,7 @@ The principal trust boundaries are:
 
 | Boundary | Implemented checks | Limit |
 | --- | --- | --- |
-| Artifact ingress | deterministic archive parsing, path and size limits, SHA-256 identity, data-only manifest validation, compatibility checks | A valid plugin still contains executable JavaScript |
+| Artifact ingress | deterministic archive parsing, path and size limits, SHA-256 identity, data-only manifest validation, compatibility checks, finite per-artifact and per-namespace quotas | A valid plugin still contains executable JavaScript; local quota is scoped to one store instance |
 | Signing | optional Ed25519 signature verification against configured trust keys | The default CLI-composed runtime has optional trust with no configured keys |
 | Deployment | requested permission envelope, granted subset, capability resolution, placement, executor support | Grants are application policy, not host sandbox policy |
 | Component RPC | exact message shapes, capability schemas, permission checks, bounded payloads | Direct Node.js APIs available inside plugin code are outside these RPC checks |
@@ -96,17 +96,31 @@ history or logs.
 The local control endpoint is a Unix-domain socket or Windows named pipe, not an
 HTTP server. The local control protocol has no application-layer authentication
 and relies on operating-system access to its endpoint. On Unix, startup verifies
-an owner-private parent directory and applies mode 0600 to the socket. Windows
-named-pipe ACL hardening is not implemented in the built-in path; operators must
-provide an operating-system deployment boundary. Each connection carries one
-bounded request.
+an owner-private parent directory and applies mode 0600 to the socket. On
+Windows, startup fails closed until the named pipe has the current Windows user
+as owner and a protected DACL. Explicit allow ACEs grant full pipe access only
+to the current Windows user, LocalSystem, and Administrators; inherited, deny,
+broad, duplicate, reordered, underprivileged, or unexpected ACEs are rejected.
+Connections accepted before the two-acknowledgement admission barrier completes
+are destroyed without dispatch. Each later connection carries one bounded
+request.
+
+The packaged PowerShell/Win32 helper uses fixed shell-free arguments, strict
+single-line JSON inspection, bounded output, and parent/child watchdogs. Real
+Windows named-pipe execution is still pending the mandatory Task 10
+`windows-control` CI evidence; if ACL application or inspection fails there,
+the alpha release remains blocked.
 
 The local control endpoint is trusted. A follower may admit content-addressed
 immutable artifact bytes before the semantic installation crosses the
 leadership fence. The operation returns `COORDINATION_NOT_LEADER`, leaving
 installations and deployments semantic state unchanged. An authorized local
 client can consume artifact storage this way. This is an authorized local
-storage denial of service risk, not a fencing bypass.
+storage denial of service risk, not a fencing bypass. Finite quota limits bound
+the impact: defaults are 256 MiB per artifact and 4 GiB per namespace, with
+construction-time `artifactLimits` overrides. Local enforcement is atomic
+within one FilesystemArtifactStore instance; PostgreSQL enforcement is shared
+transactionally by every store using the same namespace.
 
 Worker transport accepts `ws:` and `wss:` for outbound connections. The
 built-in Main listener uses a WebSocket upgrade on `node:http`, so deployments
@@ -130,5 +144,6 @@ Phase one defers:
 - certificate issuance, TLS termination, and Worker attestation;
 - Tego 1.x ACL compatibility.
 
-Production release also remains gated on Node.js 26 reaching LTS. The current
-packages are unpublished and their APIs are still evolving.
+Production eligibility also remains gated on Node.js 26 reaching LTS. The
+`2.0.0-alpha.1` npm/GitHub release remains pending and APIs are still evolving.
+Phase 2 and Phase 3 remain deferred.

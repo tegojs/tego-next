@@ -234,7 +234,7 @@ Docker Compose and Kubernetes topologies are deferred. They may later reuse the 
 
 ## Delivery and Rollback
 
-Development occurs on reviewable `codex/` feature branches. Each capability is committed only after its focused test suite passes. The initial public release is `0.1.0-alpha.1`; no production stability promise is made.
+Development occurs on reviewable `codex/` feature branches. Each capability is committed only after its focused test suite passes. The initial public package contract is `2.0.0-alpha.1` under the opt-in `alpha` dist-tag; no production stability promise is made, and `latest` remains absent.
 
 Rollback before the first release is a Git revert to the last passing capability slice. Runtime state schemas use forward-only numbered migrations and keep the previous binary’s compatibility range in release metadata. Plugin deployment rollback changes desired state to a previously installed immutable artifact and increments the deployment generation.
 

@@ -48,7 +48,7 @@ The repository SHALL pin Node.js, package-manager, TypeScript, dependency lockfi
 - **THEN** one documented verification command installs from the lockfile, checks formatting and types, runs tests, builds packages, and runs the echo-plugin smoke test
 
 ### Requirement: CI-authoritative system acceptance
-GitHub Actions SHALL be the authoritative phase-one acceptance environment and SHALL execute real process-level single-Main and multi-Main system tests. The CI workflow SHALL run automatically for pull requests targeting `main` and pushes to `main`, while retaining manual dispatch. Its required quality, PostgreSQL integration, system-E2E, and deterministic package-reproducibility gates SHALL be structurally validated as active, ordered, bounded steps and SHALL fail acceptance if disabled, moved outside the required job, commented out, or configured to continue on error.
+GitHub Actions SHALL be the authoritative phase-one acceptance environment and SHALL execute real process-level single-Main and multi-Main system tests plus a real Windows local-control security gate. The CI workflow SHALL run automatically for pull requests targeting `main` and pushes to `main`, while retaining manual dispatch. Its required quality, Windows control, PostgreSQL integration, system-E2E, and deterministic package-reproducibility gates SHALL be structurally validated as active, ordered, bounded steps and SHALL fail acceptance if disabled, moved outside the required job, commented out, configured to continue on error, or able to succeed without executing its target test.
 
 #### Scenario: Real single-Main executor parity
 - **WHEN** CI starts one Main and an independent Worker process, connects them through a real WebSocket socket, and deploys the echo plugin
@@ -69,6 +69,61 @@ GitHub Actions SHALL be the authoritative phase-one acceptance environment and S
 #### Scenario: CI required gates cannot be disabled or made continue-on-error
 - **WHEN** a required verification or deterministic package-reproducibility step is disabled, moved outside its required job, commented out, or configured with `continue-on-error`
 - **THEN** the CI contract check fails with `ci_contract_incomplete` before the workflow can serve as phase-one acceptance evidence
+
+#### Scenario: Real Windows control boundary
+- **WHEN** the `windows-control` job runs on `windows-2025`
+- **THEN** it uses exact Node.js 26.5.0 and npm 11.13.0, applies and inspects the named-pipe descriptor, completes a current-user status request, proves cleanup, and cannot pass by skipping or selecting no tests
+
+### Requirement: Fail-closed local control access
+The built-in local control endpoint SHALL dispatch no request until its operating-system boundary is
+verified. Unix SHALL require an owner-private parent directory, runtime-user ownership, and exact
+mode `0600`. Windows SHALL require the current user as owner, a protected DACL, and explicit full
+pipe access only for the current user, LocalSystem, and Administrators, with no inherited, deny,
+broad, duplicate, or unexpected ACE. Windows connections accepted before the hardened admission
+barrier completes SHALL be destroyed rather than dispatched.
+
+#### Scenario: Windows descriptor cannot be proven safe
+- **WHEN** applying, inspecting, parsing, or validating the Windows named-pipe descriptor or admission barrier fails or times out
+- **THEN** startup rolls back, every queued socket closes, and no control request is dispatched
+
+### Requirement: Deterministic readiness and test cleanup
+Process-harness ownership SHALL be established immediately after spawn and SHALL use bounded
+platform process-tree capture, termination, and proof before readiness can return or fail. Test
+cleanup SHALL preserve the primary error before cleanup errors. PostgreSQL test namespace cleanup
+SHALL accept only the destructive-test namespace shape, use one bounded transaction, delete only
+the fixed Phase 1 table allowlist with parameterized exact namespace predicates, preserve migration
+metadata, and leave every neighboring namespace unchanged.
+
+#### Scenario: Readiness fails after descendants start
+- **WHEN** a managed process times out or its readiness predicate rejects after creating descendants
+- **THEN** cleanup terminates and proves the owned process tree gone, finalizes diagnostics, and reports the readiness failure before any cleanup failure
+
+#### Scenario: One disposable PostgreSQL namespace is cleaned
+- **WHEN** cleanup receives a namespace matching `^test_[a-z0-9]+_[a-z0-9_]+$`
+- **THEN** it deletes only rows whose `driver_namespace = $1` in the fixed Phase 1 tables, including `tego_artifact_namespace_usage`, without changing `tego_schema_migrations` or neighboring namespaces
+
+### Requirement: Public alpha package channel
+The nine public runtime packages SHALL use exact version `2.0.0-alpha.1` and exact-version internal
+dependencies. Publication SHALL target only `https://registry.npmjs.org/` with public access and the
+`alpha` dist-tag. Verification SHALL require `alpha -> 2.0.0-alpha.1` and `latest -> absent`; an
+unqualified install SHALL NOT resolve to this alpha. npm publication SHALL remain separate from Git
+tagging and GitHub prerelease creation.
+
+#### Scenario: Consumer opts into the runtime alpha
+- **WHEN** a consumer runs `npm install @tego/runtime@alpha`
+- **THEN** npm may resolve `2.0.0-alpha.1` without changing the stable `latest` channel
+
+### Requirement: Resumable release verification
+The release command SHALL expose separate preflight, pack, publish, and registry-verification
+modes. A release manifest SHALL bind all nine exact packages, dependency topology, target Git SHA,
+official registry, tarball paths, and SHA-512 integrities. Publish SHALL require a single-use
+successful preflight receipt for the same immutable inputs and SHALL resume only across already
+published packages whose complete registry identity, dependency metadata, integrity, `alpha` tag,
+and absent `latest` tag match.
+
+#### Scenario: Publication is interrupted after some packages
+- **WHEN** the operator reruns publication using the unchanged verified release manifest
+- **THEN** exact matching packages are skipped, missing packages continue in dependency order, and any conflicting or incomplete registry evidence fails closed before another upload
 
 ### Requirement: Layer-one dependency boundary
 The first-layer packages SHALL NOT import Tego 1.x code or define frontend, HTTP routing, authentication, ACL, database-resource, cache, scheduler, workflow, or business-domain APIs.

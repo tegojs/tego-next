@@ -22,11 +22,34 @@ The runtime SHALL compute a SHA-256 digest over the final artifact and SHALL sto
 - **THEN** they receive different digests and the second cannot overwrite the first installation
 
 ### Requirement: Immutable artifact ingress
-A multi-Main node MAY admit content-addressed immutable artifact bytes through its trusted local endpoint without fenced semantic-write authority. Admitted bytes MAY consume shared artifact storage but SHALL NOT by themselves create or change installation, deployment, operation, or task state.
+A multi-Main node MAY admit content-addressed immutable artifact bytes through its trusted local endpoint without fenced semantic-write authority. Admitted bytes consume the configured namespace quota but SHALL NOT by themselves create or change installation, deployment, operation, or task state.
 
 #### Scenario: Follower admits artifact bytes only
 - **WHEN** a follower receives a valid plugin artifact from a trusted local client
 - **THEN** it may add the immutable content-addressed bytes to shared artifact storage without creating installation, deployment, operation, or task state
+
+### Requirement: Bounded artifact storage
+Every artifact store SHALL enforce a finite positive-safe-integer `maxArtifactBytes` and
+`maxNamespaceBytes`, with `maxNamespaceBytes >= maxArtifactBytes`. The default limits SHALL be
+256 MiB per artifact and 4 GiB per namespace. Construction-time partial overrides SHALL merge with
+those defaults. A duplicate digest SHALL consume no additional committed capacity; a rejected,
+failed, cancelled, or closed write SHALL release every non-durable reservation.
+
+#### Scenario: Artifact exceeds its configured limit
+- **WHEN** a streamed artifact crosses `maxArtifactBytes`
+- **THEN** the store rejects it with `ARTIFACT_SIZE_LIMIT_EXCEEDED` before publication
+
+#### Scenario: Concurrent distinct artifacts exceed namespace capacity
+- **WHEN** concurrent distinct writes would make committed plus reserved bytes exceed `maxNamespaceBytes`
+- **THEN** admission serializes so at most the writes within capacity commit and every rejected write reports `ARTIFACT_NAMESPACE_QUOTA_EXCEEDED`
+
+#### Scenario: Filesystem store reconstructs local usage
+- **WHEN** one filesystem artifact store instance restarts
+- **THEN** it reconstructs committed capacity from canonical stable artifact files and enforces committed plus in-process reserved bytes for that instance
+
+#### Scenario: PostgreSQL stores share durable quota
+- **WHEN** independent PostgreSQL stores write to the same PostgreSQL namespace
+- **THEN** one locked `tego_artifact_namespace_usage` row admits bytes transactionally with artifact insertion and prevents cross-process overcommit
 
 ### Requirement: Reproducible plugin package
 The CLI SHALL build a deterministic `.tego` archive from validated JavaScript ESM output and declared metadata.

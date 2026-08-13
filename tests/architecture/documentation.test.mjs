@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
@@ -9,8 +10,31 @@ const documents = {
   architecture: "docs/architecture/runtime-kernel.md",
   contributor: "docs/guides/contributing-and-plugins.md",
   operations: "docs/operations/deployment-topologies.md",
+  release: "docs/releases/2.0.0-alpha.1.md",
   security: "docs/security/threat-model.md",
 };
+
+const releaseDocuments = [
+  "README.md",
+  ...Object.values(documents),
+  "docs/reviews/phase-1-api-architecture-review.md",
+  "docs/reviews/phase-1-security-concurrency-recovery-review.md",
+  "openspec/changes/runtime-kernel-phase-1/specs/plugin-artifacts/spec.md",
+  "openspec/changes/runtime-kernel-phase-1/specs/runtime-operations/spec.md",
+  "openspec/changes/runtime-kernel-phase-1/tasks.md",
+];
+
+const publicPackages = [
+  "@tego/cli",
+  "@tego/contracts",
+  "@tego/drivers-local",
+  "@tego/drivers-postgres",
+  "@tego/executor-node",
+  "@tego/plugin-sdk",
+  "@tego/runtime",
+  "@tego/testkit",
+  "@tego/transport-websocket",
+];
 
 const documentedContracts = [
   {
@@ -31,7 +55,11 @@ const documentedContracts = [
       "relies on operating-system access to its endpoint",
       "owner-private parent directory",
       "mode 0600",
-      "Windows named-pipe ACL hardening is not implemented",
+      "protected DACL",
+      "current Windows user",
+      "LocalSystem",
+      "Administrators",
+      "full pipe access",
     ],
   },
 ];
@@ -164,19 +192,103 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/architecture-docume
 
 test("@spec:runtime-operations/layer-one-dependency-boundary/package-graph-documentation", async () => {
   const architecture = await read(documents.architecture);
-  for (const packageName of [
-    "@tego/contracts",
-    "@tego/runtime",
-    "@tego/drivers-local",
-    "@tego/drivers-postgres",
-    "@tego/executor-node",
-    "@tego/transport-websocket",
-    "@tego/plugin-sdk",
-    "@tego/testkit",
-    "@tego/cli",
-  ]) {
+  for (const packageName of publicPackages) {
     assert.match(architecture, new RegExp(packageName.replaceAll("/", "\\/"), "u"));
   }
+});
+
+test("@spec:runtime-operations/public-alpha-channel/release-documentation", async () => {
+  assert.equal(
+    existsSync(resolve(root, "docs/releases/0.1.0-alpha.1.md")),
+    false,
+    "the superseded release-note filename must be removed",
+  );
+  const readme = await read("README.md");
+  const release = await read(documents.release);
+  for (const source of [readme, release]) {
+    assert.match(source, /\b2\.0\.0-alpha\.1\b/u);
+    assert.match(source, /npm install @tego\/runtime@alpha/u);
+    assert.match(source, /alpha -> 2\.0\.0-alpha\.1/u);
+    assert.match(source, /latest -> absent/u);
+    for (const packageName of publicPackages) {
+      assert.match(source, new RegExp(packageName.replaceAll("/", "\\/"), "u"));
+    }
+  }
+});
+
+test("@spec:plugin-artifacts/bounded-artifact-storage/documentation", async () => {
+  const architecture = await read(documents.architecture);
+  const operations = await read(documents.operations);
+  const combined = `${architecture}\n${operations}`;
+  for (const marker of [
+    "256 MiB",
+    "4 GiB",
+    "maxArtifactBytes",
+    "maxNamespaceBytes",
+    "artifactLimits",
+    "ARTIFACT_SIZE_LIMIT_EXCEEDED",
+    "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+    "one FilesystemArtifactStore instance",
+    "same PostgreSQL namespace",
+    "tego_artifact_namespace_usage",
+  ]) {
+    assert.match(combined, new RegExp(marker, "u"));
+  }
+});
+
+test("@spec:runtime-operations/deterministic-cleanup/documentation", async () => {
+  const operations = await read(documents.operations);
+  for (const marker of [
+    "^test_[a-z0-9]+_[a-z0-9_]+$",
+    "driver_namespace = $1",
+    "tego_artifact_namespace_usage",
+    "tego_schema_migrations",
+    "neighboring namespaces",
+    "taskkill /T",
+    "PID + CreationDate",
+    "does not use a native Windows Job Object launcher",
+  ]) {
+    assert.ok(operations.includes(marker), `${documents.operations} must state: ${marker}`);
+  }
+});
+
+test("@spec:runtime-operations/resumable-alpha-release/documentation", async () => {
+  const contributor = await read(documents.contributor);
+  const release = await read(documents.release);
+  const combined = `${contributor}\n${release}`;
+  for (const marker of [
+    "https://registry.npmjs.org/",
+    "--preflight",
+    "--pack",
+    "--publish",
+    "--verify-registry",
+    "release-manifest.json",
+    "SHA-512",
+    "partial publication",
+    "Task 11",
+  ]) {
+    assert.ok(combined.includes(marker), `release documentation must state: ${marker}`);
+  }
+});
+
+test("current release documents reject superseded or incomplete claims", async () => {
+  const documentation = (await Promise.all(releaseDocuments.map((path) => read(path)))).join("\n");
+  for (const falseClaim of [
+    /\b0\.1\.0-alpha\.1\b/u,
+    /@tegojs\//u,
+    /Windows named-pipe ACL hardening is not implemented/iu,
+    /\bpackages are (?:not published|unpublished)\b/iu,
+  ]) {
+    assert.doesNotMatch(documentation, falseClaim);
+  }
+  assert.match(documentation, /real Windows[^.]{0,100}(?:Task 10|not yet verified)/iu);
+  assert.match(documentation, /Phase 2[^.]{0,80}Phase 3[^.]{0,80}(?:deferred|out of scope)/iu);
+  assert.match(documentation, /Node\.js 26[^.]{0,120}LTS/iu);
+  assert.match(documentation, /(?:npm|GitHub)[^.]{0,100}(?:not yet published|pending)/iu);
+  assert.match(
+    documentation,
+    /OpenSpec[^.]{0,100}(?:not\s+yet\s+archived|archive\s+remains\s+pending)/iu,
+  );
 });
 
 test("@spec:runtime-operations/reproducible-development-environment/contributor-documentation", async () => {

@@ -4,8 +4,40 @@ Tego Next is the backend runtime kernel for applications, plugins, clustered
 main nodes, and distributed workers. This repository currently implements the
 first layer of the planned three-layer architecture.
 
-> Development status: the APIs and package boundaries are still evolving.
-> Packages are not published and no compatibility layer is provided yet.
+> Alpha status: the public package contract is `2.0.0-alpha.1`, but the npm
+> upload and GitHub prerelease remain pending until the final release tasks.
+> This is an evaluation release, not a production recommendation.
+
+## Alpha installation
+
+The public release consists of exactly these nine `@tego/*` packages:
+
+- `@tego/cli`
+- `@tego/contracts`
+- `@tego/drivers-local`
+- `@tego/drivers-postgres`
+- `@tego/executor-node`
+- `@tego/plugin-sdk`
+- `@tego/runtime`
+- `@tego/testkit`
+- `@tego/transport-websocket`
+
+After publication, opt in through the prerelease channel, for example:
+
+```sh
+npm install @tego/runtime@alpha
+```
+
+The release contract is:
+
+```text
+alpha -> 2.0.0-alpha.1
+latest -> absent
+```
+
+Do not use an unqualified install for this release. Uploads target the official
+registry `https://registry.npmjs.org/` with public access and `--tag alpha`;
+the release workflow rejects any `latest` tag.
 
 ## Architecture
 
@@ -22,6 +54,7 @@ Only the runtime-kernel layer is implemented here.
 - [Phase-one threat model](docs/security/threat-model.md)
 - [Deployment topologies](docs/operations/deployment-topologies.md)
 - [Contributing and plugin authoring](docs/guides/contributing-and-plugins.md)
+- [2.0.0-alpha.1 release notes](docs/releases/2.0.0-alpha.1.md)
 
 ## Implemented capabilities
 
@@ -46,7 +79,7 @@ Only the runtime-kernel layer is implemented here.
 | `@tego/executor-node` | Thread and process executors for Node.js |
 | `@tego/transport-websocket` | Main/worker WebSocket transport |
 | `@tego/testkit` | Driver, worker, and executor conformance tests |
-| `@tego/cli` | Plugin packaging and signing commands |
+| `@tego/cli` | Node composition, operator commands, plugin tooling, and local control |
 
 The runnable example is in `examples/echo-plugin`.
 
@@ -130,7 +163,8 @@ docker compose down -v
 ```
 
 GitHub Actions is the authoritative phase-one acceptance environment. Its
-`quality`, `integration`, and `system-e2e` gates use PostgreSQL 16.14 and retain
+`quality`, `windows-control`, `integration`, and `system-e2e` gates use the
+exact Node/npm toolchain; PostgreSQL gates use PostgreSQL 16.14 and retain
 integration and process diagnostics as workflow artifacts even when a test
 fails. The PostgreSQL integration artifact contains
 `integration-result.json` and `integration-process.log`; the system artifact
@@ -140,6 +174,10 @@ Missing expected evidence fails artifact upload. Single-Main uses local
 drivers; multi-Main requires PostgreSQL coordination and persistence. This
 verification does not claim production readiness: production release remains
 gated on Node.js 26 reaching LTS.
+
+Phase 2 and Phase 3 capabilities remain deferred. The OpenSpec archive remains
+pending, and npm/GitHub publication remains pending until the fresh
+exact-SHA local and authoritative CI evidence passes.
 
 ## Plugin development
 
