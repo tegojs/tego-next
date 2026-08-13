@@ -1,3 +1,4 @@
+export * from "./artifact-store-suite.js";
 export * from "./coordination-suite.js";
 export * from "./eventually.js";
 export * from "./executor-suite.js";

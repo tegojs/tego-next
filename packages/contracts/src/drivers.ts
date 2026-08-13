@@ -1,3 +1,4 @@
+import type { ArtifactStorageLimits } from "./artifact-limits.js";
 import type { Clock } from "./clock.js";
 import type { LeadershipHandle } from "./coordination.js";
 import type { ArtifactDigest, FencingEpoch, Revision } from "./identity.js";
@@ -78,6 +79,12 @@ export interface ArtifactStore extends ManagedDriver {
   readonly scope: StorageScope;
   put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void>;
   read(digest: ArtifactDigest): AsyncIterable<Uint8Array>;
+}
+
+/** Construction-time configuration for a namespace-scoped artifact store. */
+export interface ArtifactStoreOptions {
+  readonly namespace: string;
+  readonly limits?: Partial<ArtifactStorageLimits>;
 }
 
 export interface RuntimeDrivers {

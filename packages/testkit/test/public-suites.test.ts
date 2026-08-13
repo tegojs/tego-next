@@ -1,21 +1,15 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import {
-  coordinationConformance,
-  executorConformance,
-  lifecycleConformance,
-  manifestConformance,
-  stateStoreConformance,
-  workerConformance,
-  type CoordinationFactory,
-  type ExecutorConformanceFixture,
-  type ExecutorFactory,
-  type LifecycleConformanceFactory,
-  type ManifestConformanceFactory,
-  type StateStoreFactory,
-  type WorkerConformanceFactory,
-} from "@tego/testkit";
-import {
+  type ArtifactDigest,
+  type ArtifactStore,
+  type ArtifactStoreOptions,
+  DiagnosticError,
+  type DriverHealth,
+  type ExecutorKind,
+  type FencingEpoch,
+  type JsonValue,
   parseApplicationId,
   parseArtifactDigest,
   parseFencingEpoch,
@@ -23,15 +17,106 @@ import {
   parsePluginManifest,
   parseRuntimeId,
   parseWorkerId,
-  type ArtifactDigest,
-  type ExecutorKind,
-  type FencingEpoch,
-  type JsonValue,
   type Runtime,
   type RuntimeLifecycleState,
   type RuntimeStatus,
   type WorkerId,
 } from "@tego/contracts";
+import {
+  type ArtifactStoreSuiteFactory,
+  type CoordinationFactory,
+  coordinationConformance,
+  defineArtifactStoreSuite,
+  type ExecutorConformanceFixture,
+  type ExecutorFactory,
+  executorConformance,
+  type LifecycleConformanceFactory,
+  lifecycleConformance,
+  type ManifestConformanceFactory,
+  manifestConformance,
+  type StateStoreFactory,
+  stateStoreConformance,
+  type WorkerConformanceFactory,
+  workerConformance,
+} from "@tego/testkit";
+
+class PublicQuotaFixtureStore implements ArtifactStore {
+  readonly scope = "local" as const;
+  readonly #limits: Required<ArtifactStoreOptions>["limits"];
+  readonly #artifacts = new Map<ArtifactDigest, Uint8Array>();
+  #reservedBytes = 0;
+
+  constructor(options: ArtifactStoreOptions) {
+    this.#limits = options.limits ?? {};
+  }
+
+  async open(): Promise<void> {}
+  async close(): Promise<void> {}
+
+  async health(): Promise<DriverHealth> {
+    return { status: "healthy", checkedAt: "2026-08-13T00:00:00.000Z" };
+  }
+
+  async put(digest: ArtifactDigest, source: AsyncIterable<Uint8Array>): Promise<void> {
+    if (this.#artifacts.has(digest)) return;
+    const bytes: Uint8Array[] = [];
+    let reservedForWrite = 0;
+    try {
+      for await (const chunk of source) {
+        const nextSize = reservedForWrite + chunk.byteLength;
+        if (nextSize > (this.#limits.maxArtifactBytes ?? Number.MAX_SAFE_INTEGER)) {
+          throw this.#error("ARTIFACT_SIZE_LIMIT_EXCEEDED");
+        }
+        const storedBytes = [...this.#artifacts.values()].reduce(
+          (total, artifact) => total + artifact.byteLength,
+          0,
+        );
+        if (
+          storedBytes + this.#reservedBytes + chunk.byteLength >
+          (this.#limits.maxNamespaceBytes ?? Number.MAX_SAFE_INTEGER)
+        ) {
+          throw this.#error("ARTIFACT_NAMESPACE_QUOTA_EXCEEDED");
+        }
+        const copy = Uint8Array.from(chunk);
+        bytes.push(copy);
+        reservedForWrite += copy.byteLength;
+        this.#reservedBytes += copy.byteLength;
+      }
+      const content = Buffer.concat(bytes);
+      const actual = parseArtifactDigest(
+        `sha256:${createHash("sha256").update(content).digest("hex")}`,
+      );
+      if (actual !== digest) throw this.#error("ARTIFACT_DIGEST_MISMATCH");
+      this.#artifacts.set(digest, content);
+    } finally {
+      this.#reservedBytes -= reservedForWrite;
+    }
+  }
+
+  async *read(digest: ArtifactDigest): AsyncIterable<Uint8Array> {
+    const content = this.#artifacts.get(digest);
+    if (content === undefined) throw this.#error("ARTIFACT_NOT_FOUND");
+    yield content;
+  }
+
+  #error(code: `ARTIFACT_${string}`): DiagnosticError {
+    return new DiagnosticError({
+      code,
+      message: code,
+      source: { kind: "artifact", id: "public-quota-fixture" },
+      severity: "error",
+      retryable: false,
+      observedAt: "2026-08-13T00:00:00.000Z",
+    });
+  }
+}
+
+const artifactStoreSuiteFactory: ArtifactStoreSuiteFactory = async (options) => ({
+  store: new PublicQuotaFixtureStore(options),
+  dispose: async () => {},
+});
+
+defineArtifactStoreSuite(artifactStoreSuiteFactory);
 
 manifestConformance(() => ({
   parse: parsePluginManifest,
@@ -121,6 +206,7 @@ class PublicWorkerFixture {
 workerConformance(() => new PublicWorkerFixture());
 
 const publicSuiteConsumers = {
+  artifactStore: (factory: ArtifactStoreSuiteFactory) => defineArtifactStoreSuite(factory),
   coordination: (factory: CoordinationFactory) => coordinationConformance(factory),
   executor: (factory: ExecutorFactory, fixture: ExecutorConformanceFixture) =>
     executorConformance(factory, fixture),
@@ -130,8 +216,9 @@ const publicSuiteConsumers = {
   worker: (factory: WorkerConformanceFactory) => workerConformance(factory),
 };
 
-test("all six conformance suites are consumable from the public package entry", () => {
+test("all seven conformance suites are consumable from the public package entry", () => {
   assert.deepEqual(Object.keys(publicSuiteConsumers).sort(), [
+    "artifactStore",
     "coordination",
     "executor",
     "lifecycle",

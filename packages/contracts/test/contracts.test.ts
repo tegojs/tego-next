@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  type ArtifactStorageLimits,
   type CapabilityBinding,
   type CapabilityDefinition,
   type CapabilityIdentity,
   createExecutionBinding,
+  DEFAULT_ARTIFACT_STORAGE_LIMITS,
   DiagnosticError,
   type DriverHealth,
   diagnosticCode,
@@ -20,6 +22,7 @@ import {
   type PluginManifest,
   parseApplicationId,
   parseArtifactDigest,
+  parseArtifactStorageLimits,
   parseAttemptId,
   parseCapabilityBinding,
   parseCapabilityDefinition,
@@ -303,6 +306,52 @@ test("branded identities are constructed only after validation", () => {
     () => parseRuntimeId("../escape"),
     (error: unknown) => diagnosticCode(error) === "PROTOCOL_IDENTITY_INVALID",
   );
+});
+
+test("artifact storage limits provide frozen finite defaults and merge overrides", () => {
+  const defaults = parseArtifactStorageLimits();
+  assert.deepEqual(defaults, {
+    maxArtifactBytes: 256 * 1024 * 1024,
+    maxNamespaceBytes: 4 * 1024 * 1024 * 1024,
+  } satisfies ArtifactStorageLimits);
+  assert.equal(defaults, DEFAULT_ARTIFACT_STORAGE_LIMITS);
+  assert.equal(Object.isFrozen(defaults), true);
+  assert.equal(Number.isFinite(defaults.maxArtifactBytes), true);
+  assert.equal(Number.isFinite(defaults.maxNamespaceBytes), true);
+  assert.equal(Number.isSafeInteger(defaults.maxNamespaceBytes), true);
+
+  const overridden = parseArtifactStorageLimits({ maxArtifactBytes: 1024 });
+  assert.deepEqual(overridden, {
+    maxArtifactBytes: 1024,
+    maxNamespaceBytes: 4 * 1024 * 1024 * 1024,
+  });
+  assert.equal(Object.isFrozen(overridden), true);
+});
+
+test("artifact storage limits reject invalid and inverted quotas with serializable diagnostics", () => {
+  for (const input of [
+    { maxArtifactBytes: 0 },
+    { maxArtifactBytes: -1 },
+    { maxArtifactBytes: 1.5 },
+    { maxArtifactBytes: Number.POSITIVE_INFINITY },
+    { maxArtifactBytes: Number.MAX_SAFE_INTEGER + 1 },
+    { maxNamespaceBytes: 0 },
+    { maxNamespaceBytes: -1 },
+    { maxNamespaceBytes: 1.5 },
+    { maxNamespaceBytes: Number.NEGATIVE_INFINITY },
+    { maxNamespaceBytes: Number.MAX_SAFE_INTEGER + 1 },
+    { maxArtifactBytes: 2, maxNamespaceBytes: 1 },
+  ]) {
+    assert.throws(
+      () => parseArtifactStorageLimits(input),
+      (error: unknown) => {
+        if (!(error instanceof DiagnosticError)) return false;
+        assert.equal(error.diagnostic.code, "ARTIFACT_STORAGE_LIMITS_INVALID");
+        assert.doesNotThrow(() => JSON.stringify(error.diagnostic));
+        return true;
+      },
+    );
+  }
 });
 
 test("@spec:plugin-artifacts/runtime-compatibility-validation/unsupported-commonjs-artifact", () => {

@@ -1,3 +1,4 @@
+export * from "./artifact-limits.js";
 export * from "./capability.js";
 export * from "./clock.js";
 export * from "./component-boundary.js";
