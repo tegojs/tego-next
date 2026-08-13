@@ -44,7 +44,11 @@ async function runWindowsControlSecurityContract(): Promise<void> {
   assert.equal(process.platform, "win32", "Windows control gate cannot run on another platform");
   const endpoint = `\\\\.\\pipe\\tego-windows-control-gate-${process.pid}-${randomUUID()}`;
   const productionAdapter = createWindowsPipeSecurityAdapter();
-  const server = await startControlServer({ endpoint, operations: gateOperations() });
+  const server = await startControlServer({
+    endpoint,
+    operations: gateOperations(),
+    onWindowsPipeSecurityHelperFailure: (stage) => process.stderr.write(`${stage}\n`),
+  });
   try {
     const inspection = await productionAdapter.inspect(endpoint);
     const { accessRules: _accessRules, ...publicDescriptor } = inspection;
@@ -79,5 +83,10 @@ async function runWindowsControlSecurityContract(): Promise<void> {
   );
 }
 
-await runWindowsControlSecurityContract();
-process.stdout.write(`${WINDOWS_CONTROL_GATE_MARKER}\n`);
+try {
+  await runWindowsControlSecurityContract();
+  process.stdout.write(`${WINDOWS_CONTROL_GATE_MARKER}\n`);
+} catch {
+  process.stderr.write("TEGO_WINDOWS_CONTROL_GATE_FAILED\n");
+  process.exitCode = 1;
+}

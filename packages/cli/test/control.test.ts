@@ -1501,6 +1501,56 @@ test("Windows pipe helper uses fixed shell-free arguments and an admission barri
   ]);
 });
 
+test("Windows pipe helper exposes only fixed failure stages", async () => {
+  const fixed = fakeWindowsPipeSecurityHelperProcess();
+  const stages: string[] = [];
+  const fixedAdapter = createWindowsPipeSecurityAdapter({
+    onHelperFailure: (stage) => stages.push(stage),
+    spawnHelper() {
+      queueMicrotask(() => {
+        fixed.stdout.end();
+        fixed.stderr.end("TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED\n");
+        (fixed.child as unknown as EventEmitter).emit("close", 1, null);
+      });
+      return fixed.child;
+    },
+  });
+
+  await assert.rejects(
+    fixedAdapter.harden("\\\\.\\pipe\\tego-helper-fixed-failure"),
+    (error: unknown) =>
+      error instanceof DiagnosticError &&
+      error.diagnostic.code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&
+      error.message === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+  );
+  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED"]);
+
+  const unsafe = fakeWindowsPipeSecurityHelperProcess();
+  const unsafeAdapter = createWindowsPipeSecurityAdapter({
+    onHelperFailure: (stage) => stages.push(stage),
+    spawnHelper() {
+      queueMicrotask(() => {
+        unsafe.stdout.end();
+        unsafe.stderr.end("sensitive helper detail: \\\\.\\pipe\\private-endpoint\n");
+        (unsafe.child as unknown as EventEmitter).emit("close", 1, null);
+      });
+      return unsafe.child;
+    },
+  });
+  const outcome = await unsafeAdapter.harden("\\\\.\\pipe\\tego-helper-unsafe-failure").then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ error, ok: false as const }),
+  );
+
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) {
+    assert.ok(outcome.error instanceof DiagnosticError);
+    assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
+    assert.doesNotMatch(JSON.stringify(outcome.error), /sensitive|private-endpoint/u);
+  }
+  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED"]);
+});
+
 test("Windows pipe helper abort waits for observed child close", async () => {
   const { child } = fakeWindowsPipeSecurityHelperProcess();
   let killCalls = 0;

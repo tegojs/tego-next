@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -61,6 +61,27 @@ test("public package manifests declare alpha publication metadata", async (t) =>
   }
 });
 
+test("CLI build finalization makes a freshly emitted binary executable", async () => {
+  const { finalizeCliBuild } = await import(
+    new URL("../../scripts/copy-windows-pipe-security.mjs", import.meta.url)
+  );
+  const directory = await mkdtemp(join(tmpdir(), "tego-cli-build-finalization-"));
+  const binary = join(directory, "bin.js");
+  const helperSource = join(directory, "source.ps1");
+  const helperDestination = join(directory, "control", "windows-pipe-security.ps1");
+
+  try {
+    await writeFile(binary, "#!/usr/bin/env node\n", { mode: 0o644 });
+    await writeFile(helperSource, "helper\n");
+    await finalizeCliBuild({ binary, helperDestination, helperSource, platform: "linux" });
+
+    assert.equal((await lstat(binary)).mode & 0o777, 0o755);
+    assert.equal(await readFile(helperDestination, "utf8"), "helper\n");
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
 test("packed public packages contain only consumer assets and install cleanly", async () => {
   const { packWorkspaceSet, verifyPackedConsumer } = await import(
     new URL("../../scripts/package-contract.mjs", import.meta.url)
@@ -109,12 +130,27 @@ test("packed public packages contain only consumer assets and install cleanly", 
   }
 });
 
-test("Windows pipe-security helper owns a bounded fail-fast watchdog", async () => {
+test("Windows pipe-security helper owns a bounded fail-fast watchdog through early failures", async () => {
   const helper = await readFile(join(root, "scripts", "windows-pipe-security.ps1"), "utf8");
 
   assert.match(helper, /Environment\.FailFast\(/u);
   assert.match(helper, /StartWatchdog\(9000\)/u);
-  assert.match(helper, /\$watchdog\.Dispose\(\)/u);
+  assert.match(
+    helper,
+    /\$watchdog = \$null[\s\S]*try \{[\s\S]*\$watchdog = \[TegoWindowsPipeSecurityNative\]::StartWatchdog\(9000\)[\s\S]*\$handle = \[TegoWindowsPipeSecurityNative\]::CreateFile\([\s\S]*\} finally \{[\s\S]*Close-TegoResource \$handle[\s\S]*Close-TegoResource \$watchdog/u,
+  );
+  assert.match(helper, /TEGO_WINDOWS_PIPE_SECURITY_\$\{failureStage\}_FAILED/u);
+  assert.doesNotMatch(helper, /\[Console\]::Error\.WriteLine\(\$_.+\)/u);
+});
+
+test("Windows control gate emits fixed diagnostics without exception details", async () => {
+  const gate = await readFile(
+    join(root, "packages", "cli", "test", "windows-control-gate.ts"),
+    "utf8",
+  );
+
+  assert.match(gate, /TEGO_WINDOWS_CONTROL_GATE_FAILED/u);
+  assert.doesNotMatch(gate, /error\.(?:message|stack)|String\(error\)/u);
 });
 
 test("workspace inspection rejects duplicate public names and non-alpha versions", async () => {

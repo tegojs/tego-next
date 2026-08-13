@@ -12,6 +12,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Close-TegoResource {
+  param([object]$Resource)
+  if ($null -eq $Resource) { return }
+  try { $Resource.Dispose() } catch { }
+}
+
 if (
   ($Operation -eq "harden" -and $BarrierCount -lt 1) -or
   ($Operation -eq "inspect" -and $BarrierCount -ne 0)
@@ -77,41 +83,51 @@ public static class TegoWindowsPipeSecurityNative
 }
 '@
 
-$watchdog = [TegoWindowsPipeSecurityNative]::StartWatchdog(9000)
+$watchdog = $null
+$handle = $null
+$barrierHandle = $null
+$barrierStream = $null
+$reader = $null
+$failureStage = $null
+$stage = "INITIAL_OPEN"
 
-$desiredAccess =
+try {
+  $watchdog = [TegoWindowsPipeSecurityNative]::StartWatchdog(9000)
+
+  $desiredAccess =
   [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericRead -bor
   [TegoWindowsPipeSecurityNative+DesiredAccess]::GenericWrite -bor
   [TegoWindowsPipeSecurityNative+DesiredAccess]::ReadControl -bor
   [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteDac -bor
   [TegoWindowsPipeSecurityNative+DesiredAccess]::WriteOwner
-$openExisting = [uint32]3
-$ownerSecurityInformation = [uint32]0x00000001
-$daclSecurityInformation = [uint32]0x00000004
-$protectedDaclSecurityInformation = [uint32]0x80000000
-$querySecurityInformation = $ownerSecurityInformation -bor $daclSecurityInformation
-$setSecurityInformation =
-  $querySecurityInformation -bor $protectedDaclSecurityInformation
-$barrierRequest = [Text.Encoding]::UTF8.GetBytes("TEGO_WINDOWS_PIPE_SECURITY_BARRIER_V1`n")
-$barrierAck = "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_ACK_V1`n"
-$handle = [TegoWindowsPipeSecurityNative]::CreateFile(
-  $Endpoint,
-  $desiredAccess,
-  0,
-  [IntPtr]::Zero,
-  $openExisting,
-  0,
-  [IntPtr]::Zero
-)
+  $openExisting = [uint32]3
+  $ownerSecurityInformation = [uint32]0x00000001
+  $daclSecurityInformation = [uint32]0x00000004
+  $protectedDaclSecurityInformation = [uint32]0x80000000
+  $querySecurityInformation = $ownerSecurityInformation -bor $daclSecurityInformation
+  $setSecurityInformation =
+    $querySecurityInformation -bor $protectedDaclSecurityInformation
+  $barrierRequest = [Text.Encoding]::UTF8.GetBytes("TEGO_WINDOWS_PIPE_SECURITY_BARRIER_V1`n")
+  $barrierAck = "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_ACK_V1`n"
+  $handle = [TegoWindowsPipeSecurityNative]::CreateFile(
+    $Endpoint,
+    $desiredAccess,
+    0,
+    [IntPtr]::Zero,
+    $openExisting,
+    0,
+    [IntPtr]::Zero
+  )
 
-if ($handle.IsInvalid) {
-  $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-  throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open the named pipe")
-}
+  if ($handle.IsInvalid) {
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open the named pipe")
+  }
 
-try {
+  $stage = "IDENTITY"
   $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   if ($Operation -eq "harden") {
+    $stage = "APPLY_DESCRIPTOR"
     $allowedSids = @(
       $currentUserSid
       "S-1-5-18"
@@ -139,10 +155,12 @@ try {
     # connections then consume its first replacement and prove the following
     # replacement was created after the descriptor changed.
     for ($index = 0; $index -lt $BarrierCount; $index += 1) {
+      $stage = "BARRIER_WAIT"
       if (-not [TegoWindowsPipeSecurityNative]::WaitNamedPipe($Endpoint, 1000)) {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw [ComponentModel.Win32Exception]::new($errorCode, "Pipe barrier was unavailable")
       }
+      $stage = "BARRIER_OPEN"
       $barrierHandle = [TegoWindowsPipeSecurityNative]::CreateFile(
         $Endpoint,
         $desiredAccess,
@@ -157,6 +175,7 @@ try {
         throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open the pipe barrier")
       }
       try {
+        $stage = "BARRIER_IO"
         $barrierStream = [IO.FileStream]::new(
           $barrierHandle,
           [IO.FileAccess]::ReadWrite,
@@ -177,19 +196,23 @@ try {
             $acknowledgement = $reader.ReadLine()
           } finally {
             $reader.Dispose()
+            $reader = $null
           }
           if (("$acknowledgement`n") -ne $barrierAck) {
             throw "Pipe admission barrier acknowledgement was invalid"
           }
         } finally {
           $barrierStream.Dispose()
+          $barrierStream = $null
         }
       } finally {
         if (-not $barrierHandle.IsClosed) { $barrierHandle.Dispose() }
+        $barrierHandle = $null
       }
     }
   }
 
+  $stage = "DESCRIPTOR_SIZE"
   $lengthNeeded = [uint32]0
   [void][TegoWindowsPipeSecurityNative]::GetKernelObjectSecurity(
     $handle,
@@ -204,6 +227,7 @@ try {
   }
 
   $actualBytes = [byte[]]::new($lengthNeeded)
+  $stage = "DESCRIPTOR_READ"
   if (-not [TegoWindowsPipeSecurityNative]::GetKernelObjectSecurity(
     $handle,
     $querySecurityInformation,
@@ -215,6 +239,7 @@ try {
     throw [ComponentModel.Win32Exception]::new($errorCode, "Could not inspect the pipe descriptor")
   }
 
+  $stage = "DESCRIPTOR_PARSE"
   $actualDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($actualBytes, 0)
   $rules = @(
     foreach ($ace in $actualDescriptor.DiscretionaryAcl) {
@@ -247,7 +272,17 @@ try {
     accessRules = $rules
   }
   [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress -Depth 5))
+} catch {
+  $failureStage = $stage
 } finally {
-  $handle.Dispose()
-  $watchdog.Dispose()
+  Close-TegoResource $reader
+  Close-TegoResource $barrierStream
+  Close-TegoResource $barrierHandle
+  Close-TegoResource $handle
+  Close-TegoResource $watchdog
+}
+
+if ($null -ne $failureStage) {
+  [Console]::Error.WriteLine("TEGO_WINDOWS_PIPE_SECURITY_${failureStage}_FAILED")
+  exit 1
 }

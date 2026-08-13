@@ -32,6 +32,7 @@ import {
   WINDOWS_PIPE_ADMISSION_BARRIER_ACK,
   WINDOWS_PIPE_ADMISSION_BARRIER_FRAME,
   type WindowsPipeSecurityAdapter,
+  type WindowsPipeSecurityHelperFailureStage,
 } from "./windows-pipe-security.js";
 
 export interface LocalArtifactIngress {
@@ -55,6 +56,9 @@ export interface ControlServerOptions {
   readonly setEndpointPermissions?: (endpoint: string) => Promise<void>;
   readonly windowsPipeCurrentUserSid?: string;
   readonly windowsPipeSecurityAdapter?: WindowsPipeSecurityAdapter;
+  readonly onWindowsPipeSecurityHelperFailure?: (
+    stage: WindowsPipeSecurityHelperFailureStage,
+  ) => void;
   readonly onServerError?: (error: Error) => void;
 }
 
@@ -641,7 +645,13 @@ export async function startControlServer(options: ControlServerOptions): Promise
     if (requiresWindowsPipeSecurity) {
       try {
         assertControlInitializationActive(options.signal);
-        const adapter = options.windowsPipeSecurityAdapter ?? createWindowsPipeSecurityAdapter();
+        const adapter =
+          options.windowsPipeSecurityAdapter ??
+          createWindowsPipeSecurityAdapter(
+            options.onWindowsPipeSecurityHelperFailure === undefined
+              ? {}
+              : { onHelperFailure: options.onWindowsPipeSecurityHelperFailure },
+          );
         if (process.platform === "win32" && adapter.usesAdmissionBarrier !== true) {
           throw windowsControlEndpointUnsafe();
         }

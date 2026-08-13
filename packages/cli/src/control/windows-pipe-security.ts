@@ -51,6 +51,30 @@ export type WindowsPipeSecurityHelperSpawner = (
   args: readonly string[],
 ) => ChildProcessByStdio<null, Readable, Readable>;
 
+export type WindowsPipeSecurityHelperFailureStage =
+  | "TEGO_WINDOWS_PIPE_SECURITY_APPLY_DESCRIPTOR_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_IO_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_OPEN_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_WAIT_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_DESCRIPTOR_PARSE_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_DESCRIPTOR_READ_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_DESCRIPTOR_SIZE_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_IDENTITY_FAILED"
+  | "TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED";
+
+const WINDOWS_PIPE_SECURITY_HELPER_FAILURE =
+  /^TEGO_WINDOWS_PIPE_SECURITY_(?:APPLY_DESCRIPTOR|BARRIER_IO|BARRIER_OPEN|BARRIER_WAIT|DESCRIPTOR_PARSE|DESCRIPTOR_READ|DESCRIPTOR_SIZE|IDENTITY|INITIAL_OPEN)_FAILED\r?\n$/u;
+
+class WindowsPipeSecurityHelperFailure extends Error {
+  readonly stage: WindowsPipeSecurityHelperFailureStage;
+
+  constructor(stage: WindowsPipeSecurityHelperFailureStage) {
+    super("WINDOWS_PIPE_SECURITY_HELPER_FAILED");
+    this.name = "WindowsPipeSecurityHelperFailure";
+    this.stage = stage;
+  }
+}
+
 const WINDOWS_PIPE_SECURITY_SCRIPT = fileURLToPath(
   new URL("windows-pipe-security.ps1", import.meta.url),
 );
@@ -220,6 +244,15 @@ async function runPowerShellHelperWith(
         return;
       }
       if (code !== 0 || childSignal !== null || stderr.byteLength !== 0) {
+        const diagnostic = stderr.toString("utf8");
+        if (WINDOWS_PIPE_SECURITY_HELPER_FAILURE.test(diagnostic)) {
+          finish(
+            new WindowsPipeSecurityHelperFailure(
+              diagnostic.trim() as WindowsPipeSecurityHelperFailureStage,
+            ),
+          );
+          return;
+        }
         finish(new Error("WINDOWS_PIPE_SECURITY_HELPER_FAILED"));
         return;
       }
@@ -265,7 +298,10 @@ export function parseWindowsPipeSecurityHelperOutput(
 }
 
 export function createWindowsPipeSecurityAdapter(
-  options: { readonly spawnHelper?: WindowsPipeSecurityHelperSpawner } = {},
+  options: {
+    readonly onHelperFailure?: (stage: WindowsPipeSecurityHelperFailureStage) => void;
+    readonly spawnHelper?: WindowsPipeSecurityHelperSpawner;
+  } = {},
 ): WindowsPipeSecurityAdapter & WindowsPipeSecurityInspector {
   try {
     accessSync(WINDOWS_PIPE_SECURITY_SCRIPT, fsConstants.R_OK);
@@ -301,6 +337,13 @@ export function createWindowsPipeSecurityAdapter(
     } catch (error) {
       if (signal?.aborted === true) {
         throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      }
+      if (error instanceof WindowsPipeSecurityHelperFailure) {
+        try {
+          options.onHelperFailure?.(error.stage);
+        } catch {
+          // Diagnostic observers cannot change the fail-closed production result.
+        }
       }
       if (error instanceof DiagnosticError) throw error;
       throw endpointUnsafe();
