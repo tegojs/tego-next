@@ -294,6 +294,26 @@ uses `driver_namespace = $1` for a fixed Phase 1 table allowlist including
 schema objects, or neighboring namespaces. Do not reuse this helper for a
 production namespace.
 
+The fixed deletion order is:
+
+```text
+tego_operation_history
+tego_operations
+tego_outbox
+tego_idempotency
+tego_state_changes
+tego_records
+tego_fences
+tego_state_revisions
+tego_coordination_changes
+tego_coordination_records
+tego_coordination_leases
+tego_coordination_epochs
+tego_coordination_revisions
+tego_artifacts
+tego_artifact_namespace_usage
+```
+
 ## Production gate and deferred deployment capabilities
 
 Production release remains blocked until Node.js 26 enters LTS. Phase one also

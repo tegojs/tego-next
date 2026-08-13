@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,10 +19,19 @@ const releaseDocuments = [
   ...Object.values(documents),
   "docs/reviews/phase-1-api-architecture-review.md",
   "docs/reviews/phase-1-security-concurrency-recovery-review.md",
-  "openspec/changes/runtime-kernel-phase-1/specs/plugin-artifacts/spec.md",
-  "openspec/changes/runtime-kernel-phase-1/specs/runtime-operations/spec.md",
+  "openspec/changes/runtime-kernel-phase-1/.comet/handoff/design-context.md",
   "openspec/changes/runtime-kernel-phase-1/tasks.md",
 ];
+
+const deltaSpecsRoot = "openspec/changes/runtime-kernel-phase-1/specs";
+
+async function activeDeltaSpecPaths() {
+  const entries = await readdir(resolve(root, deltaSpecsRoot), { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => `${deltaSpecsRoot}/${entry.name}/spec.md`)
+    .toSorted();
+}
 
 const publicPackages = [
   "@tego/cli",
@@ -34,6 +43,24 @@ const publicPackages = [
   "@tego/runtime",
   "@tego/testkit",
   "@tego/transport-websocket",
+];
+
+const postgresCleanupTables = [
+  "tego_operation_history",
+  "tego_operations",
+  "tego_outbox",
+  "tego_idempotency",
+  "tego_state_changes",
+  "tego_records",
+  "tego_fences",
+  "tego_state_revisions",
+  "tego_coordination_changes",
+  "tego_coordination_records",
+  "tego_coordination_leases",
+  "tego_coordination_epochs",
+  "tego_coordination_revisions",
+  "tego_artifacts",
+  "tego_artifact_namespace_usage",
 ];
 
 const documentedContracts = [
@@ -250,6 +277,15 @@ test("@spec:runtime-operations/deterministic-cleanup/documentation", async () =>
   ]) {
     assert.ok(operations.includes(marker), `${documents.operations} must state: ${marker}`);
   }
+  const order = /The fixed deletion order is:\n\n```text\n([^`]+)```/u.exec(operations);
+  assert.ok(order, `${documents.operations} must enumerate the fixed deletion order`);
+  assert.deepEqual(
+    order[1]
+      .trim()
+      .split("\n")
+      .map((line) => line.trim()),
+    postgresCleanupTables,
+  );
 });
 
 test("@spec:runtime-operations/resumable-alpha-release/documentation", async () => {
@@ -266,13 +302,22 @@ test("@spec:runtime-operations/resumable-alpha-release/documentation", async () 
     "SHA-512",
     "partial publication",
     "Task 11",
+    "repacks the current source tree",
+    "current invocation",
+    "does not load a prior release-manifest.json",
+    "same targetSha",
   ]) {
     assert.ok(combined.includes(marker), `release documentation must state: ${marker}`);
   }
+  assert.doesNotMatch(
+    combined,
+    /(?:retain|reuse|using|against) the unchanged (?:private )?(?:artifact directory|release manifest)/iu,
+  );
 });
 
 test("current release documents reject superseded or incomplete claims", async () => {
-  const documentation = (await Promise.all(releaseDocuments.map((path) => read(path)))).join("\n");
+  const currentPaths = [...releaseDocuments, ...(await activeDeltaSpecPaths())];
+  const documentation = (await Promise.all(currentPaths.map((path) => read(path)))).join("\n");
   for (const falseClaim of [
     /\b0\.1\.0-alpha\.1\b/u,
     /@tegojs\//u,
@@ -289,6 +334,31 @@ test("current release documents reject superseded or incomplete claims", async (
     documentation,
     /OpenSpec[^.]{0,100}(?:not\s+yet\s+archived|archive\s+remains\s+pending)/iu,
   );
+});
+
+test("all active delta specs agree on the hardened Windows control boundary", async () => {
+  const paths = await activeDeltaSpecPaths();
+  const specs = await Promise.all(paths.map((path) => read(path)));
+  for (const [index, spec] of specs.entries()) {
+    assert.doesNotMatch(
+      spec,
+      /(?:no implemented ACL hardening|ACL hardening is not implemented)/iu,
+      `${paths[index]} must not retain the superseded Windows boundary`,
+    );
+  }
+  const bootstrap = await read(
+    "openspec/changes/runtime-kernel-phase-1/specs/runtime-bootstrap/spec.md",
+  );
+  for (const marker of [
+    "protected DACL",
+    "current Windows user",
+    "LocalSystem",
+    "Administrators",
+    "full pipe access",
+    "before dispatch",
+  ]) {
+    assert.ok(bootstrap.includes(marker), `runtime-bootstrap delta must state: ${marker}`);
+  }
 });
 
 test("@spec:runtime-operations/reproducible-development-environment/contributor-documentation", async () => {

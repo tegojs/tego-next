@@ -122,8 +122,8 @@ published packages whose complete registry identity, dependency metadata, integr
 and absent `latest` tag match.
 
 #### Scenario: Publication is interrupted after some packages
-- **WHEN** the operator reruns publication using the unchanged verified release manifest
-- **THEN** exact matching packages are skipped, missing packages continue in dependency order, and any conflicting or incomplete registry evidence fails closed before another upload
+- **WHEN** the operator reruns publication from the unchanged verified source and the same `targetSha`
+- **THEN** the command repacks the current source tree into the current invocation's artifact directory, compares the new local integrities with registry state, skips exact matching packages, continues missing packages in dependency order, and fails closed on any conflict or incomplete evidence
 
 ### Requirement: Layer-one dependency boundary
 The first-layer packages SHALL NOT import Tego 1.x code or define frontend, HTTP routing, authentication, ACL, database-resource, cache, scheduler, workflow, or business-domain APIs.

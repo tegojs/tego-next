@@ -112,17 +112,21 @@ npm run release:alpha -- --publish
 npm run release:alpha -- --verify-registry
 ```
 
-Pack writes a mode-private `release-manifest.json` containing the exact Git SHA,
+Each mode first repacks the current source tree and writes a mode-private
+`release-manifest.json` containing the exact Git SHA,
 all nine package identities and dependency topology, relative tarball paths, and
 SHA-512 integrities. Publish always uses public access and `--tag alpha`; it
 never performs Git or GitHub operations.
 
-If partial publication occurs, retain the unchanged private artifact directory
-and rerun preflight and publish. The release tool skips a package only when its
-version, internal dependencies, SHA-512 integrity, `alpha` tag, and absent
-`latest` tag all match. Any conflict fails closed. Task 11 performs the actual
-npm uploads, Git tag, and GitHub prerelease after Task 10 exact-SHA evidence;
-those operations have not occurred yet.
+If partial publication occurs, rerun preflight and publish from unchanged
+verified source with the same targetSha. The command creates a fresh local pack
+and compares its SHA-512 integrities with registry state. `--artifact-directory`
+selects the current invocation's output directory; it does not load a prior
+release-manifest.json. The release tool skips a package only when its version,
+internal dependencies, new local integrity, `alpha` tag, and absent `latest`
+tag all match. Any conflict fails closed. Task 11 performs the actual npm
+uploads, Git tag, and GitHub prerelease after Task 10 exact-SHA evidence; those
+operations have not occurred yet.
 
 ## Author a plugin
 

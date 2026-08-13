@@ -270,7 +270,7 @@ CI verifies formatting, linting, type checking, unit tests, package tests, integ
 
 ## Delivery and Rollback
 
-Development occurs on `codex/runtime-kernel-phase-1`. Each capability is committed only after its focused test suite passes. The initial public release is `0.1.0-alpha.1`; no production stability promise is made.
+Development occurs on `codex/phase1-alpha-release`. Each capability is committed only after its focused test suite passes. The initial public package contract is `2.0.0-alpha.1` under the opt-in `alpha` dist-tag; `latest` remains absent and no production stability promise is made.
 
 Rollback before the first release is a Git revert to the last passing capability slice. Runtime state schemas use forward-only numbered migrations and keep the previous binary’s compatibility range in release metadata. Plugin deployment rollback changes desired state to a previously installed immutable artifact and increments the deployment generation.
 
@@ -390,7 +390,7 @@ None block phase one. Additional external coordinators, OS-level sandboxing, con
 - [ ] 12.3 Add an executable release-verification command covering clean install, format, lint, typecheck, tests, integration, build, package reproducibility, and smoke flows
 - [ ] 12.4 Run mutation or fault-injection checks on lifecycle, fencing, deduplication, and permission gates and close material test gaps
 - [ ] 12.5 Perform API, architecture, security, concurrency, and failure-recovery review and resolve all blocking findings
-- [ ] 12.6 Produce `0.1.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred capabilities
+- [x] 12.6 Produce `2.0.0-alpha.1` release notes with Node.js 26 LTS production gate and explicitly deferred Phase 2/3 capabilities
 ```
 
 ## openspec/changes/runtime-kernel-phase-1/specs/capability-resolution/spec.md
@@ -783,4 +783,3 @@ The runtime SHALL apply `cancel`, `finish-and-buffer`, or `finish-and-persist` w
 - **WHEN** a session is lost for a task whose orphan policy is `cancel`
 - **THEN** the Worker cancels the attempt and reports the terminal state on reconnect
 ```
-
