@@ -2,6 +2,7 @@
   "name": "@tego/root",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
   "packageManager": "npm@11.13.0",
   "volta": {
     "node": "26.5.0",

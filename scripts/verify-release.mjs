@@ -63,6 +63,11 @@ export const releaseCommands = [
   npmCommand("unit and architecture tests", "test"),
   npmCommand("integration tests", "run", "test:integration"),
   {
+    name: "public package contracts",
+    command: process.execPath,
+    args: ["scripts/package-contract.mjs", "--verify"],
+  },
+  {
     name: "deterministic plugin package",
     command: "internal:deterministic-plugin-package",
     args: [],

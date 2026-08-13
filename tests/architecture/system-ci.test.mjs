@@ -186,6 +186,7 @@ test("release verification is strict, complete, and non-recursive", async () => 
       "typecheck",
       "unit and architecture tests",
       "integration tests",
+      "public package contracts",
       "deterministic plugin package",
       "single-Main smoke",
       "multi-Main takeover",
