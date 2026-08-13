@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import {
-  type ComponentCapabilityInvocation,
-  type JsonValue,
-  parseWorkerId,
-} from "@tego/contracts";
+import { type ComponentCapabilityInvocation, type JsonValue, parseWorkerId } from "@tego/contracts";
 import { FakeClock } from "@tego/testkit";
 import {
   MemoryRemoteAttemptStore,

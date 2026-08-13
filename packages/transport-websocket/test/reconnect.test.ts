@@ -1,11 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import {
-  type ExecutionResult,
-  parseAttemptId,
-  parseTaskId,
-  parseWorkerId,
-} from "@tego/contracts";
+import { type ExecutionResult, parseAttemptId, parseTaskId, parseWorkerId } from "@tego/contracts";
 import { eventually, FakeClock } from "@tego/testkit";
 import {
   MemoryRemoteAttemptStore,

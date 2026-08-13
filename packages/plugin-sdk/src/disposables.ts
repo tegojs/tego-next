@@ -1,8 +1,4 @@
-import {
-  runtimeDiagnostic,
-  type DiagnosticSource,
-  type RuntimeDiagnostic,
-} from "@tego/contracts";
+import { runtimeDiagnostic, type DiagnosticSource, type RuntimeDiagnostic } from "@tego/contracts";
 
 export type ComponentDisposable =
   | (() => Promise<void> | void)

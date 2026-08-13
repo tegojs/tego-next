@@ -58,13 +58,12 @@ async function activeFiles(directory, relativePath = "") {
   for (const entry of entries) {
     const nextRelativePath = `${relativePath}${entry.name}`;
     if (entry.isDirectory()) {
-      if (
-        entry.name === ".git" ||
-        entry.name === "node_modules"
-      ) {
+      if (entry.name === ".git" || entry.name === "node_modules") {
         continue;
       }
-      files.push(...(await activeFiles(new URL(`${entry.name}/`, directory), `${nextRelativePath}/`)));
+      files.push(
+        ...(await activeFiles(new URL(`${entry.name}/`, directory), `${nextRelativePath}/`)),
+      );
     } else if (entry.isFile()) {
       if (isImmutableSddArtifact(relativePath, entry.name)) {
         continue;
@@ -77,9 +76,7 @@ async function activeFiles(directory, relativePath = "") {
 }
 
 test("legacy namespace scan excludes immutable SDD review diffs but scans active SDD files", async () => {
-  const directory = await mkdtemp(
-    new URL("tego-namespace-scan-", pathToFileURL(`${tmpdir()}/`)),
-  );
+  const directory = await mkdtemp(new URL("tego-namespace-scan-", pathToFileURL(`${tmpdir()}/`)));
   const root = pathToFileURL(`${directory}/`);
   const sdd = new URL(".superpowers/sdd/", root);
   const legacyScope = "@tego" + "js/";
@@ -90,8 +87,14 @@ test("legacy namespace scan excludes immutable SDD review diffs but scans active
     await writeFile(new URL("active-note.md", sdd), legacyScope);
 
     const scannedFiles = await activeFiles(root);
-    assert.equal(scannedFiles.some((file) => file.pathname.endsWith("review-abc123..def456.diff")), false);
-    assert.equal(scannedFiles.some((file) => file.pathname.endsWith("active-note.md")), true);
+    assert.equal(
+      scannedFiles.some((file) => file.pathname.endsWith("review-abc123..def456.diff")),
+      false,
+    );
+    assert.equal(
+      scannedFiles.some((file) => file.pathname.endsWith("active-note.md")),
+      true,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -108,7 +111,9 @@ test("public workspace namespace and alpha release metadata are exact", async ()
     packageDirectories
       .filter((entry) => entry.isDirectory())
       .map(async (entry) =>
-        JSON.parse(await readFile(new URL(`${entry.name}/package.json`, new URL("packages/", root)), "utf8")),
+        JSON.parse(
+          await readFile(new URL(`${entry.name}/package.json`, new URL("packages/", root)), "utf8"),
+        ),
       ),
   );
 
@@ -116,7 +121,12 @@ test("public workspace namespace and alpha release metadata are exact", async ()
   assert.deepEqual(new Set(manifests.map(({ name }) => name)), PUBLIC_PACKAGES);
   for (const manifest of manifests) {
     assert.equal(manifest.version, RELEASE_VERSION);
-    for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    for (const field of [
+      "dependencies",
+      "devDependencies",
+      "optionalDependencies",
+      "peerDependencies",
+    ]) {
       for (const [name, version] of Object.entries(manifest[field] ?? {})) {
         if (PUBLIC_PACKAGES.has(name)) assert.equal(version, RELEASE_VERSION);
       }
@@ -858,9 +868,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
       },
     },
     async (root) => {
-      assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tego/contracts -> @tego/testkit",
-      ]);
+      assert.deepEqual(await checkWorkspaceBoundaries(root), ["@tego/contracts -> @tego/testkit"]);
     },
   );
 });
@@ -882,9 +890,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
         'import { runStateStoreSuite } from "@tego/testkit";',
       );
 
-      assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tego/contracts -> @tego/testkit",
-      ]);
+      assert.deepEqual(await checkWorkspaceBoundaries(root), ["@tego/contracts -> @tego/testkit"]);
     },
   );
 });
