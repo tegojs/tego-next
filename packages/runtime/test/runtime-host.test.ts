@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import * as contracts from "@tegojs/contracts";
+import * as contracts from "@tego/contracts";
 import {
   type ArtifactDigest,
   type ArtifactStore,
@@ -45,8 +45,8 @@ import {
   type TaskId,
   type TaskRecord,
   type Versioned,
-} from "@tegojs/contracts";
-import { eventually, FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { eventually, FakeClock } from "@tego/testkit";
 import { wakeReconcilerForAuthority } from "../src/create-runtime.js";
 import { createRuntimeHost, type Reconciler, type RuntimeHostServices } from "../src/index.js";
 

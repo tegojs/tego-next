@@ -3,7 +3,7 @@ import {
   parseWorkerId,
   type FencingEpoch,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { systemWorkerClock } from "./clock.js";
 import { assertWorkerProtocolVersion } from "./codec.js";
 import type { WorkerEndpointOptions, WorkerRegistrationInput } from "./main-endpoint.js";

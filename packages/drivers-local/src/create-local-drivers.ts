@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Clock, RuntimeDrivers } from "@tegojs/contracts";
+import type { Clock, RuntimeDrivers } from "@tego/contracts";
 import { FilesystemArtifactStore } from "./filesystem-artifact-store.js";
 import { LocalCoordinationProvider } from "./local-coordination.js";
 import { NodeProcessHost } from "./node-process-host.js";

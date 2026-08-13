@@ -11,7 +11,7 @@ import {
   type StateTransaction,
   serializeWireValue,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   parseAttemptRevision,
   type RemoteAttemptCommitCondition,
@@ -21,7 +21,7 @@ import {
   type RemoteAttemptState,
   type RemoteAttemptStore,
   requestFingerprint,
-} from "@tegojs/transport-websocket";
+} from "@tego/transport-websocket";
 
 const WORKER_ATTEMPT_COLLECTION = "worker-attempts";
 const WORKER_ACTIVE_ATTEMPT_COLLECTION = "worker-active-attempts";

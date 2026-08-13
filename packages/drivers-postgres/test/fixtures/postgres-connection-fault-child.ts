@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { diagnosticCode } from "@tegojs/contracts";
+import { diagnosticCode } from "@tego/contracts";
 import { PostgresStateStore } from "../../src/postgres-state-store.js";
 
 const mode = process.argv[2];

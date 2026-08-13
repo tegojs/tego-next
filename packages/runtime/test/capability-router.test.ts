@@ -18,7 +18,7 @@ import {
   type StateStore,
   type StateTransaction,
   type TaskExecutionTarget,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type CapabilityRoute,
   CapabilityRouter,

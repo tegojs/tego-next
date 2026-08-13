@@ -20,7 +20,7 @@ import {
   type TaskExecutionTarget,
   type TaskId,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type ComponentBinding,
   type ComponentBindingPreparation,
@@ -28,11 +28,11 @@ import {
   type ComponentLifecycleHost,
   parseActivation,
   type TaskIdentity,
-} from "@tegojs/runtime";
+} from "@tego/runtime";
 import type {
   RemoteCapabilityInvocation,
   RemoteComponentActivation,
-} from "@tegojs/transport-websocket";
+} from "@tego/transport-websocket";
 import type { LocalComponentSessionRegistry } from "./local-component-session-registry.js";
 
 export interface RemoteComponentSessionHostOptions {

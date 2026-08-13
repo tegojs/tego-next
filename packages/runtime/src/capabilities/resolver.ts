@@ -4,7 +4,7 @@ import type {
   JsonObject,
   PluginCapabilityRequirement,
   PluginDeploymentIdentity,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { Activation } from "../reconcile/plan.js";
 import { stronglyConnectedComponents, topologicalOrder } from "./graph.js";
 import { isValidVersion, isValidVersionRange, satisfiesVersionRange } from "./version.js";

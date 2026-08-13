@@ -1,4 +1,4 @@
-import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
+import { DiagnosticError, runtimeDiagnostic } from "@tego/contracts";
 import { PROCESS_EXECUTOR_MAX_FRAME_BYTES } from "./framing.js";
 
 export const PROCESS_OUTBOUND_MAX_QUEUED_FRAMES = 64;

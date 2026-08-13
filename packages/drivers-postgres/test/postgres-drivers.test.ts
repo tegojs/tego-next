@@ -9,8 +9,8 @@ import {
   parseMessageId,
   parseOperationId,
   parseRevision,
-} from "@tegojs/contracts";
-import { coordinationConformance, stateStoreConformance } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { coordinationConformance, stateStoreConformance } from "@tego/testkit";
 import { Pool } from "pg";
 import {
   POSTGRES_ARTIFACT_MAX_BYTES,

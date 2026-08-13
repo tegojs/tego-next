@@ -22,7 +22,7 @@ import {
   type StateStore,
   serializeWireValue,
   type TaskExecutionTarget,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type CapabilitySchemaGate,
   CapabilitySchemaRegistry,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { diagnosticCode, parseArtifactDigest } from "@tegojs/contracts";
+import { diagnosticCode, parseArtifactDigest } from "@tego/contracts";
 import { Pool } from "pg";
 import {
   POSTGRES_ARTIFACT_MAX_BYTES,

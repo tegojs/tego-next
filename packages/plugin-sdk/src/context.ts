@@ -6,7 +6,7 @@ import type {
   PluginId,
   RuntimeId,
   RuntimeMode,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { ComponentDisposableStack } from "./disposables.js";
 
 function snapshotJson(value: unknown, path = "$", ancestors = new Set<object>()): JsonValue {

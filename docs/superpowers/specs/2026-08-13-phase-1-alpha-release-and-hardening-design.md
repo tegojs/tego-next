@@ -19,7 +19,7 @@ Phase 2 or Phase 3 work.
 ### In scope
 
 - Rename the public workspace namespace and all active source, test, example, and current
-  documentation references from `@tegojs/*` to `@tego/*`.
+  documentation references from `@tego/*` to `@tego/*`.
 - Publish these packages at `2.0.0-alpha.1`:
   - `@tego/contracts`
   - `@tego/runtime`

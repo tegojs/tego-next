@@ -16,8 +16,8 @@ import {
   type RuntimeDrivers,
   runtimeDiagnostic,
   type WorkerId,
-} from "@tegojs/contracts";
-import { createLocalDrivers } from "@tegojs/drivers-local";
+} from "@tego/contracts";
+import { createLocalDrivers } from "@tego/drivers-local";
 import {
   type ComponentSandboxSession,
   createProcessComponentSession,
@@ -25,13 +25,13 @@ import {
   ProcessExecutor,
   type ResolvedThreadComponent,
   ThreadExecutor,
-} from "@tegojs/executor-node";
+} from "@tego/executor-node";
 import {
   ArtifactService,
   createComponentBoundaries,
   type PreparedArtifact,
   PreparedArtifactCache,
-} from "@tegojs/runtime";
+} from "@tego/runtime";
 import {
   connectWorker,
   createWorkerEndpoint,
@@ -42,7 +42,7 @@ import {
   type WorkerAssignmentRejection,
   WorkerRuntime,
   type WorkerSession,
-} from "@tegojs/transport-websocket";
+} from "@tego/transport-websocket";
 import type { WorkerStartCommand } from "../parse-command.js";
 import { StateRemoteAttemptStore } from "../runtime/remote-attempt-store.js";
 

@@ -6,7 +6,7 @@ import {
   type RuntimeDiagnostic,
   runtimeDiagnostic,
   serializeWireValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export const CONTROL_PROTOCOL_VERSION = "1.0";
 export const MAX_CONTROL_LINE_BYTES = 1_048_576;

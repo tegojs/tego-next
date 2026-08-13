@@ -12,14 +12,14 @@ import {
   type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   eventually,
   FakeClock,
   type WorkerConformanceFixture,
   workerConformance,
   workerSessionConformance,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 import {
   createMainEndpoint,
   createWorkerCodec,

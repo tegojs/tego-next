@@ -6,7 +6,7 @@ import {
   parseRuntimeSnapshotResponse,
   type RuntimeStatus,
   runtimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   executeLocalPluginCommand,
   parsePluginControlResult,

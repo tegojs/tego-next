@@ -21,7 +21,7 @@ import {
   type ArtifactStore,
   type JsonObject,
   type PluginManifest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { ValidateArtifactRequest } from "./artifact-service.js";
 import {
   readPluginArtifact,

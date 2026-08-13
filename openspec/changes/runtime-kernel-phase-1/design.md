@@ -37,15 +37,15 @@ The repository will contain:
 
 ```text
 packages/
-  contracts/               @tegojs/contracts
-  runtime/                 @tegojs/runtime
-  drivers-local/           @tegojs/drivers-local
-  drivers-postgres/        @tegojs/drivers-postgres
-  executor-node/           @tegojs/executor-node
-  transport-websocket/     @tegojs/transport-websocket
-  plugin-sdk/              @tegojs/plugin-sdk
-  testkit/                 @tegojs/testkit
-  cli/                     @tegojs/cli
+  contracts/               @tego/contracts
+  runtime/                 @tego/runtime
+  drivers-local/           @tego/drivers-local
+  drivers-postgres/        @tego/drivers-postgres
+  executor-node/           @tego/executor-node
+  transport-websocket/     @tego/transport-websocket
+  plugin-sdk/              @tego/plugin-sdk
+  testkit/                 @tego/testkit
+  cli/                     @tego/cli
 examples/
   echo-plugin/
 ```
@@ -73,7 +73,7 @@ There is no separate “strict one OS process” product mode. Thread and child-
 
 ### 4. Use a local driver set for durable single-Main state
 
-`@tegojs/drivers-local` supplies a `node:sqlite` state store, local coordination, a filesystem artifact store, process hosting, system clock, and development secret source. Writes are transactional and records carry a monotonically increasing revision. Runtime restart reconstructs installations, deployments, operation journals, and unfinished tasks before accepting new work.
+`@tego/drivers-local` supplies a `node:sqlite` state store, local coordination, a filesystem artifact store, process hosting, system clock, and development secret source. Writes are transactional and records carry a monotonically increasing revision. Runtime restart reconstructs installations, deployments, operation journals, and unfinished tasks before accepting new work.
 
 An in-memory implementation remains available for unit tests. It is not advertised as crash-durable.
 
@@ -81,7 +81,7 @@ JSON files were rejected because multi-record transitions, revisions, and crash 
 
 ### 5. Use PostgreSQL as the first certified multi-Main driver set
 
-`@tegojs/drivers-postgres` provides shared state, artifact bytes, and coordination so a multi-Main deployment never relies on node-local control-plane state. Its coordination implementation provides:
+`@tego/drivers-postgres` provides shared state, artifact bytes, and coordination so a multi-Main deployment never relies on node-local control-plane state. Its coordination implementation provides:
 
 - leadership with a dedicated advisory-lock connection;
 - a transactional, monotonically increasing fencing epoch;

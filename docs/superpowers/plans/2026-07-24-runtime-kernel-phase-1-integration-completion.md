@@ -4,7 +4,7 @@
 
 **Goal:** Complete Tego Next layer one as a real-process, recoverable single-Main and multi-Main runtime whose authoritative acceptance gates run in GitHub Actions.
 
-**Architecture:** `@tegojs/runtime` remains concrete-environment agnostic and receives generic executor, Worker, and lifecycle boundaries. `@tegojs/cli` is the Node.js composition root that combines runtime, local/PostgreSQL drivers, Node executors, WebSocket transport, and the local control channel. System tests launch independent Main and Worker processes and drive them only through public CLI, control, state, and WebSocket boundaries.
+**Architecture:** `@tego/runtime` remains concrete-environment agnostic and receives generic executor, Worker, and lifecycle boundaries. `@tego/cli` is the Node.js composition root that combines runtime, local/PostgreSQL drivers, Node executors, WebSocket transport, and the local control channel. System tests launch independent Main and Worker processes and drive them only through public CLI, control, state, and WebSocket boundaries.
 
 **Tech Stack:** Node.js 26.5.0, npm 11.13.0, TypeScript 7.0.2, ESM, Node test runner, `node:sqlite`, PostgreSQL 16.14, `ws` 8.21.1, GitHub Actions.
 
@@ -12,8 +12,8 @@
 
 - Use Node.js `26.5.0`, npm `11.13.0`, TypeScript `7.0.2`, and JavaScript ESM runtime artifacts.
 - Every production behavior begins with an OpenSpec-tagged failing test and a verified RED result.
-- `@tegojs/runtime` may depend on `@tegojs/contracts`, not concrete driver, executor, transport, example, or CLI packages.
-- `@tegojs/cli` is the concrete Node.js composition root and may depend on first-layer packages.
+- `@tego/runtime` may depend on `@tego/contracts`, not concrete driver, executor, transport, example, or CLI packages.
+- `@tego/cli` is the concrete Node.js composition root and may depend on first-layer packages.
 - No HTTP, authentication policy, business ACL, data-source, cache, scheduler, workflow, frontend, Docker/Kubernetes executor, external coordinator, or Tego 1.x compatibility API is added.
 - System acceptance uses independent Main and Worker operating-system processes and real TCP/WebSocket sockets.
 - Fixed sleeps are prohibited; wait on protocol events or durable predicates under explicit deadlines.
@@ -237,8 +237,8 @@ test("@spec:coordination-provider/fenced-leadership/release-and-takeover", async
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/drivers-local
-TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" npm run test:integration --workspace @tegojs/drivers-postgres
+npm run test:unit --workspace @tego/drivers-local
+TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" npm run test:integration --workspace @tego/drivers-postgres
 ```
 
 Expected: TypeScript failure because `LeadershipHandle` and `.lost` do not exist.
@@ -280,9 +280,9 @@ on reacquisition.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/drivers-local
-npm run test:unit --workspace @tegojs/runtime
-TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" npm run test:integration --workspace @tegojs/drivers-postgres
+npm run test:unit --workspace @tego/drivers-local
+npm run test:unit --workspace @tego/runtime
+TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" npm run test:integration --workspace @tego/drivers-postgres
 npm run typecheck
 npm test
 ```
@@ -366,7 +366,7 @@ test("@spec:runtime-bootstrap/recovery/leadership-reacquisition", async () => {
 
 - [ ] **Step 2: Run focused test and verify RED**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test packages/runtime/dist/test/runtime-host.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test packages/runtime/dist/test/runtime-host.test.js`
 
 Expected: FAIL because `createRuntimeHost` is not exported.
 
@@ -420,13 +420,13 @@ reconciliation/tasks/workers, then closes drivers in reverse order.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/runtime
+npm run test:unit --workspace @tego/runtime
 node --test tests/integration/runtime-local.test.mjs
 npm run typecheck
 npm test
 ```
 
-Expected: PASS; `@tegojs/runtime` still has no concrete package dependency.
+Expected: PASS; `@tego/runtime` still has no concrete package dependency.
 
 - [ ] **Step 6: Commit**
 
@@ -489,7 +489,7 @@ test("prepared cache rejects a changed entry and removes the temporary directory
 
 - [ ] **Step 2: Verify RED**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test packages/runtime/dist/test/prepared-artifact-cache.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test packages/runtime/dist/test/prepared-artifact-cache.test.js`
 
 Expected: FAIL because `PreparedArtifactCache` does not exist.
 
@@ -524,7 +524,7 @@ test("@spec:plugin-deployment/idempotent-reconciliation/component-effects", asyn
 Run:
 
 ```bash
-npm run build --workspace @tegojs/runtime
+npm run build --workspace @tego/runtime
 node --test packages/runtime/dist/test/component-effects.test.js
 ```
 
@@ -550,7 +550,7 @@ with a structured lifecycle diagnostic.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/runtime
+npm run test:unit --workspace @tego/runtime
 npm run typecheck
 npm test
 ```
@@ -643,7 +643,7 @@ test("follower rejects mutation before reading artifact bytes", async () => {
 
 - [ ] **Step 2: Verify RED**
 
-Run: `npm run test:unit --workspace @tegojs/runtime`
+Run: `npm run test:unit --workspace @tego/runtime`
 
 Expected: TypeScript failure because operation request/result contracts and task service are absent.
 
@@ -666,7 +666,7 @@ output and never automatically retries.
 
 `installPlugin` accepts a digest that is already present in the injected
 `ArtifactStore`, then invokes `ArtifactService.install`. Local file ingress is
-owned by the CLI composition layer so `@tegojs/runtime` never receives a host
+owned by the CLI composition layer so `@tego/runtime` never receives a host
 path or imports local filesystem policy. `deployPlugin` validates installation
 and grants, increments generation transactionally, stores desired state, and
 wakes the active reconciler. Status reads desired and observed state without
@@ -684,7 +684,7 @@ cannot be proven. Do not accept new mutating operations before this pass ends.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/runtime
+npm run test:unit --workspace @tego/runtime
 node --test tests/integration/runtime-local.test.mjs
 npm run typecheck
 npm test
@@ -770,7 +770,7 @@ test("control server rejects oversized and malformed frames", async () => {
 
 - [ ] **Step 2: Verify RED**
 
-Run: `npm run test:unit --workspace @tegojs/cli`
+Run: `npm run test:unit --workspace @tego/cli`
 
 Expected: FAIL because control modules do not exist.
 
@@ -806,7 +806,7 @@ test("unknown command exits non-zero with structured diagnostic", async () => {
 });
 ```
 
-Run: `npm run test:unit --workspace @tegojs/cli`
+Run: `npm run test:unit --workspace @tego/cli`
 
 Expected: FAIL because the CLI parser and runtime commands are not implemented.
 
@@ -826,14 +826,14 @@ status. `runtime stop` is graceful and idempotent.
 
 `createNodeRuntimeHost` is the concrete composition root and adds dependencies
 on local/PostgreSQL drivers, executor-node, and transport-websocket. It injects
-only contract-shaped boundaries into `@tegojs/runtime`.
+only contract-shaped boundaries into `@tego/runtime`.
 
 - [ ] **Step 6: Verify package boundaries and CLI behavior**
 
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/cli
+npm run test:unit --workspace @tego/cli
 npm run build
 npm run typecheck
 npm test
@@ -888,7 +888,7 @@ test("@spec:runtime-operations/task-operations/run-example-task", async () => {
 
 - [ ] **Step 2: Verify RED**
 
-Run: `npm run test:unit --workspace @tegojs/cli`
+Run: `npm run test:unit --workspace @tego/cli`
 
 Expected: FAIL with unsupported plugin/task command diagnostics.
 
@@ -917,7 +917,7 @@ record, preserving `unknown` and `indeterminate` distinctions.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/cli
+npm run test:unit --workspace @tego/cli
 npm run build
 npm run typecheck
 npm test
@@ -981,7 +981,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/loopback-session",
 
 - [ ] **Step 2: Verify RED**
 
-Run: `npm run test:unit --workspace @tegojs/transport-websocket`
+Run: `npm run test:unit --workspace @tego/transport-websocket`
 
 Expected: FAIL because `listenForMain` and `connectWorker` are not exported.
 
@@ -1006,7 +1006,7 @@ Force-close the real socket during an active attempt. Assert the configured
 orphan policy, new session epoch, buffered result reconciliation, and exactly
 one terminal result. Wait on session state events, never wall-clock sleeps.
 
-Run: `npm run test:unit --workspace @tegojs/transport-websocket`
+Run: `npm run test:unit --workspace @tego/transport-websocket`
 
 Expected: FAIL until real reconnect reconciliation is wired through the
 network adapter.
@@ -1041,8 +1041,8 @@ Worker ID, and executor capabilities.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/transport-websocket
-npm run test:unit --workspace @tegojs/cli
+npm run test:unit --workspace @tego/transport-websocket
+npm run test:unit --workspace @tego/cli
 npm run build
 npm run typecheck
 npm test
@@ -1084,7 +1084,7 @@ import {
   manifestConformance,
   lifecycleConformance,
   workerConformance,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 
 manifestConformance(() => publicManifestFixture());
 lifecycleConformance(() => publicLifecycleFixture());
@@ -1093,7 +1093,7 @@ workerConformance(() => publicWorkerFixture());
 
 - [ ] **Step 2: Verify RED**
 
-Run: `npm run test:unit --workspace @tegojs/testkit`
+Run: `npm run test:unit --workspace @tego/testkit`
 
 Expected: TypeScript failure because the three suites are not exported.
 
@@ -1106,7 +1106,7 @@ git commit -m "test: specify public conformance fixtures"
 
 - [ ] **Step 3: Implement public suites**
 
-The suites import only `@tegojs/contracts` and accept public factories. Include
+The suites import only `@tego/contracts` and accept public factories. Include
 manifest positive/negative cases, lifecycle transition/idempotency cases, and
 Worker registration/heartbeat/reconnect/deduplication cases.
 
@@ -1121,14 +1121,14 @@ load has no side effects beyond the existing fixture marker.
 Run:
 
 ```bash
-npm run test:unit --workspace @tegojs/testkit
-npm run test:unit --workspace @tegojs/echo-plugin
+npm run test:unit --workspace @tego/testkit
+npm run test:unit --workspace @tego/echo-plugin
 npm run build
 npm run typecheck
 npm test
 ```
 
-Expected: PASS; the example depends only on `@tegojs/plugin-sdk`.
+Expected: PASS; the example depends only on `@tego/plugin-sdk`.
 
 - [ ] **Step 6: Commit**
 
@@ -1149,7 +1149,7 @@ git commit -m "test: complete public conformance fixtures"
 - Modify: `README.md`
 
 **Interfaces:**
-- Fixtures call public `@tegojs/cli` process entry functions.
+- Fixtures call public `@tego/cli` process entry functions.
 - Readiness events are NDJSON on stdout.
 - The E2E test invokes the built `tego` binary and communicates only over control/WebSocket sockets.
 
@@ -1309,7 +1309,7 @@ process and ensure the cluster remains available.
 Run:
 
 ```bash
-TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" npm run test:integration --workspace @tegojs/drivers-postgres
+TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" npm run test:integration --workspace @tego/drivers-postgres
 TEGO_POSTGRES_URL="$TEGO_POSTGRES_URL" node --test tests/e2e/two-main-postgres.test.mjs
 npm run typecheck
 npm test

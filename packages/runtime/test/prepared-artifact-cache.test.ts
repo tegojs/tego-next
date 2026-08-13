@@ -26,7 +26,7 @@ import {
   type ArtifactDigest,
   type ArtifactStore,
   type DriverHealth,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { canonicalJsonBytes, createDeterministicArchive } from "../src/artifacts/archive-codec.js";
 import { PreparedArtifactCache } from "../src/artifacts/prepared-artifact-cache.js";
 

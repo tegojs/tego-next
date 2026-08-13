@@ -1,6 +1,6 @@
 {
-  "name": "@tegojs/cli",
-  "version": "0.0.0",
+  "name": "@tego/cli",
+  "version": "2.0.0-alpha.1",
   "type": "module",
   "files": [
     "dist"
@@ -21,13 +21,13 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
-    "@tegojs/contracts": "0.0.0",
-    "@tegojs/drivers-local": "0.0.0",
-    "@tegojs/drivers-postgres": "0.0.0",
-    "@tegojs/executor-node": "0.0.0",
-    "@tegojs/plugin-sdk": "0.0.0",
-    "@tegojs/runtime": "0.0.0",
-    "@tegojs/transport-websocket": "0.0.0",
+    "@tego/contracts": "2.0.0-alpha.1",
+    "@tego/drivers-local": "2.0.0-alpha.1",
+    "@tego/drivers-postgres": "2.0.0-alpha.1",
+    "@tego/executor-node": "2.0.0-alpha.1",
+    "@tego/plugin-sdk": "2.0.0-alpha.1",
+    "@tego/runtime": "2.0.0-alpha.1",
+    "@tego/transport-websocket": "2.0.0-alpha.1",
     "typescript": "7.0.2"
   }
 }

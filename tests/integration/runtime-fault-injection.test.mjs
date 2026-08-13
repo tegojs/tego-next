@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { createNodeRuntimeHost, packPlugin, StateRemoteAttemptStore } from "@tegojs/cli";
+import { createNodeRuntimeHost, packPlugin, StateRemoteAttemptStore } from "@tego/cli";
 import {
   createExecutionBinding,
   diagnosticCode,
@@ -18,12 +18,12 @@ import {
   parseTaskExecutionTarget,
   parseTaskId,
   parseWorkerId,
-} from "@tegojs/contracts";
-import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import { createPostgresDrivers, PostgresStateStore } from "@tegojs/drivers-postgres";
-import { ComponentEffects, ComponentRegistry, Reconciler } from "@tegojs/runtime";
-import { eventually, FakeClock } from "@tegojs/testkit";
-import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tegojs/transport-websocket";
+} from "@tego/contracts";
+import { MemoryStateStore, SqliteStateStore } from "@tego/drivers-local";
+import { createPostgresDrivers, PostgresStateStore } from "@tego/drivers-postgres";
+import { ComponentEffects, ComponentRegistry, Reconciler } from "@tego/runtime";
+import { eventually, FakeClock } from "@tego/testkit";
+import { MemoryRemoteAttemptStore, RemoteExecutor } from "@tego/transport-websocket";
 import { Pool } from "pg";
 import { DeterministicRemoteSession } from "../fixtures/runtime-fault-session.mjs";
 

@@ -3,7 +3,7 @@ import { chmod, lstat, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
+import { DiagnosticError, runtimeDiagnostic } from "@tego/contracts";
 
 export interface BuildPluginOptions {
   readonly pluginDirectory: string;
@@ -131,7 +131,7 @@ async function runCompiler(
   const require = createRequire(import.meta.url);
   const compilerPath = join(dirname(require.resolve("typescript/package.json")), "bin", "tsc");
   const compilerConfiguration = join(temporaryRoot, "tsconfig.json");
-  const sdkTypesPath = fileURLToPath(import.meta.resolve("@tegojs/plugin-sdk")).replace(
+  const sdkTypesPath = fileURLToPath(import.meta.resolve("@tego/plugin-sdk")).replace(
     /\.js$/u,
     ".d.ts",
   );
@@ -141,7 +141,7 @@ async function runCompiler(
       extends: tsconfigPath,
       compilerOptions: {
         paths: {
-          "@tegojs/plugin-sdk": [sdkTypesPath],
+          "@tego/plugin-sdk": [sdkTypesPath],
         },
         skipLibCheck: false,
       },

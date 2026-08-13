@@ -1,9 +1,76 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { checkWorkspaceBoundaries } from "../../scripts/check-boundaries.mjs";
+
+const RELEASE_VERSION = "2.0.0-alpha.1";
+const PUBLIC_PACKAGES = new Set([
+  "@tego/cli",
+  "@tego/contracts",
+  "@tego/drivers-local",
+  "@tego/drivers-postgres",
+  "@tego/executor-node",
+  "@tego/plugin-sdk",
+  "@tego/runtime",
+  "@tego/testkit",
+  "@tego/transport-websocket",
+]);
+
+async function activeFiles(directory, relativePath = "") {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = [];
+
+  for (const entry of entries) {
+    const nextRelativePath = `${relativePath}${entry.name}`;
+    if (entry.isDirectory()) {
+      if (
+        entry.name === ".git" ||
+        entry.name === "node_modules" ||
+        nextRelativePath === ".superpowers/sdd"
+      ) {
+        continue;
+      }
+      files.push(...(await activeFiles(new URL(`${entry.name}/`, directory), `${nextRelativePath}/`)));
+    } else if (entry.isFile()) {
+      files.push(new URL(entry.name, directory));
+    }
+  }
+
+  return files;
+}
+
+test("public workspace namespace and alpha release metadata are exact", async () => {
+  const root = new URL("../../", import.meta.url);
+  const rootManifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+  const packageDirectories = await readdir(new URL("packages/", root), { withFileTypes: true });
+  const manifests = await Promise.all(
+    packageDirectories
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) =>
+        JSON.parse(await readFile(new URL(`${entry.name}/package.json`, new URL("packages/", root)), "utf8")),
+      ),
+  );
+
+  assert.deepEqual(new Set(manifests.map(({ name }) => name)), PUBLIC_PACKAGES);
+  for (const manifest of manifests) {
+    assert.equal(manifest.version, RELEASE_VERSION);
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+      for (const [name, version] of Object.entries(manifest[field] ?? {})) {
+        if (PUBLIC_PACKAGES.has(name)) assert.equal(version, RELEASE_VERSION);
+      }
+    }
+  }
+  assert.deepEqual(rootManifest.volta, { node: "26.5.0", npm: "11.13.0" });
+
+  const legacyScope = "@tego" + "js/";
+  const legacyReferences = [];
+  for (const file of await activeFiles(root)) {
+    if ((await readFile(file, "utf8")).includes(legacyScope)) legacyReferences.push(file.pathname);
+  }
+  assert.deepEqual(legacyReferences, []);
+});
 
 test("@spec:runtime-operations/layer-one-dependency-boundary/architecture-dependency-check", async () => {
   const violations = await checkWorkspaceBoundaries(new URL("../../", import.meta.url));
@@ -33,53 +100,53 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-outward-wor
   await withWorkspace(
     {
       "packages/contracts": {
-        name: "@tegojs/contracts",
-        dependencies: { "@tegojs/runtime": "0.0.0" },
+        name: "@tego/contracts",
+        dependencies: { "@tego/runtime": "0.0.0" },
       },
       "packages/runtime": {
-        name: "@tegojs/runtime",
+        name: "@tego/runtime",
         dependencies: {
-          "@tegojs/contracts": "0.0.0",
-          "@tegojs/executor-node": "0.0.0",
-          "@tegojs/echo-plugin": "0.0.0",
+          "@tego/contracts": "0.0.0",
+          "@tego/executor-node": "0.0.0",
+          "@tego/echo-plugin": "0.0.0",
         },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
-        dependencies: { "@tegojs/runtime": "0.0.0" },
+        name: "@tego/drivers-local",
+        dependencies: { "@tego/runtime": "0.0.0" },
       },
       "packages/executor-node": {
-        name: "@tegojs/executor-node",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/executor-node",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/plugin-sdk": {
-        name: "@tegojs/plugin-sdk",
-        dependencies: { "@tegojs/testkit": "0.0.0" },
+        name: "@tego/plugin-sdk",
+        dependencies: { "@tego/testkit": "0.0.0" },
       },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/cli": {
-        name: "@tegojs/cli",
+        name: "@tego/cli",
         dependencies: {
-          "@tegojs/echo-plugin": "0.0.0",
-          "@tegojs/runtime": "0.0.0",
+          "@tego/echo-plugin": "0.0.0",
+          "@tego/runtime": "0.0.0",
         },
       },
       "examples/echo-plugin": {
-        name: "@tegojs/echo-plugin",
-        dependencies: { "@tegojs/plugin-sdk": "0.0.0" },
+        name: "@tego/echo-plugin",
+        dependencies: { "@tego/plugin-sdk": "0.0.0" },
       },
     },
     async (root) => {
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/cli -> @tegojs/echo-plugin",
-        "@tegojs/contracts -> @tegojs/runtime",
-        "@tegojs/drivers-local -> @tegojs/runtime",
-        "@tegojs/plugin-sdk -> @tegojs/testkit",
-        "@tegojs/runtime -> @tegojs/echo-plugin",
-        "@tegojs/runtime -> @tegojs/executor-node",
+        "@tego/cli -> @tego/echo-plugin",
+        "@tego/contracts -> @tego/runtime",
+        "@tego/drivers-local -> @tego/runtime",
+        "@tego/plugin-sdk -> @tego/testkit",
+        "@tego/runtime -> @tego/echo-plugin",
+        "@tego/runtime -> @tego/executor-node",
       ]);
     },
   );
@@ -88,26 +155,26 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-outward-wor
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-forbidden-emitted-imports", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
+        name: "@tego/runtime",
         dependencies: {
-          "@tegojs/contracts": "0.0.0",
+          "@tego/contracts": "0.0.0",
           "executor-local": "file:../executor-node",
-          "transport-escape": "npm:@tegojs/transport-websocket@0.0.0",
+          "transport-escape": "npm:@tego/transport-websocket@0.0.0",
         },
       },
       "packages/executor-node": {
-        name: "@tegojs/executor-node",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/executor-node",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/transport-websocket": {
-        name: "@tegojs/transport-websocket",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/transport-websocket",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -116,26 +183,26 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-forbidden-e
       await writeFile(
         new URL("index.js", outputDirectory),
         [
-          'export { execute } from "@tegojs/executor-node";',
+          'export { execute } from "@tego/executor-node";',
           'import runtime from "legacy/tego/runtime";',
           'await import("../../transport-websocket/dist/index.js", { with: { type: "json" } });',
-          "await import(`@tegojs/executor-node`);",
+          "await import(`@tego/executor-node`);",
           "await import(runtimeSpecifier);",
           `const message = \`${String.fromCharCode(36)}{await import("../../executor-node/dist/index.js")}\`;`,
-          String.raw`import "@tegojs/\u0072untime";`,
-          'const pattern = /import\\s+from\\s+"@tegojs/testkit"/;',
+          String.raw`import "@tego/\u0072untime";`,
+          'const pattern = /import\\s+from\\s+"@tego/testkit"/;',
           "export default runtime;",
         ].join("\n"),
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> ../../executor-node/dist/index.js",
-        "@tegojs/runtime -> ../../transport-websocket/dist/index.js",
-        "@tegojs/runtime -> ../executor-node",
-        "@tegojs/runtime -> @tegojs/executor-node",
-        "@tegojs/runtime -> @tegojs/transport-websocket",
-        "@tegojs/runtime -> [unsupported import specifier]",
-        "@tegojs/runtime -> legacy/tego/runtime",
+        "@tego/runtime -> ../../executor-node/dist/index.js",
+        "@tego/runtime -> ../../transport-websocket/dist/index.js",
+        "@tego/runtime -> ../executor-node",
+        "@tego/runtime -> @tego/executor-node",
+        "@tego/runtime -> @tego/transport-websocket",
+        "@tego/runtime -> [unsupported import specifier]",
+        "@tego/runtime -> legacy/tego/runtime",
       ]);
     },
   );
@@ -144,14 +211,14 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-forbidden-e
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-dynamic-imports", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/runtime",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/executor-node": {
-        name: "@tegojs/executor-node",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/executor-node",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -159,11 +226,11 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-dy
       await mkdir(outputDirectory, { recursive: true });
       await writeFile(
         new URL("index.js", outputDirectory),
-        'await import("@tegojs/" + "executor-node");',
+        'await import("@tego/" + "executor-node");',
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> [unsupported import specifier]",
+        "@tego/runtime -> [unsupported import specifier]",
       ]);
     },
   );
@@ -171,14 +238,14 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-dy
 
 test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-direct-scoped-component-file-url-import", async (t) => {
   const workspaces = {
-    "packages/contracts": { name: "@tegojs/contracts" },
+    "packages/contracts": { name: "@tego/contracts" },
     "packages/runtime": {
-      name: "@tegojs/runtime",
-      dependencies: { "@tegojs/contracts": "0.0.0" },
+      name: "@tego/runtime",
+      dependencies: { "@tego/contracts": "0.0.0" },
     },
     "packages/executor-node": {
-      name: "@tegojs/executor-node",
-      dependencies: { "@tegojs/contracts": "0.0.0" },
+      name: "@tego/executor-node",
+      dependencies: { "@tego/contracts": "0.0.0" },
     },
   };
   const directLoader = [
@@ -284,7 +351,7 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
         await writeFile(new URL("component-loader.js", loaderDirectory), source);
 
         assert.deepEqual(await checkWorkspaceBoundaries(root), [
-          "@tegojs/executor-node -> [unsupported import specifier]",
+          "@tego/executor-node -> [unsupported import specifier]",
         ]);
       });
     });
@@ -297,7 +364,7 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
       await writeFile(new URL("unsafe-loader.js", runtimeDirectory), directLoader);
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> [unsupported import specifier]",
+        "@tego/runtime -> [unsupported import specifier]",
       ]);
     });
   });
@@ -305,10 +372,10 @@ test("@spec:plugin-deployment/pre-execution-deployment-gate/allows-only-one-dire
 
 test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-static-http-import-in-network-adapter", async (t) => {
   const workspaces = {
-    "packages/contracts": { name: "@tegojs/contracts" },
+    "packages/contracts": { name: "@tego/contracts" },
     "packages/transport-websocket": {
-      name: "@tegojs/transport-websocket",
-      dependencies: { "@tegojs/contracts": "0.0.0" },
+      name: "@tego/transport-websocket",
+      dependencies: { "@tego/contracts": "0.0.0" },
     },
   };
 
@@ -337,7 +404,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-st
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/transport-websocket -> node:http",
+        "@tego/transport-websocket -> node:http",
       ]);
     });
   });
@@ -352,7 +419,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-st
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/transport-websocket -> node:http",
+        "@tego/transport-websocket -> node:http",
       ]);
     });
   });
@@ -364,7 +431,7 @@ test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-st
       await writeFile(new URL("network.js", outputDirectory), 'await import("node:http");');
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/transport-websocket -> node:http",
+        "@tego/transport-websocket -> node:http",
       ]);
     });
   });
@@ -373,10 +440,10 @@ test("@spec:worker-protocol/real-process-transport-acceptance/allows-only-one-st
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-import-after-postfix-division", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/runtime",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -388,7 +455,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-im
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> [unsupported import specifier]",
+        "@tego/runtime -> [unsupported import specifier]",
       ]);
     },
   );
@@ -397,10 +464,10 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-computed-im
 test("@spec:runtime-operations/layer-one-dependency-boundary/ignores-private-methods-named-import", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/executor-node": {
-        name: "@tegojs/executor-node",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/executor-node",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -420,13 +487,13 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-s
   await withWorkspace(
     {
       "packages/contracts": {
-        name: "@tegojs/contracts",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/contracts",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/contracts -> @tegojs/contracts",
+        "@tego/contracts -> @tego/contracts",
       ]);
     },
   );
@@ -435,24 +502,24 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-s
 test("@spec:runtime-operations/layer-one-dependency-boundary/preserves-duplicate-dependency-section-entries", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
+        name: "@tego/runtime",
         dependencies: {
-          "shared-alias": "npm:@tegojs/executor-node@0.0.0",
+          "shared-alias": "npm:@tego/executor-node@0.0.0",
         },
         devDependencies: {
-          "shared-alias": "npm:@tegojs/contracts@0.0.0",
+          "shared-alias": "npm:@tego/contracts@0.0.0",
         },
       },
       "packages/executor-node": {
-        name: "@tegojs/executor-node",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/executor-node",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> @tegojs/executor-node",
+        "@tego/runtime -> @tego/executor-node",
       ]);
     },
   );
@@ -461,10 +528,10 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/preserves-duplicate
 test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-relative-imports", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/runtime",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -480,7 +547,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-rel
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/contracts -> ../../runtime/dist/index.js",
+        "@tego/contracts -> ../../runtime/dist/index.js",
       ]);
     },
   );
@@ -489,13 +556,13 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-internal-rel
 test("@spec:runtime-operations/layer-one-dependency-boundary/cache-specifier-resolution", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
+        name: "@tego/runtime",
         dependencies: {
-          "@tegojs/contracts": "0.0.0",
+          "@tego/contracts": "0.0.0",
           "@vendor/cache": "1.0.0",
-          "@tegojs/cache-driver": "0.0.0",
+          "@tego/cache-driver": "0.0.0",
         },
       },
     },
@@ -506,9 +573,9 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/cache-specifier-res
         new URL("index.js", outputDirectory),
         [
           'export { PreparedArtifactCache } from "./prepared-artifact-cache.js";',
-          'import "@tegojs/runtime/cache";',
+          'import "@tego/runtime/cache";',
           'import "@vendor/cache";',
-          'import "@tegojs/cache-driver";',
+          'import "@tego/cache-driver";',
         ].join("\n"),
       );
       await writeFile(
@@ -517,9 +584,9 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/cache-specifier-res
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> @tegojs/cache-driver",
-        "@tegojs/runtime -> @tegojs/runtime/cache",
-        "@tegojs/runtime -> @vendor/cache",
+        "@tego/runtime -> @tego/cache-driver",
+        "@tego/runtime -> @tego/runtime/cache",
+        "@tego/runtime -> @vendor/cache",
       ]);
     },
   );
@@ -528,15 +595,15 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/cache-specifier-res
 test("@spec:runtime-operations/layer-one-dependency-boundary/allows-testkit-conformance-edges", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
-        devDependencies: { "@tegojs/testkit": "0.0.0" },
+        name: "@tego/drivers-local",
+        dependencies: { "@tego/contracts": "0.0.0" },
+        devDependencies: { "@tego/testkit": "0.0.0" },
       },
     },
     async (root) => {
@@ -544,7 +611,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-testkit-conf
       await mkdir(outputDirectory, { recursive: true });
       await writeFile(
         new URL("conformance.test.js", outputDirectory),
-        'import { runStateStoreSuite } from "@tegojs/testkit";',
+        'import { runStateStoreSuite } from "@tego/testkit";',
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), []);
@@ -555,22 +622,22 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/allows-testkit-conf
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-dependency", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
+        name: "@tego/drivers-local",
         dependencies: {
-          "@tegojs/contracts": "0.0.0",
-          "@tegojs/testkit": "0.0.0",
+          "@tego/contracts": "0.0.0",
+          "@tego/testkit": "0.0.0",
         },
       },
     },
     async (root) => {
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/drivers-local -> @tegojs/testkit",
+        "@tego/drivers-local -> @tego/testkit",
       ]);
     },
   );
@@ -579,14 +646,14 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-import", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/drivers-local",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -594,11 +661,11 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
       await mkdir(outputDirectory, { recursive: true });
       await writeFile(
         new URL("index.js", outputDirectory),
-        'import { runStateStoreSuite } from "@tegojs/testkit";',
+        'import { runStateStoreSuite } from "@tego/testkit";',
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/drivers-local -> @tegojs/testkit",
+        "@tego/drivers-local -> @tego/testkit",
       ]);
     },
   );
@@ -607,16 +674,16 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-alias-import", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/drivers-local",
+        dependencies: { "@tego/contracts": "0.0.0" },
         devDependencies: {
-          "testkit-alias": "npm:@tegojs/testkit@0.0.0",
+          "testkit-alias": "npm:@tego/testkit@0.0.0",
         },
       },
     },
@@ -626,7 +693,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
       await writeFile(new URL("index.js", outputDirectory), 'import "testkit-alias";');
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/drivers-local -> @tegojs/testkit",
+        "@tego/drivers-local -> @tego/testkit",
       ]);
     },
   );
@@ -635,16 +702,16 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-production-alias-subpath-import", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/drivers-local",
+        dependencies: { "@tego/contracts": "0.0.0" },
         devDependencies: {
-          "testkit-alias": "npm:@tegojs/testkit@0.0.0",
+          "testkit-alias": "npm:@tego/testkit@0.0.0",
         },
       },
     },
@@ -657,7 +724,7 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-pro
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/drivers-local -> @tegojs/testkit/state-store-suite",
+        "@tego/drivers-local -> @tego/testkit/state-store-suite",
       ]);
     },
   );
@@ -667,20 +734,20 @@ for (const field of ["optionalDependencies", "peerDependencies"]) {
   test(`@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-${field}`, async () => {
     await withWorkspace(
       {
-        "packages/contracts": { name: "@tegojs/contracts" },
+        "packages/contracts": { name: "@tego/contracts" },
         "packages/testkit": {
-          name: "@tegojs/testkit",
-          dependencies: { "@tegojs/contracts": "0.0.0" },
+          name: "@tego/testkit",
+          dependencies: { "@tego/contracts": "0.0.0" },
         },
         "packages/drivers-local": {
-          name: "@tegojs/drivers-local",
-          dependencies: { "@tegojs/contracts": "0.0.0" },
-          [field]: { "@tegojs/testkit": "0.0.0" },
+          name: "@tego/drivers-local",
+          dependencies: { "@tego/contracts": "0.0.0" },
+          [field]: { "@tego/testkit": "0.0.0" },
         },
       },
       async (root) => {
         assert.deepEqual(await checkWorkspaceBoundaries(root), [
-          "@tegojs/drivers-local -> @tegojs/testkit",
+          "@tego/drivers-local -> @tego/testkit",
         ]);
       },
     );
@@ -690,14 +757,14 @@ for (const field of ["optionalDependencies", "peerDependencies"]) {
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-non-test-output", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
       "packages/drivers-local": {
-        name: "@tegojs/drivers-local",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/drivers-local",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -705,11 +772,11 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-testkit-non
       await mkdir(outputDirectory, { recursive: true });
       await writeFile(
         new URL("integration.test.js", outputDirectory),
-        'import { runStateStoreSuite } from "@tegojs/testkit";',
+        'import { runStateStoreSuite } from "@tego/testkit";',
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/drivers-local -> @tegojs/testkit",
+        "@tego/drivers-local -> @tego/testkit",
       ]);
     },
   );
@@ -719,17 +786,17 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
   await withWorkspace(
     {
       "packages/contracts": {
-        name: "@tegojs/contracts",
-        devDependencies: { "@tegojs/testkit": "0.0.0" },
+        name: "@tego/contracts",
+        devDependencies: { "@tego/testkit": "0.0.0" },
       },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/contracts -> @tegojs/testkit",
+        "@tego/contracts -> @tego/testkit",
       ]);
     },
   );
@@ -738,10 +805,10 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-testkit-test-import", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/testkit": {
-        name: "@tegojs/testkit",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/testkit",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -749,11 +816,11 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
       await mkdir(outputDirectory, { recursive: true });
       await writeFile(
         new URL("contracts.test.js", outputDirectory),
-        'import { runStateStoreSuite } from "@tegojs/testkit";',
+        'import { runStateStoreSuite } from "@tego/testkit";',
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/contracts -> @tegojs/testkit",
+        "@tego/contracts -> @tego/testkit",
       ]);
     },
   );
@@ -762,10 +829,10 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-contracts-t
 test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-export-only-layer-two-apis", async () => {
   await withWorkspace(
     {
-      "packages/contracts": { name: "@tegojs/contracts" },
+      "packages/contracts": { name: "@tego/contracts" },
       "packages/runtime": {
-        name: "@tegojs/runtime",
-        dependencies: { "@tegojs/contracts": "0.0.0" },
+        name: "@tego/runtime",
+        dependencies: { "@tego/contracts": "0.0.0" },
       },
     },
     async (root) => {
@@ -782,8 +849,8 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/rejects-export-only
       );
 
       assert.deepEqual(await checkWorkspaceBoundaries(root), [
-        "@tegojs/runtime -> [forbidden public export BusinessDomainScheduler]",
-        "@tegojs/runtime -> [forbidden public export WorkflowEngine]",
+        "@tego/runtime -> [forbidden public export BusinessDomainScheduler]",
+        "@tego/runtime -> [forbidden public export WorkflowEngine]",
       ]);
     },
   );

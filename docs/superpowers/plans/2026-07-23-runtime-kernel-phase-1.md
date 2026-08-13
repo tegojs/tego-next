@@ -10,7 +10,7 @@ base-ref: c81e8ab496c3a4d68443ebf9f825abee0f924fd4
 
 **Goal:** Deliver a bootable, durable, testable Tego runtime kernel that packages and deploys a TypeScript plugin and executes the same task through thread, process, and remote Worker executors in single-Main and fenced multi-Main deployments.
 
-**Architecture:** The runtime consumes explicit driver and executor interfaces from `@tegojs/contracts`. Local and PostgreSQL driver bundles implement durable state, artifact storage, and authority semantics; a reconciler converges plugin deployment intent into component instances and task attempts. All component execution uses one versioned ComponentHost protocol so executor placement does not affect plugin code.
+**Architecture:** The runtime consumes explicit driver and executor interfaces from `@tego/contracts`. Local and PostgreSQL driver bundles implement durable state, artifact storage, and authority semantics; a reconciler converges plugin deployment intent into component instances and task attempts. All component execution uses one versioned ComponentHost protocol so executor placement does not affect plugin code.
 
 **Tech Stack:** Node.js 26.5.0, npm 11.13.0 workspaces, TypeScript 7.0.2 ESM, Biome 2.5.5, `node:test`, `node:sqlite`, Ajv 8.20.0, `semver` 7.8.5, `tar` 7.5.21, `ws` 8.21.1, `pg` 8.22.0, Docker PostgreSQL.
 
@@ -91,7 +91,7 @@ Use these exact root fields:
 
 ```json
 {
-  "name": "@tegojs/root",
+  "name": "@tego/root",
   "private": true,
   "type": "module",
   "packageManager": "npm@11.13.0",
@@ -115,7 +115,7 @@ Pin development dependencies to TypeScript `7.0.2`, Biome `2.5.5`, and Node type
 
 - [x] **Step 3: Implement the boundary checker**
 
-`checkWorkspaceBoundaries(root)` reads every `packages/*/package.json`, creates a package-name graph, and returns sorted strings such as `@tegojs/contracts -> @tegojs/runtime`. Reject:
+`checkWorkspaceBoundaries(root)` reads every `packages/*/package.json`, creates a package-name graph, and returns sorted strings such as `@tego/contracts -> @tego/runtime`. Reject:
 
 - any dependency from contracts to another workspace;
 - runtime dependencies on concrete drivers, CLI, SDK, examples, or testkit;
@@ -175,7 +175,7 @@ test("@spec:worker-protocol/versioned-reliable-message-envelope/unsupported-prot
 });
 ```
 
-Run: `npm run build -w @tegojs/contracts && node --test packages/contracts/dist/test/contracts.test.js`
+Run: `npm run build -w @tego/contracts && node --test packages/contracts/dist/test/contracts.test.js`
 
 Expected: FAIL because the package exports do not exist.
 
@@ -211,9 +211,9 @@ and `parseWorkerEnvelope` must translate Ajv issues into deterministic
 Run:
 
 ```bash
-npm run build -w @tegojs/contracts
+npm run build -w @tego/contracts
 node --test packages/contracts/dist/test/contracts.test.js
-npm run typecheck -w @tegojs/contracts
+npm run typecheck -w @tego/contracts
 ```
 
 Expected: PASS with no warning output.
@@ -250,7 +250,7 @@ The suite must verify:
 - fenced transaction rejection;
 - close and iterator cleanup.
 
-Run: `npm run build -w @tegojs/testkit`
+Run: `npm run build -w @tego/testkit`
 
 Expected: FAIL because the contracts do not yet export `StateStore`.
 
@@ -273,7 +273,7 @@ no revision.
 Run:
 
 ```bash
-npm run build -w @tegojs/contracts -w @tegojs/testkit -w @tegojs/drivers-local
+npm run build -w @tego/contracts -w @tego/testkit -w @tego/drivers-local
 node --test packages/testkit/dist/test/testkit.test.js packages/drivers-local/dist/test/memory-state-store.test.js
 ```
 
@@ -314,7 +314,7 @@ test("@spec:runtime-bootstrap/durable-restart-recovery/restart-after-an-interrup
 Also verify digest mismatch, atomic artifact publish, local immediate authority,
 database migration idempotency, and Windows-safe file replacement behavior.
 
-Run: `npm run test:unit -w @tegojs/drivers-local`
+Run: `npm run test:unit -w @tego/drivers-local`
 
 Expected: FAIL with missing local driver exports.
 
@@ -337,7 +337,7 @@ Artifact writes stream to a temporary file, hash bytes, fsync, rename into
 Run:
 
 ```bash
-npm run build -w @tegojs/drivers-local
+npm run build -w @tego/drivers-local
 node --test packages/drivers-local/dist/test/*.test.js
 ```
 
@@ -376,7 +376,7 @@ with local coordination, recovery-before-accepting-operations, essential
 readiness, repeated `start`, repeated `stop`, and deterministic enumeration of
 non-terminal operation-journal entries after restart.
 
-Run: `npm run test:unit -w @tegojs/runtime`
+Run: `npm run test:unit -w @tego/runtime`
 
 Expected: FAIL because `createRuntime` is not exported.
 
@@ -402,7 +402,7 @@ exist; placeholder providers are forbidden.
 Run:
 
 ```bash
-npm run build -w @tegojs/runtime
+npm run build -w @tego/runtime
 node --test packages/runtime/dist/test/bootstrap.test.js
 ```
 
@@ -436,7 +436,7 @@ Test invalid-manifest side effects, traversal, absolute path, link/device entry,
 duplicate path, undeclared file, CommonJS, incompatible Node/Tego range, digest
 mismatch, tampered signature, and repeatable archive digest.
 
-Run: `npm run test:unit -w @tegojs/runtime -w @tegojs/cli`
+Run: `npm run test:unit -w @tego/runtime -w @tego/cli`
 
 Expected: FAIL because artifact services do not exist.
 
@@ -511,7 +511,7 @@ the grant before module import or RPC dispatch.
 
 - [x] **Step 4: Run tests and commit**
 
-Run: `npm run build -w @tegojs/runtime && node --test packages/runtime/dist/test/capability-resolution.test.js packages/runtime/dist/test/permission-gate.test.js`
+Run: `npm run build -w @tego/runtime && node --test packages/runtime/dist/test/capability-resolution.test.js packages/runtime/dist/test/permission-gate.test.js`
 
 Expected: PASS.
 
@@ -565,7 +565,7 @@ than mutating stale snapshots.
 
 - [x] **Step 4: Verify restart convergence and commit**
 
-Run: `npm run build -w @tegojs/runtime && node --test packages/runtime/dist/test/component-lifecycle.test.js packages/runtime/dist/test/reconciler.test.js`
+Run: `npm run build -w @tego/runtime && node --test packages/runtime/dist/test/component-lifecycle.test.js packages/runtime/dist/test/reconciler.test.js`
 
 Expected: PASS with one live instance after interrupted reconcile replay.
 
@@ -603,7 +603,7 @@ class assumptions, manifest entry confinement, ESM import, serialized hook
 errors, capability request/response schema checks, cancellation delivery, secret
 permission checks, redacted diagnostics, and idempotent secret-provider close.
 
-Run: `npm run test:unit -w @tegojs/plugin-sdk -w @tegojs/executor-node`
+Run: `npm run test:unit -w @tego/plugin-sdk -w @tego/executor-node`
 
 Expected: FAIL because SDK and host exports are absent.
 
@@ -623,7 +623,7 @@ prepared digest and declared entry. Convert all thrown values into
 
 - [x] **Step 4: Run tests and commit**
 
-Run: `npm run build -w @tegojs/plugin-sdk -w @tegojs/executor-node && node --test packages/plugin-sdk/dist/test/component.test.js packages/executor-node/dist/test/component-host.test.js`
+Run: `npm run build -w @tego/plugin-sdk -w @tego/executor-node && node --test packages/plugin-sdk/dist/test/component.test.js packages/executor-node/dist/test/component-host.test.js`
 
 Expected: PASS.
 
@@ -674,7 +674,7 @@ filters support, permissions, resources, and health before applying preference.
 
 - [x] **Step 4: Run conformance and commit**
 
-Run: `npm run build -w @tegojs/testkit -w @tegojs/executor-node && node --test packages/executor-node/dist/test/process-executor.test.js`
+Run: `npm run build -w @tego/testkit -w @tego/executor-node && node --test packages/executor-node/dist/test/process-executor.test.js`
 
 Expected: PASS and active child count returns to zero.
 
@@ -713,7 +713,7 @@ submissions, waits for terminal attempts, then terminates idle Workers.
 
 - [x] **Step 4: Run both executor suites and commit**
 
-Run: `npm run build -w @tegojs/executor-node && node --test packages/executor-node/dist/test/process-executor.test.js packages/executor-node/dist/test/thread-executor.test.js`
+Run: `npm run build -w @tego/executor-node && node --test packages/executor-node/dist/test/process-executor.test.js packages/executor-node/dist/test/thread-executor.test.js`
 
 Expected: both suites PASS with matching logical echo results.
 
@@ -761,7 +761,7 @@ closing the transport.
 
 - [x] **Step 4: Run conformance and commit**
 
-Run: `npm run build -w @tegojs/testkit -w @tegojs/transport-websocket && node --test packages/transport-websocket/dist/test/session.test.js`
+Run: `npm run build -w @tego/testkit -w @tego/transport-websocket && node --test packages/transport-websocket/dist/test/session.test.js`
 
 Expected: PASS for both connection directions.
 
@@ -810,7 +810,7 @@ a new attempt ID.
 Run:
 
 ```bash
-npm run build -w @tegojs/executor-node -w @tegojs/transport-websocket
+npm run build -w @tego/executor-node -w @tego/transport-websocket
 node --test packages/executor-node/dist/test/*executor.test.js packages/transport-websocket/dist/test/*.test.js
 ```
 
@@ -843,7 +843,7 @@ Cover shared state, artifact uniqueness, exclusive leadership, monotonic epoch,
 database-time lease expiry, concurrent CAS, namespace isolation, watch catch-up,
 leader-connection death, notification pause, stale fenced write, and cleanup.
 
-Run: `docker compose up -d postgres && npm run test:integration -w @tegojs/drivers-postgres`
+Run: `docker compose up -d postgres && npm run test:integration -w @tego/drivers-postgres`
 
 The PostgreSQL integration tests default to the Compose endpoint
 `postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test`. Set
@@ -871,8 +871,8 @@ Run:
 
 ```bash
 docker compose up -d postgres
-npm run build -w @tegojs/drivers-postgres
-npm run test:integration -w @tegojs/drivers-postgres
+npm run build -w @tego/drivers-postgres
+npm run test:integration -w @tego/drivers-postgres
 docker compose down -v
 ```
 
@@ -911,7 +911,7 @@ JSON status shape, failed exit code, invalid pack creates no artifact, plugin
 install/deploy/status, task run/status/wait/cancel, Worker connection direction,
 and detached startup recovery barrier.
 
-Run: `npm run test:unit -w @tegojs/cli`
+Run: `npm run test:unit -w @tego/cli`
 
 Expected: FAIL because CLI entry and control protocol are absent.
 
@@ -931,7 +931,7 @@ waits for `running` or a structured bootstrap failure.
 
 - [ ] **Step 4: Run command tests and commit**
 
-Run: `npm run build -w @tegojs/cli && node --test packages/cli/dist/test/*.test.js`
+Run: `npm run build -w @tego/cli && node --test packages/cli/dist/test/*.test.js`
 
 Expected: PASS and every spawned CLI/runtime process exits.
 

@@ -1,7 +1,7 @@
 import { createHash, sign } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import { DiagnosticError, parseArtifactDigest, runtimeDiagnostic } from "@tegojs/contracts";
-import { canonicalJsonBytes, type ArtifactSignatureEnvelope } from "@tegojs/runtime";
+import { DiagnosticError, parseArtifactDigest, runtimeDiagnostic } from "@tego/contracts";
+import { canonicalJsonBytes, type ArtifactSignatureEnvelope } from "@tego/runtime";
 
 const KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 

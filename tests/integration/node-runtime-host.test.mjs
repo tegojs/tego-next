@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { createNodeRuntimeHost, packPlugin } from "@tegojs/cli";
+import { createNodeRuntimeHost, packPlugin } from "@tego/cli";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const examplePlugin = join(root, "examples/echo-plugin");

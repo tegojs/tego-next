@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { MessageChannel } from "node:worker_threads";
-import type { Runtime, RuntimeStatus } from "@tegojs/contracts";
+import type { Runtime, RuntimeStatus } from "@tego/contracts";
 import { runMainProcess } from "../../src/runtime/main-process.js";
 
 const options = JSON.parse(process.env.TEGO_PENDING_START_OPTIONS ?? "{}") as {

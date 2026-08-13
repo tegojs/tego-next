@@ -5,8 +5,8 @@ import {
   parseAttemptId,
   parseTaskId,
   parseWorkerId,
-} from "@tegojs/contracts";
-import { eventually, FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { eventually, FakeClock } from "@tego/testkit";
 import {
   MemoryRemoteAttemptStore,
   MemoryRemoteResultStore,

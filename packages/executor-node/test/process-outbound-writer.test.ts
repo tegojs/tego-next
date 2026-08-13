@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { diagnosticCode } from "@tegojs/contracts";
+import { diagnosticCode } from "@tego/contracts";
 import {
   PROCESS_OUTBOUND_MAX_QUEUED_BYTES,
   PROCESS_OUTBOUND_MAX_QUEUED_FRAMES,

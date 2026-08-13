@@ -3,7 +3,7 @@ import {
   type PluginDeploymentObservation,
   parsePluginDeploymentObservation,
   serializeWireValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export interface DecodedPersistedPluginDeploymentObservation {
   readonly legacy: boolean;

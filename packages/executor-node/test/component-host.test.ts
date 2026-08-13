@@ -19,7 +19,7 @@ import {
   parseRuntimeId,
   parseTaskId,
   type SecretProvider,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   ComponentHost,
   type ComponentHostCommand,
@@ -235,7 +235,7 @@ async function attachmentLimitResult(
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context) => {
@@ -387,7 +387,7 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-artifact-loads-host-sd
   const fixture = await artifactFixture(
     t,
     `
-      import { defineComponent } from "@tegojs/plugin-sdk";
+      import { defineComponent } from "@tego/plugin-sdk";
       export default defineComponent({
         kind: "task",
         run: async (_context, input) => input,
@@ -617,7 +617,7 @@ test("prepare has no module side effects and import is confined to the prepared 
     t,
     `
       globalThis.${marker} = (globalThis.${marker} ?? 0) + 1;
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({ kind: "task", run: async (_context, input) => input });
     `,
   );
@@ -765,7 +765,7 @@ test("component lifecycle order and command idempotency are enforced without dup
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         start: async (context) => context.events.emit("hook", { name: "start" }),
@@ -847,7 +847,7 @@ test("only an identical command id shares an active transition", async (t) => {
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         start: async (context) => context.events.emit("start.blocked", null)
@@ -905,7 +905,7 @@ test("failed drain preserves state and remains retryable", async (t) => {
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         drain: async (context) => context.events.emit("drain", null)
@@ -949,7 +949,7 @@ test("failed stop cleanup is terminal and repeats its canonical result without r
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         start: async (context) => {
@@ -1022,7 +1022,7 @@ test("transition hook reentrancy returns promptly without waiting on the active 
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         start: async (context) => context.events.emit("start", null),
@@ -1073,7 +1073,7 @@ test("a plugin-created AsyncResource cannot self-await an active transition", as
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       let resource;
       export default defineComponent({
         kind: "task",
@@ -1154,7 +1154,7 @@ test("drain closes run intake synchronously before its hook settles", async (t) 
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async () => "ran",
@@ -1200,7 +1200,7 @@ test("non-cooperative runs respect hard capacity while cancel and drain remain a
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async () => new Promise(() => {})
@@ -1316,7 +1316,7 @@ test("duplicate task attempts compare full execution fingerprints and completed 
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({ kind: "task", run: async (_context, input) => input });
     `,
   );
@@ -1382,7 +1382,7 @@ test("deadline acceptance and chunked timers use the same injected clock", async
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context) => new Promise((resolve) => {
@@ -1463,7 +1463,7 @@ test("capability calls are forced through permission, request, invoke, and respo
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context, input) => context.capabilities.call({
@@ -1599,7 +1599,7 @@ test("provider capability commands invoke only the task provider hook", async (t
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async () => { throw new Error("run must not handle provider calls"); },
@@ -1652,7 +1652,7 @@ test("declared task capability providers fail import when the provider hook is m
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async () => null
@@ -1688,7 +1688,7 @@ test("secret values cannot cross the capability request boundary or diagnostic s
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context) => {
@@ -1805,7 +1805,7 @@ test("provider capability responses reject secret exfiltration before wire redac
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async () => null,
@@ -1879,7 +1879,7 @@ test("service components explicitly reject provider capability hooks", async (t)
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default {
         protocol: "tego.component/1.0",
         kind: "service",
@@ -1909,7 +1909,7 @@ test("duplicate task attempts execute once and cooperative cancellation reaches 
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context) => {
@@ -1984,7 +1984,7 @@ test("deadline aborts a running hook and returns a deterministic timed-out resul
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context) => new Promise((resolve) => {
@@ -2033,7 +2033,7 @@ test("secret access requires manifest request and deployment grant and never lea
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         run: async (context) => {
@@ -2166,7 +2166,7 @@ test("thrown Error and non-Error values become redacted RuntimeDiagnostic result
   const fixture = await artifactFixture(
     t,
     `
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({
         kind: "task",
         start: async () => { throw { reason: "non-error-token", nested: { password: "private" } }; }

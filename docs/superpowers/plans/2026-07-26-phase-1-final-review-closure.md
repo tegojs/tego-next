@@ -4,7 +4,7 @@
 
 **Goal:** Resolve every blocking API, architecture, security, concurrency, recovery, fault-injection, and release finding so Tego Next phase one is usable across thread, process, and remote executors and can be released as `0.1.0-alpha.1`.
 
-**Architecture:** Preserve the three-layer direction by keeping topology-neutral contracts and policy in `@tegojs/contracts` and `@tegojs/runtime`, Node-specific composition in the Node host surface, and CLI code limited to commands/control wiring. Execution requests carry an immutable, validated deployment binding; capability calls use the same task/executor transport to reach the exact active provider. Runtime status is read from durable observed state, and every authority, lifecycle, control-socket, and CI transition fails closed.
+**Architecture:** Preserve the three-layer direction by keeping topology-neutral contracts and policy in `@tego/contracts` and `@tego/runtime`, Node-specific composition in the Node host surface, and CLI code limited to commands/control wiring. Execution requests carry an immutable, validated deployment binding; capability calls use the same task/executor transport to reach the exact active provider. Runtime status is read from durable observed state, and every authority, lifecycle, control-socket, and CI transition fails closed.
 
 **Tech Stack:** Node.js 26.5.0, npm 11.13.0, TypeScript 7 ESM, Node test runner, AJV JSON Schema, SQLite `node:sqlite`, PostgreSQL 16, WebSocket `ws`, OpenSpec, GitHub Actions.
 
@@ -175,7 +175,7 @@ Use a promise gate around `setEndpointPermissions`. Connect while the permission
 - [ ] **Step 2: Run the RED control tests**
 
 ```bash
-npx -y npm@11.13.0 run build --workspace @tegojs/cli
+npx -y npm@11.13.0 run build --workspace @tego/cli
 node --test --test-name-pattern="permission initialization|owner-private|0600" packages/cli/dist/test/control.test.js
 ```
 
@@ -188,7 +188,7 @@ Create the Unix server with paused connections, bind it, call the permission set
 - [ ] **Step 4: Run GREEN control and CLI tests**
 
 ```bash
-npx -y npm@11.13.0 run build --workspace @tegojs/cli
+npx -y npm@11.13.0 run build --workspace @tego/cli
 node --test packages/cli/dist/test/control.test.js
 ```
 
@@ -239,7 +239,7 @@ For degrade and suspend, lose provider generation `1`, install compatible genera
 - [ ] **Step 3: Run RED**
 
 ```bash
-npx -y npm@11.13.0 run build --workspace @tegojs/runtime
+npx -y npm@11.13.0 run build --workspace @tego/runtime
 node --test --test-name-pattern="sequential provider loss|provider generation upgrade" packages/runtime/dist/test/capability-resolution.test.js packages/runtime/dist/test/reconciler.test.js tests/integration/reconciler-state-stores.test.mjs
 ```
 
@@ -560,7 +560,7 @@ git commit -m "feat(runtime): route capabilities across executors"
 
 - [ ] **Step 1: Write RED public API tests**
 
-Prove an adapter without `request()` fails the public compile fixture; conformance invokes `request()` and validates self-/response-correlation. Import provider-loss helpers only from `@tegojs/runtime`. Reject invalid activation with the stable diagnostic.
+Prove an adapter without `request()` fails the public compile fixture; conformance invokes `request()` and validates self-/response-correlation. Import provider-loss helpers only from `@tego/runtime`. Reject invalid activation with the stable diagnostic.
 
 - [ ] **Step 2: Write RED replay equivocation test**
 
@@ -678,7 +678,7 @@ Expose `SELECT clock_timestamp()` through the PostgreSQL driver and use it whene
 
 - [ ] **Step 3: Clarify Node composition ownership**
 
-Document the current Node host as the phase-one composition root and CLI as its command/control adapter. Do not claim the CLI package is packaging-only. Record extraction to a future `@tegojs/node-host` package as non-blocking packaging cleanup, not a behavioral dependency.
+Document the current Node host as the phase-one composition root and CLI as its command/control adapter. Do not claim the CLI package is packaging-only. Record extraction to a future `@tego/node-host` package as non-blocking packaging cleanup, not a behavioral dependency.
 
 - [ ] **Step 4: Run GREEN and commit**
 

@@ -18,7 +18,7 @@ import {
   runtimeDiagnostic,
   type RuntimeDiagnostic,
   serializeCause,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { Notification, Pool, PoolClient, QueryResultRow } from "pg";
 import {
   cloneJson,

@@ -8,7 +8,7 @@ import {
   type Leadership,
   type LeadershipHandle,
   type RuntimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const initialRetryDelayMs = 100;
 const maximumRetryDelayMs = 1_000;

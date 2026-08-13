@@ -10,7 +10,7 @@ import {
   type ArtifactDigest,
   type JsonValue,
   type PluginManifest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   assertPortableArtifactPath,
   canonicalJsonBytes,
@@ -18,7 +18,7 @@ import {
   portableArtifactCollisionKey,
   type DeterministicArchiveEntry,
   type DeterministicArchiveLimits,
-} from "@tegojs/runtime";
+} from "@tego/runtime";
 import { buildPlugin, type BuiltPlugin } from "./build-plugin.js";
 import { auditJavaScriptModules } from "./module-audit.js";
 

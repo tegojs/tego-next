@@ -15,7 +15,7 @@ import {
   type RuntimeAuthority,
   type StateKey,
   type StateStore,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   readPluginArtifact,
   type ArtifactFilesMetadata,
@@ -23,7 +23,7 @@ import {
 } from "./manifest-reader.js";
 import { satisfiesVersionRange } from "../capabilities/version.js";
 
-export type { ArtifactSignatureEnvelope } from "@tegojs/contracts";
+export type { ArtifactSignatureEnvelope } from "@tego/contracts";
 
 export interface ArtifactTrustKey {
   readonly keyId: string;

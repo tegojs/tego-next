@@ -21,7 +21,7 @@ import {
   type LeaseRequest,
   type Revision,
   type RuntimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const localEpoch = parseFencingEpoch("1");
 

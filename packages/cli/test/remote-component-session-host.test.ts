@@ -18,12 +18,12 @@ import {
   parseTaskExecutionTarget,
   parseTaskId,
   parseWorkerId,
-} from "@tegojs/contracts";
-import type { ComponentBinding, PreparedArtifact } from "@tegojs/runtime";
+} from "@tego/contracts";
+import type { ComponentBinding, PreparedArtifact } from "@tego/runtime";
 import type {
   RemoteCapabilityInvocation,
   RemoteComponentActivation,
-} from "@tegojs/transport-websocket";
+} from "@tego/transport-websocket";
 import { LocalComponentSessionRegistry } from "../src/runtime/local-component-session-registry.js";
 import {
   RemoteComponentSessionHost,

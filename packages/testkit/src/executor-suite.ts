@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { ExecutionRequest, ExecutionResult, Executor, JsonValue } from "@tegojs/contracts";
+import type { ExecutionRequest, ExecutionResult, Executor, JsonValue } from "@tego/contracts";
 
 export type ExecutorFactory = () => Executor | Promise<Executor>;
 

@@ -15,7 +15,7 @@ import {
   type TaskExecutionTarget,
   type WorkerId,
   type WorkerMessageType,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   countPendingCapabilityEntries,
   getCapabilityEntry,

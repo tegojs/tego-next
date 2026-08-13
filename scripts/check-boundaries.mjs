@@ -7,11 +7,11 @@ const DEPENDENCY_FIELDS = [
   "peerDependencies",
 ];
 
-const CONTRACTS_PACKAGE = "@tegojs/contracts";
-const CLI_PACKAGE = "@tegojs/cli";
-const EXECUTOR_NODE_PACKAGE = "@tegojs/executor-node";
-const PLUGIN_SDK_PACKAGE = "@tegojs/plugin-sdk";
-const TESTKIT_PACKAGE = "@tegojs/testkit";
+const CONTRACTS_PACKAGE = "@tego/contracts";
+const CLI_PACKAGE = "@tego/cli";
+const EXECUTOR_NODE_PACKAGE = "@tego/executor-node";
+const PLUGIN_SDK_PACKAGE = "@tego/plugin-sdk";
+const TESTKIT_PACKAGE = "@tego/testkit";
 
 const FIRST_LAYER_FORBIDDEN_FRAGMENTS = [
   "tego/",
@@ -49,7 +49,7 @@ const FIRST_LAYER_FORBIDDEN_EXPORT_FRAGMENTS = [
 
 const FIRST_LAYER_ALLOWED_EXPORTS = new Map([
   [
-    "@tegojs/transport-websocket",
+    "@tego/transport-websocket",
     new Set([
       "createAuthenticationNonce",
       "createAuthenticationProof",
@@ -82,7 +82,10 @@ function dependencyEntries(manifest) {
 
 function containsForbiddenFragment(value) {
   const normalized = value.toLowerCase();
-  return FIRST_LAYER_FORBIDDEN_FRAGMENTS.some((fragment) => normalized.includes(fragment));
+  return FIRST_LAYER_FORBIDDEN_FRAGMENTS.some(
+    (fragment) =>
+      normalized.includes(fragment) && !(fragment === "tego/" && normalized.startsWith("@tego/")),
+  );
 }
 
 async function readWorkspaceManifests(root, directoryName, kind) {
@@ -543,7 +546,7 @@ function analyzeImports(source) {
 
 function isConfinedComponentFileUrlImport(workspace, file, imports) {
   return (
-    workspace.manifest.name === "@tegojs/executor-node" &&
+    workspace.manifest.name === "@tego/executor-node" &&
     file.pathname.endsWith("/dist/src/host/component-loader.js") &&
     imports.hasPathToFileUrlImport &&
     imports.pathToFileUrlReferences === 2 &&
@@ -555,7 +558,7 @@ function isConfinedComponentFileUrlImport(workspace, file, imports) {
 
 function isConfinedWebSocketHttpImport(workspace, file, imports, specifier, targetSpecifier) {
   return (
-    workspace.manifest.name === "@tegojs/transport-websocket" &&
+    workspace.manifest.name === "@tego/transport-websocket" &&
     file.pathname.endsWith("/packages/transport-websocket/dist/src/network.js") &&
     specifier === "node:http" &&
     targetSpecifier === "node:http" &&
@@ -585,6 +588,7 @@ function containsForbiddenBoundary(source, specifiers, workspaces, importingFile
   return specifiers.some(
     (specifier) =>
       containsForbiddenFragment(specifier) &&
+      !workspaces.some((workspace) => specifier === workspace.manifest.name) &&
       !(
         specifier.startsWith(".") &&
         referencedWorkspace(specifier, workspaces, importingFile) === source

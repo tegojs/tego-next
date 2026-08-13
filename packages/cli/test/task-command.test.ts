@@ -9,7 +9,7 @@ import {
   parseTaskRecord,
   type RunTaskRequest,
   type RuntimeOperations,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { startControlServer } from "../src/control/server.js";

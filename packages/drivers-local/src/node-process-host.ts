@@ -10,7 +10,7 @@ import {
   type HostedProcessSignal,
   type ProcessHost,
   type ProcessSpawnRequest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const MAX_ARGUMENTS = 128;
 const MAX_ARGUMENT_BYTES = 64 * 1024;

@@ -15,7 +15,7 @@ capability readiness, execution-time gates, and application readiness. Both loca
 deduplicate staged outbox messages before commit.
 
 **Tech Stack:** TypeScript, Node.js test runner, MemoryStateStore, node:sqlite SqliteStateStore,
-shared `@tegojs/testkit` state-store conformance.
+shared `@tego/testkit` state-store conformance.
 
 ## Global Constraints
 

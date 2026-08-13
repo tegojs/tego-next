@@ -32,7 +32,7 @@ import {
   type StateTransactionOptions,
   type StateWriteOptions,
   type Versioned,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const zeroRevision = parseRevision("0");
 

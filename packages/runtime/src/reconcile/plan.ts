@@ -17,7 +17,7 @@ import {
   type Revision,
   type RuntimeDiagnostic,
   runtimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { ResolutionResult } from "../capabilities/resolver.js";
 import type { PermissionDecision } from "../permissions/permission-set.js";

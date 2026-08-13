@@ -3,7 +3,7 @@ import type {
   ClusterTime,
   CoordinationProvider,
   StateStore,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { PostgresArtifactStore } from "./postgres-artifact-store.js";
 import { PostgresCoordinationProvider } from "./postgres-coordination.js";
 import { PostgresStateStore } from "./postgres-state-store.js";

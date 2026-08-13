@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { createNodeRuntimeHost, packPlugin, parseCommand, runWorkerProcess } from "@tegojs/cli";
+import { createNodeRuntimeHost, packPlugin, parseCommand, runWorkerProcess } from "@tego/cli";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const examplePlugin = join(root, "examples/echo-plugin");
@@ -44,7 +44,7 @@ async function preparePlugin(workspace, role) {
   await writeFile(
     join(pluginDirectory, "src", "component.ts"),
     provider
-      ? `import { defineComponent } from "@tegojs/plugin-sdk";
+      ? `import { defineComponent } from "@tego/plugin-sdk";
 
 export default defineComponent({
   kind: "task",
@@ -62,7 +62,7 @@ export default defineComponent({
   },
 });
 `
-      : `import { defineComponent } from "@tegojs/plugin-sdk";
+      : `import { defineComponent } from "@tego/plugin-sdk";
 
 export default defineComponent({
   kind: "task",

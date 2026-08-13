@@ -3,8 +3,8 @@ import type {
   OperationJournalCursor,
   PersistedOperationJournalEntry,
   StateStore,
-} from "@tegojs/contracts";
-import { parsePluginDeployment } from "@tegojs/contracts";
+} from "@tego/contracts";
+import { parsePluginDeployment } from "@tego/contracts";
 import type { DeploymentReadiness } from "./readiness.js";
 
 const recoveryPageSize = 100;

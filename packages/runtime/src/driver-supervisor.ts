@@ -6,7 +6,7 @@ import {
   type RuntimeDriverName,
   type RuntimeDriverStatus,
   type RuntimeDrivers,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 interface NamedDriver {
   readonly name: RuntimeDriverName;

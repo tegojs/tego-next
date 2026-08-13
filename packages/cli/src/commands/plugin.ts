@@ -9,8 +9,8 @@ import {
   parsePluginDeploymentStatus,
   parsePluginInstallation,
   runtimeDiagnostic,
-} from "@tegojs/contracts";
-import { readPluginArtifact } from "@tegojs/runtime";
+} from "@tego/contracts";
+import { readPluginArtifact } from "@tego/runtime";
 import type {
   PluginDeployCommand,
   PluginInspectCommand,

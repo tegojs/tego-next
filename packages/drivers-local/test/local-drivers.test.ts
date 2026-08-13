@@ -12,8 +12,8 @@ import {
   parseArtifactDigest,
   parseFencingEpoch,
   type ArtifactDigest,
-} from "@tegojs/contracts";
-import { FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { FakeClock } from "@tego/testkit";
 import {
   artifactPublishSyncDirectories,
   createLocalDrivers,

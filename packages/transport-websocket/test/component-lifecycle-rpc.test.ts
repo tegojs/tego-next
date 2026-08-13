@@ -7,8 +7,8 @@ import {
   parseComponentInstanceId,
   parseGeneration,
   parsePluginId,
-} from "@tegojs/contracts";
-import { eventually, FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { eventually, FakeClock } from "@tego/testkit";
 import {
   MemoryRemoteAttemptStore,
   type RemoteComponentActivation,

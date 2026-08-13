@@ -1,5 +1,5 @@
 {
-  "name": "@tegojs/echo-plugin",
+  "name": "@tego/echo-plugin",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -9,6 +9,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit --pretty false && tsc --ignoreConfig --noEmit --pretty false --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --verbatimModuleSyntax --skipLibCheck test/component.test.ts"
   },
   "dependencies": {
-    "@tegojs/plugin-sdk": "0.0.0"
+    "@tego/plugin-sdk": "2.0.0-alpha.1"
   }
 }

@@ -3,7 +3,7 @@ import {
   runtimeDiagnostic,
   type ExecutorKind,
   type WorkerResourceCeilings,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export interface ExecutorSelectionCandidate {
   readonly id: string;

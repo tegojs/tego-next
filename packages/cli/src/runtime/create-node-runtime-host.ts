@@ -30,9 +30,9 @@ import {
   runtimeDiagnostic,
   type StateTransaction,
   type TaskExecutionTarget,
-} from "@tegojs/contracts";
-import { createLocalDrivers } from "@tegojs/drivers-local";
-import { createPostgresDrivers } from "@tegojs/drivers-postgres";
+} from "@tego/contracts";
+import { createLocalDrivers } from "@tego/drivers-local";
+import { createPostgresDrivers } from "@tego/drivers-postgres";
 import {
   ArtifactService,
   type CapabilityInvocationAuthority,
@@ -49,14 +49,14 @@ import {
   parseActivation,
   Reconciler,
   TaskService,
-} from "@tegojs/runtime";
+} from "@tego/runtime";
 import {
   createMainEndpoint,
   listenForMain,
   RemoteExecutor,
   StateWorkerEpochAllocator,
   type WorkerSession,
-} from "@tegojs/transport-websocket";
+} from "@tego/transport-websocket";
 import type { LocalArtifactIngress } from "../control/server.js";
 import {
   assertLocalComponentManifestSupported,

@@ -31,13 +31,13 @@ import {
   parsePluginManifest,
   parseTaskId,
   parseWorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type ExecutorConformanceFixture,
   eventually,
   executorConformance,
   FakeClock,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 import {
   encodeProcessFrame,
   PROCESS_EXECUTOR_MAX_FRAME_BYTES,

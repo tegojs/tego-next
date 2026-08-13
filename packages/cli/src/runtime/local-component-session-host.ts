@@ -15,14 +15,14 @@ import {
   runtimeDiagnostic,
   type SecretProvider,
   type TaskExecutionTarget,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type ComponentSandboxSession,
   createProcessComponentSession,
   createThreadComponentSession,
   type ResolvedProcessComponent,
   type ResolvedThreadComponent,
-} from "@tegojs/executor-node";
+} from "@tego/executor-node";
 import {
   type ComponentBinding,
   type ComponentBindingPreparation,
@@ -31,7 +31,7 @@ import {
   canonicalJsonBytes,
   createComponentBoundaries,
   parseActivation,
-} from "@tegojs/runtime";
+} from "@tego/runtime";
 import type {
   LocalComponentSessionRegistration,
   LocalComponentSessionRegistry,

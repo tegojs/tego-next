@@ -37,7 +37,7 @@ import {
   serializeWireValue,
   stateStringOrderKey,
   type Versioned,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { applySqliteMigrations } from "./migrations.js";
 
 const zeroRevision = parseRevision("0");

@@ -9,7 +9,7 @@ import {
   type Permission,
   type SchemaValidator,
   type WorkerResourceCeilings,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   canonicalizePermissionSet,
   clonePermissionBoundaryValue,

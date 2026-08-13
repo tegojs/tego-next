@@ -1,4 +1,4 @@
-import { runNodeMainProcess } from "@tegojs/cli";
+import { runNodeMainProcess } from "@tego/cli";
 
 function emit(event) {
   process.stdout.write(`${JSON.stringify(event)}\n`);

@@ -6,7 +6,7 @@ import {
   type CoordinationProvider,
   diagnosticCode,
   parseRevision,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export type CoordinationFactory = (
   namespace?: string,

@@ -6,7 +6,7 @@ import {
   type JsonValue,
   type WorkerEnvelope,
   type WorkerProtocolVersion,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const BINARY_HEADER_BYTES = 16;
 const BINARY_MAGIC = 0x54;

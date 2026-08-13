@@ -4,7 +4,7 @@ import {
   type ArtifactStore,
   type DriverHealth,
   parseArtifactDigest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { Pool } from "pg";
 import {
   createPool,

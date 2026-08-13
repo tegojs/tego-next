@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { JsonValue } from "@tegojs/contracts";
+import type { JsonValue } from "@tego/contracts";
 import {
   type ComponentContext,
   createComponentContext,

@@ -20,8 +20,8 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type Versioned,
-} from "@tegojs/contracts";
-import { FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { FakeClock } from "@tego/testkit";
 import { ArtifactService } from "../src/artifacts/artifact-service.js";
 import { readPluginArtifact } from "../src/artifacts/manifest-reader.js";
 

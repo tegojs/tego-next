@@ -27,7 +27,7 @@ import {
   type TaskExecutionTarget,
   type WorkerId,
   type WorkerMessageType,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export const REMOTE_ASSIGN = "task.assign";
 export const REMOTE_ACK = "task.acknowledge";

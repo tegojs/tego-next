@@ -1,4 +1,4 @@
-import { defineComponent } from "@tegojs/plugin-sdk";
+import { defineComponent } from "@tego/plugin-sdk";
 
 const marker = Symbol.for("tego.example.echo.loaded");
 const globals = globalThis as Record<PropertyKey, unknown>;

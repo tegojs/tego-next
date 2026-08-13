@@ -37,7 +37,7 @@ import {
   type StateTransaction,
   serializeCause,
   type Versioned,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type {
   ArtifactService,
   ValidateArtifactRequest,

@@ -4,7 +4,7 @@ import {
   parsePluginManifest,
   type ArtifactDigest,
   type PluginManifest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export function createPluginManifestFixture(
   overrides: Partial<PluginManifest> = {},

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { diagnosticCode, type Clock, type SecretProvider } from "@tegojs/contracts";
+import { diagnosticCode, type Clock, type SecretProvider } from "@tego/contracts";
 import {
   createLocalDrivers,
   DevelopmentSecretProvider,

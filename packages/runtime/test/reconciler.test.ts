@@ -41,7 +41,7 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type Versioned,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type ArtifactDeploymentGate,
   type ComponentEffectExecutor,

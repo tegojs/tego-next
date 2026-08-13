@@ -4,7 +4,7 @@ import {
   type Clock,
   type DriverHealth,
   type SecretProvider,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export const DEVELOPMENT_SECRET_PROVIDER_NOTICE =
   "Development secret provider stores values in process memory and is not for production";

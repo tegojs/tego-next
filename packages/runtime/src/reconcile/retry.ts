@@ -1,4 +1,4 @@
-import type { OperationId } from "@tegojs/contracts";
+import type { OperationId } from "@tego/contracts";
 
 export interface RetryDelayInput {
   readonly attempt: number;

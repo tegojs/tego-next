@@ -1,4 +1,4 @@
-import { DiagnosticError, runtimeDiagnostic, type DiagnosticCode } from "@tegojs/contracts";
+import { DiagnosticError, runtimeDiagnostic, type DiagnosticCode } from "@tego/contracts";
 
 export const PROCESS_EXECUTOR_MAX_FRAME_BYTES = 1024 * 1024;
 export const PROCESS_EXECUTOR_MAX_BUFFERED_BYTES = PROCESS_EXECUTOR_MAX_FRAME_BYTES + 4;

@@ -20,7 +20,7 @@ import {
   type Clock,
   type DriverHealth,
   type JsonValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const systemClock: Clock = {
   now: () => new Date(),

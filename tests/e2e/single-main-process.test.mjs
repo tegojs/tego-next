@@ -18,7 +18,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { parseRuntimeSnapshotResponse } from "@tegojs/contracts";
+import { parseRuntimeSnapshotResponse } from "@tego/contracts";
 import { Pool } from "pg";
 import { requestControl } from "../../packages/cli/dist/src/control/client.js";
 import { spawnManagedProcess } from "../support/managed-process.mjs";
@@ -117,7 +117,7 @@ async function prepareEchoPlugin(directory) {
   await cp(examplePlugin, pluginDirectory, { recursive: true });
   await writeFile(
     join(pluginDirectory, "src", "component.ts"),
-    `import { defineComponent } from "@tegojs/plugin-sdk";
+    `import { defineComponent } from "@tego/plugin-sdk";
 
 const marker = Symbol.for("tego.example.echo.loaded");
 const globals = globalThis as Record<PropertyKey, unknown>;

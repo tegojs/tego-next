@@ -1,4 +1,4 @@
-import { DiagnosticError, runtimeDiagnostic, type RuntimeLifecycleState } from "@tegojs/contracts";
+import { DiagnosticError, runtimeDiagnostic, type RuntimeLifecycleState } from "@tego/contracts";
 
 const transitions: Readonly<Record<RuntimeLifecycleState, readonly RuntimeLifecycleState[]>> = {
   created: ["failed", "opening", "stopping"],

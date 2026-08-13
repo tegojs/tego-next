@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
-import type { JsonValue } from "@tegojs/contracts";
+import type { JsonValue } from "@tego/contracts";
 import {
   CONTROL_PROTOCOL_VERSION,
   type ControlResponse,

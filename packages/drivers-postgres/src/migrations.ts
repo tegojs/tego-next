@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg";
-import { isPortableStateString, stateStringOrderKey } from "@tegojs/contracts";
+import { isPortableStateString, stateStringOrderKey } from "@tego/contracts";
 
 const migrations = [
   `

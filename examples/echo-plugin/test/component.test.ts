@@ -29,8 +29,8 @@ test("echo is executor-neutral and loading only records the fixture marker", asy
   assert.strictEqual(await run(undefined as never, input), input);
 
   const source = await readFile(new URL("../src/component.ts", import.meta.url), "utf8");
-  assert.match(source, /import\s*\{\s*defineComponent\s*\}\s*from\s*["']@tegojs\/plugin-sdk["']/u);
-  assert.doesNotMatch(source, /@tegojs\/(?:executor|transport)/u);
+  assert.match(source, /import\s*\{\s*defineComponent\s*\}\s*from\s*["']@tego\/plugin-sdk["']/u);
+  assert.doesNotMatch(source, /@tego\/(?:executor|transport)/u);
 
   const manifest = JSON.parse(
     await readFile(new URL("../manifest.json", import.meta.url), "utf8"),
@@ -60,6 +60,6 @@ test("echo is executor-neutral and loading only records the fixture marker", asy
   const packageJson = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
   ) as { dependencies?: Record<string, string> };
-  assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), ["@tegojs/plugin-sdk"]);
+  assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), ["@tego/plugin-sdk"]);
   await assert.rejects(access(new URL("../build", import.meta.url)), { code: "ENOENT" });
 });

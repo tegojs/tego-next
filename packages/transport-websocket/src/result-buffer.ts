@@ -1,4 +1,4 @@
-import type { ExecutionResult } from "@tegojs/contracts";
+import type { ExecutionResult } from "@tego/contracts";
 import { attemptKey, cloneJson, jsonBytes, positiveLimit, remoteError } from "./remote-protocol.js";
 
 export interface ResultBufferOptions {

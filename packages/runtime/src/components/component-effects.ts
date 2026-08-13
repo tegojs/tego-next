@@ -11,7 +11,7 @@ import {
   type RuntimeAuthority,
   runtimeDiagnostic,
   serializeCause,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { ValidatedPluginArtifact } from "../artifacts/artifact-service.js";
 import type { PreparedArtifactCache } from "../artifacts/prepared-artifact-cache.js";
 import {

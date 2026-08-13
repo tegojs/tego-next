@@ -18,7 +18,7 @@ import {
   type RuntimeDiagnostic,
   runtimeDiagnostic,
   type SecretProvider,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type LoadedComponentDefinition,
   loadPreparedComponent,

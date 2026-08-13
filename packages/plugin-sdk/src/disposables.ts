@@ -2,7 +2,7 @@ import {
   runtimeDiagnostic,
   type DiagnosticSource,
   type RuntimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export type ComponentDisposable =
   | (() => Promise<void> | void)

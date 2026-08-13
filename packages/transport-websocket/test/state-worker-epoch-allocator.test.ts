@@ -9,7 +9,7 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type Versioned,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { StateWorkerEpochAllocator } from "../src/index.js";
 
 const MAXIMUM_UNSIGNED_64 = "18446744073709551615";

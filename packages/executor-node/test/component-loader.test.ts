@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
-import { parseArtifactDigest } from "@tegojs/contracts";
+import { parseArtifactDigest } from "@tego/contracts";
 import * as publicApi from "../src/index.js";
 import { loadPreparedComponent, prepareArtifactBinding } from "../src/host/component-loader.js";
 
@@ -134,12 +134,12 @@ test("loader captures hooks and snapshots metadata without retaining the plugin 
 test("SDK resolution remains active across concurrent imports of one prepared root", async (t) => {
   const root = await isolatedArtifactRoot(t, {
     "fast.js": `
-      import { defineComponent } from "@tegojs/plugin-sdk";
+      import { defineComponent } from "@tego/plugin-sdk";
       export default defineComponent({ kind: "task", run: async () => "fast" });
     `,
     "slow.js": `
       await new Promise((resolve) => setTimeout(resolve, 30));
-      const { defineComponent } = await import("@tegojs/plugin-sdk");
+      const { defineComponent } = await import("@tego/plugin-sdk");
       export default defineComponent({ kind: "task", run: async () => "slow" });
     `,
   });
@@ -165,12 +165,12 @@ test("SDK resolution remains active across concurrent imports of one prepared ro
 test("failed component import revokes SDK resolution for the prepared root", async (t) => {
   const root = await isolatedArtifactRoot(t, {
     "component.js": `
-      import { defineComponent } from "@tegojs/plugin-sdk";
+      import { defineComponent } from "@tego/plugin-sdk";
       defineComponent({ kind: "task", run: async () => null });
       export default { protocol: "invalid", kind: "task" };
     `,
     "late.js": `
-      import { defineComponent } from "@tegojs/plugin-sdk";
+      import { defineComponent } from "@tego/plugin-sdk";
       export default defineComponent({ kind: "task", run: async () => null });
     `,
   });
@@ -199,7 +199,7 @@ test("duplicate loader evaluation reuses one hook registration", async (t) => {
   };
   const root = await isolatedArtifactRoot(t, {
     "component.js": `
-      import { defineComponent } from "@tegojs/plugin-sdk";
+      import { defineComponent } from "@tego/plugin-sdk";
       export default defineComponent({ kind: "task", run: async () => "duplicate" });
     `,
   });
@@ -216,7 +216,7 @@ test("duplicate loader evaluation reuses one hook registration", async (t) => {
 test("SDK resolution delegates for non-artifact parents and other bare specifiers", async (t) => {
   const outside = await isolatedArtifactRoot(t, {
     "component.js": `
-      import { defineComponent } from "@tegojs/plugin-sdk";
+      import { defineComponent } from "@tego/plugin-sdk";
       export default defineComponent({ kind: "task", run: async () => null });
     `,
   });
@@ -226,7 +226,7 @@ test("SDK resolution delegates for non-artifact parents and other bare specifier
       error instanceof Error && "code" in error && error.code === "ERR_MODULE_NOT_FOUND",
   );
 
-  for (const specifier of ["left-pad", "@tegojs/plugin-sdk/private"] as const) {
+  for (const specifier of ["left-pad", "@tego/plugin-sdk/private"] as const) {
     const root = await isolatedArtifactRoot(t, {
       "component.js": `
         import value from "${specifier}";

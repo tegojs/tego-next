@@ -18,7 +18,7 @@ import {
   type RuntimeSnapshotRequest,
   runtimeDiagnostic,
   runtimeOperationMaxBytes,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -122,7 +122,7 @@ interface WorkerStartCommandBase {
   readonly json: boolean;
   readonly labels: Readonly<Record<string, string>>;
   readonly prepare: readonly string[];
-  readonly resources: import("@tegojs/contracts").WorkerResourceCeilings;
+  readonly resources: import("@tego/contracts").WorkerResourceCeilings;
   readonly workerId: string;
 }
 

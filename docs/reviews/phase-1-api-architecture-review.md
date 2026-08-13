@@ -19,14 +19,14 @@ attempt-store changes also returned `APPROVE` with no findings.
 
 The phase-one public surface is topology-neutral:
 
-- `@tegojs/contracts` owns branded identities, strict JSON wire contracts, plugin manifests,
+- `@tego/contracts` owns branded identities, strict JSON wire contracts, plugin manifests,
   execution bindings, runtime operations, capability definitions, and Worker envelopes.
-- `@tegojs/runtime` owns bootstrap, durable recovery, reconciliation, task admission, capability
+- `@tego/runtime` owns bootstrap, durable recovery, reconciliation, task admission, capability
   routing, authority fencing, and live observed status.
 - Node-specific thread, process, WebSocket, SQLite, PostgreSQL, and host composition remain outside
   the topology-neutral contracts.
 - The CLI is the phase-one Node composition and command/control adapter. Extracting that composition
-  into a future `@tegojs/node-host` package is packaging cleanup, not a runtime prerequisite.
+  into a future `@tego/node-host` package is packaging cleanup, not a runtime prerequisite.
 
 The final review confirmed these contract properties:
 
@@ -91,7 +91,7 @@ packaging, type checking, architecture constraints, and strict OpenSpec.
 
 - Service components are not a phase-one execution target; the production capability provider hook
   is intentionally limited to task components.
-- The Node composition root still lives in `@tegojs/cli`; a separate Node host package can be
+- The Node composition root still lives in `@tego/cli`; a separate Node host package can be
   introduced without changing the reviewed contracts.
 - Layer-two HTTP, application authentication/authorization, datasource, cache, resource, workflow,
   and frontend modules remain outside this release.

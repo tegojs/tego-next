@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
+import { DiagnosticError, runtimeDiagnostic } from "@tego/contracts";
 
 const MAC_PATTERN = /^[0-9a-f]{64}$/u;
 export type ProcessMessageDirection = "child-to-parent" | "parent-to-child";

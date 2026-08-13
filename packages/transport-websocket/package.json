@@ -1,6 +1,6 @@
 {
-  "name": "@tegojs/transport-websocket",
-  "version": "0.0.0",
+  "name": "@tego/transport-websocket",
+  "version": "2.0.0-alpha.1",
   "type": "module",
   "files": [
     "dist"
@@ -18,11 +18,11 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
-    "@tegojs/contracts": "0.0.0",
+    "@tego/contracts": "2.0.0-alpha.1",
     "ws": "8.21.1"
   },
   "devDependencies": {
-    "@tegojs/testkit": "0.0.0",
+    "@tego/testkit": "2.0.0-alpha.1",
     "@types/ws": "8.18.1"
   }
 }

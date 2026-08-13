@@ -21,7 +21,7 @@ import {
   runtimeDiagnostic,
   type StopOptions,
   serializeCause,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { decodePersistedPluginDeploymentObservation } from "./deployment-observation.js";
 import { DriverSupervisor } from "./driver-supervisor.js";
 import { LeadershipController } from "./leadership-controller.js";

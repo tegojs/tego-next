@@ -9,14 +9,14 @@ import {
   parseComponentInstanceId,
   parseTaskId,
   parseWorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type ExecutorCleanupRaceFixture,
   type ExecutorConformanceFixture,
   eventually,
   executorConformance,
   FakeClock,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 import {
   MemoryRemoteAttemptStore,
   REMOTE_ASSIGN,

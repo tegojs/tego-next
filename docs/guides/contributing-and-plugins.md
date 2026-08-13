@@ -66,7 +66,7 @@ Use focused tests during RED/GREEN. For example:
 
 ```sh
 node --test tests/architecture/documentation.test.mjs
-npm run test:unit --workspace=@tegojs/runtime
+npm run test:unit --workspace=@tego/runtime
 ```
 
 Before handoff, run all local-capable gates:
@@ -106,7 +106,7 @@ includes the runtime's current `0.0.0` contract version.
 Use `defineComponent`; no base class or decorator is required:
 
 ```ts
-import { defineComponent } from "@tegojs/plugin-sdk";
+import { defineComponent } from "@tego/plugin-sdk";
 
 export default defineComponent({
   kind: "task",
@@ -157,7 +157,7 @@ execution:
 
 The packer reads and validates the manifest before importing component code.
 Built output must be JavaScript ESM. Static relative imports,
-`@tegojs/plugin-sdk`, and Node builtins are supported; dynamic imports,
+`@tego/plugin-sdk`, and Node builtins are supported; dynamic imports,
 CommonJS, and third-party bare imports are rejected.
 
 ### Validate and package

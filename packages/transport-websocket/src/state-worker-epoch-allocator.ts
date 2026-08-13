@@ -9,7 +9,7 @@ import {
   type StateKey,
   type StateStore,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { WorkerEpochAllocator } from "./main-endpoint.js";
 
 const MAXIMUM_UNSIGNED_64 = (1n << 64n) - 1n;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { Runtime } from "@tegojs/contracts";
+import type { Runtime } from "@tego/contracts";
 
 export type LifecycleConformanceFactory = () => Runtime | Promise<Runtime>;
 

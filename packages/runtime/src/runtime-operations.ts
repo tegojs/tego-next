@@ -45,7 +45,7 @@ import {
   serializeWireValue,
   type TaskId,
   type TaskRecord,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { satisfiesVersionRange } from "./capabilities/version.js";
 import { validatePermissionGrant } from "./permissions/permission-set.js";
 

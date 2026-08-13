@@ -4,8 +4,8 @@ import {
   type ComponentCapabilityInvocation,
   type JsonValue,
   parseWorkerId,
-} from "@tegojs/contracts";
-import { FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { FakeClock } from "@tego/testkit";
 import {
   MemoryRemoteAttemptStore,
   type RemoteCapabilityInvocation,

@@ -23,7 +23,7 @@ import {
   parseTaskId,
   type RuntimeDiagnostic,
   runtimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export const COMPONENT_HOST_PROTOCOL = "1.0" as const;
 const COMMAND_TYPES = new Set([

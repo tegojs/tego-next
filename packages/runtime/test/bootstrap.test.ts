@@ -39,8 +39,8 @@ import {
   type StateTransaction,
   type StateTransactionOptions,
   type Versioned,
-} from "@tegojs/contracts";
-import { lifecycleConformance } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { lifecycleConformance } from "@tego/testkit";
 import { createRuntime, isRuntimeReady, transitionRuntimeState } from "../src/index.js";
 
 const now = new Date("2026-07-23T00:00:00.000Z");

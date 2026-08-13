@@ -1,4 +1,4 @@
-import type { DriverHealth, RuntimeLifecycleState } from "@tegojs/contracts";
+import type { DriverHealth, RuntimeLifecycleState } from "@tego/contracts";
 
 export interface DeploymentReadiness {
   readonly desired: boolean;

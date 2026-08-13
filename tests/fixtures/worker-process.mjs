@@ -1,4 +1,4 @@
-import { runWorkerProcess } from "@tegojs/cli";
+import { runWorkerProcess } from "@tego/cli";
 
 function emit(event) {
   process.stdout.write(`${JSON.stringify(event)}\n`);

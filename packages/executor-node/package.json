@@ -1,6 +1,6 @@
 {
-  "name": "@tegojs/executor-node",
-  "version": "0.0.0",
+  "name": "@tego/executor-node",
+  "version": "2.0.0-alpha.1",
   "type": "module",
   "files": [
     "dist"
@@ -18,10 +18,10 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
-    "@tegojs/contracts": "0.0.0",
-    "@tegojs/plugin-sdk": "0.0.0"
+    "@tego/contracts": "2.0.0-alpha.1",
+    "@tego/plugin-sdk": "2.0.0-alpha.1"
   },
   "devDependencies": {
-    "@tegojs/testkit": "0.0.0"
+    "@tego/testkit": "2.0.0-alpha.1"
   }
 }

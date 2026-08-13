@@ -24,9 +24,9 @@ import {
   type StateFencing,
   type StateTransaction,
   type StateTransactionOptions,
-} from "@tegojs/contracts";
-import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import type { PreparedArtifact } from "@tegojs/runtime";
+} from "@tego/contracts";
+import { MemoryStateStore, SqliteStateStore } from "@tego/drivers-local";
+import type { PreparedArtifact } from "@tego/runtime";
 import {
   connectMain,
   createMainEndpoint,
@@ -39,7 +39,7 @@ import {
   requestFingerprint,
   systemWorkerClock,
   type WorkerSession,
-} from "@tegojs/transport-websocket";
+} from "@tego/transport-websocket";
 import { parseCommand, type WorkerStartCommand } from "../src/parse-command.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
 import { runCli } from "../src/run-cli.js";

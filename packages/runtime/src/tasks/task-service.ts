@@ -29,7 +29,7 @@ import {
   type TaskExecutionTarget,
   type TaskRecord,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const namespace = "tego";
 const maxResultBytes = 1_048_576;

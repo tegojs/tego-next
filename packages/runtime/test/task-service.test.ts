@@ -41,8 +41,8 @@ import {
   type TaskExecutionTarget,
   type TaskRecord,
   type Versioned,
-} from "@tegojs/contracts";
-import { eventually, FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { eventually, FakeClock } from "@tego/testkit";
 import {
   RuntimeOperationController,
   type TaskExecutorSelection,

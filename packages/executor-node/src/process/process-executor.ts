@@ -36,7 +36,7 @@ import {
   type SecretProvider,
   type TaskExecutionTarget,
   type TaskId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   COMPONENT_SESSION_CONTROL_TIMEOUT_MS,
   ComponentSandboxSession,

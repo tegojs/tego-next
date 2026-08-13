@@ -13,8 +13,8 @@ import {
   parseGeneration,
   parsePluginId,
   parseTaskId,
-} from "@tegojs/contracts";
-import { eventually, FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { eventually, FakeClock } from "@tego/testkit";
 import {
   ComponentSandboxSession,
   type ComponentSessionTransport,

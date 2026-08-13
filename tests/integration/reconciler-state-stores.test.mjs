@@ -12,9 +12,9 @@ import {
   parseGeneration,
   parsePluginDeploymentObservation,
   parsePluginId,
-} from "@tegojs/contracts";
-import { MemoryStateStore, SqliteStateStore } from "@tegojs/drivers-local";
-import { planReconcile, Reconciler, reconcileEffectIdentities } from "@tegojs/runtime";
+} from "@tego/contracts";
+import { MemoryStateStore, SqliteStateStore } from "@tego/drivers-local";
+import { planReconcile, Reconciler, reconcileEffectIdentities } from "@tego/runtime";
 
 const applicationId = parseApplicationId("app");
 const pluginId = parsePluginId("org.example.echo");

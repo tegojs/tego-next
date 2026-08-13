@@ -13,7 +13,7 @@ import {
   parseRuntimeStatus,
   type RuntimeOperations,
   runtimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { requestControl } from "../src/control/client.js";
 import { type ControlResponse, MAX_CONTROL_LINE_BYTES } from "../src/control/protocol.js";
 import { type ControlRuntimeOperations, startControlServer } from "../src/control/server.js";

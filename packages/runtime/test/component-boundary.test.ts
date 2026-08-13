@@ -7,7 +7,7 @@ import {
   type ComponentPermissionBoundary,
   type JsonValue,
   type Permission,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { createComponentBoundaries } from "../src/index.js";
 
 const definition = {

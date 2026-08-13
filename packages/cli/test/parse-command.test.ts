@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import { parseRuntimeStatus, type RuntimeStatus } from "@tegojs/contracts";
+import { parseRuntimeStatus, type RuntimeStatus } from "@tego/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { defaultControlEndpoint, parseCommand } from "../src/parse-command.js";

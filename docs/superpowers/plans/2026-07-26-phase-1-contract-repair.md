@@ -197,7 +197,7 @@ Add a test proving that `previousBindings` keeps provider A selected when provid
 
 - [ ] **Step 2: Run the resolver RED test**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="persisted automatic binding" packages/runtime/dist/test/capability-resolution.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="persisted automatic binding" packages/runtime/dist/test/capability-resolution.test.js`
 
 Expected: FAIL because the resolver currently treats only explicit desired bindings as previous bindings and may select a newly ready provider.
 
@@ -219,7 +219,7 @@ Assert that first convergence persists one `PersistedCapabilityBinding` for the 
 
 - [ ] **Step 5: Run the reconciler RED tests**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="automatic capability binding" packages/runtime/dist/test/reconciler.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="automatic capability binding" packages/runtime/dist/test/reconciler.test.js`
 
 Expected: FAIL because `#gateDeployment()` currently reconstructs `previousBindings` only from desired `capabilityBindings` and writes no observed binding state.
 
@@ -281,7 +281,7 @@ Cover every permutation of `degrade`, `suspend`, and `fail`, asserting `stronges
 
 - [ ] **Step 2: Run the precedence RED test**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="provider loss precedence" packages/runtime/dist/test/capability-resolution.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="provider loss precedence" packages/runtime/dist/test/capability-resolution.test.js`
 
 Expected: FAIL because no deployment-level precedence reducer exists.
 
@@ -313,7 +313,7 @@ Restore the same provider and assert the same `instanceId` returns to `ready`, t
 
 - [ ] **Step 5: Run the degrade RED tests**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="degrade.*provider|provider.*degrade" packages/runtime/dist/test/reconciler.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="degrade.*provider|provider.*degrade" packages/runtime/dist/test/reconciler.test.js`
 
 Expected: FAIL because `providerLossActions` are currently calculated but never reconciled.
 
@@ -323,7 +323,7 @@ Persist `PersistedProviderLoss`, transition every ready consumer instance throug
 
 - [ ] **Step 7: Run GREEN resolver and degrade tests**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="provider loss precedence|degrade.*provider|provider.*degrade" packages/runtime/dist/test/capability-resolution.test.js packages/runtime/dist/test/reconciler.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="provider loss precedence|degrade.*provider|provider.*degrade" packages/runtime/dist/test/capability-resolution.test.js packages/runtime/dist/test/reconciler.test.js`
 
 Expected: PASS with deterministic action and readiness restoration.
 
@@ -381,7 +381,7 @@ Assert generation `"7"` activation `"1"` and activation `"2"` produce different 
 
 - [ ] **Step 2: Run the activation RED tests**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="activation identity|legacy activation" packages/runtime/dist/test/reconciler.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="activation identity|legacy activation" packages/runtime/dist/test/reconciler.test.js`
 
 Expected: FAIL because identities currently contain only application, plugin, component, generation, and effect kind.
 
@@ -460,7 +460,7 @@ Create one consumer with requirements ordered `[degrade, suspend, fail]` and ano
 
 - [ ] **Step 3: Run the fail RED tests**
 
-Run: `npm run build --workspace @tegojs/runtime && node --test --test-name-pattern="failed provider loss|mixed provider loss" packages/runtime/dist/test/reconciler.test.js`
+Run: `npm run build --workspace @tego/runtime && node --test --test-name-pattern="failed provider loss|mixed provider loss" packages/runtime/dist/test/reconciler.test.js`
 
 Expected: FAIL because provider-loss fail is not applied to lifecycle or desired-generation gating.
 
@@ -521,7 +521,7 @@ Remove `correlationId` from an otherwise valid protocol-1.0 envelope and assert 
 
 - [ ] **Step 2: Run the contract RED tests**
 
-Run: `npm run build --workspace @tegojs/contracts && node --test --test-name-pattern="correlation" packages/contracts/dist/test/contracts.test.js`
+Run: `npm run build --workspace @tego/contracts && node --test --test-name-pattern="correlation" packages/contracts/dist/test/contracts.test.js`
 
 Expected: FAIL because `correlationId` is optional in the interface and absent from JSON Schema `required`.
 
@@ -543,7 +543,7 @@ Inject a raw envelope without correlation and assert close diagnostic `PROTOCOL_
 
 - [ ] **Step 5: Run the session RED tests**
 
-Run: `npm run build --workspace @tegojs/transport-websocket && node --test --test-name-pattern="self-correlates|missing correlation|response correlates" packages/transport-websocket/dist/test/session.test.js`
+Run: `npm run build --workspace @tego/transport-websocket && node --test --test-name-pattern="self-correlates|missing correlation|response correlates" packages/transport-websocket/dist/test/session.test.js`
 
 Expected: FAIL because `#sendEnvelope()` currently omits correlation when options do not provide it.
 
@@ -674,7 +674,7 @@ Use a fake `LocalArtifactIngress` that records `putPath`, and a fake `installPlu
 
 - [ ] **Step 4: Run GREEN ingress tests**
 
-Run: `npm run build --workspace @tegojs/cli && node --test --test-name-pattern="follower|artifact ingress" packages/cli/dist/test/control.test.js`
+Run: `npm run build --workspace @tego/cli && node --test --test-name-pattern="follower|artifact ingress" packages/cli/dist/test/control.test.js`
 
 Expected: PASS and explicitly demonstrate `putPath` may precede the semantic fencing rejection.
 

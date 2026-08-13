@@ -14,7 +14,7 @@ import {
   type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { FakeClock } from "./fake-clock.js";
 
 export type WorkerConnectionDirection = "main-initiated" | "worker-initiated";

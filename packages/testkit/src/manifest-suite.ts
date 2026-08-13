@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { PluginManifest } from "@tegojs/contracts";
+import type { PluginManifest } from "@tego/contracts";
 
 export interface ManifestConformanceFixture {
   parse(input: unknown): PluginManifest | Promise<PluginManifest>;

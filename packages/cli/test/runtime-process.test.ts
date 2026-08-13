@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { Runtime, RuntimeStatus } from "@tegojs/contracts";
+import type { Runtime, RuntimeStatus } from "@tego/contracts";
 import { startRuntimeDetached } from "../src/commands/runtime.js";
 import { requestControl } from "../src/control/client.js";
 import type { ControlServer } from "../src/control/server.js";

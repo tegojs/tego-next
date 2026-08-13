@@ -4,8 +4,8 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseFencingEpoch, parseWorkerId } from "@tegojs/contracts";
-import { connectWorker, createWorkerEndpoint } from "@tegojs/transport-websocket";
+import { parseFencingEpoch, parseWorkerId } from "@tego/contracts";
+import { connectWorker, createWorkerEndpoint } from "@tego/transport-websocket";
 import {
   createAuthorityCapabilityAdmission,
   createNodeRuntimeHost,

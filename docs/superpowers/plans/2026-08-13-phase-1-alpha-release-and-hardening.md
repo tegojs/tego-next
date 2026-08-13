@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - The design source is `docs/superpowers/specs/2026-08-13-phase-1-alpha-release-and-hardening-design.md`.
-- Public package names use `@tego/*`; active code, tests, examples, generated declarations, and current documentation must contain no `@tegojs/*` import or install instruction.
+- Public package names use `@tego/*`; active code, tests, examples, generated declarations, and current documentation must contain no legacy-scope import or install instruction.
 - All nine public packages use exact version `2.0.0-alpha.1`; internal published dependencies use exact `2.0.0-alpha.1`.
 - `@tego/core` and `@tego/server` are not modified or published.
 - Every npm upload explicitly uses `--registry https://registry.npmjs.org/ --access public --tag alpha`; this release must not create or update `latest`.
@@ -43,7 +43,7 @@
 - Modify: `package-lock.json`
 - Modify: `packages/*/package.json`
 - Modify: `examples/echo-plugin/package.json`
-- Modify: every active source, test, example, OpenSpec delta, README, architecture, guide, operation, security, review, and release file containing `@tegojs/`
+- Modify: every active source, test, example, OpenSpec delta, README, architecture, guide, operation, security, review, and release file containing the legacy scope.
 - Test: `tests/architecture/workspace-boundaries.test.mjs`
 - Test: `tests/architecture/readme.test.mjs`
 
@@ -72,7 +72,7 @@ for (const manifest of manifests) assert.equal(manifest.version, "2.0.0-alpha.1"
 assert.deepEqual(rootManifest.volta, { node: "26.5.0", npm: "11.13.0" });
 ```
 
-Also scan active paths and fail on `@tegojs/`, excluding immutable historical execution reports under `.superpowers/sdd/`.
+Also scan active paths and fail on the legacy scope, excluding immutable historical execution reports under `.superpowers/sdd/`.
 
 - [ ] **Step 2: Run the focused architecture tests and verify RED**
 
@@ -82,7 +82,7 @@ Run:
 node --test tests/architecture/workspace-boundaries.test.mjs tests/architecture/readme.test.mjs
 ```
 
-Expected: FAIL because manifests still use `@tegojs/*`, versions are `0.0.0`, and root Volta metadata is absent.
+Expected: FAIL because manifests still use the legacy scope, versions are `0.0.0`, and root Volta metadata is absent.
 
 - [ ] **Step 3: Apply the mechanical namespace migration and exact versions**
 
@@ -114,7 +114,7 @@ volta run --node 26.5.0 --npm 11.13.0 npm run typecheck
 node --test tests/architecture/workspace-boundaries.test.mjs tests/architecture/readme.test.mjs
 ```
 
-Expected: all commands exit 0 and the active-path namespace scan finds zero `@tegojs/*` references.
+Expected: all commands exit 0 and the active-path namespace scan finds zero legacy-scope references.
 
 - [ ] **Step 5: Commit the namespace migration**
 
@@ -671,7 +671,7 @@ git commit -m "feat(release): add resumable alpha publisher"
 
 - [ ] **Step 1: Write failing documentation-contract assertions**
 
-Require documents to name all nine packages, `2.0.0-alpha.1`, `npm install @tego/runtime@alpha`, no `latest`, quota defaults/overrides, exact namespace cleanup behavior, hardened Windows boundary, Windows CI, and remaining Node 26 LTS production gate. Reject `0.1.0-alpha.1`, active `@tegojs/*`, and the statement that Windows ACL hardening is unimplemented.
+Require documents to name all nine packages, `2.0.0-alpha.1`, `npm install @tego/runtime@alpha`, no `latest`, quota defaults/overrides, exact namespace cleanup behavior, hardened Windows boundary, Windows CI, and remaining Node 26 LTS production gate. Reject `0.1.0-alpha.1`, active legacy-scope references, and the statement that Windows ACL hardening is unimplemented.
 
 - [ ] **Step 2: Run documentation tests and verify RED**
 

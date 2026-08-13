@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { connect as connectTcp, type Socket } from "node:net";
 import { test } from "node:test";
-import { parseWorkerId } from "@tegojs/contracts";
-import { eventually, FakeClock } from "@tegojs/testkit";
+import { parseWorkerId } from "@tego/contracts";
+import { eventually, FakeClock } from "@tego/testkit";
 import {
   connectMain,
   connectWorker,

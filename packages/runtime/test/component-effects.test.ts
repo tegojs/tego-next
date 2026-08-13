@@ -12,7 +12,7 @@ import {
   parsePluginId,
   parseRevision,
   type RuntimeAuthority,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type {
   PreparedArtifact,
   PreparedArtifactCache,

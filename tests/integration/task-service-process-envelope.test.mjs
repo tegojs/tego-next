@@ -12,11 +12,11 @@ import {
   parseGeneration,
   parsePluginId,
   parseTaskId,
-} from "@tegojs/contracts";
-import { MemoryStateStore } from "@tegojs/drivers-local";
-import { ProcessExecutor } from "@tegojs/executor-node";
-import { TaskService } from "@tegojs/runtime";
-import { FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { MemoryStateStore } from "@tego/drivers-local";
+import { ProcessExecutor } from "@tego/executor-node";
+import { TaskService } from "@tego/runtime";
+import { FakeClock } from "@tego/testkit";
 
 test("@spec:runtime-operations/task-operations/process-envelope-input-limit-is-authoritative", async () => {
   const clock = new FakeClock(new Date("2026-07-25T00:00:00.000Z"));

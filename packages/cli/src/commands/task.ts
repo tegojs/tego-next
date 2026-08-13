@@ -4,7 +4,7 @@ import {
   parseTaskRecord,
   runtimeDiagnostic,
   serializeWireValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   DEFAULT_CONTROL_TIMEOUT_MS,
   type RuntimeOperationName,

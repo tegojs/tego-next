@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { isPortableStateString, stateStringOrderKey } from "@tegojs/contracts";
+import { isPortableStateString, stateStringOrderKey } from "@tego/contracts";
 
 const migrations = [
   `

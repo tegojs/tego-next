@@ -165,15 +165,15 @@ test("@spec:runtime-operations/layer-one-dependency-boundary/architecture-docume
 test("@spec:runtime-operations/layer-one-dependency-boundary/package-graph-documentation", async () => {
   const architecture = await read(documents.architecture);
   for (const packageName of [
-    "@tegojs/contracts",
-    "@tegojs/runtime",
-    "@tegojs/drivers-local",
-    "@tegojs/drivers-postgres",
-    "@tegojs/executor-node",
-    "@tegojs/transport-websocket",
-    "@tegojs/plugin-sdk",
-    "@tegojs/testkit",
-    "@tegojs/cli",
+    "@tego/contracts",
+    "@tego/runtime",
+    "@tego/drivers-local",
+    "@tego/drivers-postgres",
+    "@tego/executor-node",
+    "@tego/transport-websocket",
+    "@tego/plugin-sdk",
+    "@tego/testkit",
+    "@tego/cli",
   ]) {
     assert.match(architecture, new RegExp(packageName.replaceAll("/", "\\/"), "u"));
   }

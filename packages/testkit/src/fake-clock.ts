@@ -1,4 +1,4 @@
-import type { Clock } from "@tegojs/contracts";
+import type { Clock } from "@tego/contracts";
 
 interface Sleeper {
   readonly dueAt: number;

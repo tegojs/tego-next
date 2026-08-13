@@ -1,4 +1,4 @@
-import type { JsonObject, JsonValue, WorkerId, WorkerMessageType } from "@tegojs/contracts";
+import type { JsonObject, JsonValue, WorkerId, WorkerMessageType } from "@tego/contracts";
 import {
   type MainEndpointLike,
   type WorkerEndpointFactoryOptions,
@@ -9,7 +9,7 @@ import {
   type WorkerSessionMessage,
   type WorkerSessionSocket,
   workerSessionConformance,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 
 interface PublicAdapterWorkerRegistration extends JsonObject {
   readonly workerId: WorkerId;

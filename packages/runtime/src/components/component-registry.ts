@@ -9,7 +9,7 @@ import {
   type RuntimeAuthority,
   runtimeDiagnostic,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { PreparedArtifact } from "../artifacts/prepared-artifact-cache.js";
 import { type Activation, parseActivation, type ReconcileEffect } from "../reconcile/plan.js";
 

@@ -11,8 +11,8 @@ import {
   type JsonValue,
   type LeadershipHandle,
   type RuntimeDiagnostic,
-} from "@tegojs/contracts";
-import { FakeClock, eventually } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { FakeClock, eventually } from "@tego/testkit";
 import { LeadershipController } from "../src/leadership-controller.js";
 
 function healthy(clock: FakeClock): DriverHealth {

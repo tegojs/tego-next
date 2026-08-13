@@ -10,7 +10,7 @@ import {
   parsePluginId,
   type RunTaskRequest,
   type TaskExecutionTarget,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import * as cli from "../src/index.js";
 
 interface SessionRegistration {

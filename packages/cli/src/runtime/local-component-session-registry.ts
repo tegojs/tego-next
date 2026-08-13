@@ -6,8 +6,8 @@ import {
   type RunTaskRequest,
   runtimeDiagnostic,
   type TaskExecutionTarget,
-} from "@tegojs/contracts";
-import type { ComponentInstanceIdentity } from "@tegojs/runtime";
+} from "@tego/contracts";
+import type { ComponentInstanceIdentity } from "@tego/runtime";
 
 export interface LocalComponentSessionRegistration {
   readonly applicationId: RunTaskRequest["applicationId"];

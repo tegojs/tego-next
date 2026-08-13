@@ -24,13 +24,13 @@ import {
   parsePluginManifest,
   parseTaskId,
   parseWorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type ExecutorConformanceFixture,
   eventually,
   executorConformance,
   FakeClock,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 import {
   THREAD_EXECUTOR_MAX_MESSAGE_BYTES,
   ThreadExecutor,

@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import type { Runtime, RuntimeStatus } from "@tegojs/contracts";
+import type { Runtime, RuntimeStatus } from "@tego/contracts";
 import { type LocalArtifactIngress, startControlServer } from "../control/server.js";
 import {
   type CreateNodeRuntimeHostOptions,

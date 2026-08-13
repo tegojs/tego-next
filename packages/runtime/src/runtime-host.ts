@@ -6,7 +6,7 @@ import type {
   RuntimeDrivers,
   RuntimeTaskLifecycle,
   RuntimeWorkerDirectory,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { createManagedRuntime } from "./create-runtime.js";
 import type { Reconciler } from "./reconcile/reconciler.js";
 import type { RuntimeArtifactInstaller, RuntimeTaskOperations } from "./runtime-operations.js";

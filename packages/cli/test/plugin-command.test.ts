@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import type { JsonValue } from "@tegojs/contracts";
+import type { JsonValue } from "@tego/contracts";
 import type { ControlClientOptions } from "../src/control/client.js";
 import type { ControlResponse } from "../src/control/protocol.js";
 import { parseCommand } from "../src/parse-command.js";

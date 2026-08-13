@@ -4,7 +4,7 @@ import {
   type ComponentId,
   type JsonObject,
   type PluginId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export type ComponentLifecycleState =
   | "created"

@@ -20,7 +20,7 @@ import {
   type WorkerId,
   type WorkerMessageType,
   type WorkerProtocolVersion,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   createAuthenticationNonce,
   createAuthenticationProof,

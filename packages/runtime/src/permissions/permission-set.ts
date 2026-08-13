@@ -6,4 +6,4 @@ export {
   type PermissionDecisionCode,
   type PermissionDecisionDiagnostic,
   validatePermissionGrant,
-} from "@tegojs/contracts";
+} from "@tego/contracts";

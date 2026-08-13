@@ -7,7 +7,7 @@ import {
   type PluginManifest,
   parseExecutorId,
   parsePluginManifest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   assertLocalComponentManifestSupported,
   canonicalJsonEqual,

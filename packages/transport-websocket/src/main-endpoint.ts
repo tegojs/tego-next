@@ -8,7 +8,7 @@ import {
   parseWorkerId,
   type WorkerId,
   type WorkerProtocolVersion,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { systemWorkerClock } from "./clock.js";
 import { assertWorkerProtocolVersion, type WorkerProtocolLimitOverrides } from "./codec.js";
 import { compareWorkerEpoch, type WorkerRegistration, WorkerSession } from "./session.js";

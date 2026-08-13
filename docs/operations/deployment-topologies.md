@@ -30,7 +30,7 @@ operator CLI -> private control socket -> Main
                                       `-> child processes
 ```
 
-`@tegojs/drivers-local` creates:
+`@tego/drivers-local` creates:
 
 - SQLite state at `<data-dir>/state.sqlite`;
 - a filesystem artifact store under the data directory;

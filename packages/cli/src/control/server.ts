@@ -11,7 +11,7 @@ import {
   type RuntimeDiagnostic,
   type RuntimeOperations,
   serializeWireValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   CONTROL_PROTOCOL_VERSION,
   type ControlRequest,

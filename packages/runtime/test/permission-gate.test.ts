@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseCapabilityName, type CapabilityDefinition, type Permission } from "@tegojs/contracts";
+import { parseCapabilityName, type CapabilityDefinition, type Permission } from "@tego/contracts";
 import {
   CapabilitySchemaRegistry,
   gateCapabilityRequest,

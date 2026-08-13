@@ -5,7 +5,7 @@ import {
   type JsonValue,
   runtimeDiagnostic,
   serializeWireValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { applyPostgresMigrations } from "./migrations.js";
 

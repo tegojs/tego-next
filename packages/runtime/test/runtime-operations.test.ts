@@ -15,8 +15,8 @@ import {
   type ScannedState,
   type StateQuery,
   type StateStore,
-} from "@tegojs/contracts";
-import { FakeClock } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { FakeClock } from "@tego/testkit";
 import { RuntimeOperationController } from "../src/runtime-operations.js";
 
 interface SnapshotRequest {

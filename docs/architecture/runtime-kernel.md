@@ -21,12 +21,12 @@ imports, and forbidden import fragments. The WebSocket transport has one
 confined `node:http` import for its upgrade listener; that exception does not
 create an HTTP application API.
 
-The phase-one Node host composition root currently lives in `@tegojs/cli`.
+The phase-one Node host composition root currently lives in `@tego/cli`.
 That package owns the runtime commands and local control adapter as well as the
 current wiring of public kernel, driver, executor, and transport packages. It
 is therefore not a packaging-only shell, but it is also not a privileged back
 door into the kernel. Moving the composition code into a future
-`@tegojs/node-host` package is non-blocking packaging cleanup; it is not a
+`@tego/node-host` package is non-blocking packaging cleanup; it is not a
 phase-one behavioral or deployment prerequisite.
 
 ## Package graph and dependency direction
@@ -34,32 +34,32 @@ phase-one behavioral or deployment prerequisite.
 Production dependencies point inward:
 
 ```text
-examples/echo-plugin -> @tegojs/plugin-sdk -> @tegojs/contracts
+examples/echo-plugin -> @tego/plugin-sdk -> @tego/contracts
 
-@tegojs/runtime -------------> @tegojs/contracts
-@tegojs/drivers-local -------> @tegojs/contracts
-@tegojs/drivers-postgres ----> @tegojs/contracts
-@tegojs/transport-websocket -> @tegojs/contracts
-@tegojs/testkit -------------> @tegojs/contracts
-@tegojs/executor-node -------> @tegojs/contracts
+@tego/runtime -------------> @tego/contracts
+@tego/drivers-local -------> @tego/contracts
+@tego/drivers-postgres ----> @tego/contracts
+@tego/transport-websocket -> @tego/contracts
+@tego/testkit -------------> @tego/contracts
+@tego/executor-node -------> @tego/contracts
             |
-            +---------------> @tegojs/plugin-sdk
+            +---------------> @tego/plugin-sdk
 
-@tegojs/cli -> all first-layer implementation packages
+@tego/cli -> all first-layer implementation packages
 ```
 
-`@tegojs/contracts` exports data contracts, validators, driver interfaces, and
-diagnostics. It has no dependency on another Tego workspace. `@tegojs/runtime`
+`@tego/contracts` exports data contracts, validators, driver interfaces, and
+diagnostics. It has no dependency on another Tego workspace. `@tego/runtime`
 owns lifecycle, reconciliation, artifact validation, capability resolution,
 permission decisions, and task persistence while depending only on contracts
 at runtime. Local and PostgreSQL drivers implement contract interfaces.
-Executors and transport implement execution boundaries. `@tegojs/testkit`
+Executors and transport implement execution boundaries. `@tego/testkit`
 provides public conformance suites.
 
 The executor-to-SDK edge is narrowly allowed for loading the component
-definition protocol. Test-only dependencies on `@tegojs/testkit` are also
-allowed. Other first-layer packages may depend on `@tegojs/contracts`, but not
-on sibling implementations. `@tegojs/cli` is the composition root and may
+definition protocol. Test-only dependencies on `@tego/testkit` are also
+allowed. Other first-layer packages may depend on `@tego/contracts`, but not
+on sibling implementations. `@tego/cli` is the composition root and may
 depend on first-layer packages, but not on examples.
 
 ## Runtime topology

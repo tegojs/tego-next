@@ -19,7 +19,7 @@ import {
   runtimeDiagnostic,
   type TaskExecutionTarget,
   type TaskId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export interface ComponentSessionRunResult {
   readonly status: Exclude<ExecutionResult["status"], "indeterminate">;

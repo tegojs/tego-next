@@ -1,5 +1,5 @@
 import { builtinModules } from "node:module";
-import { DiagnosticError, runtimeDiagnostic } from "@tegojs/contracts";
+import { DiagnosticError, runtimeDiagnostic } from "@tego/contracts";
 
 interface Token {
   readonly kind: "identifier" | "number" | "punctuation" | "string" | "template";
@@ -16,7 +16,7 @@ export interface ModuleAuditOptions {
 }
 
 const MAX_LEXICAL_NESTING = 256;
-const PLUGIN_SDK_SPECIFIER = "@tegojs/plugin-sdk";
+const PLUGIN_SDK_SPECIFIER = "@tego/plugin-sdk";
 const NODE_BUILTINS = new Set(
   builtinModules.map((specifier) =>
     specifier.startsWith("node:") ? specifier : `node:${specifier}`,

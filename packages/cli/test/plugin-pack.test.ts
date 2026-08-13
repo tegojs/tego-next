@@ -16,8 +16,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { DiagnosticError } from "@tegojs/contracts";
-import { readPluginArtifact } from "@tegojs/runtime";
+import { DiagnosticError } from "@tego/contracts";
+import { readPluginArtifact } from "@tego/runtime";
 import { buildPlugin } from "../src/plugin/build-plugin.js";
 import { auditJavaScriptModules } from "../src/plugin/module-audit.js";
 import { packPlugin } from "../src/plugin/pack-plugin.js";
@@ -95,7 +95,7 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-pack-resolves-the-publ
     await writeFile(
       join(directory, "src/component.ts"),
       `
-        import { defineComponent } from "@tegojs/plugin-sdk";
+        import { defineComponent } from "@tego/plugin-sdk";
         export default defineComponent({
           kind: "task",
           run: async (_context, input) => input,
@@ -127,7 +127,7 @@ test("@spec:plugin-deployment/sdk-runtime-import/isolated-pack-resolves-the-publ
     const sbom = JSON.parse(
       Buffer.concat(entries.get("metadata/sbom.json") ?? []).toString("utf8"),
     ) as { readonly runtimeImports?: readonly string[] };
-    assert.deepEqual(sbom.runtimeImports, ["@tegojs/plugin-sdk"]);
+    assert.deepEqual(sbom.runtimeImports, ["@tego/plugin-sdk"]);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -139,11 +139,11 @@ test("@spec:plugin-deployment/sdk-runtime-import/rejects-delayed-sdk-imports", a
     await writeFile(
       join(directory, "src/component.ts"),
       `
-        import { defineComponent } from "@tegojs/plugin-sdk";
+        import { defineComponent } from "@tego/plugin-sdk";
         export default defineComponent({
           kind: "task",
           run: async (_context, input) => {
-            await import("@tegojs/plugin-sdk");
+            await import("@tego/plugin-sdk");
             return input;
           },
         });
@@ -362,10 +362,10 @@ test("rejects host-resolved bare module specifiers without false positives", asy
       "const load = () => `value: $" + '{import("left-pad")}`;\nexport default load;\n',
     ],
     ["fake node builtin", 'import value from "node:left-pad";\nexport default value;\n'],
-    ["dynamic plugin SDK import", 'export default () => import("@tegojs/plugin-sdk");\n'],
+    ["dynamic plugin SDK import", 'export default () => import("@tego/plugin-sdk");\n'],
     [
       "dynamic plugin SDK import in template expression",
-      "const load = () => `sdk: $" + '{import("@tegojs/plugin-sdk")}`;\nexport default load;\n',
+      "const load = () => `sdk: $" + '{import("@tego/plugin-sdk")}`;\nexport default load;\n',
     ],
   ] as const) {
     await context.test(label, async () => {
@@ -441,8 +441,8 @@ test("accepts legal ESM lexical forms and the plugin SDK API path", async (conte
       String.raw`const ratio = 10 / 2 / 5; const pattern = /import\(\"left-pad\"\)/u;` +
         "\nexport default { pattern, ratio };\n",
     ],
-    ["static plugin SDK import", 'import sdk from "@tegojs/plugin-sdk";\nexport default sdk;\n'],
-    ["plugin SDK export", 'export { default } from "@tegojs/plugin-sdk";\n'],
+    ["static plugin SDK import", 'import sdk from "@tego/plugin-sdk";\nexport default sdk;\n'],
+    ["plugin SDK export", 'export { default } from "@tego/plugin-sdk";\n'],
   ] as const) {
     await context.test(label, async () => {
       await withBuiltSource(source, async (directory) => {

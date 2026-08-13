@@ -1,4 +1,4 @@
-import type { Clock } from "@tegojs/contracts";
+import type { Clock } from "@tego/contracts";
 
 export const systemWorkerClock: Clock = {
   now: () => new Date(),

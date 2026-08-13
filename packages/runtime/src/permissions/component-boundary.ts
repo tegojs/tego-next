@@ -4,7 +4,7 @@ import type {
   ComponentCapabilityIdentity,
   ComponentCapabilityInvocation,
   JsonValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   CapabilitySchemaRegistry,
   gateCapabilityRequest,

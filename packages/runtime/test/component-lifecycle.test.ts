@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { diagnosticCode, parseComponentId, parsePluginId } from "@tegojs/contracts";
+import { diagnosticCode, parseComponentId, parsePluginId } from "@tego/contracts";
 import {
   componentApplicationReady,
   transitionComponentLifecycle,

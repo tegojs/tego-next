@@ -5,7 +5,7 @@ import type {
   Permission,
   PluginComponent,
   WorkerResourceCeilings,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { gatePermission } from "../permissions/gate.js";
 
 export interface PlacementWorker extends JsonObject {

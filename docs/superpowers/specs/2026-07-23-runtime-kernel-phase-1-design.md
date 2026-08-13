@@ -58,31 +58,31 @@ loader with different resolution behavior.
 ## 3. Workspace and Dependency Direction
 
 ```text
-@tegojs/contracts
+@tego/contracts
        ▲
-       ├────────────── @tegojs/plugin-sdk
-       ├────────────── @tegojs/testkit
-       ├────────────── @tegojs/executor-node
-       ├────────────── @tegojs/transport-websocket
-       ├────────────── @tegojs/drivers-local
-       └────────────── @tegojs/drivers-postgres
-       ▲
-       │
-@tegojs/runtime
+       ├────────────── @tego/plugin-sdk
+       ├────────────── @tego/testkit
+       ├────────────── @tego/executor-node
+       ├────────────── @tego/transport-websocket
+       ├────────────── @tego/drivers-local
+       └────────────── @tego/drivers-postgres
        ▲
        │
-@tegojs/cli
+@tego/runtime
+       ▲
+       │
+@tego/cli
 ```
 
-`@tegojs/contracts` owns serializable public contracts, runtime schemas,
+`@tego/contracts` owns serializable public contracts, runtime schemas,
 interfaces, stable error codes, and compatibility helpers. It does not own
 runtime orchestration.
 
-`@tegojs/runtime` owns the control-plane mechanisms. It accepts driver and
+`@tego/runtime` owns the control-plane mechanisms. It accepts driver and
 executor implementations through constructors and never imports a concrete
 driver package.
 
-`@tegojs/drivers-local` is the usable single-Main composition:
+`@tego/drivers-local` is the usable single-Main composition:
 
 - SQLite state store;
 - local authoritative coordination;
@@ -91,16 +91,16 @@ driver package.
 - system clock;
 - environment/file development secret provider.
 
-`@tegojs/drivers-postgres` is the usable multi-Main composition:
+`@tego/drivers-postgres` is the usable multi-Main composition:
 
 - shared PostgreSQL state store;
 - PostgreSQL coordination;
 - PostgreSQL artifact storage for phase one;
 - database-time clock for leases and fencing.
 
-`@tegojs/executor-node` implements worker-thread and child-process execution.
-`@tegojs/transport-websocket` implements remote Worker sessions and the remote
-executor. `@tegojs/cli` is a consumer of public runtime operations, not a hidden
+`@tego/executor-node` implements worker-thread and child-process execution.
+`@tego/transport-websocket` implements remote Worker sessions and the remote
+executor. `@tego/cli` is a consumer of public runtime operations, not a hidden
 privileged API.
 
 An architecture test parses workspace manifests and emitted import specifiers.
@@ -113,8 +113,8 @@ packages.
 The primary embedding API is a factory rather than a subclassable application:
 
 ```ts
-import { createRuntime } from "@tegojs/runtime";
-import { createLocalDrivers } from "@tegojs/drivers-local";
+import { createRuntime } from "@tego/runtime";
+import { createLocalDrivers } from "@tego/drivers-local";
 
 const drivers = await createLocalDrivers({
   dataDirectory: "/var/lib/tego",

@@ -14,7 +14,7 @@ import {
   type ManifestConformanceFactory,
   type StateStoreFactory,
   type WorkerConformanceFactory,
-} from "@tegojs/testkit";
+} from "@tego/testkit";
 import {
   parseApplicationId,
   parseArtifactDigest,
@@ -31,7 +31,7 @@ import {
   type RuntimeLifecycleState,
   type RuntimeStatus,
   type WorkerId,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 manifestConformance(() => ({
   parse: parsePluginManifest,

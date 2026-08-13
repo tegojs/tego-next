@@ -16,8 +16,8 @@ import {
   parseRevision,
   type StateKey,
   stateStringOrderKey,
-} from "@tegojs/contracts";
-import { stateStoreConformance } from "@tegojs/testkit";
+} from "@tego/contracts";
+import { stateStoreConformance } from "@tego/testkit";
 import * as publicApi from "../src/index.js";
 import { SqliteStateStore } from "../src/index.js";
 
@@ -125,7 +125,7 @@ test("a committed transaction survives abrupt process termination without close"
   const databasePath = await temporaryDatabase("crash");
   const moduleUrl = new URL("../src/index.js", import.meta.url).href;
   const childScript = `
-    import { parseOperationId } from "@tegojs/contracts";
+    import { parseOperationId } from "@tego/contracts";
     const [{ SqliteStateStore }] = await Promise.all([import(process.argv[2])]);
     const store = new SqliteStateStore({ databasePath: process.argv[1] });
     await store.open();

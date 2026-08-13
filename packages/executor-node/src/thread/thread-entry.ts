@@ -10,7 +10,7 @@ import {
   type ComponentPermissionBoundary,
   type JsonValue,
   type SecretProvider,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { ComponentHost, type ComponentHostClock } from "../host/component-host.js";
 
 interface BootstrapMessage {

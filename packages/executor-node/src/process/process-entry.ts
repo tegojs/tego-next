@@ -9,7 +9,7 @@ import {
   type ComponentPermissionBoundary,
   type JsonValue,
   type SecretProvider,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { ComponentHost, type ComponentHostClock } from "../host/component-host.js";
 import { authenticateProcessMessage, signProcessMessage } from "./authentication.js";
 import { ProcessFrameDecoder, encodeProcessFrame } from "./framing.js";

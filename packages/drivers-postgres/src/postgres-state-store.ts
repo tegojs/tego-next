@@ -30,7 +30,7 @@ import {
   type StateWriteOptions,
   stateStringOrderKey,
   type Versioned,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import {
   canonicalJson,

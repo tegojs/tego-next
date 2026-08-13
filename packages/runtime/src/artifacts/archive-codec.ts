@@ -3,7 +3,7 @@ import {
   runtimeDiagnostic,
   type JsonObject,
   type JsonValue,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 const TAR_BLOCK_SIZE = 512;
 const encoder = new TextEncoder();

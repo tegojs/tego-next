@@ -1,4 +1,4 @@
-import type { ComponentCapabilityInvocation, JsonObject, JsonValue } from "@tegojs/contracts";
+import type { ComponentCapabilityInvocation, JsonObject, JsonValue } from "@tego/contracts";
 import { type ComponentContext, snapshotComponentJson } from "./context.js";
 
 export const COMPONENT_DEFINITION_PROTOCOL = "tego.component/1.0" as const;

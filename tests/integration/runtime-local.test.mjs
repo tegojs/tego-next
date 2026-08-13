@@ -11,9 +11,9 @@ import {
   parseNodeId,
   parsePluginId,
   parseRuntimeId,
-} from "@tegojs/contracts";
-import { createLocalDrivers } from "@tegojs/drivers-local";
-import { createRuntime } from "@tegojs/runtime";
+} from "@tego/contracts";
+import { createLocalDrivers } from "@tego/drivers-local";
+import { createRuntime } from "@tego/runtime";
 
 const applicationId = parseApplicationId("application-01");
 

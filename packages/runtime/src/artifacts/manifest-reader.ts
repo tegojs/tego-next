@@ -8,7 +8,7 @@ import {
   type ArtifactDigest,
   type JsonObject,
   type PluginManifest,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { assertPortableArtifactPath, portableArtifactCollisionKey } from "./archive-codec.js";
 
 const TAR_BLOCK_SIZE = 512;

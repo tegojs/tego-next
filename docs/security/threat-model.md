@@ -81,7 +81,7 @@ request only exact names allowed by both the manifest and deployment. The
 provider's backing configuration is not serialized into plugin context or wire
 contracts.
 
-`@tegojs/drivers-local` supplies `DevelopmentSecretProvider`, which is marked
+`@tego/drivers-local` supplies `DevelopmentSecretProvider`, which is marked
 development-only. Do not treat it as a production secret manager. Process
 stderr collection redacts secret values observed through the provider and
 common credential-shaped fields, but logs are not a safe secret transport.

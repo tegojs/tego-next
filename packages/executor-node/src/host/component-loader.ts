@@ -9,7 +9,7 @@ import {
   type JsonObject,
   type JsonValue,
   runtimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import { cloneComponentHostValue } from "./protocol.js";
 
 const PREPARED_ARTIFACT = Symbol("tego.prepared-artifact");
@@ -27,7 +27,7 @@ interface RootDigestBinding {
 }
 
 const ROOT_DIGEST_BINDINGS = new Map<string, RootDigestBinding>();
-const PLUGIN_SDK_SPECIFIER = "@tegojs/plugin-sdk";
+const PLUGIN_SDK_SPECIFIER = "@tego/plugin-sdk";
 const PLUGIN_SDK_URL = import.meta.resolve(PLUGIN_SDK_SPECIFIER);
 const SDK_RESOLUTION_STATE = Symbol.for("tego.executor-node.plugin-sdk-resolution");
 

@@ -7,7 +7,7 @@ import {
   parseCapabilityName,
   parsePluginId,
   parseRuntimeDiagnostic,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   type CapabilityResolutionDeployment,
   parseActivation,
@@ -17,7 +17,7 @@ import {
   resolveCapabilities,
   satisfiesVersionRange,
   strongestProviderLoss,
-} from "@tegojs/runtime";
+} from "@tego/runtime";
 
 const applicationId = parseApplicationId("application-01");
 

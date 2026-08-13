@@ -523,12 +523,12 @@ test("README documents project scope and executable contributor paths", async ()
     "docker compose up -d postgres",
     "TEGO_POSTGRES_URL",
     "npm run test:integration",
-    "@tegojs/runtime",
-    "@tegojs/plugin-sdk",
-    "@tegojs/drivers-local",
-    "@tegojs/drivers-postgres",
-    "@tegojs/executor-node",
-    "@tegojs/transport-websocket",
+    "@tego/runtime",
+    "@tego/plugin-sdk",
+    "@tego/drivers-local",
+    "@tego/drivers-postgres",
+    "@tego/executor-node",
+    "@tego/transport-websocket",
     "examples/echo-plugin",
     "Conventional Commits",
   ]) {
@@ -585,15 +585,15 @@ Only the runtime-kernel layer is implemented here.
 
 | Package | Responsibility |
 | --- | --- |
-| `@tegojs/contracts` | Stable first-layer contracts and schemas |
-| `@tegojs/runtime` | Runtime creation, lifecycle, reconciliation, and recovery |
-| `@tegojs/plugin-sdk` | TypeScript plugin component authoring API |
-| `@tegojs/drivers-local` | Embedded and single-main local drivers |
-| `@tegojs/drivers-postgres` | Cluster-capable PostgreSQL drivers |
-| `@tegojs/executor-node` | Thread and process executors for Node.js |
-| `@tegojs/transport-websocket` | Main/worker WebSocket transport |
-| `@tegojs/testkit` | Driver, worker, and executor conformance tests |
-| `@tegojs/cli` | Plugin packaging and signing commands |
+| `@tego/contracts` | Stable first-layer contracts and schemas |
+| `@tego/runtime` | Runtime creation, lifecycle, reconciliation, and recovery |
+| `@tego/plugin-sdk` | TypeScript plugin component authoring API |
+| `@tego/drivers-local` | Embedded and single-main local drivers |
+| `@tego/drivers-postgres` | Cluster-capable PostgreSQL drivers |
+| `@tego/executor-node` | Thread and process executors for Node.js |
+| `@tego/transport-websocket` | Main/worker WebSocket transport |
+| `@tego/testkit` | Driver, worker, and executor conformance tests |
+| `@tego/cli` | Plugin packaging and signing commands |
 
 The runnable example is in `examples/echo-plugin`.
 
@@ -643,8 +643,8 @@ docker compose down -v
 ## Plugin development
 
 `examples/echo-plugin` contains a minimal TypeScript component and manifest.
-Plugin code uses `@tegojs/plugin-sdk`; packaging and signing are provided by
-`@tegojs/cli`.
+Plugin code uses `@tego/plugin-sdk`; packaging and signing are provided by
+`@tego/cli`.
 
 ## Contributing
 

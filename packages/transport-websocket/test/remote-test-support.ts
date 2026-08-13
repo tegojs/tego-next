@@ -22,7 +22,7 @@ import {
   runtimeDiagnostic,
   type TaskId,
   type WorkerMessageType,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 import {
   MemoryRemoteResultStore,
   type RemoteResultStore,

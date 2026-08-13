@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { setImmediate as yieldToEventLoop, setTimeout as delay } from "node:timers/promises";
-import { diagnosticCode, parseRevision } from "@tegojs/contracts";
+import { diagnosticCode, parseRevision } from "@tego/contracts";
 import { Pool } from "pg";
 import { PostgresCoordinationProvider, PostgresStateStore } from "../src/index.js";
 

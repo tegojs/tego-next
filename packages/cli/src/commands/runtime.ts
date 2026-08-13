@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import type { RuntimeStatus } from "@tegojs/contracts";
+import type { RuntimeStatus } from "@tego/contracts";
 import { removeOwnedControlEndpoint } from "../control/server.js";
 import type { RuntimeStartCommand } from "../parse-command.js";
 import { runNodeMainProcess } from "../runtime/main-process.js";

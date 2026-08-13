@@ -57,7 +57,7 @@ Docker Compose and Kubernetes were rejected for this phase because they would ad
 
 ## Runtime Composition
 
-A runtime host composes existing packages without moving concrete implementations into `@tegojs/runtime`.
+A runtime host composes existing packages without moving concrete implementations into `@tego/runtime`.
 
 The host owns:
 
@@ -70,7 +70,7 @@ The host owns:
 - the local control server;
 - shutdown ordering and resource cleanup.
 
-`@tegojs/runtime` continues to depend only on contracts and injected boundaries. Concrete local or PostgreSQL drivers, Node executors, and WebSocket adapters are selected by the executable composition layer.
+`@tego/runtime` continues to depend only on contracts and injected boundaries. Concrete local or PostgreSQL drivers, Node executors, and WebSocket adapters are selected by the executable composition layer.
 
 Startup does not report recovery complete until drivers are healthy, durable state has been reconstructed, leadership state is known, the reconciler has performed its initial pass when this Main is authoritative, and the local control endpoint is ready.
 

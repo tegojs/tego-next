@@ -18,7 +18,7 @@ import {
   type StateKey,
   type StateStore,
   type StateTransactionOptions,
-} from "@tegojs/contracts";
+} from "@tego/contracts";
 
 export type StateStoreFactory = () => StateStore | Promise<StateStore>;
 
