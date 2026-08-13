@@ -1,5 +1,6 @@
-import type { Pool, PoolClient } from "pg";
+import { createHash } from "node:crypto";
 import { isPortableStateString, stateStringOrderKey } from "@tego/contracts";
+import type { Pool, PoolClient } from "pg";
 
 const migrations = [
   `
@@ -188,18 +189,64 @@ const migrations = [
     CREATE INDEX tego_operation_history_scan_order
       ON tego_operation_history(driver_namespace, revision, operation_id COLLATE "C");
   `,
+  `
+    ALTER TABLE tego_artifacts
+      DROP CONSTRAINT IF EXISTS tego_artifacts_size_limit;
+
+    CREATE TABLE IF NOT EXISTS tego_artifact_namespace_usage (
+      driver_namespace text PRIMARY KEY,
+      committed_bytes bigint NOT NULL CHECK (committed_bytes >= 0)
+    );
+
+    INSERT INTO tego_artifact_namespace_usage(driver_namespace, committed_bytes)
+    SELECT driver_namespace, SUM(octet_length(content)::bigint)
+    FROM tego_artifacts
+    GROUP BY driver_namespace
+    ON CONFLICT(driver_namespace) DO NOTHING;
+  `,
 ] as const;
 
 export const postgresSchemaVersion = migrations.length;
 
+const LEGACY_MIGRATION_CHECKSUMS = Object.freeze([
+  "b1a02fe5e514c53e3dc6e205f0ab5bf3fcf5b31cb17d88dec1b5187dee95ae07",
+  "ce839561cf1121b8e4a44f94fefd7eaef6951189b1d364982f2218b5d8ece878",
+  "42326b1531a69edaf248b33986e1a94884cf234369b9c64048b2571bebca75b4",
+  "90cd291090fdb8d2dc4e1ac3135e02a6dffe753f353f88f4b0ee4697c2d8254e",
+] as const);
+
+function migrationChecksum(sql: string): string {
+  return createHash("sha256").update(sql).digest("hex");
+}
+
 async function applyMigration(client: PoolClient, version: number, sql: string): Promise<void> {
-  const applied = await client.query<{ applied: number }>(
-    "SELECT 1 AS applied FROM tego_schema_migrations WHERE version = $1",
+  const checksum = migrationChecksum(sql);
+  const applied = await client.query<{ checksum: string | null }>(
+    "SELECT checksum FROM tego_schema_migrations WHERE version = $1",
     [version],
   );
-  if (applied.rowCount !== 0) return;
+  const recorded = applied.rows[0]?.checksum;
+  if (recorded !== undefined) {
+    const checksumForComparison = recorded ?? LEGACY_MIGRATION_CHECKSUMS[version - 1];
+    if (checksumForComparison === undefined) {
+      throw new Error(`PostgreSQL migration ${version} is missing a trusted legacy checksum`);
+    }
+    if (checksumForComparison !== checksum) {
+      throw new Error(`PostgreSQL migration ${version} checksum does not match this build`);
+    }
+    if (recorded === null) {
+      await client.query("UPDATE tego_schema_migrations SET checksum = $2 WHERE version = $1", [
+        version,
+        checksum,
+      ]);
+    }
+    return;
+  }
   await client.query(sql);
-  await client.query("INSERT INTO tego_schema_migrations(version) VALUES ($1)", [version]);
+  await client.query("INSERT INTO tego_schema_migrations(version, checksum) VALUES ($1, $2)", [
+    version,
+    checksum,
+  ]);
 }
 
 export async function applyPostgresMigrations(pool: Pool): Promise<void> {
@@ -217,9 +264,11 @@ export async function applyPostgresMigrations(pool: Pool): Promise<void> {
     await client.query(`
       CREATE TABLE IF NOT EXISTS tego_schema_migrations (
         version integer PRIMARY KEY,
+        checksum text,
         applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
       )
     `);
+    await client.query("ALTER TABLE tego_schema_migrations ADD COLUMN IF NOT EXISTS checksum text");
     const latest = await client.query<{ version: number | null }>(
       "SELECT MAX(version)::integer AS version FROM tego_schema_migrations",
     );
@@ -232,6 +281,7 @@ export async function applyPostgresMigrations(pool: Pool): Promise<void> {
     for (let index = 0; index < migrations.length; index += 1) {
       await applyMigration(client, index + 1, migrations[index] ?? "");
     }
+    await client.query("ALTER TABLE tego_schema_migrations ALTER COLUMN checksum SET NOT NULL");
     const missingOrderKeys = await client.query<{
       driver_namespace: string;
       namespace: string;

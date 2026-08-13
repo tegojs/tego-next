@@ -1,4 +1,5 @@
 import type {
+  ArtifactStorageLimits,
   ArtifactStore,
   ClusterTime,
   CoordinationProvider,
@@ -16,13 +17,21 @@ export interface PostgresDrivers {
   readonly clusterTime: ClusterTime;
 }
 
-export function createPostgresDrivers(options: PostgresConnectionOptions): PostgresDrivers {
+export interface CreatePostgresDriversOptions extends PostgresConnectionOptions {
+  readonly artifactLimits?: Partial<ArtifactStorageLimits>;
+}
+
+export function createPostgresDrivers(options: CreatePostgresDriversOptions): PostgresDrivers {
   assertPostgresOptions(options);
   const state = new PostgresStateStore(options);
   return {
     state,
     coordination: new PostgresCoordinationProvider(options),
-    artifacts: new PostgresArtifactStore(options),
+    artifacts: new PostgresArtifactStore({
+      connectionString: options.connectionString,
+      namespace: options.namespace,
+      ...(options.artifactLimits === undefined ? {} : { limits: options.artifactLimits }),
+    }),
     clusterTime: state,
   };
 }

@@ -4,19 +4,25 @@ import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   type ArtifactDigest,
+  DiagnosticError,
   diagnosticCode,
   parseArtifactDigest,
   parseMessageId,
   parseOperationId,
   parseRevision,
 } from "@tego/contracts";
-import { coordinationConformance, stateStoreConformance } from "@tego/testkit";
+import {
+  coordinationConformance,
+  defineArtifactStoreSuite,
+  stateStoreConformance,
+} from "@tego/testkit";
 import { Pool } from "pg";
 import {
-  POSTGRES_ARTIFACT_MAX_BYTES,
+  applyPostgresMigrations,
   PostgresArtifactStore,
   PostgresCoordinationProvider,
   PostgresStateStore,
+  postgresSchemaVersion,
 } from "../src/index.js";
 
 const connectionString =
@@ -71,6 +77,15 @@ coordinationConformance(
 function digest(bytes: Uint8Array): ArtifactDigest {
   return parseArtifactDigest(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
 }
+
+defineArtifactStoreSuite(async (options) => ({
+  store: new PostgresArtifactStore({
+    connectionString,
+    namespace: namespace(options.namespace),
+    ...(options.limits === undefined ? {} : { limits: options.limits }),
+  }),
+  dispose: async () => {},
+}));
 
 async function* source(...chunks: readonly Uint8Array[]): AsyncIterable<Uint8Array> {
   yield* chunks;
@@ -520,15 +535,308 @@ test("PostgreSQL ArtifactStore verifies digest, uniqueness, size, and restart re
   await reopened.close();
 });
 
+test("PostgreSQL ArtifactStore persists quota usage across restart and validates duplicate sources", async () => {
+  const storeNamespace = namespace("artifact_quota_restart");
+  const limits = { maxArtifactBytes: 4, maxNamespaceBytes: 6 };
+  const content = Buffer.from("full");
+  const artifactDigest = digest(content);
+  const first = new PostgresArtifactStore({
+    connectionString,
+    namespace: storeNamespace,
+    limits,
+  });
+  await first.open();
+  await first.put(artifactDigest, source(content));
+  await first.close();
+
+  const reopened = new PostgresArtifactStore({
+    connectionString,
+    namespace: storeNamespace,
+    limits,
+  });
+  await reopened.open();
+  try {
+    await reopened.put(artifactDigest, source(Buffer.from(content)));
+    await assert.rejects(
+      reopened.put(artifactDigest, source(Buffer.from("FAIL"))),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_DIGEST_MISMATCH",
+    );
+    const nextDigest = digest(Buffer.from("next"));
+    await assert.rejects(
+      reopened.put(nextDigest, source(Buffer.from("next"))),
+      (error: unknown) => {
+        assert.ok(error instanceof DiagnosticError);
+        assert.equal(error.diagnostic.code, "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED");
+        assert.deepEqual(error.diagnostic.details, {
+          digest: nextDigest,
+          namespace: storeNamespace,
+          artifactBytes: 4,
+          committedBytes: "4",
+          reservedBytes: "4",
+          maximumBytes: 6,
+        });
+        assert.doesNotThrow(() => JSON.stringify(error.diagnostic));
+        return true;
+      },
+    );
+  } finally {
+    await reopened.close();
+  }
+});
+
+test("PostgreSQL quota migration backfills exact bytes once and records stable checksums", async () => {
+  const storeNamespace = namespace("artifact_quota_migration");
+  const content = Buffer.from("before quota migration");
+  const artifactDigest = digest(content);
+  const pool = new Pool({ connectionString });
+  try {
+    await applyPostgresMigrations(pool);
+    await pool.query("DELETE FROM tego_artifact_namespace_usage WHERE driver_namespace = $1", [
+      storeNamespace,
+    ]);
+    await pool.query(
+      `INSERT INTO tego_artifacts(driver_namespace, digest, content, size_bytes)
+       VALUES ($1, $2, $3, $4)`,
+      [storeNamespace, artifactDigest, content, content.byteLength.toString()],
+    );
+    await pool.query("DELETE FROM tego_schema_migrations WHERE version = $1", [
+      postgresSchemaVersion,
+    ]);
+
+    await applyPostgresMigrations(pool);
+    await applyPostgresMigrations(pool);
+
+    const usage = await pool.query<{ committed_bytes: string }>(
+      `SELECT committed_bytes::text
+         FROM tego_artifact_namespace_usage
+        WHERE driver_namespace = $1`,
+      [storeNamespace],
+    );
+    assert.equal(usage.rows[0]?.committed_bytes, content.byteLength.toString());
+    const migrations = await pool.query<{ checksum: string; version: number }>(
+      "SELECT version, checksum FROM tego_schema_migrations ORDER BY version",
+    );
+    assert.deepEqual(
+      migrations.rows.map((row) => row.version),
+      Array.from({ length: postgresSchemaVersion }, (_, index) => index + 1),
+    );
+    assert.ok(migrations.rows.every((row) => /^[0-9a-f]{64}$/u.test(row.checksum)));
+  } finally {
+    await pool.query("DELETE FROM tego_artifacts WHERE driver_namespace = $1", [storeNamespace]);
+    await pool.query("DELETE FROM tego_artifact_namespace_usage WHERE driver_namespace = $1", [
+      storeNamespace,
+    ]);
+    await pool.end();
+  }
+});
+
+test("PostgreSQL migrations reject a recorded checksum that differs from the current migration", async () => {
+  const pool = new Pool({ connectionString });
+  const original = await pool.query<{ checksum: string }>(
+    "SELECT checksum FROM tego_schema_migrations WHERE version = $1",
+    [postgresSchemaVersion],
+  );
+  const checksum = original.rows[0]?.checksum;
+  assert.ok(checksum !== undefined);
+  try {
+    await pool.query("UPDATE tego_schema_migrations SET checksum = $2 WHERE version = $1", [
+      postgresSchemaVersion,
+      "0".repeat(64),
+    ]);
+    await assert.rejects(
+      applyPostgresMigrations(pool),
+      new RegExp(`PostgreSQL migration ${postgresSchemaVersion} checksum does not match`),
+    );
+  } finally {
+    await pool.query("UPDATE tego_schema_migrations SET checksum = $2 WHERE version = $1", [
+      postgresSchemaVersion,
+      checksum,
+    ]);
+    await pool.end();
+  }
+});
+
+test("two PostgreSQL ArtifactStore pools cannot overcommit an existing namespace usage row", async () => {
+  const storeNamespace = namespace("artifact_quota_existing_race");
+  const limits = { maxArtifactBytes: 4, maxNamespaceBytes: 6 };
+  const left = new PostgresArtifactStore({ connectionString, namespace: storeNamespace, limits });
+  const right = new PostgresArtifactStore({ connectionString, namespace: storeNamespace, limits });
+  const observer = new Pool({ connectionString });
+  const blocker = await observer.connect();
+  await Promise.all([left.open(), right.open()]);
+  let blocked = false;
+  try {
+    await observer.query(
+      `INSERT INTO tego_artifact_namespace_usage(driver_namespace, committed_bytes)
+       VALUES ($1, 0)
+       ON CONFLICT(driver_namespace) DO NOTHING`,
+      [storeNamespace],
+    );
+    await blocker.query("BEGIN");
+    await blocker.query(
+      `SELECT committed_bytes
+         FROM tego_artifact_namespace_usage
+        WHERE driver_namespace = $1
+        FOR UPDATE`,
+      [storeNamespace],
+    );
+    blocked = true;
+
+    const writes = [
+      left.put(digest(Buffer.from("left")), source(Buffer.from("left"))),
+      right.put(digest(Buffer.from("rght")), source(Buffer.from("rght"))),
+    ];
+    await waitFor(async () => {
+      const result = await observer.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+          WHERE application_name = $1
+            AND wait_event_type = 'Lock'`,
+        [`tego:${storeNamespace}:artifacts`.slice(0, 63)],
+      );
+      return BigInt(result.rows[0]?.count ?? "0") === 2n;
+    }, "Artifact transactions did not both reach the namespace usage lock");
+    await blocker.query("COMMIT");
+    blocked = false;
+
+    const results = await within(
+      Promise.allSettled(writes),
+      "Timed out waiting for existing-row artifact quota contenders",
+    );
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    const rejected = results.filter((result) => result.status === "rejected");
+    assert.equal(rejected.length, 1);
+    assert.ok(
+      rejected[0]?.status === "rejected" &&
+        diagnosticCode(rejected[0].reason) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+    );
+    const durable = await observer.query<{ artifacts: string; committed_bytes: string }>(
+      `SELECT
+         count(a.digest)::text AS artifacts,
+         u.committed_bytes::text
+       FROM tego_artifact_namespace_usage u
+       LEFT JOIN tego_artifacts a USING (driver_namespace)
+       WHERE u.driver_namespace = $1
+       GROUP BY u.committed_bytes`,
+      [storeNamespace],
+    );
+    assert.deepEqual(durable.rows[0], { artifacts: "1", committed_bytes: "4" });
+  } finally {
+    if (blocked) await blocker.query("ROLLBACK").catch(() => undefined);
+    blocker.release();
+    await Promise.all([left.close(), right.close(), observer.end()]);
+  }
+});
+
+test("two PostgreSQL ArtifactStore pools serialize concurrent first use of a namespace", async () => {
+  const storeNamespace = namespace("artifact_quota_first_race");
+  const limits = { maxArtifactBytes: 4, maxNamespaceBytes: 6 };
+  const left = new PostgresArtifactStore({ connectionString, namespace: storeNamespace, limits });
+  const right = new PostgresArtifactStore({ connectionString, namespace: storeNamespace, limits });
+  const observer = new Pool({ connectionString });
+  const blocker = await observer.connect();
+  await Promise.all([left.open(), right.open()]);
+  let blocked = false;
+  try {
+    await observer.query("DELETE FROM tego_artifact_namespace_usage WHERE driver_namespace = $1", [
+      storeNamespace,
+    ]);
+    await blocker.query("BEGIN");
+    await blocker.query(
+      `INSERT INTO tego_artifact_namespace_usage(driver_namespace, committed_bytes)
+       VALUES ($1, 0)`,
+      [storeNamespace],
+    );
+    blocked = true;
+
+    const writes = [
+      left.put(digest(Buffer.from("aaaa")), source(Buffer.from("aaaa"))),
+      right.put(digest(Buffer.from("bbbb")), source(Buffer.from("bbbb"))),
+    ];
+    await waitFor(async () => {
+      const result = await observer.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+          WHERE application_name = $1
+            AND wait_event_type = 'Lock'`,
+        [`tego:${storeNamespace}:artifacts`.slice(0, 63)],
+      );
+      return BigInt(result.rows[0]?.count ?? "0") === 2n;
+    }, "Artifact transactions did not both reach first-use row creation");
+    await blocker.query("ROLLBACK");
+    blocked = false;
+
+    const results = await within(
+      Promise.allSettled(writes),
+      "Timed out waiting for first-use artifact quota contenders",
+    );
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    const rejected = results.filter((result) => result.status === "rejected");
+    assert.equal(rejected.length, 1);
+    assert.ok(
+      rejected[0]?.status === "rejected" &&
+        diagnosticCode(rejected[0].reason) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+    );
+    const durable = await observer.query<{ artifacts: string; committed_bytes: string }>(
+      `SELECT
+         count(a.digest)::text AS artifacts,
+         u.committed_bytes::text
+       FROM tego_artifact_namespace_usage u
+       LEFT JOIN tego_artifacts a USING (driver_namespace)
+       WHERE u.driver_namespace = $1
+       GROUP BY u.committed_bytes`,
+      [storeNamespace],
+    );
+    assert.deepEqual(durable.rows[0], { artifacts: "1", committed_bytes: "4" });
+  } finally {
+    if (blocked) await blocker.query("ROLLBACK").catch(() => undefined);
+    blocker.release();
+    await Promise.all([left.close(), right.close(), observer.end()]);
+  }
+});
+
+test("PostgreSQL ArtifactStore quota usage is isolated by driver namespace", async () => {
+  const limits = { maxArtifactBytes: 4, maxNamespaceBytes: 4 };
+  const left = new PostgresArtifactStore({
+    connectionString,
+    namespace: namespace("artifact_quota_isolated_left"),
+    limits,
+  });
+  const right = new PostgresArtifactStore({
+    connectionString,
+    namespace: namespace("artifact_quota_isolated_right"),
+    limits,
+  });
+  const content = Buffer.from("same");
+  const artifactDigest = digest(content);
+  await Promise.all([left.open(), right.open()]);
+  try {
+    await Promise.all([
+      left.put(artifactDigest, source(content)),
+      right.put(artifactDigest, source(content)),
+    ]);
+    await assert.rejects(
+      left.put(digest(Buffer.from("more")), source(Buffer.from("more"))),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_NAMESPACE_QUOTA_EXCEEDED",
+    );
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of right.read(artifactDigest)) chunks.push(chunk);
+    assert.deepEqual(Buffer.concat(chunks), content);
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
+});
+
 test("PostgreSQL ArtifactStore rejects digest mismatches and oversized artifacts", async () => {
   const store = new PostgresArtifactStore({
     connectionString,
     namespace: namespace("artifact_bounds"),
+    limits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
   });
   await store.open();
   try {
     await assert.rejects(
-      store.put(digest(Buffer.from("expected")), source(Buffer.from("different"))),
+      store.put(digest(Buffer.from("same")), source(Buffer.from("diff"))),
       (error: unknown) =>
         error instanceof Error &&
         "diagnostic" in error &&
@@ -536,14 +844,12 @@ test("PostgreSQL ArtifactStore rejects digest mismatches and oversized artifacts
           "ARTIFACT_DIGEST_MISMATCH",
     );
     await assert.rejects(
-      store.put(
-        digest(Buffer.alloc(POSTGRES_ARTIFACT_MAX_BYTES + 1)),
-        source(Buffer.alloc(POSTGRES_ARTIFACT_MAX_BYTES + 1)),
-      ),
+      store.put(digest(Buffer.alloc(5)), source(Buffer.alloc(5))),
       (error: unknown) =>
         error instanceof Error &&
         "diagnostic" in error &&
-        (error as { diagnostic?: { code?: string } }).diagnostic?.code === "ARTIFACT_SIZE_EXCEEDED",
+        (error as { diagnostic?: { code?: string } }).diagnostic?.code ===
+          "ARTIFACT_SIZE_LIMIT_EXCEEDED",
     );
   } finally {
     await store.close();
@@ -586,10 +892,24 @@ test("createPostgresDrivers creates one shared driver namespace", async () => {
   const drivers = createPostgresDrivers({
     connectionString,
     namespace: namespace("bundle"),
+    artifactLimits: { maxArtifactBytes: 4, maxNamespaceBytes: 4 },
   });
   assert.equal(drivers.state.scope, "shared");
   assert.equal(drivers.coordination.scope, "distributed");
   assert.equal(drivers.artifacts.scope, "shared");
+  await drivers.artifacts.open();
+  try {
+    await assert.rejects(
+      drivers.artifacts.put(digest(Buffer.alloc(5)), source(Buffer.alloc(5))),
+      (error: unknown) => diagnosticCode(error) === "ARTIFACT_SIZE_LIMIT_EXCEEDED",
+    );
+  } finally {
+    await Promise.all([
+      drivers.artifacts.close(),
+      drivers.coordination.close(),
+      drivers.state.close(),
+    ]);
+  }
 });
 
 test("PostgreSQL cluster time is canonical UTC and independent of the process clock", async () => {
