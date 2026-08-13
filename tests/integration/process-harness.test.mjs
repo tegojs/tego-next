@@ -425,11 +425,13 @@ test("teardown kills a spawned grandchild when readiness fails", async (t) => {
 
 test("throwing readiness predicate cleans the whole process tree and preserves the predicate error", async () => {
   const artifacts = await createRunArtifacts("predicate-tree-cleanup");
-  const grandchild = "process.once('SIGTERM', () => process.exit(0)); process.stdin.resume();";
+  const grandchild =
+    "process.once('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000);";
   const parent = [
     "const { spawn } = require('node:child_process');",
     `const spawned = spawn(process.execPath, ['--eval', ${JSON.stringify(grandchild)}],`,
     "{ stdio: ['ignore', 'inherit', 'inherit'] });",
+    "spawned.unref();",
     "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: spawned.pid }));",
     "process.once('SIGTERM', () => process.exit(0));",
     "process.stdin.resume();",
@@ -473,6 +475,117 @@ test("throwing readiness predicate cleans the whole process tree and preserves t
     ),
     true,
   );
+});
+
+test("assertClean rejects a live grandchild after its direct parent exits", async (t) => {
+  const artifacts = await createRunArtifacts("parent-exits-grandchild-lives");
+  const grandchild =
+    "process.once('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000);";
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    `const spawned = spawn(process.execPath, ['--eval', ${JSON.stringify(grandchild)}],`,
+    "{ stdio: ['ignore', 'inherit', 'inherit'] });",
+    "spawned.unref();",
+    "console.log(JSON.stringify({ type: 'grandchild-spawned', pid: spawned.pid }));",
+  ].join(" ");
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: ["--input-type=commonjs", "--eval", parent],
+    name: "exited-parent",
+  });
+  registerCleanup(t, child);
+  const spawned = await child.ready((event) => event.type === "grandchild-spawned", {
+    timeoutMs: 2_000,
+  });
+  await waitForPidDeath(child.pid, { timeoutMs: 2_000 });
+
+  await assert.rejects(child.assertClean({ timeoutMs: 100 }), /PROCESS_TREE_STILL_RUNNING/u);
+  assert.equal(isProcessAlive(spawned.pid), true);
+  await child.stop({ timeoutMs: 2_000 });
+  assert.equal(isProcessAlive(spawned.pid), false);
+});
+
+test("Windows cleanup targets the owned tree and proves descendant termination", async () => {
+  const artifacts = await createRunArtifacts("windows-tree-strategy");
+  const events = [];
+  let treeAlive = true;
+  let childPid;
+  await usingManagedProcess(
+    async (child) => {
+      childPid = child.pid;
+      await child.ready(() => true, { timeoutMs: 20 });
+    },
+    {
+      artifacts,
+      command: process.execPath,
+      args: [
+        "--eval",
+        "process.once('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000)",
+      ],
+      name: "windows-tree-child",
+      platform: "win32",
+      windowsTreeStrategy: {
+        canTerminateAfterLeaderExit: true,
+        async probe(processId) {
+          events.push(`probe:${processId}:${treeAlive}`);
+          return !treeAlive;
+        },
+        async terminate(processId, signal) {
+          events.push(`terminate:${processId}:${signal}`);
+          process.kill(processId, signal);
+          treeAlive = false;
+          return true;
+        },
+      },
+    },
+  ).catch((error) => {
+    const primary = error instanceof AggregateError ? error.errors[0] : error;
+    assert.match(String(primary), /PROCESS_READY_TIMEOUT/u);
+  });
+  assert.deepEqual(
+    events
+      .filter((event) => event.startsWith("terminate:"))
+      .map((event) => event.replace(String(childPid), "pid")),
+    ["terminate:pid:SIGTERM"],
+  );
+  assert.equal(
+    events.some((event) => event === `probe:${childPid}:false`),
+    true,
+  );
+});
+
+test("Windows cleanup fails closed when whole-tree termination cannot be proven", async () => {
+  const artifacts = await createRunArtifacts("windows-tree-unproven");
+  let childPid;
+  const child = await spawnManagedProcess({
+    artifacts,
+    command: process.execPath,
+    args: [
+      "--eval",
+      "process.once('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000)",
+    ],
+    name: "windows-unproven-child",
+    platform: "win32",
+    windowsTreeStrategy: {
+      canTerminateAfterLeaderExit: true,
+      async probe() {
+        return false;
+      },
+      async terminate(processId, signal) {
+        childPid = processId;
+        try {
+          process.kill(processId, signal);
+        } catch (error) {
+          if (error?.code !== "ESRCH") throw error;
+        }
+        return false;
+      },
+    },
+  });
+  await assert.rejects(child.stop({ timeoutMs: 20 }), /PROCESS_STOP_TIMEOUT/u);
+  await assert.rejects(child.assertClean({ timeoutMs: 20 }), /PROCESS_TREE_STILL_RUNNING/u);
+  if (isProcessAlive(childPid)) process.kill(childPid, "SIGKILL");
 });
 
 test("artifact event predicate errors surface immediately", async () => {

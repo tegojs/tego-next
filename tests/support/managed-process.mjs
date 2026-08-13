@@ -52,14 +52,52 @@ function processSpawnDiagnostic(error, name) {
   return new Error(`PROCESS_SPAWN_ERROR:${name}:${error.code ?? "UNKNOWN"}:${error.message}`);
 }
 
-export async function spawnManagedProcess({ artifacts, command, args, env = {}, name }) {
+async function taskkill(processId, force) {
+  const result = await new Promise((resolve) => {
+    const killer = spawn("taskkill", ["/pid", String(processId), "/T", ...(force ? ["/F"] : [])], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.once("error", (error) => resolve({ error, status: null }));
+    killer.once("close", (status) => resolve({ status }));
+  });
+  return result.error === undefined && result.status === 0;
+}
+
+function createWindowsTreeStrategy() {
+  const provenTerminated = new Set();
+  return {
+    // taskkill owns only a numeric PID. After the leader closes, PID reuse makes
+    // targeting unsafe, so the default strategy fails closed instead.
+    canTerminateAfterLeaderExit: false,
+    async probe(processId) {
+      return provenTerminated.has(processId);
+    },
+    async terminate(processId, signal) {
+      const terminated = await taskkill(processId, signal === "SIGKILL");
+      if (terminated) provenTerminated.add(processId);
+      return terminated;
+    },
+  };
+}
+
+export async function spawnManagedProcess({
+  artifacts,
+  command,
+  args,
+  env = {},
+  name,
+  platform = process.platform,
+  windowsTreeStrategy = createWindowsTreeStrategy(),
+}) {
   await artifacts.initialize(name);
   const child = spawn(command, args, {
-    detached: process.platform !== "win32",
+    detached: platform !== "win32",
     env: { ...process.env, ...env },
     stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
-  return new ManagedProcess({ artifacts, child, name });
+  return new ManagedProcess({ artifacts, child, name, platform, windowsTreeStrategy });
 }
 
 export class ManagedProcess {
@@ -79,11 +117,18 @@ export class ManagedProcess {
   #stopActions = [];
   #streamErrors = [];
   #streams;
+  #treeOwnership;
 
-  constructor({ artifacts, child, name }) {
+  constructor({ artifacts, child, name, platform = process.platform, windowsTreeStrategy }) {
     this.#artifacts = artifacts;
     this.#child = child;
     this.#name = name;
+    this.#treeOwnership = {
+      closed: false,
+      platform,
+      processId: child.pid,
+      windowsTreeStrategy: windowsTreeStrategy ?? createWindowsTreeStrategy(),
+    };
     this.#streams = {
       stdout: createWriteStream(artifacts.stdout(name), { flags: "a" }),
       stderr: createWriteStream(artifacts.stderr(name), { flags: "a" }),
@@ -162,7 +207,7 @@ export class ManagedProcess {
       await this.#waitForFinalization(timeoutMs);
       return;
     }
-    if (this.#exit.settled && !this.#processTreeAlive()) {
+    if (this.#treeOwnership.closed) {
       await this.#waitForFinalization(timeoutMs);
       return;
     }
@@ -171,11 +216,11 @@ export class ManagedProcess {
     this.#child.stdin.end();
     if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
       this.#stopActions.push("signal:SIGTERM");
-      this.#signalProcessTree("SIGTERM");
+      await this.#signalProcessTree("SIGTERM");
     }
     if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
       this.#stopActions.push("signal:SIGKILL");
-      this.#signalProcessTree("SIGKILL");
+      await this.#signalProcessTree("SIGKILL");
       if (!(await this.#waitForProcessTreeExit(timeoutMs))) {
         throw new Error(`PROCESS_STOP_TIMEOUT:${this.#name}:${this.pid}`);
       }
@@ -199,6 +244,9 @@ export class ManagedProcess {
       throw new Error(`PROCESS_STILL_RUNNING:${this.#name}:${this.pid}`);
     }
     const exit = await this.#exit.promise;
+    if (!(await this.#processTreeTerminated())) {
+      throw new Error(`PROCESS_TREE_STILL_RUNNING:${this.#name}:${this.pid}`);
+    }
     if (this.#cleanupError !== undefined) throw this.#cleanupError;
     await this.#waitForFinalization(timeoutMs);
     if (exit.code !== 0 && exit.signal === null) {
@@ -319,35 +367,72 @@ export class ManagedProcess {
     for (const stream of Object.values(this.#streams)) stream.destroy();
   }
 
-  #processTreeAlive() {
-    if (this.pid === undefined) return !this.#exit.settled;
+  async #processTreeTerminated() {
+    const ownership = this.#treeOwnership;
+    if (ownership.closed) return true;
+    if (ownership.processId === undefined) return this.#exit.settled;
+    if (
+      ownership.platform === "win32" &&
+      this.#exit.settled &&
+      ownership.windowsTreeStrategy.canTerminateAfterLeaderExit !== true
+    ) {
+      return false;
+    }
+    if (ownership.platform === "win32") {
+      const terminated = await ownership.windowsTreeStrategy.probe(ownership.processId);
+      if (terminated) ownership.closed = true;
+      return terminated;
+    }
+    // POSIX exposes process groups only by numeric PGID, with no durable kernel
+    // handle. Keep that identity owned only until ESRCH proves the group gone,
+    // then close it permanently. Stop keeps each probe/signal pair adjacent to
+    // minimize the unavoidable reuse window and never signals after closure.
     try {
-      process.kill(process.platform === "win32" ? this.pid : -this.pid, 0);
-      return true;
+      process.kill(-ownership.processId, 0);
+      return false;
     } catch (error) {
-      if (error?.code === "ESRCH") return false;
-      if (error?.code === "EPERM") return !this.#exit.settled;
+      if (error?.code === "ESRCH") {
+        ownership.closed = true;
+        return true;
+      }
+      if (error?.code === "EPERM") return false;
       throw error;
     }
   }
 
-  #signalProcessTree(signal) {
-    if (this.pid === undefined) return;
+  async #signalProcessTree(signal) {
+    const ownership = this.#treeOwnership;
+    if (ownership.closed || ownership.processId === undefined) return false;
+    if (
+      ownership.platform === "win32" &&
+      this.#exit.settled &&
+      ownership.windowsTreeStrategy.canTerminateAfterLeaderExit !== true
+    ) {
+      return false;
+    }
+    if (ownership.platform === "win32") {
+      return ownership.windowsTreeStrategy.terminate(ownership.processId, signal);
+    }
     try {
-      if (process.platform === "win32") this.#child.kill(signal);
-      else process.kill(-this.pid, signal);
+      process.kill(-ownership.processId, signal);
+      return true;
     } catch (error) {
-      if (error?.code !== "ESRCH") throw error;
+      if (error?.code === "ESRCH") {
+        ownership.closed = true;
+        return true;
+      }
+      if (error?.code === "EPERM") return false;
+      throw error;
     }
   }
 
   async #waitForProcessTreeExit(timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (!this.#processTreeAlive()) return true;
+      if (await this.#processTreeTerminated()) return true;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    return !this.#processTreeAlive();
+    return this.#processTreeTerminated();
   }
 
   async #waitForFinalization(timeoutMs) {

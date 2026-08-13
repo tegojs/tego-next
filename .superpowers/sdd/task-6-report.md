@@ -97,3 +97,57 @@ multi-Main E2E 1/1 passed.
 - Migration metadata and global schema are untouched.
 
 No Critical, Important, or Minor findings remain.
+
+## Follow-up ownership and deadline hardening
+
+A follow-up review identified three boundaries not covered by the first implementation: Windows
+whole-tree termination, a direct parent exiting while its process group remains live, and
+JavaScript-side PostgreSQL promises that ignore server timeouts.
+
+### Follow-up RED
+
+New process tests initially failed because `assertClean()` returned successfully with a live
+grandchild and the injected Windows strategy was never called:
+
+```text
+Missing expected rejection: /PROCESS_TREE_STILL_RUNNING/
+Expected Windows terminate/probe events; actual: []
+```
+
+The injected PostgreSQL tests initially showed neither aggregation nor late-client destruction:
+
+```text
+assert.ok(error instanceof AggregateError) was false
+Expected release calls [true]; actual []
+```
+
+### Follow-up GREEN
+
+- Every `ManagedProcess` now retains one tree-ownership object. POSIX owns the detached PGID until
+  `ESRCH` proves it gone; Windows uses the same `taskkill /PID ... /T` strategy shape as
+  `scripts/run-ci-test.mjs` and refuses to treat an unproven tree as clean.
+- `assertClean()` probes retained ownership after the leader exits. A real parent-exits test proves
+  it rejects while a grandchild remains, then `stop()` removes the group.
+- Platform-injected tests prove Windows descendants are targeted and tree cleanup fails closed when
+  termination cannot be proven. Real Windows execution remains covered by the later Windows CI
+  task.
+- POSIX has no durable kernel process-group handle. The implementation minimizes the unavoidable
+  numeric PGID reuse window by keeping probe/signal operations adjacent, closing ownership only
+  after termination proof, and never signaling a cached negative PID after closure.
+- PostgreSQL cleanup has one end-to-end deadline covering connect, BEGIN, SET, every DELETE,
+  COMMIT, ROLLBACK, release, and `pool.end()`. Pool query/connection timeouts reinforce the outer
+  deadline. A timed-out client is destroyed, including one acquired after the caller deadline.
+- Cleanup preserves errors in exact order: primary operation, rollback, release, pool end. No
+  rollback rejection is discarded and no `finally` failure overwrites the primary error.
+
+Follow-up verification on isolated Homebrew PostgreSQL 16 root
+`/tmp/tego-task6-followup-pg16.vReFtP`, port 55462:
+
+```text
+process harness: 19/19 passed
+single-Main helpers: 5/5 passed
+runtime fault suite: 18/18 passed
+real multi-Main E2E: 1/1 passed
+Biome: clean
+git diff --check: clean
+```

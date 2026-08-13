@@ -447,6 +447,101 @@ test("namespace cleanup rejects unsafe targets before opening PostgreSQL", async
   }
 });
 
+test("namespace cleanup bounds a never-settling query and pool end", async () => {
+  const releaseCalls = [];
+  const client = {
+    query() {
+      return new Promise(() => {});
+    },
+    release(destroy) {
+      releaseCalls.push(destroy);
+    },
+  };
+  const startedAt = Date.now();
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_timeout_query",
+      timeoutMs: 30,
+      createPool: () => ({
+        connect: async () => client,
+        end: () => new Promise(() => {}),
+      }),
+    }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.errors[0].message, /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:BEGIN/u);
+      assert.match(error.errors.at(-1).message, /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:pool.end/u);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 500);
+  assert.deepEqual(releaseCalls, [true]);
+});
+
+test("namespace cleanup destroys a client acquired after its deadline", async () => {
+  const releaseCalls = [];
+  const lateClient = {
+    release(destroy) {
+      releaseCalls.push(destroy);
+    },
+  };
+  let resolveConnect;
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_timeout_connect",
+      timeoutMs: 20,
+      createPool: () => ({
+        connect: () =>
+          new Promise((resolve) => {
+            resolveConnect = resolve;
+          }),
+        async end() {},
+      }),
+    }),
+    /POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:connect/u,
+  );
+  resolveConnect(lateClient);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(releaseCalls, [true]);
+});
+
+test("namespace cleanup aggregates primary rollback release and pool errors in order", async () => {
+  const primaryError = new Error("delete failed");
+  const rollbackError = new Error("rollback failed");
+  const releaseError = new Error("release failed");
+  const endError = new Error("pool end failed");
+  let queryIndex = 0;
+  await assert.rejects(
+    cleanupPostgresNamespace({
+      connectionString: "unused",
+      namespace: "test_errors_order",
+      timeoutMs: 1_000,
+      createPool: () => ({
+        connect: async () => ({
+          async query() {
+            queryIndex += 1;
+            if (queryIndex === 4) throw primaryError;
+            if (queryIndex === 5) throw rollbackError;
+          },
+          release() {
+            throw releaseError;
+          },
+        }),
+        async end() {
+          throw endError;
+        },
+      }),
+    }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.deepEqual(error.errors, [primaryError, rollbackError, releaseError, endError]);
+      return true;
+    },
+  );
+});
+
 test("namespace cleanup deletes one exact namespace and preserves another byte-for-byte", {
   skip: process.env.TEGO_POSTGRES_URL === undefined ? "TEGO_POSTGRES_URL is required" : false,
 }, async () => {

@@ -25,27 +25,126 @@ export function assertDisposablePostgresNamespace(namespace) {
   }
 }
 
-export async function cleanupPostgresNamespace({ connectionString, namespace }) {
+function timeoutError(stage, timeoutMs) {
+  return new Error(`POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:${stage}:${timeoutMs}ms`);
+}
+
+async function settleBeforeDeadline(operation, stage, deadline, timeoutMs) {
+  const remaining = Math.max(0, deadline - Date.now());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(timeoutError(stage, timeoutMs)), remaining);
+    Promise.resolve()
+      .then(operation)
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+  });
+}
+
+async function acquireBeforeDeadline(pool, deadline, timeoutMs) {
+  const acquisition = Promise.resolve().then(() => pool.connect());
+  try {
+    return await settleBeforeDeadline(() => acquisition, "connect", deadline, timeoutMs);
+  } catch (error) {
+    void acquisition.then(
+      (lateClient) => {
+        try {
+          lateClient.release(true);
+        } catch {
+          // The deadline error remains primary; pool.end is independently observed below.
+        }
+      },
+      () => undefined,
+    );
+    throw error;
+  }
+}
+
+function throwCollectedErrors(errors) {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "PostgreSQL namespace cleanup failed");
+  }
+}
+
+export async function cleanupPostgresNamespace({
+  connectionString,
+  namespace,
+  timeoutMs = 5_000,
+  createPool = (options) => new Pool(options),
+}) {
   assertDisposablePostgresNamespace(namespace);
-  const pool = new Pool({ connectionString, connectionTimeoutMillis: 5_000, max: 1 });
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`INVALID_POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:${String(timeoutMs)}`);
+  }
+  const deadline = Date.now() + timeoutMs;
+  const pool = createPool({
+    connectionString,
+    connectionTimeoutMillis: timeoutMs,
+    max: 1,
+    query_timeout: timeoutMs,
+  });
   let client;
   let transactionStarted = false;
+  let destroyClient = false;
+  const errors = [];
   try {
-    client = await pool.connect();
-    await client.query("BEGIN");
+    client = await acquireBeforeDeadline(pool, deadline, timeoutMs);
+    await settleBeforeDeadline(() => client.query("BEGIN"), "BEGIN", deadline, timeoutMs);
     transactionStarted = true;
-    await client.query("SET LOCAL statement_timeout = '5000ms'");
-    await client.query("SET LOCAL lock_timeout = '5000ms'");
+    await settleBeforeDeadline(
+      () => client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`),
+      "statement_timeout",
+      deadline,
+      timeoutMs,
+    );
+    await settleBeforeDeadline(
+      () => client.query(`SET LOCAL lock_timeout = '${timeoutMs}ms'`),
+      "lock_timeout",
+      deadline,
+      timeoutMs,
+    );
     for (const table of cleanupTables) {
-      await client.query(`DELETE FROM ${table} WHERE driver_namespace = $1`, [namespace]);
+      await settleBeforeDeadline(
+        () => client.query(`DELETE FROM ${table} WHERE driver_namespace = $1`, [namespace]),
+        `DELETE:${table}`,
+        deadline,
+        timeoutMs,
+      );
     }
-    await client.query("COMMIT");
+    await settleBeforeDeadline(() => client.query("COMMIT"), "COMMIT", deadline, timeoutMs);
     transactionStarted = false;
   } catch (error) {
-    if (transactionStarted) await client?.query("ROLLBACK").catch(() => undefined);
-    throw error;
+    errors.push(error);
+    destroyClient = error?.message?.startsWith("POSTGRES_NAMESPACE_CLEANUP_TIMEOUT:") === true;
+    if (transactionStarted) {
+      try {
+        await settleBeforeDeadline(() => client.query("ROLLBACK"), "ROLLBACK", deadline, timeoutMs);
+      } catch (rollbackError) {
+        errors.push(rollbackError);
+        destroyClient = true;
+      }
+    }
   } finally {
-    client?.release();
-    await pool.end();
+    if (client !== undefined) {
+      try {
+        client.release(destroyClient);
+      } catch (releaseError) {
+        errors.push(releaseError);
+      }
+    }
+    try {
+      await settleBeforeDeadline(() => pool.end(), "pool.end", deadline, timeoutMs);
+    } catch (endError) {
+      errors.push(endError);
+    }
   }
+  throwCollectedErrors(errors);
 }
