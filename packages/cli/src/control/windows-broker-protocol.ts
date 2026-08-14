@@ -141,7 +141,7 @@ interface WindowsBrokerConnectionStateOptions {
 }
 
 export type WindowsBrokerFrameDirection = "broker-to-parent" | "parent-to-broker";
-export type WindowsBrokerCloseDisposition = "close-converged" | "close-first";
+export type WindowsBrokerCloseDisposition = "close-converged" | "close-first" | "eof-after-close";
 
 const directions = ["broker-to-parent", "parent-to-broker"] as const;
 
@@ -312,11 +312,12 @@ export class WindowsBrokerConnectionState {
       }
       case "eof": {
         requireEmptyPayload(frame);
-        const connection = this.#activeConnection(frame.connectionId);
+        const connection = this.#connection(frame.connectionId);
         const channel = connection.directions[direction];
-        if (channel.eof) throw protocolError();
+        if (channel.eof || connection.closeSeen[direction]) throw protocolError();
+        const afterOppositeClose = connection.closeSeen[oppositeDirection(direction)];
         channel.eof = true;
-        return;
+        return afterOppositeClose ? "eof-after-close" : undefined;
       }
       case "close": {
         requireEmptyPayload(frame);

@@ -541,6 +541,7 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
         return;
       }
       case "eof": {
+        if (disposition === "eof-after-close") return;
         const connection = this.#connections.get(frame.connectionId);
         if (connection === undefined) throw endpointUnsafe();
         connection.receiveEof();

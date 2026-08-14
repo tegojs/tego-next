@@ -181,6 +181,21 @@ test("EOF is directional and opposite CLOSE frames converge exactly once", () =>
   assert.throws(() => accept(state, parentToBroker, "close", 1n), PROTOCOL_ERROR);
 });
 
+test("parent-first CLOSE accepts an already-issued broker EOF before reciprocal CLOSE", () => {
+  const state = new WindowsBrokerConnectionState();
+  readyAndOpen(state);
+  assert.equal(accept(state, parentToBroker, "close", 1n), "close-first");
+  assert.equal(accept(state, brokerToParent, "eof", 1n), "eof-after-close");
+  assert.throws(() => accept(state, brokerToParent, "eof", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "eof", 2n), PROTOCOL_ERROR);
+  assert.throws(
+    () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([1])),
+    PROTOCOL_ERROR,
+  );
+  assert.equal(accept(state, brokerToParent, "close", 1n), "close-converged");
+  assert.equal(state.activeConnectionCount, 0);
+});
+
 test("converged CLOSE handshakes release all protocol state across 10k connections", () => {
   const state = new WindowsBrokerConnectionState();
   accept(state, brokerToParent, "ready", 0n);

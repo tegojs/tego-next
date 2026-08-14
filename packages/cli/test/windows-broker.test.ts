@@ -425,6 +425,39 @@ test("parent-first CLOSE accepts a late broker acknowledgement after the Duplex 
   await closeGracefully(broker, child, parentFrames);
 });
 
+test("parent-first CLOSE accepts an in-flight broker EOF before its reciprocal CLOSE", async () => {
+  const { broker, child, startup } = createStartedBroker();
+  const parentFrames = collectParentFrames(child);
+  const connections: Parameters<Parameters<typeof broker.onConnection>[0]>[0][] = [];
+  const failures: Error[] = [];
+  broker.onConnection((connection) => connections.push(connection));
+  broker.onError((error) => failures.push(error));
+  await startup;
+
+  child.stdout.write(brokerFrame("open", 31n));
+  const first = connections[0];
+  assert.ok(first !== undefined);
+  const firstClosed = once(first, "close");
+  first.end();
+  await firstClosed;
+  await eventually(() =>
+    parentFrames.some(({ connectionId, type }) => connectionId === 31n && type === "close"),
+  );
+
+  child.stdout.write(
+    Buffer.concat([brokerFrame("eof", 31n), brokerFrame("close", 31n), brokerFrame("open", 32n)]),
+  );
+  await eventually(() => connections.length === 2 || failures.length > 0);
+  assert.deepEqual(failures, []);
+  assert.equal(connections.length, 2);
+
+  child.stdout.write(brokerFrame("close", 32n));
+  await eventually(() =>
+    parentFrames.some(({ connectionId, type }) => connectionId === 32n && type === "close"),
+  );
+  await closeGracefully(broker, child, parentFrames);
+});
+
 test("64 parent-first closes retain admission until reciprocal broker acknowledgements", async () => {
   async function fillParentFirst(
     child: FakeBrokerChild,
