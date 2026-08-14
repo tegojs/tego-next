@@ -230,6 +230,10 @@ function assertCSharpContract(source) {
   const openParent = balancedBlock(source, "private static SafeWaitHandle OpenParentProcess(");
   const overlapped = balancedBlock(source, "sealed class OverlappedOperation");
   const overlappedDispose = balancedBlock(overlapped, "public void Dispose(");
+  const requestCancellation = balancedBlock(overlapped, "internal void RequestCancellation(");
+  const markIssued = balancedBlock(overlapped, "private bool MarkIssued(");
+  const issueWrite = balancedBlock(overlapped, "internal bool IssueWrite(");
+  const completeOperation = balancedBlock(overlapped, "internal bool Complete(");
   const writer = balancedBlock(source, "sealed class ParentFrameWriter");
   const selfTest = balancedBlock(source, "public static int SelfTest(");
   const x64Guard = balancedBlock(source, "private static bool IsX64Process(");
@@ -240,6 +244,7 @@ function assertCSharpContract(source) {
   const retryCanceledRead = balancedBlock(source, "private static bool ShouldRetryCanceledRead(");
   const connectionDispose = balancedBlock(pipeConnection, "public void Dispose(");
   const acceptCleanup = balancedBlock(source, "private void StopAcceptLoop(");
+  const failFastResource = balancedBlock(source, "private static void FailFastResource(");
 
   assert.match(
     entry,
@@ -270,12 +275,30 @@ function assertCSharpContract(source) {
   assert.match(overlapped, /GetOverlappedResult/u);
   assert.match(overlapped, /FailFastResource/u);
   assert.match(source, /TerminateProcess\(GetCurrentProcess\(\), 1\)/u);
+  assert.match(failFastResource, /try[\s\S]+EmitStage[\s\S]+catch/u);
+  assert.match(failFastResource, /try[\s\S]+TerminateProcess[\s\S]+catch/u);
+  assert.ok(
+    failFastResource.indexOf("TerminateProcess") < failFastResource.indexOf("Environment.FailFast"),
+  );
   assert.match(overlapped, /DangerousAddRef/u);
   assert.match(overlapped, /DangerousRelease/u);
   assert.equal(overlapped.match(/DangerousRelease/gu)?.length, 2);
   assert.match(overlapped, /SettleKernelOperation/u);
   assert.match(overlapped, /GetOverlappedResult/u);
   assert.match(overlapped, /ErrorOperationAborted/u);
+  assert.match(overlapped, /bool _cancellationRequested/u);
+  assert.match(requestCancellation, /_cancellationRequested = true;/u);
+  assert.ok(
+    requestCancellation.indexOf("_cancellationRequested = true;") <
+      requestCancellation.indexOf("if (!_issued)"),
+  );
+  assert.ok(
+    markIssued.indexOf("_issued = true;") < markIssued.indexOf("if (_cancellationRequested)"),
+  );
+  assert.match(issueWrite, /lock \(_stateGate\)/u);
+  assert.ok(issueWrite.indexOf("MarkIssued") < issueWrite.indexOf("WriteFile"));
+  assert.match(completeOperation, /catch[\s\S]+FailFastResource/u);
+  assert.match(overlappedDispose, /catch[\s\S]+FailFastResource/u);
   assert.ok(
     overlappedDispose.indexOf("RequestCancellation") <
       overlappedDispose.indexOf("SettleKernelOperation"),
@@ -332,6 +355,8 @@ function assertCSharpContract(source) {
     /ErrorOperationAborted[\s\S]{0,200}Interlocked\.CompareExchange\(ref _paused/u,
   );
   assert.match(pipeConnection, /MarkCompletedWithoutIo\(\)/u);
+  assert.match(pipeConnection, /operation\.IssueWrite/u);
+  assert.doesNotMatch(pipeConnection, /bool synchronous = WriteFile\(/u);
   assert.doesNotMatch(pipeConnection, /_readThread\.Join\(ShutdownTimeoutMilliseconds\)/u);
   assert.ok(
     connectionDispose.indexOf("RequestIoCancellation") <
@@ -363,6 +388,15 @@ function assertCSharpContract(source) {
   assert.match(selfTest, /TestPrivatePipeCancellation\(\)/u);
   assert.match(selfTest, /TestPauseImmediateResume\(\)/u);
   assert.match(selfTest, /TestRepeatedPipeCleanup\(\)/u);
+  assert.match(selfTest, /TestWritePreIssueCancellation\(\)/u);
+  const writeInterlockSelfTest = balancedBlock(
+    source,
+    "private static void TestWritePreIssueCancellation(",
+  );
+  assert.match(writeInterlockSelfTest, /writePublished/u);
+  assert.match(writeInterlockSelfTest, /writeCancellationObserved/u);
+  assert.match(writeInterlockSelfTest, /connection\.Write/u);
+  assert.match(writeInterlockSelfTest, /connection\.Dispose/u);
   assert.match(source, /WaitUntilWatchdogEntered/u);
   assert.doesNotMatch(selfTest, /CreateNamedPipeW|CreateVerifiedPipe|\\\\\.\\pipe/u);
   assert.doesNotMatch(
@@ -392,6 +426,20 @@ function cancelledReadModel(cancellationReason, resumed, closing) {
   }
   return resumed ? "issue-next-read" : "wait-for-resume";
 }
+
+function preIssueWriteCancellationModel() {
+  const operation = { issued: false, cancellationRequested: false };
+  operation.cancellationRequested = true;
+  operation.issued = true;
+  if (operation.cancellationRequested) {
+    return "settled-without-native-issue";
+  }
+  return "native-write-issued";
+}
+
+test("write cancellation published before issue cannot be lost", () => {
+  assert.equal(preIssueWriteCancellationModel(), "settled-without-native-issue");
+});
 
 test("pending-read cancellation reason survives an immediate resume", () => {
   assert.equal(cancelledReadModel("pause", true, false), "issue-next-read");
@@ -451,9 +499,13 @@ test("source contracts reject security and lifecycle mutations", async () => {
     mutateOnce(csharp, "_closeAllAcknowledged = true;", ""),
     mutateOnce(csharp, "_closeAllAckQueued = true;", ""),
     mutateOnce(csharp, "TerminateProcess(GetCurrentProcess(), 1);", ""),
+    mutateOnce(csharp, "Environment.FailFast(StageCode(FailureStage.Resource));", ""),
     mutateOnce(csharp, "_pipeHandle.DangerousAddRef(ref addRef);", "addRef = true;"),
     mutateOnce(csharp, "_pipeHandle.DangerousRelease();", ""),
     mutateOnce(csharp, "SettleKernelOperation(out ignored);", ""),
+    mutateOnce(csharp, "_cancellationRequested = true;", ""),
+    mutateOnce(csharp, "if (_cancellationRequested)", "if (false)"),
+    mutateOnce(csharp, "TestWritePreIssueCancellation();", ""),
     mutateOnce(
       csharp,
       "pendingRead.CancellationReason == ReadCancellationReason.Pause",

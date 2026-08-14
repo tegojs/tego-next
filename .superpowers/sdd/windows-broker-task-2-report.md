@@ -182,3 +182,47 @@ spelling.
 The evidence boundary is unchanged: this macOS host has no `powershell`, `pwsh`, `dotnet`, `csc`, or
 `mcs`. The new private-pipe SelfTest and Windows PowerShell 5.1 `Add-Type` path were therefore not
 executed here and must be run on the authoritative Windows worker.
+
+## Pre-issue write-cancellation remediation
+
+A final independent review found a narrower write-owner race after `ade0a17`: `Write` published
+`_activeWrite` and released `_writeGate` before `MarkIssued`. A concurrent connection Dispose could
+find that active operation, call `RequestCancellation`, and receive the old pre-issue early return.
+The write could then become pending with no cancellation until its five-second I/O timeout, while
+the owner reached its two-second settlement deadline and fail-fasted.
+
+The final TDD cycle began on the unchanged implementation. The source/model run reported 5 passed
+and 2 failed: the required gated issue method did not exist, and the mutation could not find a
+persisted cancellation request. A separate fail-fast reliability assertion was then observed RED at
+6 passed and 1 failed because a managed stderr/P/Invoke exception could prevent the final fail-fast.
+
+The final implementation:
+
+- atomically persists `_cancellationRequested` even before issue and dispatches `CancelIoEx` at most
+  once after a kernel operation exists;
+- routes accept/read/write through `IssueConnect`, `IssueRead`, and `IssueWrite`, each holding the
+  operation state gate across issued-state publication and the non-blocking overlapped Win32 call;
+- makes `MarkIssued` observe a previously persisted cancellation and settle with
+  `ERROR_OPERATION_ABORTED` without issuing a new kernel operation;
+- adds a deterministic private-pipe SelfTest interlock which stops immediately after `_activeWrite`
+  publication, starts connection disposal, waits until cancellation is observed, and only then
+  permits the write to issue. The write and disposer must both finish inside the owner bound without
+  fail-fast;
+- treats unexpected managed exceptions while issuing, cancelling, or settling as unsafe kernel
+  state and calls the fixed resource fail-fast before any pinned/native/event/SafeHandle cleanup;
+- makes the fail-fast path itself tolerate stderr and `TerminateProcess` exceptions before the final
+  `Environment.FailFast` call. Expected Win32 completion, broken-pipe, no-data, and aborted results
+  remain bounded normal returns.
+
+Final fresh verification for this cycle:
+
+```text
+focused source/model: 7/7 passed
+focused architecture + real tarball clean-consumer package contract: 27/27 passed
+npm run build --workspace @tego/cli: passed
+npm run typecheck --workspace @tego/cli: passed
+Biome on the changed JavaScript test: passed
+```
+
+The macOS evidence boundary remains unchanged: the deterministic interlock is compiled into the
+fixed Windows-only SelfTest but could not be executed here with Win32 or PowerShell 5.1.
