@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { realpath } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   type ControlRuntimeOperations,
   type ControlServer,
@@ -73,12 +73,6 @@ interface ParentFixtureReady {
   readonly type: "ready";
 }
 
-interface DiagnosticBrokerFrameDecoder {
-  push(chunk: Uint8Array): readonly { readonly type: string }[];
-}
-
-type DiagnosticBrokerFrameDecoderConstructor = new () => DiagnosticBrokerFrameDecoder;
-
 let liveServer: TrackedServer | undefined;
 // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
 const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
@@ -90,8 +84,17 @@ let nonAuthoritativeReconnectBrokerSettlement = "not-entered";
 let nonAuthoritativeReconnectPipeProof = "not-entered";
 let nonAuthoritativeReconnectCleanup = "not-entered";
 let nonAuthoritativeBrokerFailureStage = "none";
-let diagnosticBrokerFrameDecoder: DiagnosticBrokerFrameDecoderConstructor | undefined;
-const brokersWithCloseAllAcknowledgement = new WeakSet<ChildProcess>();
+let nonAuthoritativeNativeCloseStage = "not-entered";
+let nonAuthoritativeNativeCloseStagePath: string | undefined;
+const task4NativeStageEnvironment = [
+  "TEGO",
+  "TASK4",
+  "NON",
+  "AUTHORITATIVE",
+  "CLOSE",
+  "STAGE",
+  "PATH",
+].join("_");
 
 function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
   return (
@@ -136,6 +139,28 @@ function recordReconnectCloseError(error: unknown): void {
     return;
   }
   nonAuthoritativeReconnectCloseResult = "other";
+}
+
+async function recordNativeCloseStage(): Promise<void> {
+  if (nonAuthoritativeNativeCloseStagePath === undefined) {
+    nonAuthoritativeNativeCloseStage = "path-missing";
+    return;
+  }
+  try {
+    const value = await readFile(nonAuthoritativeNativeCloseStagePath, "ascii");
+    nonAuthoritativeNativeCloseStage = [
+      "entered",
+      "terminal-frames-written",
+      "pipes-closed",
+      "ack-written",
+    ].includes(value)
+      ? value
+      : "invalid";
+  } catch {
+    nonAuthoritativeNativeCloseStage = "file-missing";
+  }
+  nonAuthoritativeReconnectAcknowledgement =
+    nonAuthoritativeNativeCloseStage === "ack-written" ? "observed" : "missing";
 }
 
 function gateOperations(): ControlRuntimeOperations {
@@ -258,22 +283,17 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
             windowsHide: true,
           });
           const spawned = spawn(command, [...args], {
+            env:
+              label === "live-descriptor" && nonAuthoritativeNativeCloseStagePath !== undefined
+                ? {
+                    ...process.env,
+                    [task4NativeStageEnvironment]: nonAuthoritativeNativeCloseStagePath,
+                  }
+                : process.env,
             shell: false,
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
           });
-          if (diagnosticBrokerFrameDecoder !== undefined) {
-            const decoder = new diagnosticBrokerFrameDecoder();
-            spawned.stdout?.on("data", (chunk: Buffer) => {
-              try {
-                for (const frame of decoder.push(chunk)) {
-                  if (frame.type === "close-all-ack") {
-                    brokersWithCloseAllAcknowledgement.add(spawned);
-                  }
-                }
-              } catch {}
-            });
-          }
           brokerClosed = new Promise<void>((resolveClose) => {
             spawned.once("close", resolveClose);
           });
@@ -304,11 +324,7 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
               recordReconnectCloseError(error);
               throw error;
             } finally {
-              nonAuthoritativeReconnectAcknowledgement = brokersWithCloseAllAcknowledgement.has(
-                trackedBroker,
-              )
-                ? "observed"
-                : "missing";
+              await recordNativeCloseStage();
               recordReconnectBrokerSettlement(trackedBroker);
             }
           },
@@ -381,12 +397,10 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
-  const diagnosticProtocol = (await import(
-    pathToFileURL(join(installedCliRoot, "dist", "src", "control", "windows-broker-protocol.js"))
-      .href
-  )) as { readonly WindowsBrokerFrameDecoder?: DiagnosticBrokerFrameDecoderConstructor };
-  assert.equal(typeof diagnosticProtocol.WindowsBrokerFrameDecoder, "function");
-  diagnosticBrokerFrameDecoder = diagnosticProtocol.WindowsBrokerFrameDecoder;
+  nonAuthoritativeNativeCloseStagePath = join(
+    consumerRoot,
+    `.tego-task4-close-stage-${randomUUID()}.txt`,
+  );
   const selfTestArguments = [
     "-NoLogo",
     "-NoProfile",
@@ -622,6 +636,9 @@ if (process.argv[2] === "--parent-crash-fixture") {
     );
     process.stderr.write(
       `${task4DiagnosticMarker}_BROKER_FAILURE_STAGE:${nonAuthoritativeBrokerFailureStage}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_NATIVE_CLOSE_STAGE:${nonAuthoritativeNativeCloseStage}\n`,
     );
     const owned = liveServer;
     liveServer = undefined;

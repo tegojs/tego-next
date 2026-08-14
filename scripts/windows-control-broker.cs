@@ -1727,6 +1727,7 @@ public static class TegoWindowsControlBroker
 
         private void CloseAllFromParent()
         {
+            WriteTask4CloseStage("entered");
             ParentFrameWriter.PreparedFrame[] terminalFrames;
             lock (_outputGate)
             {
@@ -1746,7 +1747,9 @@ public static class TegoWindowsControlBroker
             }
             for (int index = 0; index < terminalFrames.Length; index += 1)
                 _writer.WritePrepared(terminalFrames[index]);
+            WriteTask4CloseStage("terminal-frames-written");
             CloseEveryPipe();
+            WriteTask4CloseStage("pipes-closed");
             ParentFrameWriter.PreparedFrame acknowledgement;
             lock (_outputGate)
             {
@@ -1764,6 +1767,7 @@ public static class TegoWindowsControlBroker
             try
             {
                 _writer.WritePrepared(acknowledgement);
+                WriteTask4CloseStage("ack-written");
                 lock (_gate)
                 {
                     _closeAllAcknowledged = true;
@@ -1778,6 +1782,22 @@ public static class TegoWindowsControlBroker
                 }
                 EmitStage(FailureStage.Io);
                 _shutdown.Set();
+            }
+        }
+
+        // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after localization.
+        private static void WriteTask4CloseStage(string stage)
+        {
+            string path = Environment.GetEnvironmentVariable(
+                "TEGO_TASK4_NON_AUTHORITATIVE_CLOSE_STAGE_PATH");
+            if (String.IsNullOrEmpty(path))
+                return;
+            try
+            {
+                File.WriteAllText(path, stage, Encoding.ASCII);
+            }
+            catch
+            {
             }
         }
 
