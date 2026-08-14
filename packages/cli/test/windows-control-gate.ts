@@ -15,6 +15,7 @@ import {
   type WindowsBrokerSecurityDescriptor,
 } from "@tego/cli";
 import { diagnosticCode, parseRuntimeStatus, type RuntimeOperations } from "@tego/contracts";
+import { WindowsBrokerFrameDecoder } from "../src/control/windows-broker-protocol.js";
 
 const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
@@ -81,7 +82,9 @@ let nonAuthoritativeReconnectStage = "not-entered";
 let nonAuthoritativeReconnectCleanupStage = "not-entered";
 let nonAuthoritativeReconnectCloseResult = "not-entered";
 let nonAuthoritativeReconnectBrokerExit = "not-entered";
+let nonAuthoritativeReconnectAcknowledgement = "not-entered";
 let nonAuthoritativeBrokerFailureStage = "none";
+const brokersWithCloseAllAcknowledgement = new WeakSet<ChildProcess>();
 let nonAuthoritativeRound = -1;
 let nonAuthoritativeRoundStage = "not-entered";
 
@@ -218,6 +221,16 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
             shell: false,
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
+          });
+          const diagnosticDecoder = new WindowsBrokerFrameDecoder();
+          spawned.stdout?.on("data", (chunk: Buffer) => {
+            try {
+              for (const frame of diagnosticDecoder.push(chunk)) {
+                if (frame.type === "close-all-ack") {
+                  brokersWithCloseAllAcknowledgement.add(spawned);
+                }
+              }
+            } catch {}
           });
           brokerClosed = new Promise<void>((resolveClose) => {
             spawned.once("close", resolveClose);
@@ -486,6 +499,11 @@ async function runReconnectFailure(): Promise<void> {
       } else {
         nonAuthoritativeReconnectBrokerExit = "alive";
       }
+      nonAuthoritativeReconnectAcknowledgement = brokersWithCloseAllAcknowledgement.has(
+        tracked.broker,
+      )
+        ? "observed"
+        : "missing";
       throw error;
     }
     nonAuthoritativeReconnectStage = "child-close";
@@ -559,6 +577,9 @@ if (process.argv[2] === "--parent-crash-fixture") {
     );
     process.stderr.write(
       `${task4DiagnosticMarker}_RECONNECT_CLOSE:${nonAuthoritativeReconnectCloseResult}:${nonAuthoritativeReconnectBrokerExit}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_ACK:${nonAuthoritativeReconnectAcknowledgement}\n`,
     );
     process.stderr.write(
       `${task4DiagnosticMarker}_BROKER_FAILURE_STAGE:${nonAuthoritativeBrokerFailureStage}\n`,
