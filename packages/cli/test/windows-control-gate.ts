@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   type ControlRuntimeOperations,
   type ControlServer,
@@ -15,7 +15,6 @@ import {
   type WindowsBrokerSecurityDescriptor,
 } from "@tego/cli";
 import { diagnosticCode, parseRuntimeStatus, type RuntimeOperations } from "@tego/contracts";
-import { WindowsBrokerFrameDecoder } from "../src/control/windows-broker-protocol.js";
 
 const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
@@ -190,6 +189,19 @@ function assertDescriptor(descriptor: WindowsBrokerSecurityDescriptor): void {
 }
 
 async function startTrackedServer(label: string): Promise<TrackedServer> {
+  const installedCliEntry = await realpath(fileURLToPath(import.meta.resolve("@tego/cli")));
+  const installedCliRoot = resolve(dirname(installedCliEntry), "..", "..");
+  const installedProtocol = await realpath(
+    join(installedCliRoot, "dist", "src", "control", "windows-broker-protocol.js"),
+  );
+  assert.equal(isContained(installedCliRoot, installedProtocol), true);
+  const { WindowsBrokerFrameDecoder: DiagnosticWindowsBrokerFrameDecoder } = (await import(
+    pathToFileURL(installedProtocol).href
+  )) as {
+    WindowsBrokerFrameDecoder: new () => {
+      push(chunk: Buffer): readonly { readonly type: string }[];
+    };
+  };
   const endpoint = `\\\\.\\pipe\\tego-windows-control-${label}-${process.pid}-${randomUUID()}`;
   const failed = Promise.withResolvers<Error>();
   let broker: ChildProcess | undefined;
@@ -222,7 +234,7 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
           });
-          const diagnosticDecoder = new WindowsBrokerFrameDecoder();
+          const diagnosticDecoder = new DiagnosticWindowsBrokerFrameDecoder();
           spawned.stdout?.on("data", (chunk: Buffer) => {
             try {
               for (const frame of diagnosticDecoder.push(chunk)) {
