@@ -460,7 +460,6 @@ if (process.argv[2] === "--parent-crash-fixture") {
   try {
     await runParentCrashFixture();
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
     process.exitCode = 1;
   }
 } else {
@@ -468,6 +467,7 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
+    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {
