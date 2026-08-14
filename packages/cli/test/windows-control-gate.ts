@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -149,6 +149,7 @@ async function recordNativeCloseStage(): Promise<void> {
   try {
     const value = await readFile(nonAuthoritativeNativeCloseStagePath, "ascii");
     nonAuthoritativeNativeCloseStage = [
+      "startup",
       "entered",
       "terminal-frames-written",
       "pipes-closed",
@@ -158,6 +159,10 @@ async function recordNativeCloseStage(): Promise<void> {
       : "invalid";
   } catch {
     nonAuthoritativeNativeCloseStage = "file-missing";
+  } finally {
+    try {
+      await unlink(nonAuthoritativeNativeCloseStagePath);
+    } catch {}
   }
   nonAuthoritativeReconnectAcknowledgement =
     nonAuthoritativeNativeCloseStage === "ack-written" ? "observed" : "missing";

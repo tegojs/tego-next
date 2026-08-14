@@ -1402,6 +1402,7 @@ public static class TegoWindowsControlBroker
 
         internal int Execute()
         {
+            WriteTask4CloseStage("startup");
             _watchdog.Start();
             _acceptThread = new Thread(new ThreadStart(AcceptLoop));
             _acceptThread.IsBackground = true;
