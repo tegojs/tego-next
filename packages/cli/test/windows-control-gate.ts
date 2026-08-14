@@ -74,6 +74,9 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
+const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
+let nonAuthoritativeStage = "not-entered";
 
 function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
   return (
@@ -255,9 +258,10 @@ async function assertStatus(endpoint: string, requestId: string): Promise<void> 
 }
 
 async function runWindowsControlGateStage(
-  _stage: string,
+  stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
+  nonAuthoritativeStage = stage;
   await operation();
 }
 
@@ -490,6 +494,7 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
+    process.stderr.write(`${task4DiagnosticMarker}_STAGE:${nonAuthoritativeStage}\n`);
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {
