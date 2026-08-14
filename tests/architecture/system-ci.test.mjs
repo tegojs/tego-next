@@ -86,13 +86,38 @@ const windowsControlGateImplementationFixtureBodies = new Map([
       "  }",
     ],
   ],
-  ["runReconnectFailure", ["  await tracked.server.close();", "  await assertPipeUnavailable();"]],
+  [
+    "runReconnectFailure",
+    [
+      "  const tracked = liveServer;",
+      "  try {",
+      "    await tracked.server.close();",
+      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "    await assertPipeUnavailable(tracked.endpoint);",
+      "    assert.equal(liveServer, tracked);",
+      "    liveServer = undefined;",
+      "  } finally {",
+      "    if (liveServer === tracked) {",
+      "      await cleanupTrackedServer(tracked);",
+      "      liveServer = undefined;",
+      "    }",
+      "  }",
+    ],
+  ],
   [
     "runTwentyLifecycleRounds",
     [
       "  for (let round = 0; round < 20; round += 1) {",
-      "    await assertStatus();",
-      "    await assertPipeUnavailable();",
+      "    let tracked: TrackedServer | undefined = await startTrackedServer();",
+      "    try {",
+      "      await assertStatus();",
+      "      await tracked.server.close();",
+      "      await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "      await assertPipeUnavailable(tracked.endpoint);",
+      "      tracked = undefined;",
+      "    } finally {",
+      "      if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+      "    }",
       "  }",
     ],
   ],
@@ -730,6 +755,78 @@ test("Windows broker-crash cleanup reuses the exact aggregate and releases captu
         validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
       );
     });
+  }
+});
+
+test("Windows reconnect and lifecycle close retain ownership through captured close and pipe proof", async (t) => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?normal-close-ownership=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+  assert.match(
+    gateSource,
+    /async function runReconnectFailure\(\): Promise<void> \{[\s\S]+await tracked\.server\.close\(\);[\s\S]+await withDeadline\(tracked\.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+liveServer = undefined;[\s\S]+if \(liveServer === tracked\) \{[\s\S]+await cleanupTrackedServer\(tracked\);[\s\S]+liveServer = undefined;/u,
+  );
+  assert.match(
+    gateSource,
+    /async function runTwentyLifecycleRounds\(\): Promise<void> \{[\s\S]+let tracked: TrackedServer \| undefined = await startTrackedServer[\s\S]+await tracked\.server\.close\(\);[\s\S]+await withDeadline\(tracked\.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+tracked = undefined;[\s\S]+if \(tracked !== undefined\) await cleanupTrackedServer\(tracked\);/u,
+  );
+  for (const [implementation, mutations] of [
+    [
+      "runReconnectFailure",
+      [
+        [
+          "numeric PID polling",
+          "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+          "await waitForProcessExit(tracked.brokerPid);",
+        ],
+        [
+          "early release",
+          "    await assertPipeUnavailable(tracked.endpoint);\n    assert.equal(liveServer, tracked);\n    liveServer = undefined;",
+          "    liveServer = undefined;\n    await assertPipeUnavailable(tracked.endpoint);\n    assert.equal(liveServer, tracked);",
+        ],
+        [
+          "release before fallback cleanup",
+          "    if (liveServer === tracked) {\n      await cleanupTrackedServer(tracked);\n      liveServer = undefined;",
+          "    if (liveServer === tracked) {\n      liveServer = undefined;\n      await cleanupTrackedServer(tracked);",
+        ],
+      ],
+    ],
+    [
+      "runTwentyLifecycleRounds",
+      [
+        [
+          "numeric PID polling",
+          "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+          "await waitForProcessExit(tracked.brokerPid);",
+        ],
+        [
+          "early release",
+          "      await assertPipeUnavailable(tracked.endpoint);\n      tracked = undefined;",
+          "      tracked = undefined;\n      await assertPipeUnavailable(tracked.endpoint);",
+        ],
+        [
+          "unconditional fallback",
+          "      if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+          "      await cleanupTrackedServer(tracked);",
+        ],
+      ],
+    ],
+  ]) {
+    for (const [name, from, to] of mutations) {
+      await t.test(`${implementation}: ${name}`, () => {
+        const mutation = replaceInTopLevelAsyncFunctionBody(gateSource, implementation, from, to);
+        assert.ok(
+          validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        );
+      });
+    }
   }
 });
 

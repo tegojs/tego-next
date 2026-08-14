@@ -129,9 +129,7 @@ function hasActiveStageExecutor(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
     ?.replaceAll("\r\n", "\n")
     .trim();
-  return (
-    body === "await operation();" || body === "nonAuthoritativeStage = stage;\n  await operation();"
-  );
+  return body === "await operation();";
 }
 
 function hasForbiddenGateFlow(body) {
@@ -244,6 +242,51 @@ function hasBrokerCrashOwnershipTransfer(source) {
   return true;
 }
 
+function hasReconnectOwnershipTransfer(source) {
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runReconnectFailure");
+  if (body === undefined || body.includes("waitForProcessExit(")) return false;
+  const requiredInOrder = [
+    "const tracked = liveServer;",
+    "await tracked.server.close();",
+    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await assertPipeUnavailable(tracked.endpoint);",
+    "assert.equal(liveServer, tracked);",
+    "liveServer = undefined;",
+    "} finally {",
+    "if (liveServer === tracked) {",
+    "await cleanupTrackedServer(tracked);",
+    "liveServer = undefined;",
+  ];
+  let cursor = -1;
+  for (const token of requiredInOrder) {
+    cursor = body.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return true;
+}
+
+function hasLifecycleOwnershipTransfer(source) {
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runTwentyLifecycleRounds");
+  if (body === undefined || body.includes("waitForProcessExit(")) return false;
+  const requiredInOrder = [
+    "round < 20",
+    "let tracked: TrackedServer | undefined = await startTrackedServer(",
+    "await assertStatus(",
+    "await tracked.server.close();",
+    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await assertPipeUnavailable(tracked.endpoint);",
+    "tracked = undefined;",
+    "} finally {",
+    "if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+  ];
+  let cursor = -1;
+  for (const token of requiredInOrder) {
+    cursor = body.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return true;
+}
+
 export function validateWindowsControlGateContract({ gateSource, runnerSource }) {
   const errors = [];
   if (typeof gateSource !== "string" || typeof runnerSource !== "string") {
@@ -289,6 +332,12 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasBrokerCrashOwnershipTransfer(gateSource)) {
     errors.push("broker-crash cleanup ownership must release only after exact child close");
+  }
+  if (!hasReconnectOwnershipTransfer(gateSource)) {
+    errors.push("reconnect cleanup ownership must release only after exact child close");
+  }
+  if (!hasLifecycleOwnershipTransfer(gateSource)) {
+    errors.push("lifecycle cleanup ownership must release only after exact child close");
   }
   const gateCloseMatcher = uniqueTopLevelSyncFunctionBody(
     gateSource,
