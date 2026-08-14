@@ -15,20 +15,70 @@ const gateSourcePath = fileURLToPath(
 const runnerSourcePath = fileURLToPath(import.meta.url);
 
 const requiredWindowsControlGateStages = [
-  ["packed-clean-consumer", "preparePackedWindowsControlConsumer"],
-  ["powershell-csharp-self-test", "runPowerShellSelfTest"],
-  ["live-server-handle-descriptor", "startLiveDescriptor"],
-  ["status-request", "runStatusRequest"],
-  ["malformed-broker-frame-fail-closed", "runMalformedFrameFailure"],
-  ["parent-crash-cleanup", "runParentCrashCleanup"],
-  ["broker-crash-cleanup", "runBrokerCrashCleanup"],
-  ["reconnect-failure", "runReconnectFailure"],
-  ["twenty-lifecycle-rounds", "runTwentyLifecycleRounds"],
+  [
+    "packed-clean-consumer",
+    "preparePackedWindowsControlConsumer",
+    ["await packWorkspaceSet(", "preparedConsumer ="],
+  ],
+  [
+    "powershell-csharp-self-test",
+    "runPowerShellSelfTest",
+    ["spawnSync(", '"-SelfTest"', "await initializeCurrentUserSid();"],
+  ],
+  [
+    "live-server-handle-descriptor",
+    "startLiveDescriptor",
+    ['startTrackedServer("live-descriptor")'],
+  ],
+  ["status-request", "runStatusRequest", ["await assertStatus("]],
+  [
+    "malformed-broker-frame-fail-closed",
+    "runMalformedFrameFailure",
+    [
+      "await writeMalformedFrame(",
+      "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+      "await assertPipeUnavailable(",
+    ],
+  ],
+  [
+    "parent-crash-cleanup",
+    "runParentCrashCleanup",
+    ['"--parent-crash-fixture"', "details.brokerPid", "await assertPipeUnavailable("],
+  ],
+  [
+    "broker-crash-cleanup",
+    "runBrokerCrashCleanup",
+    ['tracked.broker.kill("SIGKILL")', "await assertPipeUnavailable("],
+  ],
+  [
+    "reconnect-failure",
+    "runReconnectFailure",
+    ["await tracked.server.close();", "await assertPipeUnavailable("],
+  ],
+  [
+    "twenty-lifecycle-rounds",
+    "runTwentyLifecycleRounds",
+    ["round < 20", "await assertStatus(", "await assertPipeUnavailable("],
+  ],
 ];
 
-function stageCalls(source) {
+function uniqueTopLevelAsyncFunctionBody(source, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const declarations = [
+    ...source.matchAll(new RegExp(`^(?:export\\s+)?async function ${escaped}\\b`, "gmu")),
+  ];
+  if (declarations.length !== 1) return undefined;
+  const bodyStart = source.indexOf("{", declarations[0].index);
+  if (bodyStart === -1) return undefined;
+  const bodyEndPattern = /^\}\r?$/gmu;
+  bodyEndPattern.lastIndex = bodyStart;
+  const bodyEnd = bodyEndPattern.exec(source)?.index ?? -1;
+  return bodyEnd === -1 ? undefined : source.slice(bodyStart + 1, bodyEnd);
+}
+
+function stageCalls(body) {
   return [
-    ...source.matchAll(
+    ...body.matchAll(
       /^\s*await runWindowsControlGateStage\("([a-z0-9-]+)", ([A-Za-z_$][\w$]*)\);\s*$/gmu,
     ),
   ].map((match) => [match[1], match[2]]);
@@ -40,12 +90,18 @@ function exactAwaitCount(source, expression) {
 }
 
 function hasActiveStageExecutor(source) {
-  const matches = [...source.matchAll(/^async function runWindowsControlGateStage/gmu)];
-  if (matches.length !== 1) return false;
-  const start = matches[0].index;
-  const end = source.indexOf("\n}", start);
-  const invocation = source.indexOf("await operation();", start);
-  return end !== -1 && invocation !== -1 && invocation < end;
+  return (
+    uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")?.trim() ===
+    "await operation();"
+  );
+}
+
+function hasForbiddenGateFlow(body) {
+  return (
+    /\bif\s*\(\s*false\s*\)/u.test(body) ||
+    /\bcatch\b/u.test(body) ||
+    /^\s*(?:return\b|break\b|continue\b)/mu.test(body)
+  );
 }
 
 export function validateWindowsControlGateContract({ gateSource, runnerSource }) {
@@ -55,22 +111,57 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   const expectedOuter = requiredWindowsControlGateStages.slice(0, 1);
   const expectedInner = requiredWindowsControlGateStages.slice(1);
-  if (JSON.stringify(stageCalls(runnerSource)) !== JSON.stringify(expectedOuter)) {
+  const runnerBody = uniqueTopLevelAsyncFunctionBody(runnerSource, "runWindowsControlGate");
+  const gateBody = uniqueTopLevelAsyncFunctionBody(gateSource, "runInstalledWindowsControlGate");
+  const outerStages = expectedOuter.map(([stage, implementation]) => [stage, implementation]);
+  const innerStages = expectedInner.map(([stage, implementation]) => [stage, implementation]);
+  if (
+    runnerBody === undefined ||
+    JSON.stringify(stageCalls(runnerBody)) !== JSON.stringify(outerStages)
+  ) {
     errors.push("Windows gate runner stages are missing, reordered, conditional, or replaced");
   }
-  if (JSON.stringify(stageCalls(gateSource)) !== JSON.stringify(expectedInner)) {
+  if (
+    gateBody === undefined ||
+    JSON.stringify(stageCalls(gateBody)) !== JSON.stringify(innerStages)
+  ) {
     errors.push("installed Windows gate stages are missing, reordered, conditional, or replaced");
+  }
+  if (
+    (runnerBody !== undefined && hasForbiddenGateFlow(runnerBody)) ||
+    (gateBody !== undefined && hasForbiddenGateFlow(gateBody))
+  ) {
+    errors.push(
+      "Windows gate orchestration cannot skip, return early, continue, or swallow failure",
+    );
   }
   if (!hasActiveStageExecutor(runnerSource) || !hasActiveStageExecutor(gateSource)) {
     errors.push("Windows gate stage executors must await their required operation");
   }
-  if (exactAwaitCount(runnerSource, "runInstalledWindowsControlGate()") !== 1) {
+  for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
+    const implementationBody = uniqueTopLevelAsyncFunctionBody(
+      stage === "packed-clean-consumer" ? runnerSource : gateSource,
+      implementation,
+    );
+    if (
+      implementationBody === undefined ||
+      evidence.some((token) => !implementationBody.includes(token))
+    ) {
+      errors.push(`${stage} implementation is missing its required real operation`);
+    }
+  }
+  if (
+    runnerBody === undefined ||
+    exactAwaitCount(runnerBody, "runInstalledWindowsControlGate()") !== 1
+  ) {
     errors.push("Windows gate runner must await exactly one installed consumer execution");
   }
-  const installedMatch = /^\s*await runInstalledWindowsControlGate\(\);\s*$/mu.exec(runnerSource);
+  const installedMatch = /^\s*await runInstalledWindowsControlGate\(\);\s*$/mu.exec(
+    runnerBody ?? "",
+  );
   const packedMatch =
     /^\s*await runWindowsControlGateStage\("packed-clean-consumer", preparePackedWindowsControlConsumer\);\s*$/mu.exec(
-      runnerSource,
+      runnerBody ?? "",
     );
   const installedIndex = installedMatch?.index ?? -1;
   const packedIndex = packedMatch?.index ?? -1;
@@ -78,11 +169,11 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
     errors.push("packed Windows consumer preparation must precede installed execution");
   }
   const markerWrite = `process.stdout.write(\`\${WINDOWS_CONTROL_GATE_MARKER}\\n\`);`;
-  const markerIndex = runnerSource.indexOf(markerWrite);
+  const markerIndex = runnerBody?.indexOf(markerWrite) ?? -1;
   if (
     markerIndex === -1 ||
     markerIndex < installedIndex ||
-    runnerSource.indexOf(markerWrite, markerIndex + markerWrite.length) !== -1 ||
+    runnerBody?.indexOf(markerWrite, markerIndex + markerWrite.length) !== -1 ||
     gateSource.includes(markerWrite)
   ) {
     errors.push("Windows gate completion marker must be unique and follow installed execution");

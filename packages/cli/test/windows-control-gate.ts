@@ -73,8 +73,6 @@ interface ParentFixtureReady {
 
 let currentUserSid: string | undefined;
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after the PowerShell RED is localized.
-let diagnosticSelfTestSubstage = "installed-paths";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -253,32 +251,21 @@ async function initializeCurrentUserSid(): Promise<void> {
       "-NoProfile",
       "-NonInteractive",
       "-Command",
-      '[Console]::Out.WriteLine("{0}.{1}", $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor); [Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
+      '$ProgressPreference = "SilentlyContinue"; $ErrorActionPreference = "Stop"; [Console]::Out.WriteLine("{0}.{1}", $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor); [Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
     ],
     { encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true },
   );
-  const identityLines =
-    typeof identity.stdout === "string" ? identity.stdout.trim().split(/\r?\n/u) : [];
-  const identitySid = identityLines[1] ?? "";
-  if (identity.error !== undefined) diagnosticSelfTestSubstage = "identity-spawn";
-  else if (identity.signal !== null) diagnosticSelfTestSubstage = "identity-signal";
-  else if (identity.status !== 0) diagnosticSelfTestSubstage = "identity-exit";
-  else if (identity.stderr !== "") diagnosticSelfTestSubstage = "identity-stderr";
-  else if (identityLines[0] !== "5.1") diagnosticSelfTestSubstage = "identity-version";
-  else if (!/^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u.test(identitySid)) {
-    diagnosticSelfTestSubstage = "identity-sid";
-  } else diagnosticSelfTestSubstage = "identity-result-contract";
   assert.equal(identity.error, undefined);
   assert.equal(identity.signal, null);
   assert.equal(identity.status, 0);
   assert.equal(identity.stderr, "");
+  const identityLines = identity.stdout.trim().split(/\r?\n/u);
   assert.equal(identityLines[0], "5.1", "PowerShell 5.1 is mandatory");
-  assert.match(identitySid, /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
-  currentUserSid = identitySid;
+  assert.match(identityLines[1] ?? "", /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
+  currentUserSid = identityLines[1];
 }
 
 async function runPowerShellSelfTest(): Promise<void> {
-  diagnosticSelfTestSubstage = "installed-paths";
   assert.equal(process.platform, "win32", "Windows control gate requires win32");
   assert.equal(process.arch, "x64", "Windows control gate requires x64");
   const consumerRoot = await realpath(requiredEnvironment("TEGO_WINDOWS_CONTROL_CONSUMER_ROOT"));
@@ -303,10 +290,8 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
-  diagnosticSelfTestSubstage = "identity";
   await initializeCurrentUserSid();
 
-  diagnosticSelfTestSubstage = "self-test-invocation";
   const selfTest = spawnSync(
     "powershell.exe",
     [
@@ -321,14 +306,6 @@ async function runPowerShellSelfTest(): Promise<void> {
     ],
     { encoding: "utf8", shell: false, timeout: 2 * 60 * 1000, windowsHide: true },
   );
-  const fixedSelfTestCode = selfTest.stderr.trim();
-  if (fixedSelfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED") {
-    diagnosticSelfTestSubstage = "add-type-compile";
-  } else if (fixedSelfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
-    diagnosticSelfTestSubstage = "native-self-test";
-  } else {
-    diagnosticSelfTestSubstage = "result-contract";
-  }
   assert.equal(selfTest.error, undefined);
   assert.equal(selfTest.signal, null);
   assert.equal(selfTest.status, 0);
@@ -502,7 +479,6 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_SUBSTAGE:${diagnosticSelfTestSubstage}\n`);
     if (liveServer !== undefined) await cleanupTrackedServer(liveServer);
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
     process.exitCode = 1;

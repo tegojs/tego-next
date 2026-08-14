@@ -24,6 +24,62 @@ const requiredWindowsControlGateStages = [
   ["reconnect-failure", "runReconnectFailure"],
   ["twenty-lifecycle-rounds", "runTwentyLifecycleRounds"],
 ];
+const windowsControlGateImplementationFixtureBodies = new Map([
+  [
+    "preparePackedWindowsControlConsumer",
+    ["  await packWorkspaceSet();", "  preparedConsumer = {};"],
+  ],
+  [
+    "runPowerShellSelfTest",
+    ["  spawnSync();", '  "-SelfTest";', "  await initializeCurrentUserSid();"],
+  ],
+  ["startLiveDescriptor", ['  startTrackedServer("live-descriptor");']],
+  ["runStatusRequest", ["  await assertStatus();"]],
+  [
+    "runMalformedFrameFailure",
+    [
+      "  await writeMalformedFrame();",
+      '  "PROTOCOL_CONTROL_ENDPOINT_UNSAFE";',
+      "  await assertPipeUnavailable();",
+    ],
+  ],
+  [
+    "runParentCrashCleanup",
+    ['  "--parent-crash-fixture";', "  details.brokerPid;", "  await assertPipeUnavailable();"],
+  ],
+  [
+    "runBrokerCrashCleanup",
+    ['  tracked.broker.kill("SIGKILL");', "  await assertPipeUnavailable();"],
+  ],
+  ["runReconnectFailure", ["  await tracked.server.close();", "  await assertPipeUnavailable();"]],
+  [
+    "runTwentyLifecycleRounds",
+    [
+      "  for (let round = 0; round < 20; round += 1) {",
+      "    await assertStatus();",
+      "    await assertPipeUnavailable();",
+      "  }",
+    ],
+  ],
+]);
+
+function windowsControlGateImplementationFixture(name) {
+  const body = windowsControlGateImplementationFixtureBodies.get(name);
+  assert.ok(body !== undefined, `${name} fixture body must exist`);
+  return [`async function ${name}() {`, ...body, "}"].join("\n");
+}
+
+function replaceTopLevelAsyncFunctionBody(source, name, body) {
+  const declaration = new RegExp(`^async function ${name}\\b`, "mu").exec(source);
+  assert.ok(declaration !== null, `${name} declaration must exist`);
+  const bodyStart = source.indexOf("{", declaration.index);
+  assert.notEqual(bodyStart, -1, `${name} body must start`);
+  const bodyEndMatch = /^\}\r?$/gmu;
+  bodyEndMatch.lastIndex = bodyStart;
+  const bodyEnd = bodyEndMatch.exec(source)?.index ?? -1;
+  assert.notEqual(bodyEnd, -1, `${name} body must end`);
+  return `${source.slice(0, bodyStart + 1)}\n${body}\n${source.slice(bodyEnd)}`;
+}
 const requiredStepsByJob = {
   integration: [
     "Check out repository",
@@ -234,6 +290,32 @@ test("Windows parent-crash fixture initializes its own descriptor identity", asy
   );
 });
 
+test("Windows PowerShell identity probe suppresses progress and makes errors terminating", async () => {
+  const gateSource = await readFile(windowsControlGateSource, "utf8");
+  const identityStart = gateSource.indexOf(
+    "async function initializeCurrentUserSid(): Promise<void> {",
+  );
+  const identityEnd = gateSource.indexOf(
+    "\n}\n\nasync function runPowerShellSelfTest",
+    identityStart,
+  );
+  assert.notEqual(identityStart, -1);
+  assert.notEqual(identityEnd, -1);
+  const identityBody = gateSource.slice(identityStart, identityEnd);
+  const commandStart = identityBody.indexOf('      "-Command",');
+  const progressPreference = identityBody.indexOf(
+    '$ProgressPreference = "SilentlyContinue";',
+    commandStart,
+  );
+  const errorPreference = identityBody.indexOf('$ErrorActionPreference = "Stop";', commandStart);
+  const identityQuery = identityBody.indexOf("$PSVersionTable.PSVersion.Major", commandStart);
+
+  assert.notEqual(commandStart, -1);
+  assert.ok(progressPreference > commandStart && progressPreference < identityQuery);
+  assert.ok(errorPreference > progressPreference && errorPreference < identityQuery);
+  assert.match(identityBody, /assert\.equal\(identity\.stderr, ""\);/u);
+});
+
 test("Windows control gate source validation rejects removed, reordered, softened, or no-op stages", async (t) => {
   const { validateWindowsControlGateContract } = await import(
     new URL(
@@ -259,6 +341,7 @@ test("Windows control gate source validation rejects removed, reordered, softene
   ].join("\n");
   const runnerFixture = [
     activeStageHelper,
+    windowsControlGateImplementationFixture(requiredWindowsControlGateStages[0][1]),
     "async function runWindowsControlGate() {",
     stageLines[0],
     "  await runInstalledWindowsControlGate();",
@@ -267,6 +350,9 @@ test("Windows control gate source validation rejects removed, reordered, softene
   ].join("\n");
   const gateFixture = [
     activeStageHelper,
+    ...requiredWindowsControlGateStages
+      .slice(1)
+      .map(([_stage, implementation]) => windowsControlGateImplementationFixture(implementation)),
     "async function runInstalledWindowsControlGate() {",
     ...stageLines.slice(1),
     "}",
@@ -344,6 +430,55 @@ test("Windows control gate source validation rejects removed, reordered, softene
       }).length > 0,
       `${sourceName} cannot replace the stage executor with a no-op`,
     );
+  }
+});
+
+test("Windows control gate validation rejects hidden control flow and implementation no-ops", async (t) => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?deep-stage-mutations=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+  const statusLine = '  await runWindowsControlGateStage("status-request", runStatusRequest);';
+
+  for (const [name, mutation] of [
+    ["conditional block", gateSource.replace(statusLine, `  if (false) {\n${statusLine}\n  }`)],
+    ["swallowed catch", gateSource.replace(statusLine, `  try {\n${statusLine}\n  } catch {}`)],
+    ["early return", gateSource.replace(statusLine, `  return;\n${statusLine}`)],
+    [
+      "loop continue",
+      gateSource.replace(statusLine, `  for (;;) {\n    continue;\n${statusLine}\n  }`),
+    ],
+  ]) {
+    await t.test(name, () => {
+      assert.notEqual(mutation, gateSource);
+      assert.ok(
+        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+      );
+    });
+  }
+
+  for (const [index, [_stage, implementation]] of requiredWindowsControlGateStages.entries()) {
+    const sourceName = index === 0 ? "runnerSource" : "gateSource";
+    const source = sourceName === "runnerSource" ? runnerSource : gateSource;
+    const mutation = replaceTopLevelAsyncFunctionBody(
+      source,
+      implementation,
+      "  await Promise.resolve();",
+    );
+    await t.test(`${implementation} implementation no-op`, () => {
+      assert.ok(
+        validateWindowsControlGateContract({
+          gateSource: sourceName === "gateSource" ? mutation : gateSource,
+          runnerSource: sourceName === "runnerSource" ? mutation : runnerSource,
+        }).length > 0,
+      );
+    });
   }
 });
 
