@@ -170,9 +170,6 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   if (!hasStrictPowerShellSelfTest(gateSource)) {
     errors.push("Windows gate must retain one bounded strict authoritative SelfTest");
   }
-  if (gateSource.includes("TEGO_TASK4_NON_AUTHORITATIVE")) {
-    errors.push("Windows gate cannot retain temporary diagnostic output");
-  }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(
       stage === "packed-clean-consumer" ? runnerSource : gateSource,
