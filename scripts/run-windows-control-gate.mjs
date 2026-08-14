@@ -19,13 +19,13 @@ const temporaryTaskDiagnosticTokens = [
 const expectedParentCrashCleanupSha256 =
   "bac041802252245f8a4a01f1270699a67282dde9bbb65c66dec80fbbaefbf3ef";
 const expectedWindowsGateSourceSha256 =
-  "99dbb76dd7d6d0a0dd93df16ab8140230dd7d84fe3ca7e7cfd3b83f75086a3d6";
+  "0965ff9d074096e56fbdb8b953a27797e8f3420633cd42c4f7d5664999521df1";
 const expectedWindowsBrokerCSharpSourceSha256 =
   "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4";
 const expectedWindowsBrokerPowerShellSourceSha256 =
   "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53";
 const expectedWindowsGateRunnerSourceSha256 =
-  "a3f603349b03bea1d2506a4455eb7af8e2022809bfe6bbf73505b45c3f23ba0a";
+  "dc24428c857726edf71593723661e61ff576b7309b48bdc0e6c0e7aad3385a36";
 const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -66,13 +66,15 @@ const expectedWindowsPipeProbeArgumentsBody = [
   '  Buffer.from(windowsPipeProbeSource, "utf16le").toString("base64"),',
 ].join("\n");
 const expectedRunNativePipeProbeBody = [
-  'const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));',
+  'task4NonAuthoritativeStageDetail = "powershell-path";',
+  '  const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));',
   "  assert.equal(isAbsolute(systemRoot), true);",
   "  assert.match(systemRoot, /^[A-Za-z]:\\\\[^\\r\\n]+$/u);",
   "  const powershellExecutable = realpathSync(",
   '    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),',
   "  );",
   "  assert.equal(isContained(systemRoot, powershellExecutable), true);",
+  '  task4NonAuthoritativeStageDetail = "powershell-spawn";',
   "  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {",
   '    encoding: "utf8",',
   "    env: {",
@@ -88,6 +90,22 @@ const expectedRunNativePipeProbeBody = [
   "    timeout: PROCESS_CLEANUP_TIMEOUT_MS,",
   "    windowsHide: true,",
   "  });",
+  "  task4NonAuthoritativeStageDetail =",
+  "    probe.error !== undefined",
+  '      ? "powershell-spawn-error"',
+  "      : probe.signal !== null",
+  '        ? "powershell-signal"',
+  '        : probe.stdout !== ""',
+  '          ? "powershell-stdout"',
+  '          : probe.stderr !== ""',
+  '            ? "powershell-stderr"',
+  "            : probe.status === 0",
+  '              ? "powershell-status-absent"',
+  "              : probe.status === 2",
+  '                ? "powershell-status-present"',
+  "                : probe.status === 3",
+  '                  ? "powershell-status-error"',
+  '                  : "powershell-status-unknown";',
   "  assert.equal(probe.error, undefined);",
   "  assert.equal(probe.signal, null);",
   '  assert.equal(probe.stdout, "");',
@@ -108,7 +126,8 @@ const expectedAssertPipeUnavailableBody = [
   "  );",
 ].join("\n");
 const expectedRunStatusRequestBody = [
-  "assert.ok(liveServer !== undefined);",
+  'task4NonAuthoritativeStageDetail = "status-request";',
+  "  assert.ok(liveServer !== undefined);",
   '  await assertStatus(liveServer.endpoint, "windows-control-gate-status");',
   "  assertNativePipePresent(liveServer.endpoint);",
 ].join("\n");
@@ -116,13 +135,17 @@ const expectedNonAuthoritativeStageExecutorBody = [
   "try {",
   "    await operation();",
   "  } catch (error) {",
+  "    process.stderr.write(",
   [
-    "    process.stderr.write(`",
+    "      `",
     "$",
     "{task4NonAuthoritativeStagePrefix}:",
     "$",
-    "{_stage}\\n`);",
+    "{_stage}:",
+    "$",
+    "{task4NonAuthoritativeStageDetail}\\n`,",
   ].join(""),
+  "    );",
   "    throw error;",
   "  }",
 ].join("\n");

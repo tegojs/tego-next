@@ -308,8 +308,8 @@ test("Windows gate executable source digests are independently fixed", async (t)
   const expectedDigests = {
     brokerCSharpSource: "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4",
     brokerPowerShellSource: "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53",
-    gateSource: "99dbb76dd7d6d0a0dd93df16ab8140230dd7d84fe3ca7e7cfd3b83f75086a3d6",
-    runnerSource: "a3f603349b03bea1d2506a4455eb7af8e2022809bfe6bbf73505b45c3f23ba0a",
+    gateSource: "0965ff9d074096e56fbdb8b953a27797e8f3420633cd42c4f7d5664999521df1",
+    runnerSource: "dc24428c857726edf71593723661e61ff576b7309b48bdc0e6c0e7aad3385a36",
   };
   const sources = { brokerCSharpSource, brokerPowerShellSource, gateSource, runnerSource };
   assert.deepEqual(

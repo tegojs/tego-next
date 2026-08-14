@@ -20,6 +20,7 @@ const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
 const task4NonAuthoritativeStagePrefix = ["TEGO", "TASK4", "NON", "AUTHORITATIVE", "STAGE"].join(
   "_",
 );
+let task4NonAuthoritativeStageDetail = "none";
 const WINDOWS_PIPE_FULL_CONTROL = 0x1f01ff;
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
@@ -182,6 +183,7 @@ function ownChild(child: ChildProcess): OwnedChild {
 }
 
 function runNativePipeProbe(endpoint: string): number {
+  task4NonAuthoritativeStageDetail = "powershell-path";
   const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));
   assert.equal(isAbsolute(systemRoot), true);
   assert.match(systemRoot, /^[A-Za-z]:\\[^\r\n]+$/u);
@@ -189,6 +191,7 @@ function runNativePipeProbe(endpoint: string): number {
     join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
   );
   assert.equal(isContained(systemRoot, powershellExecutable), true);
+  task4NonAuthoritativeStageDetail = "powershell-spawn";
   const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {
     encoding: "utf8",
     env: {
@@ -204,6 +207,22 @@ function runNativePipeProbe(endpoint: string): number {
     timeout: PROCESS_CLEANUP_TIMEOUT_MS,
     windowsHide: true,
   });
+  task4NonAuthoritativeStageDetail =
+    probe.error !== undefined
+      ? "powershell-spawn-error"
+      : probe.signal !== null
+        ? "powershell-signal"
+        : probe.stdout !== ""
+          ? "powershell-stdout"
+          : probe.stderr !== ""
+            ? "powershell-stderr"
+            : probe.status === 0
+              ? "powershell-status-absent"
+              : probe.status === 2
+                ? "powershell-status-present"
+                : probe.status === 3
+                  ? "powershell-status-error"
+                  : "powershell-status-unknown";
   assert.equal(probe.error, undefined);
   assert.equal(probe.signal, null);
   assert.equal(probe.stdout, "");
@@ -398,7 +417,9 @@ async function runWindowsControlGateStage(
   try {
     await operation();
   } catch (error) {
-    process.stderr.write(`${task4NonAuthoritativeStagePrefix}:${_stage}\n`);
+    process.stderr.write(
+      `${task4NonAuthoritativeStagePrefix}:${_stage}:${task4NonAuthoritativeStageDetail}\n`,
+    );
     throw error;
   }
 }
@@ -457,6 +478,7 @@ async function startLiveDescriptor(): Promise<void> {
 }
 
 async function runStatusRequest(): Promise<void> {
+  task4NonAuthoritativeStageDetail = "status-request";
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
   assertNativePipePresent(liveServer.endpoint);
