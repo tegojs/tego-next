@@ -4,7 +4,8 @@
 
 The dated SHAs and GitHub run below are historical Phase 1 evidence. The current
 `2.0.0-alpha.1` closure adds quotas, deterministic cleanup, Windows ACL hardening, and release
-engineering; fresh exact-SHA Task 10 evidence is still pending.
+engineering. The broker implementation's real Windows gate is complete; Task 5 records the fresh
+final release-evidence chain.
 
 - Review date: 2026-07-27
 - Baseline: `436b1d7b4c2e14259e9a8146555f7d675c637c1a`
@@ -40,8 +41,10 @@ The final implementation fails closed at the phase-one trust boundaries:
 - Artifact ingress is bounded by 256 MiB per artifact and 4 GiB per namespace by default, with
   validated partial overrides. Duplicate, failure, close, restart, and concurrent admission paths
   are covered for the local and PostgreSQL stores.
-- Windows named pipes fail closed until a protected owner DACL grants full pipe access only to the
-  current user, LocalSystem, and Administrators. Queued pre-cutover sockets never dispatch.
+- On Windows, a dedicated broker process owns the public named pipe from creation through shutdown.
+  Every instance has a protected owner DACL granting full pipe access only to the current user,
+  LocalSystem, and Administrators; the live descriptor is validated before `READY` and request
+  dispatch.
 
 ## Concurrency and recovery conclusions
 
@@ -82,6 +85,13 @@ passed GitHub run [`30259537251`](https://github.com/tegojs/tego-next/actions/ru
 | [PostgreSQL integration](https://github.com/tegojs/tego-next/actions/runs/30259537251/job/89955930399) | Passed | `postgres-integration-diagnostics` |
 | [Main and Worker process E2E](https://github.com/tegojs/tego-next/actions/runs/30259537251/job/89955930323) | Passed | `process-e2e-diagnostics` |
 
+The final broker implementation commit `ae83ef4c303842a7f4567fbdd4b3ebb19435329b`
+passed all four jobs in authoritative
+[run 31837308587](https://github.com/tegojs/tego-next/actions/runs/31837308587).
+The [Windows job](https://github.com/tegojs/tego-next/actions/runs/31837308587/job/94886355643)
+ran the packed `@tego/cli` consumer, live descriptor/status checks, malformed and crash cleanup,
+stable parent-handle cleanup, reconnect rejection, and 20 leak-free lifecycle rounds.
+
 The CI structure itself is tested. Required jobs and ordered steps cannot be disabled, moved,
 duplicated, changed to no-ops, or marked `continue-on-error`; actions are pinned to reviewed commit
 SHAs; PostgreSQL health settings, bounded reporters, always-upload diagnostics, deterministic
@@ -95,11 +105,16 @@ packaging, pull-request triggers, and `main` push triggers are enforced.
   proves neighboring namespaces unchanged.
 - Windows process-tree cleanup uses bounded `taskkill /T` and refreshed PID + CreationDate tokens;
   it does not use a native Windows Job Object launcher. The theoretical PID-reuse and final-snapshot
-  orphan limitations are accepted for this alpha and must be exercised empirically in Task 10.
+  orphan limitations remain accepted for this alpha. This general harness boundary is separate
+  from the broker cleanup evidence below.
+- The alpha supports `win32-x64` only and delivers auditable PowerShell plus embedded C# source.
+  The broker opens a stable synchronization handle to the exact parent process and has no fallback
+  to an unhardened Node named pipe. Windows ARM64 support and a signed precompiled broker are
+  deferred.
 - A trusted local client may still consume its finite artifact namespace quota through follower
   ingress. This remains a trusted-boundary denial-of-service consideration, not a fencing bypass.
-- The real `windows-control` job and all other exact-SHA release gates remain pending Task 10. npm
-  publication, Git tag, GitHub prerelease, and OpenSpec archive remain pending Task 11.
+- Fresh exact-SHA local and four-job release evidence is recorded by Task 5. npm publication, Git
+  tag, GitHub prerelease, and OpenSpec archive remain pending Task 11.
 
 ## Verdict
 

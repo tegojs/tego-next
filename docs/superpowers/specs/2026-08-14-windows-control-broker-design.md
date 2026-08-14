@@ -7,7 +7,10 @@ Approved on 2026-08-14 for the Phase 1 `2.0.0-alpha.1` release closure.
 This design replaces the post-listen Windows named-pipe ACL helper. Real Windows CI proved that a
 client handle cannot obtain the security rights required to inspect or update the server object's
 descriptor, while Node.js 26 does not expose the server handle through a supported public API.
-The release remains blocked until this design passes the authoritative Windows gate.
+The broker implementation passed the authoritative packed-consumer Windows gate in
+[run 31837308587](https://github.com/tegojs/tego-next/actions/runs/31837308587), including
+[Windows job 94886355643](https://github.com/tegojs/tego-next/actions/runs/31837308587/job/94886355643).
+Final release evidence and publication remain separate later gates.
 
 ## Scope
 

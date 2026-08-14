@@ -77,10 +77,13 @@ GitHub Actions SHALL be the authoritative phase-one acceptance environment and S
 ### Requirement: Fail-closed local control access
 The built-in local control endpoint SHALL dispatch no request until its operating-system boundary is
 verified. Unix SHALL require an owner-private parent directory, runtime-user ownership, and exact
-mode `0600`. Windows SHALL require the current user as owner, a protected DACL, and explicit full
-pipe access only for the current user, LocalSystem, and Administrators, with no inherited, deny,
-broad, duplicate, or unexpected ACE. Windows connections accepted before the hardened admission
-barrier completes SHALL be destroyed rather than dispatched.
+mode `0600`. On Windows, a dedicated broker process SHALL own the public named pipe from creation
+through shutdown and create every instance with the current user as owner, a protected DACL, and
+explicit full pipe access only for the current user, LocalSystem, and Administrators, with no
+inherited, deny, broad, duplicate, or unexpected ACE. The alpha SHALL support `win32-x64` only and
+deliver auditable PowerShell plus embedded C# source. The broker SHALL validate its live
+server-handle descriptor before `READY`, bind cleanup to a stable synchronization handle for the
+exact parent process, and provide no fallback to an unhardened Node named pipe.
 
 #### Scenario: Windows descriptor cannot be proven safe
 - **WHEN** creating or reading back the Windows named-pipe descriptor, decoding or validating the broker `READY` descriptor, or broker startup fails or times out

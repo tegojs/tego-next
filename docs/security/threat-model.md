@@ -97,20 +97,26 @@ The local control endpoint is a Unix-domain socket or Windows named pipe, not an
 HTTP server. The local control protocol has no application-layer authentication
 and relies on operating-system access to its endpoint. On Unix, startup verifies
 an owner-private parent directory and applies mode 0600 to the socket. On
-Windows, startup fails closed until the named pipe has the current Windows user
-as owner and a protected DACL. Explicit allow ACEs grant full pipe access only
-to the current Windows user, LocalSystem, and Administrators; inherited, deny,
-broad, duplicate, reordered, underprivileged, or unexpected ACEs are rejected.
-The broker creates every pipe instance with that descriptor, reads the server
-handle descriptor back, and reports the canonical descriptor in its framed
-`READY` payload. TypeScript validates every reported field before dispatching
-queued connections. Each connection carries one bounded request.
+Windows, a dedicated broker process owns the public named pipe from creation
+through shutdown. It creates every pipe instance with the current Windows user
+as owner and a protected DACL whose explicit allow ACEs grant full pipe access
+only to the current Windows user, LocalSystem, and Administrators; inherited,
+deny, broad, duplicate, reordered, underprivileged, or unexpected ACEs are
+rejected. The broker reads the server-handle descriptor back and reports the
+canonical descriptor in its framed `READY` payload. TypeScript validates every
+reported field before dispatching a request. Each connection carries one
+bounded request.
 
-The packaged PowerShell/Win32 broker uses fixed shell-free arguments, strict
-framed stdout, allowlisted stderr, bounded queues, and parent/child watchdogs. Real
-Windows named-pipe execution is still pending the mandatory Task 10
-`windows-control` CI evidence; if ACL application or inspection fails there,
-the alpha release remains blocked.
+The alpha supports `win32-x64` only. The broker is delivered inside `@tego/cli`
+as auditable PowerShell plus embedded C# source, uses fixed shell-free arguments,
+strict framed stdout, allowlisted stderr, and bounded queues, and opens a stable
+synchronization handle to the exact parent process for watchdog cleanup. Missing
+or incompatible PowerShell, unsupported architecture, descriptor failure,
+protocol failure, or cleanup timeout produces the redacted unsafe-endpoint
+diagnostic; there is no fallback to an unhardened Node named pipe. The complete
+packed-consumer contract passed authoritative Windows run
+<https://github.com/tegojs/tego-next/actions/runs/31837308587>,
+including the real status request and bounded parent/broker cleanup.
 
 The local control endpoint is trusted. A follower may admit content-addressed
 immutable artifact bytes before the semantic installation crosses the
@@ -143,6 +149,7 @@ Phase one defers:
 - arbitrary-language or native-code plugins;
 - production secret-manager integrations;
 - certificate issuance, TLS termination, and Worker attestation;
+- Windows ARM64 support and a signed precompiled broker;
 - Tego 1.x ACL compatibility.
 
 Production eligibility also remains gated on Node.js 26 reaching LTS. The

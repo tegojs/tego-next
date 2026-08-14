@@ -20,6 +20,16 @@ the exported `runNodeMainProcess` API.
 This guide distinguishes runnable CLI operations from the connectivity proven
 by the system tests. It does not claim a turnkey production deployment.
 
+On Windows, the alpha supports `win32-x64` only. A dedicated broker process
+owns the public named pipe from creation through shutdown; `@tego/cli` delivers
+the broker as auditable PowerShell plus embedded C# source. It validates the
+protected owner DACL from the live server handle before `READY`, and a stable
+synchronization handle to the exact parent process closes pipe instances if
+Main exits. Broker, PowerShell, architecture, descriptor, or protocol failure
+has no fallback to an unhardened Node named pipe. The installed-package behavior
+passed authoritative Windows run
+<https://github.com/tegojs/tego-next/actions/runs/31837308587>.
+
 ## Embedded single-Main
 
 ### Topology and local storage
@@ -284,8 +294,10 @@ tokens. The Windows strategy does not use a native Windows Job Object launcher;
 there remains an accepted theoretical PID-reuse window and a descendant created
 after the final snapshot may escape discovery if all known parents exit. It
 never targets an unvalidated descendant and fails closed when discovery or
-termination proof is unavailable. Task 10 must exercise this practical boundary
-in real Windows CI.
+termination proof is unavailable. This accepted general test-process cleanup
+boundary remains separate from the broker's stable parent-handle watchdog. The
+broker-specific real Windows run recorded above completed 20 start/request/close
+rounds with no remaining endpoint or broker process.
 
 PostgreSQL integration cleanup is deliberately destructive only for an exact
 test namespace matching `^test_[a-z0-9]+_[a-z0-9_]+$`. One bounded transaction
@@ -325,10 +337,12 @@ defers:
 - Main-side Worker network configuration in the CLI;
 - automatic Worker redirection to a promoted leader;
 - additional coordination providers such as etcd or Consul;
+- Windows ARM64 support and a signed precompiled broker;
 - OS-grade plugin sandboxing and production secret-manager drivers.
 
 Use `npm run verify:release` and the authoritative GitHub Actions `quality`,
 `windows-control`, `integration`, and `system-e2e` jobs as release evidence,
-not as a production-readiness claim. Real Windows ACL and process-tree evidence
-is still pending Task 10. Phase 2 and Phase 3 remain deferred; npm/GitHub
-publication and OpenSpec archive remain pending later release tasks.
+not as a production-readiness claim. The broker's real Windows implementation
+gate is recorded above; fresh final exact-SHA release evidence remains separate.
+Phase 2 and Phase 3 remain deferred; npm/GitHub publication and OpenSpec archive
+remain pending Task 11.

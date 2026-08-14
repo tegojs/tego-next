@@ -23,6 +23,16 @@ const releaseDocuments = [
   "openspec/changes/runtime-kernel-phase-1/tasks.md",
 ];
 
+const windowsBrokerDocuments = [
+  "docs/superpowers/specs/2026-08-14-windows-control-broker-design.md",
+  documents.security,
+  documents.operations,
+  documents.release,
+  "docs/reviews/phase-1-security-concurrency-recovery-review.md",
+  "openspec/changes/runtime-kernel-phase-1/specs/runtime-bootstrap/spec.md",
+  "openspec/changes/runtime-kernel-phase-1/specs/runtime-operations/spec.md",
+];
+
 const deltaSpecsRoot = "openspec/changes/runtime-kernel-phase-1/specs";
 
 async function activeDeltaSpecPaths() {
@@ -326,7 +336,10 @@ test("current release documents reject superseded or incomplete claims", async (
   ]) {
     assert.doesNotMatch(documentation, falseClaim);
   }
-  assert.match(documentation, /real Windows[^.]{0,100}(?:Task 10|not yet verified)/iu);
+  assert.match(
+    documentation,
+    /real Windows[^.]{0,160}https:\/\/github\.com\/tegojs\/tego-next\/actions\/runs\/31837308587/iu,
+  );
   assert.match(documentation, /Phase 2[^.]{0,80}Phase 3[^.]{0,80}(?:deferred|out of scope)/iu);
   assert.match(documentation, /Node\.js 26[^.]{0,120}LTS/iu);
   assert.match(documentation, /(?:npm|GitHub)[^.]{0,100}(?:not yet published|pending)/iu);
@@ -358,6 +371,40 @@ test("all active delta specs agree on the hardened Windows control boundary", as
     "before dispatch",
   ]) {
     assert.ok(bootstrap.includes(marker), `runtime-bootstrap delta must state: ${marker}`);
+  }
+});
+
+test("reviewed documents describe only the proven Windows broker boundary", async () => {
+  const sources = await Promise.all(windowsBrokerDocuments.map((path) => read(path)));
+  const documentation = normalizeWhitespace(sources.join("\n"));
+  const implementedDocumentation = normalizeWhitespace(sources.slice(1).join("\n"));
+
+  for (const marker of [
+    "dedicated broker process",
+    "owns the public named pipe from creation through shutdown",
+    "`win32-x64` only",
+    "PowerShell plus embedded C# source",
+    "stable synchronization handle to the exact parent process",
+    "no fallback to an unhardened Node named pipe",
+    "https://github.com/tegojs/tego-next/actions/runs/31837308587",
+    "Windows ARM64 support",
+    "precompiled",
+    "deferred",
+  ]) {
+    assert.ok(documentation.includes(marker), `Windows broker documentation must state: ${marker}`);
+  }
+
+  for (const supersededClaim of [
+    /post-listen[^.]{0,100}(?:ACL|DACL|descriptor) (?:application|hardening|mutation)/iu,
+    /(?:admission barrier|pre-cutover sockets)/iu,
+    /connections accepted before[^.]{0,100}(?:hardening|ACL|DACL|descriptor)/iu,
+    /real Windows[^.]{0,100}(?:Task 10|not yet verified|still pending)/iu,
+  ]) {
+    assert.doesNotMatch(
+      implementedDocumentation,
+      supersededClaim,
+      `implemented Windows documentation must reject ${supersededClaim}`,
+    );
   }
 });
 
