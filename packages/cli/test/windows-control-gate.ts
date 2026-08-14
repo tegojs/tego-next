@@ -292,8 +292,12 @@ async function runPowerShellSelfTest(): Promise<void> {
   if (prime.error !== undefined) diagnosticStage = "prime-spawn";
   else if (prime.signal !== null) diagnosticStage = "prime-signal";
   else if (prime.status !== 0) {
-    if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED") {
-      diagnosticStage = "prime-compile";
+    const compileDiagnostic =
+      /^(TEGO_TASK4_NON_AUTHORITATIVE_COMPILE_(SYNTAX|SYMBOL|TYPE|STATE|ASSEMBLY|OTHER)_(L[0-6]))\r?\nTEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED$/u.exec(
+        primeCode,
+      );
+    if (compileDiagnostic !== null) {
+      diagnosticStage = `prime-compile-${compileDiagnostic[2]?.toLowerCase()}-${compileDiagnostic[3]?.toLowerCase()}`;
     } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
       diagnosticStage = "prime-native";
     } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED") {

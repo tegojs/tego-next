@@ -58,6 +58,42 @@ try {
   }
   Add-Type -Path $sourcePath
 } catch {
+  # TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after the compiler RED is localized.
+  $compilerError = $null
+  if ($Error.Count -gt 0 -and $Error[0].TargetObject -is [System.CodeDom.Compiler.CompilerError]) {
+    $compilerError = $Error[0].TargetObject
+  } else {
+    foreach ($record in $Error) {
+      if ($record.TargetObject -is [System.CodeDom.Compiler.CompilerError]) {
+        $compilerError = $record.TargetObject
+        break
+      }
+    }
+  }
+  $compilerCategory = "OTHER"
+  $compilerLineBand = "L0"
+  if ($null -ne $compilerError) {
+    switch -Regex ([string]$compilerError.ErrorNumber) {
+      '^CS(?:1001|1002|1003|1026|1056|1513|1519|1525|1644|8026)$' {
+        $compilerCategory = "SYNTAX"
+      }
+      '^CS(?:0103|0117|0122|0234|0246)$' { $compilerCategory = "SYMBOL" }
+      '^CS(?:0029|0266|1501|1502|1503)$' { $compilerCategory = "TYPE" }
+      '^CS(?:0165|0177)$' { $compilerCategory = "STATE" }
+      '^CS(?:0012|1705)$' { $compilerCategory = "ASSEMBLY" }
+    }
+    $compilerLine = [int]$compilerError.Line
+    if ($compilerLine -ge 1) {
+      if ($compilerLine -le 500) { $compilerLineBand = "L1" }
+      elseif ($compilerLine -le 1000) { $compilerLineBand = "L2" }
+      elseif ($compilerLine -le 1500) { $compilerLineBand = "L3" }
+      elseif ($compilerLine -le 2000) { $compilerLineBand = "L4" }
+      elseif ($compilerLine -le 2500) { $compilerLineBand = "L5" }
+      elseif ($compilerLine -le 3000) { $compilerLineBand = "L6" }
+    }
+  }
+  $diagnosticCode = "TEGO_TASK4_NON_AUTHORITATIVE_COMPILE_{0}_{1}" -f $compilerCategory, $compilerLineBand
+  [Console]::Error.WriteLine($diagnosticCode)
   [Console]::Error.WriteLine("TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED")
   exit 1
 }
