@@ -3,7 +3,7 @@ import { EventEmitter, once } from "node:events";
 import { isAbsolute } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import { setImmediate as waitImmediate } from "node:timers/promises";
+import { setTimeout as wait, setImmediate as waitImmediate } from "node:timers/promises";
 import {
   createWindowsControlBroker,
   type WindowsBrokerChildProcess,
@@ -622,7 +622,10 @@ test("close prefers graceful ACK and otherwise escalates to forced termination",
   await assert.rejects(abnormalClose, UNSAFE);
 
   const forcedChild = createFakeBrokerChild();
-  const forced = createStartedBroker(forcedChild, { shutdownTimeoutMs: 5 });
+  const forced = createStartedBroker(forcedChild, {
+    closeAcknowledgementTimeoutMs: 5,
+    shutdownTimeoutMs: 5,
+  });
   const forcedFrames = collectParentFrames(forcedChild);
   await forced.startup;
   await forced.broker.close();
@@ -631,6 +634,42 @@ test("close prefers graceful ACK and otherwise escalates to forced termination",
     true,
   );
   assert.deepEqual(forcedChild.kills, ["SIGTERM"]);
+});
+
+test("close gives bounded C# settlement a separate acknowledgement deadline", async () => {
+  const child = createFakeBrokerChild();
+  const { broker, startup } = createStartedBroker(child, {
+    closeAcknowledgementTimeoutMs: 500,
+    shutdownTimeoutMs: 5,
+  });
+  const frames = collectParentFrames(child);
+  await startup;
+
+  const closing = broker.close();
+  await eventually(() => frames.some(({ type }) => type === "close-all"));
+  await wait(15);
+  assert.deepEqual(child.kills, []);
+  child.stdout.write(brokerFrame("close-all-ack"));
+  child.exit();
+  await closing;
+});
+
+test("close keeps post-ACK child settlement on the shorter shutdown deadline", async () => {
+  const child = createFakeBrokerChild();
+  const { broker, startup } = createStartedBroker(child, {
+    closeAcknowledgementTimeoutMs: 500,
+    shutdownTimeoutMs: 5,
+  });
+  const frames = collectParentFrames(child);
+  await startup;
+
+  const closing = broker.close();
+  await eventually(() => frames.some(({ type }) => type === "close-all"));
+  const killed = once(child, "kill");
+  child.stdout.write(brokerFrame("close-all-ack"));
+  assert.equal(await Promise.race([killed.then(() => true), wait(100).then(() => false)]), true);
+  await closing;
+  assert.deepEqual(child.kills, ["SIGTERM"]);
 });
 
 test("cleanup errors retain the primary protocol failure first", async () => {

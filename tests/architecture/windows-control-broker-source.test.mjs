@@ -251,6 +251,11 @@ function assertCSharpContract(source) {
   );
   const x64Guard = balancedBlock(source, "private static bool IsX64Process(");
   const pipeConnection = balancedBlock(source, "private sealed class PipeConnection");
+  const beginConnectionShutdown = balancedBlock(pipeConnection, "internal bool BeginShutdown(");
+  const completeConnectionShutdown = balancedBlock(
+    pipeConnection,
+    "internal void CompleteShutdown(",
+  );
   const broker = balancedBlock(source, "private sealed class Broker : IDisposable");
   const brokerDispose = balancedBlock(broker, "public void Dispose(");
   const readLoop = balancedBlock(pipeConnection, "private void ReadLoop(");
@@ -267,6 +272,7 @@ function assertCSharpContract(source) {
   const pendingRead = balancedBlock(source, "private sealed class PendingReadOperation");
   const retryCanceledRead = balancedBlock(source, "private static bool ShouldRetryCanceledRead(");
   const connectionDispose = balancedBlock(pipeConnection, "public void Dispose(");
+  const waitForIoSettlement = balancedBlock(pipeConnection, "private void WaitForIoSettlement(");
   const acceptCleanup = balancedBlock(source, "private void StopAcceptLoop(");
   const failFastResource = balancedBlock(source, "private static void FailFastResource(");
 
@@ -397,16 +403,25 @@ function assertCSharpContract(source) {
   );
   assert.doesNotMatch(pipeConnection, /bool synchronous = WriteFile\(/u);
   assert.doesNotMatch(pipeConnection, /_readThread\.Join\(ShutdownTimeoutMilliseconds\)/u);
+  assert.match(beginConnectionShutdown, /Interlocked\.Exchange\(ref _closed, 1\)/u);
+  assert.match(beginConnectionShutdown, /RequestIoCancellation\(\)/u);
+  assert.match(completeConnectionShutdown, /WaitForIoSettlement\(deadline\)/u);
+  assert.doesNotMatch(completeConnectionShutdown, /DateTime\.UtcNow|AddMilliseconds/u);
   assert.ok(
-    connectionDispose.indexOf("RequestIoCancellation") <
-      connectionDispose.indexOf("WaitForIoSettlement"),
+    completeConnectionShutdown.indexOf("WaitForIoSettlement(deadline)") <
+      completeConnectionShutdown.indexOf("_pipeHandle.Dispose"),
   );
-  assert.ok(
-    connectionDispose.indexOf("WaitForIoSettlement") <
-      connectionDispose.indexOf("_pipeHandle.Dispose"),
-  );
+  assert.match(pipeConnection, /private void WaitForIoSettlement\(DateTime deadline\)/u);
+  assert.doesNotMatch(waitForIoSettlement, /DateTime\.UtcNow|AddMilliseconds/u);
+  assert.match(connectionDispose, /DateTime shutdownDeadline/u);
+  assert.match(connectionDispose, /BeginShutdown\(\)/u);
+  assert.match(connectionDispose, /CompleteShutdown\(shutdownDeadline\)/u);
   assert.ok(acceptCleanup.indexOf("Set()") < acceptCleanup.indexOf("Join("));
   assert.ok(acceptCleanup.indexOf("Join(") < acceptCleanup.indexOf("DisposePendingAcceptHandle"));
+  assert.match(broker, /private void StopAcceptLoop\(DateTime deadline\)/u);
+  assert.match(acceptCleanup, /WaitUntil\(_acceptStopped, deadline\)/u);
+  assert.doesNotMatch(acceptCleanup, /DateTime\.UtcNow|AddMilliseconds/u);
+  assert.doesNotMatch(acceptCleanup, /WaitOne\(ShutdownTimeoutMilliseconds\)/u);
   assert.match(
     closeAll,
     /lock \(_outputGate\)[\s\S]+FrameClose[\s\S]+CloseEveryPipe\(\)[\s\S]+lock \(_outputGate\)[\s\S]+FrameCloseAllAck/u,
@@ -438,6 +453,15 @@ function assertCSharpContract(source) {
   assert.match(
     closeEveryPipe,
     /_closeDeadlineTimer\.Change\(Timeout\.Infinite, Timeout\.Infinite\)/u,
+  );
+  assert.equal(
+    closeEveryPipe.match(/DateTime\.UtcNow\.AddMilliseconds\(ShutdownTimeoutMilliseconds\)/gu)
+      ?.length,
+    1,
+  );
+  assert.match(
+    closeEveryPipe,
+    /DateTime shutdownDeadline[\s\S]+BeginShutdown\(\)[\s\S]+StopAcceptLoop\(shutdownDeadline\)[\s\S]+CompleteShutdown\(shutdownDeadline\)/u,
   );
   assert.match(brokerDispose, /_closeDeadlineTimer\.Dispose\(timerStopped\)/u);
   assert.match(brokerDispose, /timerStopped\.WaitOne\(ShutdownTimeoutMilliseconds\)/u);
@@ -639,6 +663,36 @@ test("source contracts reject security and lifecycle mutations", async () => {
     ),
     mutateOnce(csharp, "_connections.Count + _pendingCloses.Count", "_connections.Count"),
     mutateOnce(csharp, "_pendingCloses.Clear();", ""),
+    mutateOnce(
+      csharp,
+      "shutdownOwnership[index] = connections[index].BeginShutdown();",
+      "shutdownOwnership[index] = true;",
+    ),
+    mutateOnce(
+      csharp,
+      "StopAcceptLoop(shutdownDeadline);",
+      "StopAcceptLoop(DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds));",
+    ),
+    mutateOnce(
+      csharp,
+      "connections[index].CompleteShutdown(shutdownDeadline);",
+      "connections[index].CompleteShutdown(DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds));",
+    ),
+    mutateOnce(
+      csharp,
+      "            WaitForIoSettlement(deadline);",
+      "            deadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);\n            WaitForIoSettlement(deadline);",
+    ),
+    mutateOnce(
+      csharp,
+      "            _acceptCancellation.Set();",
+      "            deadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);\n            _acceptCancellation.Set();",
+    ),
+    mutateOnce(
+      csharp,
+      "            bool onReadThread = Thread.CurrentThread == _readThread;",
+      "            deadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);\n            bool onReadThread = Thread.CurrentThread == _readThread;",
+    ),
     mutateOnce(csharp, "_closeDeadlineTimer.Dispose(timerStopped)", "true"),
     mutateOnce(csharp, "TestPendingCloseAdmission();", ""),
     mutateOnce(csharp, "TerminateProcess(GetCurrentProcess(), 1);", ""),

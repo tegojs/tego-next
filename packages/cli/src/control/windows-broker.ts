@@ -22,6 +22,7 @@ import {
 const WINDOWS_BROKER_SCRIPT = fileURLToPath(new URL("windows-control-broker.ps1", import.meta.url));
 const WINDOWS_BROKER_CSHARP = fileURLToPath(new URL("windows-control-broker.cs", import.meta.url));
 const WINDOWS_BROKER_STARTUP_TIMEOUT_MS = 10_000;
+const WINDOWS_BROKER_CLOSE_ACKNOWLEDGEMENT_TIMEOUT_MS = 5_000;
 const WINDOWS_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
 const WINDOWS_BROKER_STDERR_LIMIT = 64 * 1024;
 const WINDOWS_BROKER_MAX_CONNECTIONS = 64;
@@ -89,6 +90,7 @@ export interface WindowsControlBroker {
 }
 
 export interface WindowsControlBrokerOptions {
+  readonly closeAcknowledgementTimeoutMs?: number;
   readonly endpoint: string;
   readonly maxConnections: number;
   readonly maxQueuedBytes: number;
@@ -257,6 +259,7 @@ class BrokerConnection extends Duplex implements ControlConnection {
 }
 
 class WindowsControlBrokerAdapter implements WindowsControlBroker {
+  readonly #closeAcknowledgementTimeoutMs: number;
   readonly endpoint: string;
   readonly #connectionListeners = new Set<(connection: ControlConnection) => void>();
   readonly #connections = new Map<bigint, BrokerConnection>();
@@ -303,6 +306,10 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
       }
     }
     this.endpoint = options.endpoint;
+    this.#closeAcknowledgementTimeoutMs = duration(
+      options.closeAcknowledgementTimeoutMs,
+      WINDOWS_BROKER_CLOSE_ACKNOWLEDGEMENT_TIMEOUT_MS,
+    );
     this.#maxConnections = options.maxConnections;
     this.#maxQueuedBytes = options.maxQueuedBytes;
     this.#onFailureStage = options.onFailureStage;
@@ -435,7 +442,7 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
     this.#phase = "closing";
     try {
       await this.#sendFrame({ connectionId: 0n, payload: new Uint8Array(), type: "close-all" });
-      await withDeadline(this.#acknowledged.promise, this.#shutdownTimeoutMs);
+      await withDeadline(this.#acknowledged.promise, this.#closeAcknowledgementTimeoutMs);
       this.#child?.stdin.end();
       await withDeadline(this.#childClosed.promise, this.#shutdownTimeoutMs);
     } catch {

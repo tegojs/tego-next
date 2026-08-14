@@ -85,6 +85,14 @@ public static class TegoWindowsControlBroker
     private const ushort ImageFileMachineUnknown = 0x0000;
     private const ushort ImageFileMachineAmd64 = 0x8664;
 
+    private static bool WaitUntil(WaitHandle waitHandle, DateTime deadline)
+    {
+        TimeSpan remaining = deadline - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+            return waitHandle.WaitOne(0);
+        return waitHandle.WaitOne(remaining);
+    }
+
     private enum FailureStage
     {
         ParentOpen,
@@ -1275,23 +1283,14 @@ public static class TegoWindowsControlBroker
             }
         }
 
-        private void WaitForIoSettlement()
+        private void WaitForIoSettlement(DateTime deadline)
         {
-            DateTime deadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);
             bool onReadThread = Thread.CurrentThread == _readThread;
             if (!onReadThread && Interlocked.CompareExchange(ref _started, 0, 0) != 0 &&
                 !WaitUntil(_readStopped, deadline))
                 FailFastResource();
             if (!WaitUntil(_writeIdle, deadline))
                 FailFastResource();
-        }
-
-        private static bool WaitUntil(WaitHandle waitHandle, DateTime deadline)
-        {
-            TimeSpan remaining = deadline - DateTime.UtcNow;
-            if (remaining <= TimeSpan.Zero)
-                return waitHandle.WaitOne(0);
-            return waitHandle.WaitOne(remaining);
         }
 
         private void DisposeSynchronizationObjects()
@@ -1303,20 +1302,33 @@ public static class TegoWindowsControlBroker
             _writeIdle.Dispose();
         }
 
-        public void Dispose()
+        internal bool BeginShutdown()
         {
             if (Interlocked.Exchange(ref _closed, 1) != 0)
-                return;
+                return false;
             lock (_startGate)
             {
             }
             RequestIoCancellation();
-            WaitForIoSettlement();
+            return true;
+        }
+
+        internal void CompleteShutdown(DateTime deadline)
+        {
+            WaitForIoSettlement(deadline);
             _pipeHandle.Dispose();
             if (Thread.CurrentThread == _readThread)
                 Interlocked.Exchange(ref _disposeSynchronizationOnReadExit, 1);
             else
                 DisposeSynchronizationObjects();
+        }
+
+        public void Dispose()
+        {
+            DateTime shutdownDeadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);
+            if (!BeginShutdown())
+                return;
+            CompleteShutdown(shutdownDeadline);
         }
     }
 
@@ -1827,6 +1839,7 @@ public static class TegoWindowsControlBroker
 
         private void CloseEveryPipe()
         {
+            DateTime shutdownDeadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);
             PipeConnection[] connections;
             lock (_gate)
             {
@@ -1837,13 +1850,19 @@ public static class TegoWindowsControlBroker
                 _pendingCloses.Clear();
                 _closeDeadlineTimer.Change(Timeout.Infinite, Timeout.Infinite);
             }
-            StopAcceptLoop();
+            bool[] shutdownOwnership = new bool[connections.Length];
             for (int index = 0; index < connections.Length; index += 1)
-                connections[index].Dispose();
+                shutdownOwnership[index] = connections[index].BeginShutdown();
+            StopAcceptLoop(shutdownDeadline);
+            for (int index = 0; index < connections.Length; index += 1)
+            {
+                if (shutdownOwnership[index])
+                    connections[index].CompleteShutdown(shutdownDeadline);
+            }
             _connectionSlot.Set();
         }
 
-        private void StopAcceptLoop()
+        private void StopAcceptLoop(DateTime deadline)
         {
             _acceptCancellation.Set();
             _readyGate.Set();
@@ -1851,7 +1870,7 @@ public static class TegoWindowsControlBroker
             Thread acceptThread = _acceptThread;
             if (acceptThread != null && Thread.CurrentThread != acceptThread)
             {
-                if (!_acceptStopped.WaitOne(ShutdownTimeoutMilliseconds))
+                if (!WaitUntil(_acceptStopped, deadline))
                     FailFastResource();
                 if (acceptThread.IsAlive && !acceptThread.Join(0))
                     FailFastResource();
