@@ -191,6 +191,7 @@ test("queue limits are direction-aware, drain requires the matching active direc
   const state = new WindowsBrokerConnectionState({ maxConnectionBytes: 3, maxTotalBytes: 4 });
   readyAndOpen(state);
   accept(state, brokerToParent, "data", 1n, Uint8Array.from([1, 2]));
+  assert.throws(() => state.drain(1n, parentToBroker, 1), PROTOCOL_ERROR);
   accept(state, parentToBroker, "data", 1n, Uint8Array.from([3]));
   assert.throws(
     () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([4, 5])),
@@ -210,6 +211,7 @@ test("CLOSE_ALL requires parent ownership, drains all terminals before broker ac
   readyAndOpen(state, 1n);
   accept(state, brokerToParent, "open", 2n);
   accept(state, parentToBroker, "close-all", 0n);
+  assert.throws(() => accept(state, brokerToParent, "open", 3n), PROTOCOL_ERROR);
   assert.throws(
     () => accept(state, parentToBroker, "data", 1n, Uint8Array.from([1])),
     PROTOCOL_ERROR,
