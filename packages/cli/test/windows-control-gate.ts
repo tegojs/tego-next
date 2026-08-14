@@ -79,6 +79,9 @@ const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_"
 let nonAuthoritativeStage = "not-entered";
 let nonAuthoritativeReconnectStage = "not-entered";
 let nonAuthoritativeReconnectCleanupStage = "not-entered";
+let nonAuthoritativeReconnectCloseResult = "not-entered";
+let nonAuthoritativeReconnectBrokerExit = "not-entered";
+let nonAuthoritativeBrokerFailureStage = "none";
 let nonAuthoritativeRound = -1;
 let nonAuthoritativeRoundStage = "not-entered";
 
@@ -198,6 +201,9 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
     windowsControlBrokerFactory(options) {
       return createWindowsControlBroker({
         ...options,
+        onFailureStage(stage) {
+          nonAuthoritativeBrokerFailureStage = stage;
+        },
         onReadyDescriptor(value) {
           descriptor = value;
         },
@@ -450,7 +456,38 @@ async function runReconnectFailure(): Promise<void> {
   const tracked = liveServer;
   try {
     nonAuthoritativeReconnectStage = "server-close";
-    await tracked.server.close();
+    try {
+      await tracked.server.close();
+      nonAuthoritativeReconnectCloseResult = "resolved";
+    } catch (error) {
+      if (diagnosticCode(error) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE") {
+        nonAuthoritativeReconnectCloseResult = "direct-unsafe";
+      } else if (error instanceof AggregateError) {
+        const codes = error.errors.map((entry) => diagnosticCode(entry));
+        if (
+          codes.length === 2 &&
+          codes.every((code) => code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE")
+        ) {
+          nonAuthoritativeReconnectCloseResult = "aggregate-two-unsafe";
+        } else if (codes.includes("PROTOCOL_CONTROL_ENDPOINT_UNSAFE")) {
+          nonAuthoritativeReconnectCloseResult = "aggregate-contains-unsafe";
+        } else {
+          nonAuthoritativeReconnectCloseResult = "aggregate-other";
+        }
+      } else {
+        nonAuthoritativeReconnectCloseResult = "other";
+      }
+      if (tracked.broker.signalCode !== null) {
+        nonAuthoritativeReconnectBrokerExit = "signaled";
+      } else if (tracked.broker.exitCode === 0) {
+        nonAuthoritativeReconnectBrokerExit = "exit-zero";
+      } else if (tracked.broker.exitCode !== null) {
+        nonAuthoritativeReconnectBrokerExit = "exit-nonzero";
+      } else {
+        nonAuthoritativeReconnectBrokerExit = "alive";
+      }
+      throw error;
+    }
     nonAuthoritativeReconnectStage = "child-close";
     await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
     nonAuthoritativeReconnectStage = "pipe-proof";
@@ -519,6 +556,12 @@ if (process.argv[2] === "--parent-crash-fixture") {
     );
     process.stderr.write(
       `${task4DiagnosticMarker}_RECONNECT_CLEANUP:${nonAuthoritativeReconnectCleanupStage}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_CLOSE:${nonAuthoritativeReconnectCloseResult}:${nonAuthoritativeReconnectBrokerExit}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_BROKER_FAILURE_STAGE:${nonAuthoritativeBrokerFailureStage}\n`,
     );
     process.stderr.write(
       `${task4DiagnosticMarker}_ROUND:${String(nonAuthoritativeRound)}:${nonAuthoritativeRoundStage}\n`,
