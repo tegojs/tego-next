@@ -129,7 +129,9 @@ function hasActiveStageExecutor(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
     ?.replaceAll("\r\n", "\n")
     .trim();
-  return body === "await operation();";
+  return (
+    body === "await operation();" || body === "nonAuthoritativeStage = stage;\n  await operation();"
+  );
 }
 
 function hasForbiddenGateFlow(body) {
