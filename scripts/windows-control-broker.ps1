@@ -22,6 +22,16 @@ if (
   exit 1
 }
 
+if (
+  $SelfTest -and (
+    $PSVersionTable.PSVersion.Major -ne 5 -or
+    $PSVersionTable.PSVersion.Minor -ne 1
+  )
+) {
+  [Console]::Error.WriteLine("TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED")
+  exit 1
+}
+
 if ($SelfTest) {
   if (
     -not [string]::IsNullOrEmpty($Endpoint) -or

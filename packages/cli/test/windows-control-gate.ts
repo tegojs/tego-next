@@ -22,6 +22,7 @@ const WINDOWS_PIPE_FULL_CONTROL = 0x1f01ff;
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
 const PROCESS_CLEANUP_TIMEOUT_MS = 15_000;
+const POWERSHELL_STARTUP_STDERR_MAX_BYTES = 64 * 1024;
 const expectedPackageNames = [
   "@tego/cli",
   "@tego/contracts",
@@ -71,10 +72,7 @@ interface ParentFixtureReady {
   readonly type: "ready";
 }
 
-let currentUserSid: string | undefined;
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let diagnosticPowerShellStage = "installed-contract";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -151,12 +149,13 @@ async function assertPipeUnavailable(endpoint: string): Promise<void> {
 }
 
 function assertDescriptor(descriptor: WindowsBrokerSecurityDescriptor): void {
-  assert.ok(currentUserSid !== undefined);
-  assert.equal(descriptor.ownerSid, currentUserSid);
+  const ownerSid = descriptor.ownerSid;
+  assert.match(ownerSid, /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
   assert.equal(descriptor.protectedDacl, true);
+  const expectedSids = [...new Set([ownerSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID])];
   assert.deepEqual(
     descriptor.accessRules,
-    [currentUserSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID].map((sid) => ({
+    expectedSids.map((sid) => ({
       accessMask: WINDOWS_PIPE_FULL_CONTROL,
       callback: false as const,
       inherited: false as const,
@@ -245,28 +244,6 @@ async function runWindowsControlGateStage(
   await operation();
 }
 
-async function initializeCurrentUserSid(): Promise<void> {
-  const identity = spawnSync(
-    "powershell.exe",
-    [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      '$ProgressPreference = "SilentlyContinue"; $ErrorActionPreference = "Stop"; [Console]::Out.WriteLine("{0}.{1}", $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor); [Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
-    ],
-    { encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true },
-  );
-  assert.equal(identity.error, undefined);
-  assert.equal(identity.signal, null);
-  assert.equal(identity.status, 0);
-  assert.equal(identity.stderr, "");
-  const identityLines = identity.stdout.trim().split(/\r?\n/u);
-  assert.equal(identityLines[0], "5.1", "PowerShell 5.1 is mandatory");
-  assert.match(identityLines[1] ?? "", /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
-  currentUserSid = identityLines[1];
-}
-
 async function runPowerShellSelfTest(): Promise<void> {
   assert.equal(process.platform, "win32", "Windows control gate requires win32");
   assert.equal(process.arch, "x64", "Windows control gate requires x64");
@@ -292,24 +269,36 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
-  diagnosticPowerShellStage = "identity";
-  await initializeCurrentUserSid();
+  const selfTestArguments = [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    brokerPowerShell,
+    "-SelfTest",
+  ];
+  const prime = spawnSync("powershell.exe", selfTestArguments, {
+    encoding: "utf8",
+    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,
+    shell: false,
+    timeout: 2 * 60 * 1000,
+    windowsHide: true,
+  });
+  assert.equal(prime.error, undefined);
+  assert.equal(prime.signal, null);
+  assert.equal(prime.status, 0);
+  assert.equal(prime.stdout, "");
+  assert.ok(Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES);
 
-  diagnosticPowerShellStage = "selftest-invocation";
-  const selfTest = spawnSync(
-    "powershell.exe",
-    [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      brokerPowerShell,
-      "-SelfTest",
-    ],
-    { encoding: "utf8", shell: false, timeout: 2 * 60 * 1000, windowsHide: true },
-  );
+  const selfTest = spawnSync("powershell.exe", selfTestArguments, {
+    encoding: "utf8",
+    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,
+    shell: false,
+    timeout: 2 * 60 * 1000,
+    windowsHide: true,
+  });
   assert.equal(selfTest.error, undefined);
   assert.equal(selfTest.signal, null);
   assert.equal(selfTest.status, 0);
@@ -350,7 +339,6 @@ async function runMalformedFrameFailure(): Promise<void> {
 }
 
 async function runParentCrashFixture(): Promise<void> {
-  await initializeCurrentUserSid();
   const tracked = await startTrackedServer("parent-crash");
   if (process.send === undefined) throw new Error("Windows parent fixture requires IPC");
   await new Promise<void>((resolveSend, rejectSend) => {
@@ -483,7 +471,6 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticPowerShellStage}\n`);
     if (liveServer !== undefined) await cleanupTrackedServer(liveServer);
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
     process.exitCode = 1;

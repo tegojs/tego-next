@@ -23,7 +23,7 @@ const requiredWindowsControlGateStages = [
   [
     "powershell-csharp-self-test",
     "runPowerShellSelfTest",
-    ["spawnSync(", '"-SelfTest"', "await initializeCurrentUserSid();"],
+    ["spawnSync(", '"-SelfTest"', "prime.status", "selfTest.stderr"],
   ],
   [
     "live-server-handle-descriptor",
@@ -104,6 +104,36 @@ function hasForbiddenGateFlow(body) {
   );
 }
 
+function hasStrictPowerShellSelfTest(source) {
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runPowerShellSelfTest");
+  if (body === undefined || body.includes('"-Endpoint"')) return false;
+  const spawnExpression = 'spawnSync("powershell.exe", selfTestArguments, {';
+  if (body.split(spawnExpression).length - 1 !== 2) return false;
+  if (body.split("maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES").length - 1 !== 2) {
+    return false;
+  }
+  const requiredInOrder = [
+    'const prime = spawnSync("powershell.exe", selfTestArguments, {',
+    "assert.equal(prime.error, undefined);",
+    "assert.equal(prime.signal, null);",
+    "assert.equal(prime.status, 0);",
+    'assert.equal(prime.stdout, "");',
+    'Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES',
+    'const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
+    "assert.equal(selfTest.error, undefined);",
+    "assert.equal(selfTest.signal, null);",
+    "assert.equal(selfTest.status, 0);",
+    'assert.equal(selfTest.stdout, "");',
+    'assert.equal(selfTest.stderr, "");',
+  ];
+  let cursor = -1;
+  for (const token of requiredInOrder) {
+    cursor = body.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return !/process\.(?:stdout|stderr)\.write\([^)]*prime/gu.test(body);
+}
+
 export function validateWindowsControlGateContract({ gateSource, runnerSource }) {
   const errors = [];
   if (typeof gateSource !== "string" || typeof runnerSource !== "string") {
@@ -137,6 +167,9 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasActiveStageExecutor(runnerSource) || !hasActiveStageExecutor(gateSource)) {
     errors.push("Windows gate stage executors must await their required operation");
+  }
+  if (!hasStrictPowerShellSelfTest(gateSource)) {
+    errors.push("Windows gate must retain its bounded prime and strict authoritative SelfTest");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(

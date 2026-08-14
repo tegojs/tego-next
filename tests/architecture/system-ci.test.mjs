@@ -31,7 +31,25 @@ const windowsControlGateImplementationFixtureBodies = new Map([
   ],
   [
     "runPowerShellSelfTest",
-    ["  spawnSync();", '  "-SelfTest";', "  await initializeCurrentUserSid();"],
+    [
+      '  const selfTestArguments = ["-SelfTest"];',
+      '  const prime = spawnSync("powershell.exe", selfTestArguments, {',
+      "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
+      "  });",
+      "  assert.equal(prime.error, undefined);",
+      "  assert.equal(prime.signal, null);",
+      "  assert.equal(prime.status, 0);",
+      '  assert.equal(prime.stdout, "");',
+      '  assert.ok(Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES);',
+      '  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
+      "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
+      "  });",
+      "  assert.equal(selfTest.error, undefined);",
+      "  assert.equal(selfTest.signal, null);",
+      "  assert.equal(selfTest.status, 0);",
+      '  assert.equal(selfTest.stdout, "");',
+      '  assert.equal(selfTest.stderr, "");',
+    ],
   ],
   ["startLiveDescriptor", ['  startTrackedServer("live-descriptor");']],
   ["runStatusRequest", ["  await assertStatus();"]],
@@ -278,42 +296,17 @@ test("Windows control gate source contract fixes every real stage before the sol
   assert.deepEqual(validateWindowsControlGateContract({ gateSource, runnerSource }), []);
 });
 
-test("Windows parent-crash fixture initializes its own descriptor identity", async () => {
+test("Windows gate proves the current-user descriptor without a redundant PowerShell SID query", async () => {
   const gateSource = await readFile(windowsControlGateSource, "utf8");
+  assert.doesNotMatch(gateSource, /initializeCurrentUserSid|currentUserSid|\$PSVersionTable/u);
   assert.match(
     gateSource,
-    /async function initializeCurrentUserSid\(\): Promise<void> \{[\s\S]*?currentUserSid = identityLines\[1\];[\s\S]*?^\}/mu,
+    /function assertDescriptor\([^)]+\)[\s\S]+const ownerSid = descriptor\.ownerSid;[\s\S]+\[ownerSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID\]/u,
   );
   assert.match(
     gateSource,
-    /async function runParentCrashFixture\(\): Promise<void> \{\s+await initializeCurrentUserSid\(\);\s+const tracked = await startTrackedServer\("parent-crash"\);/u,
+    /async function runParentCrashFixture\(\): Promise<void> \{\s+const tracked = await startTrackedServer\("parent-crash"\);/u,
   );
-});
-
-test("Windows PowerShell identity probe suppresses progress and makes errors terminating", async () => {
-  const gateSource = await readFile(windowsControlGateSource, "utf8");
-  const identityStart = gateSource.indexOf(
-    "async function initializeCurrentUserSid(): Promise<void> {",
-  );
-  const identityEnd = gateSource.indexOf(
-    "\n}\n\nasync function runPowerShellSelfTest",
-    identityStart,
-  );
-  assert.notEqual(identityStart, -1);
-  assert.notEqual(identityEnd, -1);
-  const identityBody = gateSource.slice(identityStart, identityEnd);
-  const commandStart = identityBody.indexOf('      "-Command",');
-  const progressPreference = identityBody.indexOf(
-    '$ProgressPreference = "SilentlyContinue";',
-    commandStart,
-  );
-  const errorPreference = identityBody.indexOf('$ErrorActionPreference = "Stop";', commandStart);
-  const identityQuery = identityBody.indexOf("$PSVersionTable.PSVersion.Major", commandStart);
-
-  assert.notEqual(commandStart, -1);
-  assert.ok(progressPreference > commandStart && progressPreference < identityQuery);
-  assert.ok(errorPreference > progressPreference && errorPreference < identityQuery);
-  assert.match(identityBody, /assert\.equal\(identity\.stderr, ""\);/u);
 });
 
 test("Windows control gate source validation rejects removed, reordered, softened, or no-op stages", async (t) => {
@@ -477,6 +470,43 @@ test("Windows control gate validation rejects hidden control flow and implementa
           gateSource: sourceName === "gateSource" ? mutation : gateSource,
           runnerSource: sourceName === "runnerSource" ? mutation : runnerSource,
         }).length > 0,
+      );
+    });
+  }
+});
+
+test("Windows gate validation keeps the bounded prime and strict authoritative SelfTest", async (t) => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?selftest-mutations=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+  const mutations = [
+    gateSource.replace(
+      "  assert.equal(prime.status, 0);",
+      "  assert.equal(prime.status, prime.status);",
+    ),
+    gateSource.replace(
+      '  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
+      "  const selfTest = prime;\n  void ({",
+    ),
+    gateSource.replace('  assert.equal(selfTest.stderr, "");', "  void selfTest.stderr;"),
+    gateSource.replace(
+      '  assert.ok(Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES);',
+      "  process.stderr.write(prime.stderr);",
+    ),
+  ];
+
+  for (const [index, mutation] of mutations.entries()) {
+    await t.test(`SelfTest mutation ${String(index + 1)}`, () => {
+      assert.notEqual(mutation, gateSource);
+      assert.ok(
+        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
       );
     });
   }

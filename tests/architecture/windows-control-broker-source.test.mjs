@@ -198,6 +198,11 @@ function assertPowerShellContract(source) {
   assert.match(source, /PROCESSOR_ARCHITECTURE[\s\S]+AMD64/u);
   assert.match(source, /\[PlatformID\]::Win32NT/u);
   assert.match(source, /Join-Path \$PSScriptRoot "windows-control-broker\.cs"/u);
+  const versionGuardIndex = source.indexOf("$PSVersionTable.PSVersion.Major -ne 5");
+  const addTypeIndex = source.indexOf("Add-Type -Path $sourcePath");
+  assert.notEqual(versionGuardIndex, -1, "Windows PowerShell 5.1 must be mandatory");
+  assert.match(source, /\$PSVersionTable\.PSVersion\.Minor -ne 1/u);
+  assert.ok(versionGuardIndex < addTypeIndex, "PowerShell version must be checked before Add-Type");
   assert.match(source, /Add-Type -Path \$sourcePath/u);
   assert.doesNotMatch(source, /Add-Type\s+-TypeDefinition|@['"]/u);
   assert.match(source, /if \(\$SelfTest\)[\s\S]+::SelfTest\(\)/u);
@@ -214,6 +219,7 @@ function assertPowerShellContract(source) {
     "TEGO_WINDOWS_CONTROL_BROKER_ARCH_UNSUPPORTED",
     "TEGO_WINDOWS_CONTROL_BROKER_ARGUMENTS_INVALID",
     "TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED",
+    "TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED",
     "TEGO_WINDOWS_CONTROL_BROKER_START_FAILED",
   ]);
 }
@@ -578,6 +584,17 @@ test("source contracts reject security and lifecycle mutations", async () => {
     ),
     mutateOnce(csharp, "VerifyDescriptor(handle, expectedSids);", ""),
     mutateOnce(csharp, "ReadReadyDescriptor(firstPipe, descriptor.ExpectedSids)", "new byte[0]"),
+    mutateOnce(
+      csharp,
+      "WindowsIdentity.GetCurrent().User",
+      "new SecurityIdentifier(LocalSystemSid)",
+    ),
+    mutateOnce(
+      csharp,
+      "        ValidateDescriptor(descriptor, expectedSids);\n\n        byte[] ownerSid =",
+      "\n        byte[] ownerSid =",
+    ),
+    mutateOnce(csharp, "descriptor.Owner.Equals(expectedSids[0])", "true"),
     mutateOnce(
       csharp,
       "_writer.WriteFrame(FrameReady, 0, _readyDescriptor);",
