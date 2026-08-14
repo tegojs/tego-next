@@ -229,3 +229,27 @@ repository source versus emitted broker .ps1/.cs: byte-for-byte equal
 
 The platform evidence boundary remains unchanged: this macOS run does not claim PowerShell 5.1
 compilation or live Win32 pipe behavior. Task 4 remains authoritative for those checks.
+
+## Final adapter disposition and admission follow-up
+
+The adapter now consumes Task 1's typed close disposition. A broker-first close still requires a
+live Duplex, queues the memoized parent close, and terminates the stream. A converging broker close
+is also valid when the parent-first Duplex has already emitted its close frame and been removed from
+the live map; the adapter accepts that late acknowledgement without treating the endpoint as
+unsafe. If the Duplex still exists during that race, the same memoized termination path settles it.
+
+`OPEN` admission now checks `WindowsBrokerConnectionState.activeConnectionCount` before accepting
+the frame, rather than checking only the live Duplex map. This count includes both live streams and
+parent-first streams awaiting reciprocal broker close, and decreases only when the two directions
+converge. Consequently, removing 64 parent-first Duplexes cannot expose an accidental 65th slot.
+
+The parent-first test was written first and reproduced the endpoint fault when a late broker close
+found no live Duplex. A second deterministic test opens and parent-closes 64 streams with all broker
+acknowledgements delayed: an attempted 65th open fails closed even though the live map is empty. On
+a fresh healthy endpoint with the same saturated state, acknowledging the earliest close releases
+one protocol slot and permits connection 65. The existing broker-first race remains covered.
+
+Fresh follow-up verification: focused control/protocol/adapter 55/55, focused C# source contract
+8/8, all CLI unit tests 197/197, and all architecture/package tests 353/353 passed. CLI build,
+typecheck, scoped Biome, scoped diff-check, and repository-source versus emitted C# comparison also
+passed. The Task 4 Windows evidence boundary remains unchanged.

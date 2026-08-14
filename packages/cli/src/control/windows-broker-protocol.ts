@@ -141,6 +141,7 @@ interface WindowsBrokerConnectionStateOptions {
 }
 
 export type WindowsBrokerFrameDirection = "broker-to-parent" | "parent-to-broker";
+export type WindowsBrokerCloseDisposition = "close-converged" | "close-first";
 
 const directions = ["broker-to-parent", "parent-to-broker"] as const;
 
@@ -217,7 +218,10 @@ export class WindowsBrokerConnectionState {
     return this.#connections.size;
   }
 
-  accept(frame: WindowsBrokerFrame, direction: WindowsBrokerFrameDirection): void {
+  accept(
+    frame: WindowsBrokerFrame,
+    direction: WindowsBrokerFrameDirection,
+  ): WindowsBrokerCloseDisposition | undefined {
     assertFrame(frame);
     assertDirection(direction);
     if (this.#fatal || this.#closeAllAcknowledged) throw protocolError();
@@ -334,8 +338,9 @@ export class WindowsBrokerConnectionState {
         connection.closeSeen[direction] = true;
         if (directions.every((currentDirection) => connection.closeSeen[currentDirection])) {
           this.#connections.delete(frame.connectionId);
+          return "close-converged";
         }
-        return;
+        return "close-first";
       }
       case "pause": {
         requireEmptyPayload(frame);

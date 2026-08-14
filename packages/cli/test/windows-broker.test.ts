@@ -371,6 +371,101 @@ test("broker-first CLOSE promptly queues one parent acknowledgement without pois
   await closeGracefully(broker, child, parentFrames);
 });
 
+test("parent-first CLOSE accepts a late broker acknowledgement after the Duplex is removed", async () => {
+  const { broker, child, startup } = createStartedBroker();
+  const parentFrames = collectParentFrames(child);
+  const connections: Parameters<Parameters<typeof broker.onConnection>[0]>[0][] = [];
+  const failures: Error[] = [];
+  broker.onConnection((connection) => connections.push(connection));
+  broker.onError((error) => failures.push(error));
+  await startup;
+
+  child.stdout.write(brokerFrame("open", 21n));
+  const first = connections[0];
+  assert.ok(first !== undefined);
+  const firstClosed = once(first, "close");
+  first.end();
+  await firstClosed;
+  await eventually(() =>
+    parentFrames.some(({ connectionId, type }) => connectionId === 21n && type === "close"),
+  );
+
+  child.stdout.write(brokerFrame("close", 21n));
+  child.stdout.write(brokerFrame("open", 22n));
+  await eventually(() => connections.length === 2 || failures.length > 0);
+  assert.deepEqual(failures, []);
+  assert.equal(connections.length, 2);
+
+  child.stdout.write(brokerFrame("close", 22n));
+  await eventually(() =>
+    parentFrames.some(({ connectionId, type }) => connectionId === 22n && type === "close"),
+  );
+  await closeGracefully(broker, child, parentFrames);
+});
+
+test("64 parent-first closes retain admission until reciprocal broker acknowledgements", async () => {
+  async function fillParentFirst(
+    child: FakeBrokerChild,
+    broker: ReturnType<typeof createWindowsControlBroker>,
+    connections: Parameters<Parameters<typeof broker.onConnection>[0]>[0][],
+    parentFrames: WindowsBrokerFrame[],
+  ): Promise<void> {
+    child.stdout.write(
+      Buffer.concat(
+        Array.from({ length: 64 }, (_, index) => brokerFrame("open", BigInt(index + 1))),
+      ),
+    );
+    assert.equal(connections.length, 64);
+    const closed = connections.map((connection) => once(connection, "close"));
+    for (const connection of connections) connection.end();
+    await Promise.all(closed);
+    await eventually(() => parentFrames.filter(({ type }) => type === "close").length === 64);
+  }
+
+  const saturated = createStartedBroker(createFakeBrokerChild(), { maxConnections: 64 });
+  const saturatedFrames = collectParentFrames(saturated.child);
+  const saturatedConnections: Parameters<Parameters<typeof saturated.broker.onConnection>[0]>[0][] =
+    [];
+  const saturatedFailures: Error[] = [];
+  saturated.broker.onConnection((connection) => saturatedConnections.push(connection));
+  saturated.broker.onError((error) => saturatedFailures.push(error));
+  await saturated.startup;
+  await fillParentFirst(saturated.child, saturated.broker, saturatedConnections, saturatedFrames);
+  saturated.child.stdout.write(brokerFrame("open", 65n));
+  await eventually(() => saturatedConnections.length > 64 || saturatedFailures.length > 0);
+  assert.equal(saturatedConnections.length, 64);
+  assert.equal(saturatedFailures.length, 1);
+  await assert.rejects(saturated.broker.close(), UNSAFE);
+
+  const converging = createStartedBroker(createFakeBrokerChild(), { maxConnections: 64 });
+  const convergingFrames = collectParentFrames(converging.child);
+  const convergingConnections: Parameters<
+    Parameters<typeof converging.broker.onConnection>[0]
+  >[0][] = [];
+  const convergingFailures: Error[] = [];
+  converging.broker.onConnection((connection) => convergingConnections.push(connection));
+  converging.broker.onError((error) => convergingFailures.push(error));
+  await converging.startup;
+  await fillParentFirst(
+    converging.child,
+    converging.broker,
+    convergingConnections,
+    convergingFrames,
+  );
+
+  converging.child.stdout.write(brokerFrame("close", 1n));
+  converging.child.stdout.write(brokerFrame("open", 65n));
+  await eventually(() => convergingConnections.length === 65 || convergingFailures.length > 0);
+  assert.deepEqual(convergingFailures, []);
+  assert.equal(convergingConnections.length, 65);
+
+  converging.child.stdout.write(brokerFrame("close", 65n));
+  await eventually(() =>
+    convergingFrames.some(({ connectionId, type }) => connectionId === 65n && type === "close"),
+  );
+  await closeGracefully(converging.broker, converging.child, convergingFrames);
+});
+
 test("virtual connection propagates readable backpressure with PAUSE and RESUME", async () => {
   const { broker, child, startup } = createStartedBroker(createFakeBrokerChild(), {
     maxConnections: 2,

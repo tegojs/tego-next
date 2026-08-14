@@ -166,3 +166,15 @@ retained converged entries. It churns 10,000 monotonically increasing connection
 directional closes, requires the count to return to zero, rejects reuse and old frames, and then
 proves the close-all acknowledgement path scans no historical state. The focused Task 1 suite now
 passes 15/15.
+
+## Typed CLOSE disposition follow-up
+
+The adapter must distinguish a broker-first close, which requires a live Duplex and a prompt parent
+acknowledgement, from a broker close that merely converges an earlier parent close after that Duplex
+has already been removed. `accept` therefore returns `"close-first"` or `"close-converged"` only
+for a valid `CLOSE`, and `undefined` for every other accepted frame. Unknown IDs and same-direction
+duplicates still throw before any disposition is returned.
+
+The direction-convergence test was changed first and observed `undefined` for both expected
+dispositions. It now proves the typed first/converged results while retaining the 10,000-connection
+state-release and old-ID rejection coverage. The wire protocol is unchanged.

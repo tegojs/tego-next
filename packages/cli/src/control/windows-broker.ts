@@ -502,14 +502,16 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
   }
 
   #acceptFrame(frame: WindowsBrokerFrame): void {
-    this.#state.accept(frame, "broker-to-parent");
+    if (frame.type === "open" && this.#state.activeConnectionCount >= this.#maxConnections) {
+      throw endpointUnsafe();
+    }
+    const disposition = this.#state.accept(frame, "broker-to-parent");
     switch (frame.type) {
       case "ready":
         decodeWindowsBrokerReadyDescriptor(frame.payload);
         this.#ready.resolve();
         return;
       case "open": {
-        if (this.#connections.size >= this.#maxConnections) throw endpointUnsafe();
         const highWaterMark = Math.max(1, Math.floor(this.#maxQueuedBytes / this.#maxConnections));
         const connection = new BrokerConnection(this, frame.connectionId, highWaterMark);
         this.#connections.set(frame.connectionId, connection);
@@ -531,6 +533,7 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
       }
       case "close": {
         const connection = this.#connections.get(frame.connectionId);
+        if (disposition === "close-converged" && connection === undefined) return;
         if (connection === undefined) throw endpointUnsafe();
         connection.receiveClose();
         return;

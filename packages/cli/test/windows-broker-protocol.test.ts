@@ -132,8 +132,8 @@ function accept(
     | "resume",
   connectionId: bigint,
   payload = new Uint8Array(),
-): void {
-  state.accept({ type, connectionId, payload }, direction);
+): ReturnType<WindowsBrokerConnectionState["accept"]> {
+  return state.accept({ type, connectionId, payload }, direction);
 }
 
 function readyAndOpen(state: WindowsBrokerConnectionState, connectionId = 1n): void {
@@ -148,7 +148,7 @@ test("Windows broker state limits global frames and opens to their owning direct
   accept(state, brokerToParent, "ready", 0n);
   assert.throws(() => accept(state, parentToBroker, "open", 1n), PROTOCOL_ERROR);
   accept(state, brokerToParent, "open", 1n);
-  accept(state, brokerToParent, "close", 1n);
+  assert.equal(accept(state, brokerToParent, "close", 1n), "close-first");
   accept(state, brokerToParent, "open", 2n);
   assert.throws(() => accept(state, brokerToParent, "open", 1n), PROTOCOL_ERROR);
   assert.throws(() => accept(state, brokerToParent, "ready", 0n), PROTOCOL_ERROR);
@@ -176,7 +176,7 @@ test("EOF is directional and opposite CLOSE frames converge exactly once", () =>
   assert.throws(() => accept(state, parentToBroker, "pause", 1n), PROTOCOL_ERROR);
   assert.throws(() => accept(state, parentToBroker, "resume", 1n), PROTOCOL_ERROR);
   assert.throws(() => accept(state, brokerToParent, "close", 1n), PROTOCOL_ERROR);
-  accept(state, parentToBroker, "close", 1n);
+  assert.equal(accept(state, parentToBroker, "close", 1n), "close-converged");
   assert.equal(state.activeConnectionCount, 0);
   assert.throws(() => accept(state, parentToBroker, "close", 1n), PROTOCOL_ERROR);
 });
