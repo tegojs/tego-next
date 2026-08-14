@@ -328,7 +328,7 @@ test("broker converts OPEN/DATA/EOF and virtual connection response DATA/CLOSE f
   await closeGracefully(broker, child, parentFrames);
 });
 
-test("broker and parent CLOSE frames converge without poisoning later connections", async () => {
+test("broker-first CLOSE promptly queues one parent acknowledgement without poisoning later connections", async () => {
   const { broker, child, startup } = createStartedBroker();
   const parentFrames = collectParentFrames(child);
   const connections: Parameters<Parameters<typeof broker.onConnection>[0]>[0][] = [];
@@ -344,10 +344,14 @@ test("broker and parent CLOSE frames converge without poisoning later connection
   await eventually(() =>
     parentFrames.some(({ connectionId, type }) => connectionId === 11n && type === "data"),
   );
-  first.end();
   child.stdout.write(brokerFrame("close", 11n));
   await eventually(() =>
     parentFrames.some(({ connectionId, type }) => connectionId === 11n && type === "close"),
+  );
+  assert.equal(
+    parentFrames.filter(({ connectionId, type }) => connectionId === 11n && type === "close")
+      .length,
+    1,
   );
 
   child.stdout.write(brokerFrame("open", 12n));

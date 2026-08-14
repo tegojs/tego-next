@@ -241,13 +241,19 @@ function assertCSharpContract(source) {
   const selfTest = balancedBlock(source, "public static int SelfTest(");
   const x64Guard = balancedBlock(source, "private static bool IsX64Process(");
   const pipeConnection = balancedBlock(source, "private sealed class PipeConnection");
+  const broker = balancedBlock(source, "private sealed class Broker : IDisposable");
+  const brokerDispose = balancedBlock(broker, "public void Dispose(");
   const readLoop = balancedBlock(pipeConnection, "private void ReadLoop(");
   const closeAll = balancedBlock(source, "private void CloseAllFromParent(");
   const closeConnection = balancedBlock(source, "private void CloseConnection(");
   const closeFromParent = balancedBlock(source, "private void CloseFromParent(");
-  const rememberFirstClose = balancedBlock(source, "private void RememberFirstCloseLocked(");
-  const acceptLateParentClose = balancedBlock(source, "private void AcceptLateParentCloseLocked(");
+  const pendingCloseTracker = balancedBlock(source, "private sealed class PendingCloseTracker");
+  const addBrokerFirst = balancedBlock(pendingCloseTracker, "internal void AddBrokerFirst(");
+  const acknowledgeParent = balancedBlock(pendingCloseTracker, "internal void AcknowledgeParent(");
+  const closeDeadlineElapsed = balancedBlock(source, "private void CloseDeadlineElapsed(");
+  const scheduleCloseDeadline = balancedBlock(source, "private void ScheduleCloseDeadlineLocked(");
   const closeEveryPipe = balancedBlock(source, "private void CloseEveryPipe(");
+  const connectionCount = balancedBlock(source, "private int ConnectionCount(");
   const pendingRead = balancedBlock(source, "private sealed class PendingReadOperation");
   const retryCanceledRead = balancedBlock(source, "private static bool ShouldRetryCanceledRead(");
   const connectionDispose = balancedBlock(pipeConnection, "public void Dispose(");
@@ -393,17 +399,34 @@ function assertCSharpContract(source) {
   );
   assert.match(closeAll, /_closeAllAcknowledged = true/u);
   assert.match(closeAll, /_closeAllAckQueued = true/u);
-  assert.match(source, /Dictionary<ulong, ClosedConnectionState> _closedConnections/u);
-  assert.match(source, /Queue<ulong> _closedConnectionOrder/u);
-  assert.match(closeConnection, /RememberFirstCloseLocked\(connection\.Id, notifyParent\)/u);
-  assert.match(closeConnection, /AcceptLateParentCloseLocked\(connection\.Id\)/u);
-  assert.match(closeFromParent, /AcceptLateParentCloseLocked\(id\)/u);
-  assert.match(rememberFirstClose, /_closedConnections\.Add/u);
-  assert.match(rememberFirstClose, /while \(_closedConnectionOrder\.Count > MaxConnections\)/u);
-  assert.match(acceptLateParentClose, /state\.ParentCloseSeen/u);
-  assert.match(acceptLateParentClose, /state\.BrokerCloseSeen/u);
-  assert.match(closeEveryPipe, /_closedConnections\.Clear\(\)/u);
-  assert.match(closeEveryPipe, /_closedConnectionOrder\.Clear\(\)/u);
+  assert.match(source, /readonly PendingCloseTracker _pendingCloses/u);
+  assert.match(source, /readonly Timer _closeDeadlineTimer/u);
+  assert.doesNotMatch(source, /RecentClosed|Queue<ulong>|closedConnectionOrder/iu);
+  assert.match(addBrokerFirst, /state\.BrokerCloseSeen = true/u);
+  assert.match(addBrokerFirst, /state\.ParentCloseSeen = false/u);
+  assert.match(addBrokerFirst, /state\.DeadlineUtc = deadlineUtc/u);
+  assert.match(acknowledgeParent, /state\.ParentCloseSeen/u);
+  assert.match(acknowledgeParent, /state\.BrokerCloseSeen/u);
+  assert.match(acknowledgeParent, /_states\.Remove\(id\)/u);
+  assert.match(closeConnection, /_pendingCloses\.AddBrokerFirst/u);
+  assert.match(
+    closeConnection,
+    /DateTime\.UtcNow\.AddMilliseconds\(ShutdownTimeoutMilliseconds\)/u,
+  );
+  assert.match(closeConnection, /PrepareFrame\(FrameClose/u);
+  assert.match(closeFromParent, /_pendingCloses\.AcknowledgeParent\(id\)/u);
+  assert.match(connectionCount, /_connections\.Count \+ _pendingCloses\.Count/u);
+  assert.match(scheduleCloseDeadline, /EarliestDeadlineUtc/u);
+  assert.match(scheduleCloseDeadline, /_closeDeadlineTimer\.Change/u);
+  assert.match(closeDeadlineElapsed, /HasExpired/u);
+  assert.match(closeDeadlineElapsed, /Fail\(FailureStage\.Protocol\)/u);
+  assert.match(closeEveryPipe, /_pendingCloses\.Clear\(\)/u);
+  assert.match(
+    closeEveryPipe,
+    /_closeDeadlineTimer\.Change\(Timeout\.Infinite, Timeout\.Infinite\)/u,
+  );
+  assert.match(brokerDispose, /_closeDeadlineTimer\.Dispose\(timerStopped\)/u);
+  assert.match(brokerDispose, /timerStopped\.WaitOne\(ShutdownTimeoutMilliseconds\)/u);
   assert.match(inputLoop, /CloseFromParent\(frame\.ConnectionId\)/u);
   assert.ok(
     inputLoop.indexOf("CloseFromParent(frame.ConnectionId)") <
@@ -424,6 +447,15 @@ function assertCSharpContract(source) {
   assert.match(selfTest, /TestPauseImmediateResume\(\)/u);
   assert.match(selfTest, /TestRepeatedPipeCleanup\(\)/u);
   assert.match(selfTest, /TestWritePreIssueCancellation\(\)/u);
+  assert.match(selfTest, /TestPendingCloseAdmission\(\)/u);
+  const pendingCloseSelfTest = balancedBlock(
+    source,
+    "private static void TestPendingCloseAdmission(",
+  );
+  assert.match(pendingCloseSelfTest, /MaxConnections/u);
+  assert.match(pendingCloseSelfTest, /10_000|10000/u);
+  assert.match(pendingCloseSelfTest, /AcknowledgeParent/u);
+  assert.match(pendingCloseSelfTest, /CanAdmit/u);
   const writeInterlockSelfTest = balancedBlock(
     source,
     "private static void TestWritePreIssueCancellation(",
@@ -472,6 +504,26 @@ function preIssueWriteCancellationModel() {
   return "native-write-issued";
 }
 
+function pendingCloseAdmissionModel(maxConnections) {
+  const pending = new Map();
+  return {
+    acknowledge(id) {
+      assert.equal(pending.delete(id), true);
+    },
+    admit(id, deadline) {
+      if (pending.size >= maxConnections) return false;
+      pending.set(id, deadline);
+      return true;
+    },
+    get count() {
+      return pending.size;
+    },
+    has(id) {
+      return pending.has(id);
+    },
+  };
+}
+
 test("write cancellation published before issue cannot be lost", () => {
   assert.equal(preIssueWriteCancellationModel(), "settled-without-native-issue");
 });
@@ -481,6 +533,19 @@ test("pending-read cancellation reason survives an immediate resume", () => {
   assert.equal(cancelledReadModel("pause", false, false), "wait-for-resume");
   assert.equal(cancelledReadModel("close", true, false), "stop");
   assert.equal(cancelledReadModel("pause", true, true), "stop");
+});
+
+test("broker-first CLOSE admission retains the earliest acknowledgement beyond 64 churn", () => {
+  const model = pendingCloseAdmissionModel(64);
+  for (let id = 1; id <= 64; id += 1) assert.equal(model.admit(id, 2_000), true);
+  assert.equal(model.count, 64);
+  assert.equal(model.has(1), true);
+  assert.equal(model.admit(65, 2_000), false);
+
+  model.acknowledge(1);
+  assert.equal(model.admit(65, 2_000), true);
+  assert.equal(model.count, 64);
+  assert.equal(model.has(65), true);
 });
 
 test("Windows broker protocol constants and directions exactly match Task 1", async () => {
@@ -539,15 +604,17 @@ test("source contracts reject security and lifecycle mutations", async () => {
     ),
     mutateOnce(csharp, "_closeAllAcknowledged = true;", ""),
     mutateOnce(csharp, "_closeAllAckQueued = true;", ""),
-    mutateOnce(csharp, "RememberFirstCloseLocked(connection.Id, notifyParent);", ""),
-    mutateOnce(csharp, "AcceptLateParentCloseLocked(connection.Id);", ""),
+    mutateOnce(csharp, "_pendingCloses.AddBrokerFirst", "_pendingCloses.IgnoreBrokerFirst"),
+    mutateOnce(csharp, "_pendingCloses.AcknowledgeParent(id);", ""),
     mutateOnce(
       csharp,
       "CloseFromParent(frame.ConnectionId);",
       "FindConnection(frame.ConnectionId);",
     ),
-    mutateOnce(csharp, "while (_closedConnectionOrder.Count > MaxConnections)", "while (false)"),
-    mutateOnce(csharp, "_closedConnections.Clear();", ""),
+    mutateOnce(csharp, "_connections.Count + _pendingCloses.Count", "_connections.Count"),
+    mutateOnce(csharp, "_pendingCloses.Clear();", ""),
+    mutateOnce(csharp, "_closeDeadlineTimer.Dispose(timerStopped)", "true"),
+    mutateOnce(csharp, "TestPendingCloseAdmission();", ""),
     mutateOnce(csharp, "TerminateProcess(GetCurrentProcess(), 1);", ""),
     mutateOnce(csharp, "Environment.FailFast(StageCode(FailureStage.Resource));", ""),
     mutateOnce(csharp, "_pipeHandle.DangerousAddRef(ref addRef);", "addRef = true;"),

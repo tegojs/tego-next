@@ -168,3 +168,64 @@ CLI build and typecheck: passed
 repository Biome lint and format: 261 files passed
 repository source versus emitted broker .ps1/.cs: byte-for-byte equal
 ```
+
+## Final close-handshake redesign
+
+The final review rejected the bounded recent-ID FIFO described in the first remediation: eviction
+could make a still-queued acknowledgement for the earliest broker-first close look like an unknown
+ID. This section supersedes that FIFO/tombstone design.
+
+Task 1 deletes connection state immediately after both directional closes and relies on the
+monotonic `lastConnectionId` to reject reuse and old traffic. A 10,000-connection regression proves
+the active map returns to zero. `CLOSE_ALL` still needs only one observed close for each remaining
+active entry, so its scan is bounded by live adapter admission rather than lifetime churn.
+
+The virtual Duplex now memoizes its parent close operation. A broker-first close queues the parent
+close acknowledgement before destroying the virtual connection; `_final` and `_destroy` share the
+same promise, so either race order emits at most one parent close. The deterministic fake-child test
+queues response data, delivers broker close first, observes exactly one later parent close, and then
+serves another connection on the same healthy endpoint.
+
+The C# broker replaces the recent-close dictionary/FIFO with an unresolved-only
+`PendingCloseTracker`:
+
+- a parent-first close removes the active pipe and promptly writes the broker close
+  acknowledgement, completing convergence without retained history;
+- a broker-first close replaces its active slot with one pending close carrying an absolute UTC
+  deadline no later than `ShutdownTimeoutMilliseconds` (2 seconds), then writes broker close;
+- parent acknowledgement validates the directional state, removes the pending entry, reschedules
+  the single deadline timer, and releases admission capacity;
+- active connections plus unresolved broker-first closes can never exceed `MaxConnections` (64),
+  so a full pending set prevents creation/acceptance of a 65th connection without evicting any ID;
+- the timer callback never blocks the parent input loop; expiry emits the fixed protocol failure and
+  fails closed, while shutdown clears pending state, disarms the timer, and boundedly waits for any
+  callback during disposal; and
+- fully converged, duplicate, or never-opened parent close IDs remain fatal protocol input.
+
+Both the JavaScript admission model and the C# `SelfTest` hold the earliest close unresolved while
+filling all 64 slots, reject further admission, acknowledge the earliest ID, and churn through
+10,000 IDs while retaining exactly 64 unresolved entries. Source mutation contracts prohibit
+`RecentClosed`, `Queue<ulong>`, or FIFO-cap code and require the timer deadline, capacity sum,
+acknowledgement removal, shutdown clearing, and callback settlement.
+
+### Final redesign TDD and verification
+
+The Task 1 test first failed with an undefined active count and retained state. The adapter test was
+changed before implementation so broker close arrived without a preceding `end`; it could not
+observe the required parent acknowledgement. The C# source contract then failed on the missing
+pending tracker and retained FIFO code. Each focused suite passed after its corresponding minimal
+implementation.
+
+Fresh verification on Node v26.5.0:
+
+```text
+focused Task 1 protocol + adapter: 26/26 passed
+focused C# source/model/mutation contract: 8/8 passed
+all CLI unit tests: 195/195 passed
+all architecture and package tests: 353/353 passed
+CLI build and typecheck: passed
+repository source versus emitted broker .ps1/.cs: byte-for-byte equal
+```
+
+The platform evidence boundary remains unchanged: this macOS run does not claim PowerShell 5.1
+compilation or live Win32 pipe behavior. Task 4 remains authoritative for those checks.

@@ -259,6 +259,66 @@ public static class TegoWindowsControlBroker
     {
         internal bool BrokerCloseSeen;
         internal bool ParentCloseSeen;
+        internal DateTime DeadlineUtc;
+    }
+
+    private sealed class PendingCloseTracker
+    {
+        private readonly Dictionary<ulong, ClosedConnectionState> _states =
+            new Dictionary<ulong, ClosedConnectionState>();
+
+        internal int Count { get { return _states.Count; } }
+
+        internal bool CanAdmit(int activeConnections)
+        {
+            if (activeConnections < 0 || activeConnections > MaxConnections)
+                throw new InvalidDataException();
+            return activeConnections + _states.Count < MaxConnections;
+        }
+
+        internal void AddBrokerFirst(ulong id, DateTime deadlineUtc)
+        {
+            if (_states.Count >= MaxConnections || _states.ContainsKey(id))
+                throw new InvalidDataException();
+            ClosedConnectionState state = new ClosedConnectionState();
+            state.BrokerCloseSeen = true;
+            state.ParentCloseSeen = false;
+            state.DeadlineUtc = deadlineUtc;
+            _states.Add(id, state);
+        }
+
+        internal void AcknowledgeParent(ulong id)
+        {
+            ClosedConnectionState state;
+            if (!_states.TryGetValue(id, out state) ||
+                state.ParentCloseSeen ||
+                !state.BrokerCloseSeen)
+                throw new InvalidDataException();
+            state.ParentCloseSeen = true;
+            _states.Remove(id);
+        }
+
+        internal DateTime? EarliestDeadlineUtc()
+        {
+            DateTime? earliest = null;
+            foreach (ClosedConnectionState state in _states.Values)
+            {
+                if (!earliest.HasValue || state.DeadlineUtc < earliest.Value)
+                    earliest = state.DeadlineUtc;
+            }
+            return earliest;
+        }
+
+        internal bool HasExpired(DateTime nowUtc)
+        {
+            DateTime? earliest = EarliestDeadlineUtc();
+            return earliest.HasValue && earliest.Value <= nowUtc;
+        }
+
+        internal void Clear()
+        {
+            _states.Clear();
+        }
     }
 
     private sealed class ParentFrameReader
@@ -1282,8 +1342,8 @@ public static class TegoWindowsControlBroker
         private readonly object _gate = new object();
         private readonly object _outputGate = new object();
         private readonly Dictionary<ulong, PipeConnection> _connections = new Dictionary<ulong, PipeConnection>();
-        private readonly Dictionary<ulong, ClosedConnectionState> _closedConnections = new Dictionary<ulong, ClosedConnectionState>();
-        private readonly Queue<ulong> _closedConnectionOrder = new Queue<ulong>();
+        private readonly PendingCloseTracker _pendingCloses = new PendingCloseTracker();
+        private readonly Timer _closeDeadlineTimer;
         private readonly ManualResetEvent _readyGate = new ManualResetEvent(false);
         private readonly ManualResetEvent _firstAcceptArmed = new ManualResetEvent(false);
         private readonly AutoResetEvent _connectionSlot = new AutoResetEvent(false);
@@ -1319,6 +1379,11 @@ public static class TegoWindowsControlBroker
             _writer = writer;
             _input = input;
             _watchdog = new ParentProcessWatchdog(parentHandle, new Action(ParentExited));
+            _closeDeadlineTimer = new Timer(
+                new TimerCallback(CloseDeadlineElapsed),
+                null,
+                Timeout.Infinite,
+                Timeout.Infinite);
         }
 
         internal ManualResetEvent Shutdown { get { return _shutdown; } }
@@ -1547,10 +1612,11 @@ public static class TegoWindowsControlBroker
             CloseConnection(connection, true);
         }
 
-        private void CloseConnection(PipeConnection connection, bool notifyParent)
+        private void CloseConnection(PipeConnection connection, bool brokerFirst)
         {
             bool removed;
             bool endpointClosing;
+            bool pendingResolved = false;
             ParentFrameWriter.PreparedFrame closeFrame = null;
             lock (_outputGate)
             {
@@ -1558,16 +1624,29 @@ public static class TegoWindowsControlBroker
                 {
                     removed = _connections.Remove(connection.Id);
                     endpointClosing = _closing;
-                    if (removed)
-                        RememberFirstCloseLocked(connection.Id, notifyParent);
-                    else if (!notifyParent)
-                        AcceptLateParentCloseLocked(connection.Id);
+                    if (removed && brokerFirst && !endpointClosing)
+                    {
+                        _pendingCloses.AddBrokerFirst(
+                            connection.Id,
+                            DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds));
+                        ScheduleCloseDeadlineLocked();
+                    }
+                    else if (!removed && !brokerFirst)
+                    {
+                        _pendingCloses.AcknowledgeParent(connection.Id);
+                        ScheduleCloseDeadlineLocked();
+                        pendingResolved = true;
+                    }
                 }
-                if (removed && notifyParent && !endpointClosing && !_shutdown.WaitOne(0))
+                if (removed && !endpointClosing && !_shutdown.WaitOne(0))
                     closeFrame = _writer.PrepareFrame(FrameClose, connection.Id, new byte[0]);
             }
             if (!removed)
+            {
+                if (pendingResolved)
+                    _connectionSlot.Set();
                 return;
+            }
             if (closeFrame != null)
             {
                 try
@@ -1586,40 +1665,52 @@ public static class TegoWindowsControlBroker
         private void CloseFromParent(ulong id)
         {
             PipeConnection connection;
+            bool pendingResolved = false;
             lock (_gate)
             {
                 if (!_connections.TryGetValue(id, out connection))
                 {
-                    AcceptLateParentCloseLocked(id);
-                    return;
+                    _pendingCloses.AcknowledgeParent(id);
+                    ScheduleCloseDeadlineLocked();
+                    pendingResolved = true;
                 }
+            }
+            if (pendingResolved)
+            {
+                _connectionSlot.Set();
+                return;
             }
             CloseConnection(connection, false);
         }
 
-        private void RememberFirstCloseLocked(ulong id, bool brokerToParent)
+        private void ScheduleCloseDeadlineLocked()
         {
-            ClosedConnectionState state = new ClosedConnectionState();
-            state.BrokerCloseSeen = brokerToParent;
-            state.ParentCloseSeen = !brokerToParent;
-            _closedConnections.Add(id, state);
-            _closedConnectionOrder.Enqueue(id);
-            while (_closedConnectionOrder.Count > MaxConnections)
+            DateTime? earliest = _pendingCloses.EarliestDeadlineUtc();
+            if (_closing || !earliest.HasValue)
             {
-                ulong expired = _closedConnectionOrder.Dequeue();
-                _closedConnections.Remove(expired);
+                _closeDeadlineTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                return;
             }
+            double remaining = (earliest.Value - DateTime.UtcNow).TotalMilliseconds;
+            int dueTime = remaining <= 1
+                ? 1
+                : (int)Math.Min(Math.Ceiling(remaining), ShutdownTimeoutMilliseconds);
+            _closeDeadlineTimer.Change(dueTime, Timeout.Infinite);
         }
 
-        private void AcceptLateParentCloseLocked(ulong id)
+        private void CloseDeadlineElapsed(object unused)
         {
-            ClosedConnectionState state;
-            if (!_closedConnections.TryGetValue(id, out state) ||
-                state.ParentCloseSeen ||
-                !state.BrokerCloseSeen)
-                throw new InvalidDataException();
-            state.ParentCloseSeen = true;
-            _closedConnections.Remove(id);
+            bool expired;
+            lock (_gate)
+            {
+                if (_closing)
+                    return;
+                expired = _pendingCloses.HasExpired(DateTime.UtcNow);
+                if (!expired)
+                    ScheduleCloseDeadlineLocked();
+            }
+            if (expired)
+                Fail(FailureStage.Protocol);
         }
 
         private void CloseAllFromParent()
@@ -1692,7 +1783,7 @@ public static class TegoWindowsControlBroker
             {
                 lock (_gate)
                 {
-                    if (_failed || _closeAllAckQueued || _closeAllAcknowledged)
+                    if (_failed || _closing || _closeAllAckQueued || _closeAllAcknowledged)
                         return;
                     _failed = true;
                     _closing = true;
@@ -1743,8 +1834,8 @@ public static class TegoWindowsControlBroker
                 connections = new PipeConnection[_connections.Count];
                 _connections.Values.CopyTo(connections, 0);
                 _connections.Clear();
-                _closedConnections.Clear();
-                _closedConnectionOrder.Clear();
+                _pendingCloses.Clear();
+                _closeDeadlineTimer.Change(Timeout.Infinite, Timeout.Infinite);
             }
             StopAcceptLoop();
             for (int index = 0; index < connections.Length; index += 1)
@@ -1784,7 +1875,7 @@ public static class TegoWindowsControlBroker
         {
             lock (_gate)
             {
-                return _connections.Count;
+                return _connections.Count + _pendingCloses.Count;
             }
         }
 
@@ -1850,6 +1941,12 @@ public static class TegoWindowsControlBroker
                 _acceptThread.Join(ShutdownTimeoutMilliseconds);
             if (_inputThread != null && _inputThread.IsAlive)
                 _inputThread.Join(ShutdownTimeoutMilliseconds);
+            using (ManualResetEvent timerStopped = new ManualResetEvent(false))
+            {
+                if (!_closeDeadlineTimer.Dispose(timerStopped) ||
+                    !timerStopped.WaitOne(ShutdownTimeoutMilliseconds))
+                    FailFastResource();
+            }
             if (_firstPipe != null)
                 _firstPipe.Dispose();
             _watchdog.Dispose();
@@ -2333,6 +2430,7 @@ public static class TegoWindowsControlBroker
             TestRepeatedResourceCleanup();
             TestPrivatePipeCancellation();
             TestWritePreIssueCancellation();
+            TestPendingCloseAdmission();
             TestPauseImmediateResume();
             TestRepeatedPipeCleanup();
             return 0;
@@ -2576,6 +2674,34 @@ public static class TegoWindowsControlBroker
             if (writeResult || writeFailed || disposeFailed)
                 throw new InvalidOperationException();
         }
+    }
+
+    private static void TestPendingCloseAdmission()
+    {
+        PendingCloseTracker tracker = new PendingCloseTracker();
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);
+        int id;
+        for (id = 1; id <= MaxConnections; id += 1)
+            tracker.AddBrokerFirst((ulong)id, deadline);
+        if (tracker.Count != MaxConnections || tracker.CanAdmit(0))
+            throw new InvalidOperationException();
+
+        tracker.AcknowledgeParent(1);
+        if (!tracker.CanAdmit(0))
+            throw new InvalidOperationException();
+        tracker.AddBrokerFirst((ulong)(MaxConnections + 1), deadline);
+        for (id = 2; id <= 10000; id += 1)
+        {
+            tracker.AcknowledgeParent((ulong)id);
+            tracker.AddBrokerFirst((ulong)(id + MaxConnections), deadline);
+            if (tracker.Count != MaxConnections)
+                throw new InvalidOperationException();
+        }
+        if (tracker.CanAdmit(0) || tracker.HasExpired(deadline.AddMilliseconds(-1)))
+            throw new InvalidOperationException();
+        tracker.Clear();
+        if (tracker.Count != 0 || !tracker.CanAdmit(0))
+            throw new InvalidOperationException();
     }
 
     private static void TestPauseImmediateResume()

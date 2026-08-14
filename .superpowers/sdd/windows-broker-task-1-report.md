@@ -144,3 +144,25 @@ defines at most one `CLOSE` in each direction:
 The revised focused test was observed RED when the opposite parent-to-broker close reached the old
 `closed` boolean, then GREEN after replacing it with per-direction `closeSeen` state. The complete
 Task 1 protocol suite passes 14/14.
+
+## Final CLOSE-handshake evolution
+
+The final Task 3 review found that retaining every converged connection in the Task 1 map would
+turn long-running connection churn into unbounded protocol state. This section supersedes the
+retention detail above without changing the version-1 wire format:
+
+- each direction may still contribute at most one `CLOSE`, and the first close remains immediately
+  data-terminal and releases both queues once;
+- after the opposite directional close arrives, the state deletes the connection entry rather than
+  keeping a tombstone;
+- `lastConnectionId` remains the sole monotonic history needed to reject reused `OPEN` IDs, while
+  the absent map entry rejects any later frame for an old or never-opened ID;
+- during `CLOSE_ALL`, a parent-to-broker per-connection `CLOSE` is accepted only as the prompt
+  acknowledgement of an already observed broker-to-parent `CLOSE`; and
+- the readonly `activeConnectionCount` observation exists only to prove internal state release.
+
+The regression was written first and failed because `activeConnectionCount` was absent and the map
+retained converged entries. It churns 10,000 monotonically increasing connections through both
+directional closes, requires the count to return to zero, rejects reuse and old frames, and then
+proves the close-all acknowledgement path scans no historical state. The focused Task 1 suite now
+passes 15/15.

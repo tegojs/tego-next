@@ -189,9 +189,9 @@ function allowedAfterCloseAll(
   type: WindowsBrokerFrameType,
   direction: WindowsBrokerFrameDirection,
 ): boolean {
-  return (
-    direction === "broker-to-parent" && ["eof", "close", "fatal", "close-all-ack"].includes(type)
-  );
+  return direction === "broker-to-parent"
+    ? ["eof", "close", "fatal", "close-all-ack"].includes(type)
+    : type === "close";
 }
 
 export class WindowsBrokerConnectionState {
@@ -211,6 +211,10 @@ export class WindowsBrokerConnectionState {
       WINDOWS_BROKER_MAX_CONNECTION_BYTES,
     );
     this.#maxTotalBytes = byteLimit(options.maxTotalBytes, WINDOWS_BROKER_MAX_CONNECTION_BYTES);
+  }
+
+  get activeConnectionCount(): number {
+    return this.#connections.size;
   }
 
   accept(frame: WindowsBrokerFrame, direction: WindowsBrokerFrameDirection): void {
@@ -313,6 +317,13 @@ export class WindowsBrokerConnectionState {
       case "close": {
         requireEmptyPayload(frame);
         const connection = this.#connection(frame.connectionId);
+        if (
+          this.#closeAllRequested &&
+          direction === "parent-to-broker" &&
+          !connection.closeSeen["broker-to-parent"]
+        ) {
+          throw protocolError();
+        }
         if (connection.closeSeen[direction]) throw protocolError();
         if (!directions.some((currentDirection) => connection.closeSeen[currentDirection])) {
           for (const currentDirection of directions) {
@@ -321,6 +332,9 @@ export class WindowsBrokerConnectionState {
           }
         }
         connection.closeSeen[direction] = true;
+        if (directions.every((currentDirection) => connection.closeSeen[currentDirection])) {
+          this.#connections.delete(frame.connectionId);
+        }
         return;
       }
       case "pause": {

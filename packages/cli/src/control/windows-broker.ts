@@ -132,6 +132,7 @@ class BrokerConnection extends Duplex implements ControlConnection {
   readonly #broker: WindowsControlBrokerAdapter;
   readonly #connectionId: bigint;
   #consumerPaused = false;
+  #localClose: Promise<void> | undefined;
   #pressurePaused = false;
   #protocolPaused = false;
   #remoteClosed = false;
@@ -163,6 +164,7 @@ class BrokerConnection extends Duplex implements ControlConnection {
   }
 
   receiveClose(error?: Error): void {
+    void this.#sendCloseOnce().catch(() => undefined);
     this.#remoteClosed = true;
     this.destroy(error);
   }
@@ -204,7 +206,7 @@ class BrokerConnection extends Duplex implements ControlConnection {
   override _final(callback: (error?: Error | null) => void): void {
     this.#broker.releaseInbound(this.#connectionId, this.#trackedInboundBytes);
     this.#trackedInboundBytes = 0;
-    void this.#broker.closeConnection(this.#connectionId).then(
+    void this.#sendCloseOnce().then(
       () => {
         this.#remoteClosed = true;
         callback();
@@ -223,7 +225,7 @@ class BrokerConnection extends Duplex implements ControlConnection {
       callback(error);
       return;
     }
-    void this.#broker.closeConnection(this.#connectionId).then(
+    void this.#sendCloseOnce().then(
       () => callback(error),
       (closeError: unknown) =>
         callback(error ?? (closeError instanceof Error ? closeError : endpointUnsafe())),
@@ -235,6 +237,11 @@ class BrokerConnection extends Duplex implements ControlConnection {
     if (retained >= this.#trackedInboundBytes) return;
     this.#broker.releaseInbound(this.#connectionId, this.#trackedInboundBytes - retained);
     this.#trackedInboundBytes = retained;
+  }
+
+  #sendCloseOnce(): Promise<void> {
+    this.#localClose ??= this.#broker.closeConnection(this.#connectionId);
+    return this.#localClose;
   }
 
   #updatePause(): void {
@@ -378,7 +385,7 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
   }
 
   closeConnection(connectionId: bigint): Promise<void> {
-    if (this.isClosing()) return Promise.resolve();
+    if (this.#phase === "closed" || this.#terminalError !== undefined) return Promise.resolve();
     return this.#sendFrame({ connectionId, payload: new Uint8Array(), type: "close" });
   }
 

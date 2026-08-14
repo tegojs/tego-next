@@ -177,7 +177,25 @@ test("EOF is directional and opposite CLOSE frames converge exactly once", () =>
   assert.throws(() => accept(state, parentToBroker, "resume", 1n), PROTOCOL_ERROR);
   assert.throws(() => accept(state, brokerToParent, "close", 1n), PROTOCOL_ERROR);
   accept(state, parentToBroker, "close", 1n);
+  assert.equal(state.activeConnectionCount, 0);
   assert.throws(() => accept(state, parentToBroker, "close", 1n), PROTOCOL_ERROR);
+});
+
+test("converged CLOSE handshakes release all protocol state across 10k connections", () => {
+  const state = new WindowsBrokerConnectionState();
+  accept(state, brokerToParent, "ready", 0n);
+
+  for (let id = 1n; id <= 10_000n; id += 1n) {
+    accept(state, brokerToParent, "open", id);
+    accept(state, brokerToParent, "close", id);
+    accept(state, parentToBroker, "close", id);
+  }
+
+  assert.equal(state.activeConnectionCount, 0);
+  assert.throws(() => accept(state, brokerToParent, "open", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "close", 1n), PROTOCOL_ERROR);
+  accept(state, parentToBroker, "close-all", 0n);
+  accept(state, brokerToParent, "close-all-ack", 0n);
 });
 
 test("PAUSE pauses only the opposite direction until its matching RESUME", () => {
