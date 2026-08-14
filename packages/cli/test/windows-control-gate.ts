@@ -73,6 +73,8 @@ interface ParentFixtureReady {
 
 let currentUserSid: string | undefined;
 let liveServer: TrackedServer | undefined;
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
+let diagnosticPowerShellStage = "installed-contract";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -290,8 +292,10 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
+  diagnosticPowerShellStage = "identity";
   await initializeCurrentUserSid();
 
+  diagnosticPowerShellStage = "selftest-invocation";
   const selfTest = spawnSync(
     "powershell.exe",
     [
@@ -479,6 +483,7 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
+    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticPowerShellStage}\n`);
     if (liveServer !== undefined) await cleanupTrackedServer(liveServer);
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
     process.exitCode = 1;
