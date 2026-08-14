@@ -316,16 +316,22 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 }
 
 async function runMalformedFrameFailure(): Promise<void> {
-  diagnosticStage = "malformed-broker-frame-fail-closed";
+  diagnosticStage = "malformed-start";
   const tracked = await startTrackedServer("malformed-frame");
   try {
+    diagnosticStage = "malformed-write";
     await writeMalformedFrame(tracked.broker);
+    diagnosticStage = "malformed-broker-failure";
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    diagnosticStage = "malformed-server-close";
     await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    diagnosticStage = "malformed-process-exit";
     await waitForProcessExit(tracked.brokerPid);
+    diagnosticStage = "malformed-pipe-absence";
     await assertPipeUnavailable(tracked.endpoint);
   } finally {
+    diagnosticStage = "malformed-cleanup";
     await cleanupTrackedServer(tracked);
   }
 }
