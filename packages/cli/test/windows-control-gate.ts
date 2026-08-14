@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   type ControlRuntimeOperations,
   type ControlServer,
@@ -73,10 +73,25 @@ interface ParentFixtureReady {
   readonly type: "ready";
 }
 
+interface DiagnosticBrokerFrameDecoder {
+  push(chunk: Uint8Array): readonly { readonly type: string }[];
+}
+
+type DiagnosticBrokerFrameDecoderConstructor = new () => DiagnosticBrokerFrameDecoder;
+
 let liveServer: TrackedServer | undefined;
 // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
 const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
 let nonAuthoritativeStage = "not-entered";
+let nonAuthoritativeReconnectStage = "not-entered";
+let nonAuthoritativeReconnectCloseResult = "not-entered";
+let nonAuthoritativeReconnectAcknowledgement = "not-entered";
+let nonAuthoritativeReconnectBrokerSettlement = "not-entered";
+let nonAuthoritativeReconnectPipeProof = "not-entered";
+let nonAuthoritativeReconnectCleanup = "not-entered";
+let nonAuthoritativeBrokerFailureStage = "none";
+let diagnosticBrokerFrameDecoder: DiagnosticBrokerFrameDecoderConstructor | undefined;
+const brokersWithCloseAllAcknowledgement = new WeakSet<ChildProcess>();
 
 function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
   return (
@@ -86,6 +101,41 @@ function isExpectedMalformedServerClose(error: unknown, observedFailure: Error):
     error.errors[1] === observedFailure &&
     diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"
   );
+}
+
+function recordReconnectBrokerSettlement(broker: ChildProcess): void {
+  if (broker.signalCode === "SIGTERM") {
+    nonAuthoritativeReconnectBrokerSettlement = "signal-sigterm";
+  } else if (broker.signalCode === "SIGKILL") {
+    nonAuthoritativeReconnectBrokerSettlement = "signal-sigkill";
+  } else if (broker.signalCode !== null) {
+    nonAuthoritativeReconnectBrokerSettlement = "signal-other";
+  } else if (broker.exitCode === 0) {
+    nonAuthoritativeReconnectBrokerSettlement = "exit-zero";
+  } else if (broker.exitCode !== null) {
+    nonAuthoritativeReconnectBrokerSettlement = "exit-nonzero";
+  } else {
+    nonAuthoritativeReconnectBrokerSettlement = "alive";
+  }
+}
+
+function recordReconnectCloseError(error: unknown): void {
+  if (diagnosticCode(error) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE") {
+    nonAuthoritativeReconnectCloseResult = "direct-unsafe";
+    return;
+  }
+  if (error instanceof AggregateError) {
+    const codes = error.errors.map((entry) => diagnosticCode(entry));
+    if (codes.length === 2 && codes.every((code) => code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE")) {
+      nonAuthoritativeReconnectCloseResult = "aggregate-two-unsafe";
+    } else if (codes.includes("PROTOCOL_CONTROL_ENDPOINT_UNSAFE")) {
+      nonAuthoritativeReconnectCloseResult = "aggregate-contains-unsafe";
+    } else {
+      nonAuthoritativeReconnectCloseResult = "aggregate-other";
+    }
+    return;
+  }
+  nonAuthoritativeReconnectCloseResult = "other";
 }
 
 function gateOperations(): ControlRuntimeOperations {
@@ -194,6 +244,9 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
     windowsControlBrokerFactory(options) {
       return createWindowsControlBroker({
         ...options,
+        onFailureStage(stage) {
+          nonAuthoritativeBrokerFailureStage = stage;
+        },
         onReadyDescriptor(value) {
           descriptor = value;
         },
@@ -209,6 +262,18 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
           });
+          if (diagnosticBrokerFrameDecoder !== undefined) {
+            const decoder = new diagnosticBrokerFrameDecoder();
+            spawned.stdout?.on("data", (chunk: Buffer) => {
+              try {
+                for (const frame of decoder.push(chunk)) {
+                  if (frame.type === "close-all-ack") {
+                    brokersWithCloseAllAcknowledgement.add(spawned);
+                  }
+                }
+              } catch {}
+            });
+          }
           brokerClosed = new Promise<void>((resolveClose) => {
             spawned.once("close", resolveClose);
           });
@@ -223,6 +288,32 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
   assert.ok(Number.isSafeInteger(broker.pid) && (broker.pid ?? 0) > 0);
   assert.ok(descriptor !== undefined);
   assertDescriptor(descriptor);
+  const trackedBroker = broker;
+  let reconnectCloseObserved = false;
+  const trackedServer: ControlServer =
+    label === "live-descriptor"
+      ? {
+          endpoint: server.endpoint,
+          async close() {
+            if (reconnectCloseObserved) return server.close();
+            reconnectCloseObserved = true;
+            try {
+              await server.close();
+              nonAuthoritativeReconnectCloseResult = "resolved";
+            } catch (error) {
+              recordReconnectCloseError(error);
+              throw error;
+            } finally {
+              nonAuthoritativeReconnectAcknowledgement = brokersWithCloseAllAcknowledgement.has(
+                trackedBroker,
+              )
+                ? "observed"
+                : "missing";
+              recordReconnectBrokerSettlement(trackedBroker);
+            }
+          },
+        }
+      : server;
   return {
     broker,
     brokerClosed,
@@ -230,7 +321,7 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
     descriptor,
     endpoint,
     failure: failed.promise,
-    server,
+    server: trackedServer,
   };
 }
 
@@ -290,6 +381,12 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
+  const diagnosticProtocol = (await import(
+    pathToFileURL(join(installedCliRoot, "dist", "src", "control", "windows-broker-protocol.js"))
+      .href
+  )) as { readonly WindowsBrokerFrameDecoder?: DiagnosticBrokerFrameDecoderConstructor };
+  assert.equal(typeof diagnosticProtocol.WindowsBrokerFrameDecoder, "function");
+  diagnosticBrokerFrameDecoder = diagnosticProtocol.WindowsBrokerFrameDecoder;
   const selfTestArguments = [
     "-NoLogo",
     "-NoProfile",
@@ -441,18 +538,28 @@ async function runBrokerCrashCleanup(): Promise<void> {
 }
 
 async function runReconnectFailure(): Promise<void> {
+  nonAuthoritativeReconnectStage = "start";
   assert.ok(liveServer !== undefined);
   const tracked = liveServer;
   try {
+    nonAuthoritativeReconnectStage = "server-close";
     await tracked.server.close();
+    nonAuthoritativeReconnectStage = "captured-child-close";
     await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+    recordReconnectBrokerSettlement(tracked.broker);
+    nonAuthoritativeReconnectStage = "pipe-proof";
+    nonAuthoritativeReconnectPipeProof = "entered";
     await assertPipeUnavailable(tracked.endpoint);
     assert.equal(liveServer, tracked);
     liveServer = undefined;
+    nonAuthoritativeReconnectPipeProof = "passed";
+    nonAuthoritativeReconnectStage = "complete";
   } finally {
+    if (liveServer === tracked) nonAuthoritativeReconnectCleanup = "entered";
     if (liveServer === tracked) {
       await cleanupTrackedServer(tracked);
       liveServer = undefined;
+      nonAuthoritativeReconnectCleanup = "passed";
     }
   }
 }
@@ -495,6 +602,27 @@ if (process.argv[2] === "--parent-crash-fixture") {
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
     process.stderr.write(`${task4DiagnosticMarker}_STAGE:${nonAuthoritativeStage}\n`);
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_STAGE:${nonAuthoritativeReconnectStage}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_CLOSE:${nonAuthoritativeReconnectCloseResult}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_ACK:${nonAuthoritativeReconnectAcknowledgement}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_SETTLEMENT:${nonAuthoritativeReconnectBrokerSettlement}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_PIPE:${nonAuthoritativeReconnectPipeProof}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_CLEANUP:${nonAuthoritativeReconnectCleanup}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_BROKER_FAILURE_STAGE:${nonAuthoritativeBrokerFailureStage}\n`,
+    );
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {
