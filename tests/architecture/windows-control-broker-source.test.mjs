@@ -220,12 +220,14 @@ function assertPowerShellContract(source) {
 
 function assertCSharpContract(source) {
   const entry = balancedBlock(source, "public static int Run(");
+  const execute = balancedBlock(source, "internal int Execute(");
   const createPipe = balancedBlock(source, "private static SafeFileHandle CreateVerifiedPipe(");
   const descriptor = balancedBlock(
     source,
     "private static SecurityDescriptorContext CreateSecurityDescriptor(",
   );
   const verify = balancedBlock(source, "private static void VerifyDescriptor(");
+  const readyDescriptor = balancedBlock(source, "private static byte[] ReadReadyDescriptor(");
   const validate = balancedBlock(source, "private static void ValidateDescriptor(");
   const openParent = balancedBlock(source, "private static SafeWaitHandle OpenParentProcess(");
   const overlapped = balancedBlock(source, "sealed class OverlappedOperation");
@@ -254,12 +256,23 @@ function assertCSharpContract(source) {
   assert.match(createPipe, /CreateNamedPipeW\([\s\S]+ref securityAttributes/u);
   assert.match(createPipe, /PipeAccessDuplex \| FileFlagOverlapped/u);
   assert.match(createPipe, /VerifyDescriptor\(handle, expectedSids\)/u);
+  assert.match(entry, /ReadReadyDescriptor\(firstPipe, descriptor\.ExpectedSids\)/u);
+  assert.match(execute, /WriteFrame\(FrameReady, 0, _readyDescriptor\)/u);
   assert.match(descriptor, /WindowsIdentity\.GetCurrent\(\)\.User/u);
   assert.match(descriptor, /LocalSystemSid[\s\S]+AdministratorsSid/u);
   assert.match(descriptor, /DiscretionaryAclProtected/u);
   assert.match(descriptor, /RawSecurityDescriptor\([\s\S]+currentUserSid[\s\S]+dacl/u);
   assert.match(verify, /GetKernelObjectSecurity/u);
   assert.match(verify, /ValidateDescriptor\(descriptor, expectedSids\)/u);
+  assert.match(readyDescriptor, /GetKernelObjectSecurity/u);
+  assert.match(readyDescriptor, /ValidateDescriptor\(descriptor, expectedSids\)/u);
+  assert.match(readyDescriptor, /Encoding\.ASCII\.GetBytes/u);
+  assert.match(readyDescriptor, /DescriptorPayloadVersion/u);
+  assert.match(readyDescriptor, /DescriptorPayloadProtected/u);
+  assert.match(readyDescriptor, /ace\.IsCallback/u);
+  assert.match(readyDescriptor, /ace\.AceFlags/u);
+  assert.match(readyDescriptor, /ace\.AccessMask/u);
+  assert.match(readyDescriptor, /ace\.SecurityIdentifier/u);
   assert.match(validate, /descriptor\.Owner\.Equals\(expectedSids\[0\]\)/u);
   assert.match(validate, /DiscretionaryAclProtected/u);
   assert.match(validate, /DiscretionaryAcl\.Count != expectedSids\.Length/u);
@@ -477,6 +490,12 @@ test("source contracts reject security and lifecycle mutations", async () => {
       "            ref defaultSecurityAttributes);",
     ),
     mutateOnce(csharp, "VerifyDescriptor(handle, expectedSids);", ""),
+    mutateOnce(csharp, "ReadReadyDescriptor(firstPipe, descriptor.ExpectedSids)", "new byte[0]"),
+    mutateOnce(
+      csharp,
+      "_writer.WriteFrame(FrameReady, 0, _readyDescriptor);",
+      "_writer.WriteFrame(FrameReady, 0, new byte[0]);",
+    ),
     mutateOnce(csharp, "ControlFlags.DiscretionaryAclProtected", "ControlFlags.None"),
     mutateOnce(
       csharp,

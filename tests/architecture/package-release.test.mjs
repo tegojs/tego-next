@@ -71,8 +71,6 @@ test("CLI build finalization makes a freshly emitted binary executable", async (
   );
   const directory = await mkdtemp(join(tmpdir(), "tego-cli-build-finalization-"));
   const binary = join(directory, "bin.js");
-  const helperSource = join(directory, "source.ps1");
-  const helperDestination = join(directory, "control", "windows-pipe-security.ps1");
   const brokerPowerShellSource = join(directory, "windows-control-broker.ps1");
   const brokerPowerShellDestination = join(directory, "control", "windows-control-broker.ps1");
   const brokerCSharpSource = join(directory, "windows-control-broker.cs");
@@ -80,7 +78,6 @@ test("CLI build finalization makes a freshly emitted binary executable", async (
 
   try {
     await writeFile(binary, "#!/usr/bin/env node\n", { mode: 0o644 });
-    await writeFile(helperSource, "helper\n");
     await writeFile(brokerPowerShellSource, "broker powershell\n");
     await writeFile(brokerCSharpSource, "broker csharp\n");
     await finalizeCliBuild({
@@ -89,13 +86,10 @@ test("CLI build finalization makes a freshly emitted binary executable", async (
       brokerCSharpSource,
       brokerPowerShellDestination,
       brokerPowerShellSource,
-      helperDestination,
-      helperSource,
       platform: "linux",
     });
 
     assert.equal((await lstat(binary)).mode & 0o777, 0o755);
-    assert.equal(await readFile(helperDestination, "utf8"), "helper\n");
     assert.equal(await readFile(brokerPowerShellDestination, "utf8"), "broker powershell\n");
     assert.equal(await readFile(brokerCSharpDestination, "utf8"), "broker csharp\n");
   } finally {
@@ -137,12 +131,6 @@ test("packed public packages contain only consumer assets and install cleanly", 
         const executable = workspace.files.find((file) => file.path === "package/dist/src/bin.js");
         assert.ok(executable, "CLI binary must be packed");
         assert.equal(executable.mode, 0o755, "packed CLI binary must be executable");
-        assert.ok(
-          workspace.files.some(
-            (file) => file.path === "package/dist/src/control/windows-pipe-security.ps1",
-          ),
-          "CLI package must include the fixed Windows pipe-security helper",
-        );
         for (const asset of ["windows-control-broker.ps1", "windows-control-broker.cs"]) {
           const packedPath = `package/dist/src/control/${asset}`;
           assert.ok(
@@ -161,40 +149,6 @@ test("packed public packages contain only consumer assets and install cleanly", 
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
-});
-
-test("Windows pipe-security helper owns a bounded fail-fast watchdog through early failures", async () => {
-  const helper = await readFile(join(root, "scripts", "windows-pipe-security.ps1"), "utf8");
-
-  assert.match(helper, /Environment\.FailFast\(/u);
-  assert.match(helper, /StartWatchdog\(9000\)/u);
-  assert.match(
-    helper,
-    /\$watchdog = \$null[\s\S]*try \{[\s\S]*\$watchdog = \[TegoWindowsPipeSecurityNative\]::StartWatchdog\(9000\)[\s\S]*\$handle = \[TegoWindowsPipeSecurityNative\]::CreateFile\([\s\S]*\} finally \{[\s\S]*Close-TegoResource \$handle[\s\S]*Close-TegoResource \$watchdog/u,
-  );
-  assert.match(helper, /TEGO_WINDOWS_PIPE_SECURITY_\$\{failureStage\}_FAILED/u);
-  assert.doesNotMatch(helper, /\[Console\]::Error\.WriteLine\(\$_.+\)/u);
-});
-
-test("Windows pipe-security helper requests only the access each handle needs", async () => {
-  const helper = await readFile(join(root, "scripts", "windows-pipe-security.ps1"), "utf8");
-  const access = helper.match(
-    /\$desiredAccess =(?<initial>[\s\S]+?)\$barrierDesiredAccess =(?<barrier>[\s\S]+?)\$openExisting/u,
-  );
-
-  assert.ok(access?.groups);
-  assert.match(access.groups.initial, /GenericRead/u);
-  assert.match(access.groups.initial, /GenericWrite/u);
-  assert.match(access.groups.initial, /ReadControl/u);
-  assert.match(access.groups.initial, /WriteDac/u);
-  assert.doesNotMatch(access.groups.initial, /WriteOwner/u);
-  assert.match(access.groups.barrier, /GenericRead/u);
-  assert.match(access.groups.barrier, /GenericWrite/u);
-  assert.doesNotMatch(access.groups.barrier, /ReadControl|WriteDac|WriteOwner/u);
-  assert.match(
-    helper,
-    /\$setSecurityInformation =\s*\$daclSecurityInformation -bor \$protectedDaclSecurityInformation/u,
-  );
 });
 
 test("Windows control gate emits fixed diagnostics without exception details", async () => {

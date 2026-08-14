@@ -10,6 +10,7 @@ export {
   type RuntimeOperationName,
 } from "./control/protocol.js";
 export {
+  type ControlConnection,
   type ControlRuntimeOperations,
   type ControlServer,
   type ControlServerOptions,
@@ -17,18 +18,16 @@ export {
   startControlServer,
 } from "./control/server.js";
 export {
-  createWindowsPipeSecurityAdapter,
-  parseWindowsPipeSecurityHelperOutput,
-  validateWindowsPipeSecurityDescriptor,
-  WINDOWS_PIPE_ADMISSION_BARRIER_ACK,
-  WINDOWS_PIPE_ADMISSION_BARRIER_FRAME,
-  type WindowsPipeSecurityAccessRule,
-  type WindowsPipeSecurityAdapter,
-  type WindowsPipeSecurityDescriptor,
-  type WindowsPipeSecurityHelperSpawner,
-  type WindowsPipeSecurityInspection,
-  type WindowsPipeSecurityInspector,
-} from "./control/windows-pipe-security.js";
+  createWindowsControlBroker,
+  type WindowsBrokerFailureStage,
+  type WindowsControlBroker,
+  type WindowsControlBrokerOptions,
+} from "./control/windows-broker.js";
+export {
+  decodeWindowsBrokerReadyDescriptor,
+  type WindowsBrokerSecurityAccessRule,
+  type WindowsBrokerSecurityDescriptor,
+} from "./control/windows-broker-security.js";
 export {
   type DefaultControlEndpointOptions,
   defaultControlEndpoint,

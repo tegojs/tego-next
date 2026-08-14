@@ -1,5 +1,5 @@
 import { chmod, lstat, unlink } from "node:fs/promises";
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Server } from "node:net";
 import { dirname, resolve } from "node:path";
 import {
   type ArtifactDigest,
@@ -27,16 +27,18 @@ import {
   UNKNOWN_CONTROL_REQUEST_ID,
 } from "./protocol.js";
 import {
-  createWindowsPipeSecurityAdapter,
-  validateWindowsPipeSecurityDescriptor,
-  WINDOWS_PIPE_ADMISSION_BARRIER_ACK,
-  WINDOWS_PIPE_ADMISSION_BARRIER_FRAME,
-  type WindowsPipeSecurityAdapter,
-  type WindowsPipeSecurityHelperFailureStage,
-} from "./windows-pipe-security.js";
+  createWindowsControlBroker,
+  type WindowsControlBroker,
+  type WindowsControlBrokerOptions,
+} from "./windows-broker.js";
 
 export interface LocalArtifactIngress {
   putPath(artifactPath: string): Promise<ArtifactDigest>;
+}
+
+export interface ControlConnection extends NodeJS.ReadWriteStream {
+  readonly destroyed: boolean;
+  destroy(error?: Error): void;
 }
 
 export interface ControlRuntimeOperations {
@@ -54,11 +56,10 @@ export interface ControlServerOptions {
   readonly maxOutstandingRequests?: number;
   readonly readTimeoutMs?: number;
   readonly setEndpointPermissions?: (endpoint: string) => Promise<void>;
-  readonly windowsPipeCurrentUserSid?: string;
-  readonly windowsPipeSecurityAdapter?: WindowsPipeSecurityAdapter;
-  readonly onWindowsPipeSecurityHelperFailure?: (
-    stage: WindowsPipeSecurityHelperFailureStage,
-  ) => void;
+  readonly windowsBrokerArchitecture?: string;
+  readonly windowsControlBrokerFactory?: (
+    options: Pick<WindowsControlBrokerOptions, "endpoint" | "maxConnections" | "maxQueuedBytes">,
+  ) => WindowsControlBroker;
   readonly onServerError?: (error: Error) => void;
 }
 
@@ -87,7 +88,8 @@ interface EndpointParentIdentity {
 }
 
 const CONTROL_CLOSE_DRAIN_TIMEOUT_MS = 2_000;
-const WINDOWS_PIPE_ADMISSION_READ_TIMEOUT_MS = 11_000;
+const WINDOWS_BROKER_MAX_CONNECTIONS = 64;
+const WINDOWS_BROKER_MAX_QUEUED_BYTES = 256 * 1024;
 
 function controlInitializationAbortError(): DOMException {
   return new DOMException("Control server initialization aborted", "AbortError");
@@ -225,7 +227,7 @@ async function dispatch(
   }
 }
 
-async function writeResponse(socket: Socket, response: ControlResponse): Promise<void> {
+async function writeResponse(socket: ControlConnection, response: ControlResponse): Promise<void> {
   if (socket.destroyed) return;
   await new Promise<void>((resolve) => {
     let settled = false;
@@ -332,10 +334,270 @@ export async function verifyUnixControlEndpoint(path: string): Promise<EndpointS
   return await verifyUnixControlEndpointIdentity(path);
 }
 
+function createControlDispatcher(
+  options: ControlServerOptions,
+  limits: {
+    readonly maxLineBytes: number;
+    readonly maxOutstanding: number;
+    readonly readTimeoutMs: number;
+  },
+) {
+  const connections = new Set<ControlConnection>();
+  const activeDispatchConnections = new Set<ControlConnection>();
+  const dispatches = new Set<Promise<void>>();
+  let reservations = 0;
+  let closing = false;
+
+  const begin = (connection: ControlConnection) => {
+    if (closing || reservations >= limits.maxOutstanding) {
+      void writeResponse(
+        connection,
+        diagnosticResponse(
+          UNKNOWN_CONTROL_REQUEST_ID,
+          protocolDiagnostic(
+            "PROTOCOL_CONTROL_CAPACITY_EXCEEDED",
+            "Control request capacity is exhausted",
+          ),
+        ),
+      );
+      return;
+    }
+
+    reservations += 1;
+    const frame = Buffer.allocUnsafe(limits.maxLineBytes);
+    let bytes = 0;
+    let handled = false;
+    let reservationOwner: "dispatch" | "released" | "socket" = "socket";
+    const releaseReservation = (owner: "dispatch" | "socket") => {
+      if (reservationOwner !== owner) return;
+      reservationOwner = "released";
+      reservations -= 1;
+    };
+    const readTimer = setTimeout(() => {
+      if (handled) return;
+      handled = true;
+      void writeResponse(
+        connection,
+        diagnosticResponse(
+          UNKNOWN_CONTROL_REQUEST_ID,
+          protocolDiagnostic(
+            "PROTOCOL_CONTROL_READ_TIMEOUT",
+            "Control request was not completed before its deadline",
+          ),
+        ),
+      );
+    }, limits.readTimeoutMs);
+    readTimer.unref();
+    connection.once("close", () => {
+      clearTimeout(readTimer);
+      releaseReservation("socket");
+    });
+    connection.on("data", (chunk: Buffer) => {
+      if (handled || closing) return;
+      const newline = chunk.indexOf(0x0a);
+      const payloadBytes = newline === -1 ? chunk.byteLength : newline;
+      if (bytes + payloadBytes > limits.maxLineBytes) {
+        handled = true;
+        void writeResponse(
+          connection,
+          diagnosticResponse(
+            UNKNOWN_CONTROL_REQUEST_ID,
+            protocolDiagnostic(
+              "PROTOCOL_CONTROL_FRAME_TOO_LARGE",
+              "Control request exceeds the line limit",
+            ),
+          ),
+        );
+        return;
+      }
+      chunk.copy(frame, bytes, 0, payloadBytes);
+      bytes += payloadBytes;
+      if (newline === -1) return;
+      handled = true;
+      clearTimeout(readTimer);
+      if (newline !== chunk.byteLength - 1) {
+        void writeResponse(
+          connection,
+          diagnosticResponse(
+            UNKNOWN_CONTROL_REQUEST_ID,
+            protocolDiagnostic(
+              "PROTOCOL_CONTROL_FRAME_INVALID",
+              "Control connection must contain exactly one request line",
+            ),
+          ),
+        );
+        return;
+      }
+      let requestId = UNKNOWN_CONTROL_REQUEST_ID;
+      reservationOwner = "dispatch";
+      activeDispatchConnections.add(connection);
+      const dispatchPromise = (async () => {
+        try {
+          const decoded = JSON.parse(frame.subarray(0, bytes).toString("utf8"));
+          requestId = extractControlRequestId(decoded);
+          const request = parseControlRequest(decoded);
+          const result = await dispatch(request, options.operations, options.artifactIngress);
+          await writeResponse(connection, {
+            protocolVersion: CONTROL_PROTOCOL_VERSION,
+            requestId,
+            ok: true,
+            result: sanitizeControlValue(result),
+          });
+        } catch (error) {
+          const diagnostic =
+            error instanceof SyntaxError
+              ? protocolDiagnostic(
+                  "PROTOCOL_CONTROL_FRAME_INVALID",
+                  "Control request is not valid JSON",
+                )
+              : operationDiagnostic(error);
+          await writeResponse(connection, diagnosticResponse(requestId, diagnostic));
+        } finally {
+          releaseReservation("dispatch");
+        }
+      })();
+      dispatches.add(dispatchPromise);
+      void dispatchPromise.then(
+        () => {
+          dispatches.delete(dispatchPromise);
+          activeDispatchConnections.delete(connection);
+        },
+        () => {
+          dispatches.delete(dispatchPromise);
+          activeDispatchConnections.delete(connection);
+        },
+      );
+    });
+  };
+
+  return {
+    activeDispatchConnections,
+    begin,
+    connections,
+    dispatches,
+    async closeConnections(): Promise<void> {
+      closing = true;
+      for (const connection of connections) {
+        if (!activeDispatchConnections.has(connection)) connection.destroy();
+      }
+      if (dispatches.size > 0) {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            Promise.allSettled([...dispatches]),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, CONTROL_CLOSE_DRAIN_TIMEOUT_MS);
+              timer.unref();
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      for (const connection of connections) connection.destroy();
+    },
+    markClosing(): void {
+      closing = true;
+    },
+  };
+}
+
+async function startWindowsBrokerControlServer(
+  options: ControlServerOptions,
+  dispatcher: ReturnType<typeof createControlDispatcher>,
+): Promise<ControlServer> {
+  if ((options.windowsBrokerArchitecture ?? process.arch) !== "x64") {
+    throw windowsControlEndpointUnsafe();
+  }
+  let broker: WindowsControlBroker;
+  try {
+    broker = (options.windowsControlBrokerFactory ?? createWindowsControlBroker)({
+      endpoint: options.endpoint,
+      maxConnections: WINDOWS_BROKER_MAX_CONNECTIONS,
+      maxQueuedBytes: WINDOWS_BROKER_MAX_QUEUED_BYTES,
+    });
+  } catch {
+    throw windowsControlEndpointUnsafe();
+  }
+
+  const pending = new Set<ControlConnection>();
+  let ready = false;
+  let terminalError: Error | undefined;
+  broker.onConnection((connection) => {
+    dispatcher.connections.add(connection);
+    connection.on("error", () => undefined);
+    connection.once("close", () => {
+      pending.delete(connection);
+      dispatcher.connections.delete(connection);
+    });
+    if (!ready) {
+      pending.add(connection);
+      return;
+    }
+    dispatcher.begin(connection);
+    connection.resume();
+  });
+  broker.onError(() => {
+    const error = windowsControlEndpointUnsafe();
+    terminalError ??= error;
+    try {
+      options.onServerError?.(error);
+    } catch (callbackError) {
+      terminalError = new AggregateError(
+        [terminalError, callbackError],
+        "Control listener error reporting failed",
+      );
+    }
+    for (const connection of dispatcher.connections) connection.destroy();
+  });
+
+  try {
+    await broker.start(options.signal);
+    assertControlInitializationActive(options.signal);
+  } catch {
+    for (const connection of dispatcher.connections) connection.destroy();
+    const primary =
+      options.signal?.aborted === true
+        ? controlInitializationAbortError()
+        : windowsControlEndpointUnsafe();
+    try {
+      await broker.close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [primary, cleanupError],
+        "Windows control broker startup rollback failed",
+      );
+    }
+    throw primary;
+  }
+
+  ready = true;
+  for (const connection of pending) {
+    pending.delete(connection);
+    if (connection.destroyed) continue;
+    dispatcher.begin(connection);
+    connection.resume();
+  }
+
+  let closePromise: Promise<void> | undefined;
+  return {
+    endpoint: options.endpoint,
+    close() {
+      closePromise ??= (async () => {
+        dispatcher.markClosing();
+        await dispatcher.closeConnections();
+        await broker.close();
+        if (terminalError !== undefined) throw terminalError;
+      })();
+      return closePromise;
+    },
+  };
+}
+
 async function closeListener(
   server: Server,
-  sockets: ReadonlySet<Socket>,
-  activeDispatchSockets: ReadonlySet<Socket> = new Set(),
+  sockets: ReadonlySet<ControlConnection>,
+  activeDispatchSockets: ReadonlySet<ControlConnection> = new Set(),
   dispatches: ReadonlySet<Promise<void>> = new Set(),
 ): Promise<void> {
   for (const socket of sockets) {
@@ -409,185 +671,34 @@ export async function startControlServer(options: ControlServerOptions): Promise
   if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 1) {
     throw new RangeError("readTimeoutMs must be a positive safe integer");
   }
-  if (
-    options.windowsPipeSecurityAdapter !== undefined &&
-    options.windowsPipeCurrentUserSid === undefined
-  ) {
-    throw windowsControlEndpointUnsafe();
+
+  const dispatcher = createControlDispatcher(options, {
+    maxLineBytes,
+    maxOutstanding,
+    readTimeoutMs,
+  });
+  if (process.platform === "win32" || options.windowsControlBrokerFactory !== undefined) {
+    return await startWindowsBrokerControlServer(options, dispatcher);
   }
+
   await assertPrivateEndpointParent(options.endpoint);
   assertControlInitializationActive(options.signal);
-
-  const sockets = new Set<Socket>();
-  const activeDispatchSockets = new Set<Socket>();
-  const dispatches = new Set<Promise<void>>();
-  const pendingAdmissionSockets = new Set<Socket>();
-  let reservations = 0;
-  let closing = false;
-  const requiresWindowsPipeSecurity =
-    process.platform === "win32" || options.windowsPipeSecurityAdapter !== undefined;
+  const pendingConnections = new Set<ControlConnection>();
   let endpointReady = false;
-  let windowsAdmissionBarrierActive = false;
   let terminalError: Error | undefined;
-  const beginWindowsAdmissionBarrier = (socket: Socket) => {
-    const expected = Buffer.from(WINDOWS_PIPE_ADMISSION_BARRIER_FRAME);
-    const received = Buffer.allocUnsafe(expected.byteLength);
-    let bytes = 0;
-    const timer = setTimeout(() => socket.destroy(), WINDOWS_PIPE_ADMISSION_READ_TIMEOUT_MS);
-    timer.unref();
-    socket.once("close", () => clearTimeout(timer));
-    socket.on("data", (chunk: Buffer) => {
-      if (!windowsAdmissionBarrierActive || socket.destroyed) return;
-      if (bytes + chunk.byteLength > expected.byteLength) {
-        socket.destroy();
-        return;
-      }
-      chunk.copy(received, bytes);
-      bytes += chunk.byteLength;
-      if (bytes !== expected.byteLength) return;
-      if (!received.equals(expected)) {
-        socket.destroy();
-        return;
-      }
-      socket.end(WINDOWS_PIPE_ADMISSION_BARRIER_ACK);
+  const server: Server = createServer({ pauseOnConnect: true }, (connection) => {
+    dispatcher.connections.add(connection);
+    connection.on("close", () => {
+      dispatcher.connections.delete(connection);
+      pendingConnections.delete(connection);
     });
-    socket.resume();
-  };
-  const beginControlConnection = (socket: Socket) => {
-    if (closing || reservations >= maxOutstanding) {
-      void writeResponse(
-        socket,
-        diagnosticResponse(
-          UNKNOWN_CONTROL_REQUEST_ID,
-          protocolDiagnostic(
-            "PROTOCOL_CONTROL_CAPACITY_EXCEEDED",
-            "Control request capacity is exhausted",
-          ),
-        ),
-      );
-      return;
-    }
-
-    reservations += 1;
-    const frame = Buffer.allocUnsafe(maxLineBytes);
-    let bytes = 0;
-    let handled = false;
-    let reservationOwner: "dispatch" | "released" | "socket" = "socket";
-    const releaseReservation = (owner: "dispatch" | "socket") => {
-      if (reservationOwner !== owner) return;
-      reservationOwner = "released";
-      reservations -= 1;
-    };
-    const readTimer = setTimeout(() => {
-      if (handled) return;
-      handled = true;
-      void writeResponse(
-        socket,
-        diagnosticResponse(
-          UNKNOWN_CONTROL_REQUEST_ID,
-          protocolDiagnostic(
-            "PROTOCOL_CONTROL_READ_TIMEOUT",
-            "Control request was not completed before its deadline",
-          ),
-        ),
-      );
-    }, readTimeoutMs);
-    readTimer.unref();
-    socket.once("close", () => {
-      clearTimeout(readTimer);
-      releaseReservation("socket");
-    });
-    socket.on("data", (chunk: Buffer) => {
-      if (handled || closing) return;
-      const newline = chunk.indexOf(0x0a);
-      const payloadBytes = newline === -1 ? chunk.byteLength : newline;
-      if (bytes + payloadBytes > maxLineBytes) {
-        handled = true;
-        void writeResponse(
-          socket,
-          diagnosticResponse(
-            UNKNOWN_CONTROL_REQUEST_ID,
-            protocolDiagnostic(
-              "PROTOCOL_CONTROL_FRAME_TOO_LARGE",
-              "Control request exceeds the line limit",
-            ),
-          ),
-        );
-        return;
-      }
-      chunk.copy(frame, bytes, 0, payloadBytes);
-      bytes += payloadBytes;
-      if (newline === -1) return;
-      handled = true;
-      clearTimeout(readTimer);
-      if (newline !== chunk.byteLength - 1) {
-        void writeResponse(
-          socket,
-          diagnosticResponse(
-            UNKNOWN_CONTROL_REQUEST_ID,
-            protocolDiagnostic(
-              "PROTOCOL_CONTROL_FRAME_INVALID",
-              "Control connection must contain exactly one request line",
-            ),
-          ),
-        );
-        return;
-      }
-      let requestId = UNKNOWN_CONTROL_REQUEST_ID;
-      reservationOwner = "dispatch";
-      activeDispatchSockets.add(socket);
-      const dispatchPromise = (async () => {
-        try {
-          const decoded = JSON.parse(frame.subarray(0, bytes).toString("utf8"));
-          requestId = extractControlRequestId(decoded);
-          const request = parseControlRequest(decoded);
-          const result = await dispatch(request, options.operations, options.artifactIngress);
-          await writeResponse(socket, {
-            protocolVersion: CONTROL_PROTOCOL_VERSION,
-            requestId,
-            ok: true,
-            result: sanitizeControlValue(result),
-          });
-        } catch (error) {
-          const diagnostic =
-            error instanceof SyntaxError
-              ? protocolDiagnostic(
-                  "PROTOCOL_CONTROL_FRAME_INVALID",
-                  "Control request is not valid JSON",
-                )
-              : operationDiagnostic(error);
-          await writeResponse(socket, diagnosticResponse(requestId, diagnostic));
-        } finally {
-          releaseReservation("dispatch");
-        }
-      })();
-      dispatches.add(dispatchPromise);
-      void dispatchPromise.then(
-        () => {
-          dispatches.delete(dispatchPromise);
-          activeDispatchSockets.delete(socket);
-        },
-        () => {
-          dispatches.delete(dispatchPromise);
-          activeDispatchSockets.delete(socket);
-        },
-      );
-    });
-  };
-  const server: Server = createServer({ pauseOnConnect: true }, (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => {
-      sockets.delete(socket);
-      pendingAdmissionSockets.delete(socket);
-    });
-    socket.on("error", () => undefined);
+    connection.on("error", () => undefined);
     if (!endpointReady) {
-      pendingAdmissionSockets.add(socket);
-      if (windowsAdmissionBarrierActive) beginWindowsAdmissionBarrier(socket);
+      pendingConnections.add(connection);
       return;
     }
-    beginControlConnection(socket);
-    socket.resume();
+    dispatcher.begin(connection);
+    connection.resume();
   });
 
   try {
@@ -615,19 +726,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
         onAbort();
         return;
       }
-      const previousPendingInstances = process.env.NODE_PENDING_PIPE_INSTANCES;
-      if (process.platform === "win32") process.env.NODE_PENDING_PIPE_INSTANCES = "1";
-      try {
-        server.listen({ exclusive: true, path: options.endpoint });
-      } finally {
-        if (process.platform === "win32") {
-          if (previousPendingInstances === undefined) {
-            delete process.env.NODE_PENDING_PIPE_INSTANCES;
-          } else {
-            process.env.NODE_PENDING_PIPE_INSTANCES = previousPendingInstances;
-          }
-        }
-      }
+      server.listen({ exclusive: true, path: options.endpoint });
     });
     server.on("error", (error) => {
       terminalError ??= error;
@@ -639,73 +738,49 @@ export async function startControlServer(options: ControlServerOptions): Promise
           "Control listener error reporting failed",
         );
       }
-      for (const socket of sockets) socket.destroy();
+      for (const connection of dispatcher.connections) connection.destroy();
     });
 
-    if (requiresWindowsPipeSecurity) {
-      try {
-        assertControlInitializationActive(options.signal);
-        const adapter =
-          options.windowsPipeSecurityAdapter ??
-          createWindowsPipeSecurityAdapter(
-            options.onWindowsPipeSecurityHelperFailure === undefined
-              ? {}
-              : { onHelperFailure: options.onWindowsPipeSecurityHelperFailure },
-          );
-        if (process.platform === "win32" && adapter.usesAdmissionBarrier !== true) {
-          throw windowsControlEndpointUnsafe();
-        }
-        windowsAdmissionBarrierActive = true;
-        for (const socket of pendingAdmissionSockets) beginWindowsAdmissionBarrier(socket);
-        const descriptor = await adapter.harden(options.endpoint, options.signal);
-        assertControlInitializationActive(options.signal);
-        if (options.windowsPipeCurrentUserSid !== undefined) {
-          validateWindowsPipeSecurityDescriptor(descriptor, options.windowsPipeCurrentUserSid);
-        }
-      } catch (error) {
-        if (options.signal?.aborted === true) throw error;
-        throw windowsControlEndpointUnsafe();
-      } finally {
-        windowsAdmissionBarrierActive = false;
-      }
-      for (const socket of pendingAdmissionSockets) socket.destroy();
-      pendingAdmissionSockets.clear();
-    } else {
-      const endpointIdentity = await awaitControlInitialization(
-        () => controlEndpointIdentity(options.endpoint),
-        options.signal,
-      );
-      const parentIdentity = await awaitControlInitialization(
-        () => privateEndpointParentIdentity(options.endpoint),
-        options.signal,
-      );
-      await awaitControlInitialization(
-        () =>
-          (options.setEndpointPermissions ?? ((endpoint) => chmod(endpoint, 0o600)))(
-            options.endpoint,
-          ),
-        options.signal,
-      );
-      await awaitControlInitialization(
-        () => assertPrivateEndpointParent(options.endpoint, parentIdentity),
-        options.signal,
-      );
-      await awaitControlInitialization(
-        () => verifyUnixControlEndpointIdentity(options.endpoint, endpointIdentity),
-        options.signal,
-      );
-    }
+    const endpointIdentity = await awaitControlInitialization(
+      () => controlEndpointIdentity(options.endpoint),
+      options.signal,
+    );
+    const parentIdentity = await awaitControlInitialization(
+      () => privateEndpointParentIdentity(options.endpoint),
+      options.signal,
+    );
+    await awaitControlInitialization(
+      () =>
+        (options.setEndpointPermissions ?? ((endpoint) => chmod(endpoint, 0o600)))(
+          options.endpoint,
+        ),
+      options.signal,
+    );
+    await awaitControlInitialization(
+      () => assertPrivateEndpointParent(options.endpoint, parentIdentity),
+      options.signal,
+    );
+    await awaitControlInitialization(
+      () => verifyUnixControlEndpointIdentity(options.endpoint, endpointIdentity),
+      options.signal,
+    );
     assertControlInitializationActive(options.signal);
     endpointReady = true;
-    for (const socket of pendingAdmissionSockets) {
-      pendingAdmissionSockets.delete(socket);
-      if (socket.destroyed) continue;
-      beginControlConnection(socket);
-      socket.resume();
+    for (const connection of pendingConnections) {
+      pendingConnections.delete(connection);
+      if (connection.destroyed) continue;
+      dispatcher.begin(connection);
+      connection.resume();
     }
   } catch (error) {
+    dispatcher.markClosing();
     try {
-      await closeListener(server, sockets, activeDispatchSockets, dispatches);
+      await closeListener(
+        server,
+        dispatcher.connections,
+        dispatcher.activeDispatchConnections,
+        dispatcher.dispatches,
+      );
     } catch (closeError) {
       throw new AggregateError(
         [error, closeError],
@@ -720,8 +795,13 @@ export async function startControlServer(options: ControlServerOptions): Promise
     endpoint: options.endpoint,
     close() {
       closePromise ??= (async () => {
-        closing = true;
-        await closeListener(server, sockets, activeDispatchSockets, dispatches);
+        dispatcher.markClosing();
+        await closeListener(
+          server,
+          dispatcher.connections,
+          dispatcher.activeDispatchConnections,
+          dispatcher.dispatches,
+        );
         if (terminalError !== undefined) throw terminalError;
       })();
       return closePromise;

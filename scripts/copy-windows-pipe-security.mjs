@@ -3,16 +3,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const helperSource = join(root, "scripts", "windows-pipe-security.ps1");
-const helperDestination = join(
-  root,
-  "packages",
-  "cli",
-  "dist",
-  "src",
-  "control",
-  "windows-pipe-security.ps1",
-);
 const brokerPowerShellSource = join(root, "scripts", "windows-control-broker.ps1");
 const brokerPowerShellDestination = join(
   root,
@@ -41,17 +31,14 @@ export async function finalizeCliBuild({
   brokerCSharpSource,
   brokerPowerShellDestination,
   brokerPowerShellSource,
-  helperDestination: destination,
-  helperSource: source,
   platform = process.platform,
 }) {
   await Promise.all(
-    [destination, brokerPowerShellDestination, brokerCSharpDestination].map((asset) =>
+    [brokerPowerShellDestination, brokerCSharpDestination].map((asset) =>
       mkdir(dirname(asset), { recursive: true }),
     ),
   );
   await Promise.all([
-    copyFile(source, destination),
     copyFile(brokerPowerShellSource, brokerPowerShellDestination),
     copyFile(brokerCSharpSource, brokerCSharpDestination),
   ]);
@@ -64,6 +51,4 @@ await finalizeCliBuild({
   brokerCSharpSource,
   brokerPowerShellDestination,
   brokerPowerShellSource,
-  helperDestination,
-  helperSource,
 });

@@ -23,6 +23,10 @@ public static class TegoWindowsControlBroker
     private const int Magic1 = 0x47;
     private const int Magic2 = 0x42;
     private const int Magic3 = 0x50;
+    private const int DescriptorPayloadVersion = 1;
+    private const int DescriptorPayloadProtected = 1;
+    private const int DescriptorPayloadHeaderBytes = 12;
+    private const int DescriptorPayloadAceHeaderBytes = 12;
 
     private const ushort FrameReady = 1;
     private const ushort FrameOpen = 2;
@@ -1266,6 +1270,7 @@ public static class TegoWindowsControlBroker
     {
         private readonly string _endpoint;
         private readonly SecurityDescriptorContext _security;
+        private readonly byte[] _readyDescriptor;
         private readonly ParentFrameWriter _writer;
         private readonly Stream _input;
         private readonly object _gate = new object();
@@ -1293,6 +1298,7 @@ public static class TegoWindowsControlBroker
         internal Broker(
             string endpoint,
             SecurityDescriptorContext security,
+            byte[] readyDescriptor,
             SafeFileHandle firstPipe,
             ParentFrameWriter writer,
             Stream input,
@@ -1300,6 +1306,7 @@ public static class TegoWindowsControlBroker
         {
             _endpoint = endpoint;
             _security = security;
+            _readyDescriptor = readyDescriptor;
             _firstPipe = firstPipe;
             _writer = writer;
             _input = input;
@@ -1321,7 +1328,7 @@ public static class TegoWindowsControlBroker
                 Fail(FailureStage.Connect);
                 return 1;
             }
-            _writer.WriteFrame(FrameReady, 0, new byte[0]);
+            _writer.WriteFrame(FrameReady, 0, _readyDescriptor);
             _readyGate.Set();
             _inputThread = new Thread(new ThreadStart(InputLoop));
             _inputThread.IsBackground = true;
@@ -1939,6 +1946,82 @@ public static class TegoWindowsControlBroker
         ValidateDescriptor(descriptor, expectedSids);
     }
 
+    private static byte[] ReadReadyDescriptor(
+        SafeFileHandle handle,
+        SecurityIdentifier[] expectedSids)
+    {
+        uint lengthNeeded;
+        GetKernelObjectSecurity(
+            handle,
+            OwnerSecurityInformation | DaclSecurityInformation,
+            null,
+            0,
+            out lengthNeeded);
+        if (lengthNeeded == 0 || lengthNeeded > MaxConnectionBytes)
+            throw new InvalidOperationException();
+        byte[] bytes = new byte[(int)lengthNeeded];
+        if (!GetKernelObjectSecurity(
+            handle,
+            OwnerSecurityInformation | DaclSecurityInformation,
+            bytes,
+            lengthNeeded,
+            out lengthNeeded))
+            throw new InvalidOperationException();
+        RawSecurityDescriptor descriptor = new RawSecurityDescriptor(bytes, 0);
+        ValidateDescriptor(descriptor, expectedSids);
+
+        byte[] ownerSid = Encoding.ASCII.GetBytes(descriptor.Owner.Value);
+        byte[][] aceSids = new byte[descriptor.DiscretionaryAcl.Count][];
+        int payloadLength = DescriptorPayloadHeaderBytes + ownerSid.Length;
+        for (int index = 0; index < descriptor.DiscretionaryAcl.Count; index += 1)
+        {
+            CommonAce ace = descriptor.DiscretionaryAcl[index] as CommonAce;
+            if (ace == null ||
+                ace.IsCallback ||
+                ace.AceFlags != AceFlags.None ||
+                (uint)ace.AccessMask != PipeFullControl ||
+                ace.SecurityIdentifier == null)
+                throw new InvalidOperationException();
+            aceSids[index] = Encoding.ASCII.GetBytes(ace.SecurityIdentifier.Value);
+            payloadLength = checked(payloadLength + DescriptorPayloadAceHeaderBytes + aceSids[index].Length);
+        }
+        if (ownerSid.Length == 0 || ownerSid.Length > ushort.MaxValue ||
+            aceSids.Length == 0 || aceSids.Length > ushort.MaxValue ||
+            payloadLength > MaxFrameBytes)
+            throw new InvalidOperationException();
+
+        byte[] payload = new byte[payloadLength];
+        payload[0] = 0x54;
+        payload[1] = 0x47;
+        payload[2] = 0x53;
+        payload[3] = 0x44;
+        WriteUInt16(payload, 4, DescriptorPayloadVersion);
+        WriteUInt16(payload, 6, DescriptorPayloadProtected);
+        WriteUInt16(payload, 8, ownerSid.Length);
+        WriteUInt16(payload, 10, aceSids.Length);
+        int offset = DescriptorPayloadHeaderBytes;
+        Buffer.BlockCopy(ownerSid, 0, payload, offset, ownerSid.Length);
+        offset += ownerSid.Length;
+        for (int index = 0; index < descriptor.DiscretionaryAcl.Count; index += 1)
+        {
+            CommonAce ace = descriptor.DiscretionaryAcl[index] as CommonAce;
+            byte[] aceSid = aceSids[index];
+            payload[offset] = 1;
+            payload[offset + 1] = 0;
+            payload[offset + 2] = 0;
+            payload[offset + 3] = 0;
+            WriteUInt32(payload, offset + 4, (uint)ace.AccessMask);
+            WriteUInt16(payload, offset + 8, aceSid.Length);
+            WriteUInt16(payload, offset + 10, 0);
+            offset += DescriptorPayloadAceHeaderBytes;
+            Buffer.BlockCopy(aceSid, 0, payload, offset, aceSid.Length);
+            offset += aceSid.Length;
+        }
+        if (offset != payload.Length)
+            throw new InvalidOperationException();
+        return payload;
+    }
+
     private static void ValidateDescriptor(
         RawSecurityDescriptor descriptor,
         SecurityIdentifier[] expectedSids)
@@ -2134,14 +2217,23 @@ public static class TegoWindowsControlBroker
         SafeFileHandle firstPipe = null;
         ParentFrameWriter writer = null;
         Stream input = null;
+        byte[] readyDescriptor = null;
         try
         {
             parentHandle = OpenParentProcess(parentProcessId);
             descriptor = CreateSecurityDescriptor();
             firstPipe = CreateVerifiedPipe(endpoint, descriptor, true);
+            readyDescriptor = ReadReadyDescriptor(firstPipe, descriptor.ExpectedSids);
             writer = new ParentFrameWriter(Console.OpenStandardOutput());
             input = Console.OpenStandardInput();
-            using (Broker broker = new Broker(endpoint, descriptor, firstPipe, writer, input, parentHandle))
+            using (Broker broker = new Broker(
+                endpoint,
+                descriptor,
+                readyDescriptor,
+                firstPipe,
+                writer,
+                input,
+                parentHandle))
             {
                 descriptor = null;
                 firstPipe = null;

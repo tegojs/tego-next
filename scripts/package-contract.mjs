@@ -11,7 +11,7 @@ const npmCli = resolveNpmCli();
 const forbiddenPackedPath =
   /\.tsbuildinfo$|(^|\/)(?:test|tests|__tests__)\/|\.(?:test|spec)\.(?:[cm]?js|d\.ts)(?:\.map)?$|(?<!\.d)\.ts$/u;
 const allowedPackedPath =
-  /^package\/(?:LICENSE|README\.md|package\.json|dist\/src\/.+\.(?:d\.ts(?:\.map)?|js(?:\.map)?)|dist\/src\/control\/(?:windows-pipe-security\.ps1|windows-control-broker\.(?:ps1|cs)))$/u;
+  /^package\/(?:LICENSE|README\.md|package\.json|dist\/src\/.+\.(?:d\.ts(?:\.map)?|js(?:\.map)?)|dist\/src\/control\/windows-control-broker\.(?:ps1|cs))$/u;
 const releaseVersion = "2.0.0-alpha.1";
 const expectedPackages = [
   {
@@ -161,9 +161,6 @@ export function assertPackedFiles(name, files, entryPoint) {
   if (name === "@tego/cli") {
     const executable = files.find((file) => file.path === "package/dist/src/bin.js");
     if (executable?.mode !== 0o755) throw new Error(`${name} CLI binary must have mode 0755`);
-    if (!files.some((file) => file.path === "package/dist/src/control/windows-pipe-security.ps1")) {
-      throw new Error(`${name} omits the Windows pipe-security helper`);
-    }
     for (const asset of ["windows-control-broker.ps1", "windows-control-broker.cs"]) {
       if (!files.some((file) => file.path === `package/dist/src/control/${asset}`)) {
         throw new Error(`${name} omits the Windows control broker asset: ${asset}`);

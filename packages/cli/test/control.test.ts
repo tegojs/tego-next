@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import { access, chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { Duplex } from "node:stream";
 import { test } from "node:test";
 import {
   type ArtifactDigest,
@@ -18,94 +17,12 @@ import {
 } from "@tego/contracts";
 import { requestControl } from "../src/control/client.js";
 import { type ControlResponse, MAX_CONTROL_LINE_BYTES } from "../src/control/protocol.js";
-import { type ControlRuntimeOperations, startControlServer } from "../src/control/server.js";
 import {
-  createWindowsPipeSecurityAdapter,
-  parseWindowsPipeSecurityHelperOutput,
-  validateWindowsPipeSecurityDescriptor,
-  type WindowsPipeSecurityHelperSpawner,
-} from "../src/control/windows-pipe-security.js";
-
-const TEST_WINDOWS_USER_SID = "S-1-5-21-1000-1000-1000-1001";
-const WINDOWS_SYSTEM_SID = "S-1-5-18";
-const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
-const WINDOWS_PIPE_FULL_CONTROL = 0x1f01ff;
-
-interface TestWindowsPipeSecurityDescriptor {
-  readonly ownerSid: string | undefined;
-  readonly accessSids: readonly string[];
-  readonly protectedDacl: boolean;
-  readonly accessRules: readonly {
-    readonly accessMask: number;
-    readonly inherited: boolean;
-    readonly sid: string;
-    readonly type: "allow" | "deny";
-  }[];
-}
-
-function allowedWindowsPipeSecurityDescriptor(): TestWindowsPipeSecurityDescriptor {
-  const accessSids = [TEST_WINDOWS_USER_SID, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID];
-  return {
-    ownerSid: TEST_WINDOWS_USER_SID,
-    accessSids,
-    protectedDacl: true,
-    accessRules: accessSids.map((sid) => ({
-      accessMask: WINDOWS_PIPE_FULL_CONTROL,
-      inherited: false,
-      sid,
-      type: "allow" as const,
-    })),
-  };
-}
-
-function fakeWindowsPipeSecurityHelperProcess() {
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-  const child = new EventEmitter() as EventEmitter & {
-    kill(signal?: NodeJS.Signals | number): boolean;
-  };
-  Object.assign(child, { stderr, stdout });
-  child.kill = () => true;
-  return {
-    child: child as unknown as ReturnType<WindowsPipeSecurityHelperSpawner>,
-    stderr,
-    stdout,
-  };
-}
-
-type WindowsSecurityControlOptions = Omit<
-  Parameters<typeof startControlServer>[0],
-  "windowsPipeSecurityAdapter"
-> & {
-  readonly windowsPipeCurrentUserSid: string;
-  readonly windowsPipeSecurityAdapter: {
-    harden(endpoint: string, signal?: AbortSignal): Promise<TestWindowsPipeSecurityDescriptor>;
-  };
-};
-
-type WindowsSecurityControlOptionsWithBarrier = Omit<
-  WindowsSecurityControlOptions,
-  "windowsPipeSecurityAdapter"
-> & {
-  readonly windowsPipeSecurityAdapter: WindowsSecurityControlOptions["windowsPipeSecurityAdapter"] & {
-    readonly usesAdmissionBarrier: true;
-  };
-};
-
-const startWithWindowsSecurityUnchecked = startControlServer as unknown as (
-  options: WindowsSecurityControlOptionsWithBarrier,
-) => ReturnType<typeof startControlServer>;
-
-function startWithWindowsSecurity(options: WindowsSecurityControlOptions) {
-  const windowsPipeSecurityAdapter = {
-    ...options.windowsPipeSecurityAdapter,
-    usesAdmissionBarrier: true as const,
-  };
-  return startWithWindowsSecurityUnchecked({
-    ...options,
-    windowsPipeSecurityAdapter,
-  });
-}
+  type ControlConnection,
+  type ControlRuntimeOperations,
+  startControlServer,
+} from "../src/control/server.js";
+import type { WindowsControlBroker } from "../src/control/windows-broker.js";
 
 function runtimeStatus() {
   return parseRuntimeStatus({
@@ -1158,473 +1075,173 @@ test("@spec:runtime-operations/local-runtime-operations/aborted-control-initiali
   });
 });
 
-test("Windows pipe hardening pauses accepted sockets until descriptor validation", async () => {
-  await withEndpoint(async (endpoint) => {
-    const hardeningEntered = Promise.withResolvers<void>();
-    const hardeningRelease = Promise.withResolvers<void>();
-    let stopCalls = 0;
-    const operations = fakeOperations();
-    const startup = startWithWindowsSecurity({
-      endpoint,
-      operations: {
-        ...operations,
-        stop: async () => {
-          stopCalls += 1;
-        },
-      },
-      windowsPipeCurrentUserSid: TEST_WINDOWS_USER_SID,
-      windowsPipeSecurityAdapter: {
-        async harden(hardenedEndpoint) {
-          assert.equal(hardenedEndpoint, endpoint);
-          hardeningEntered.resolve();
-          await hardeningRelease.promise;
-          return allowedWindowsPipeSecurityDescriptor();
-        },
-      },
-    });
+class FakeBrokerConnection extends Duplex implements ControlConnection {
+  readonly output: Buffer[] = [];
 
-    const adapterWasInvoked = await Promise.race([
-      hardeningEntered.promise.then(() => true),
-      startup.then(() => false),
-    ]);
-    if (!adapterWasInvoked) {
-      await (await startup).close();
-      assert.equal(adapterWasInvoked, true, "Windows security adapter must gate readiness");
-      return;
-    }
+  override _read(): void {}
 
-    const socket = await connect(endpoint);
-    const closed = readUntilClosed(socket);
-    socket.end(runtimeStopFrame("windows-security-window"));
-    const stopCallsBeforeHardening = stopCalls;
-
-    hardeningRelease.resolve();
-    const server = await startup;
-    try {
-      assert.equal(await closed, "");
-      const response = await requestControl({
-        endpoint,
-        operation: "runtime.status",
-        input: {},
-        timeoutMs: 1_000,
-      });
-      assert.equal(response.ok, true);
-      assert.equal(stopCalls, 0);
-    } finally {
-      await server.close();
-    }
-    assert.equal(stopCallsBeforeHardening, 0);
-  });
-});
-
-test("Windows pipe hardening drains connections accepted before the security cutover", async () => {
-  await withEndpoint(async (endpoint) => {
-    let preCutoverClosed: Promise<string> | undefined;
-    let stopCalls = 0;
-    const operations = fakeOperations();
-    const server = await startWithWindowsSecurity({
-      endpoint,
-      operations: {
-        ...operations,
-        stop: async () => {
-          stopCalls += 1;
-        },
-      },
-      windowsPipeCurrentUserSid: TEST_WINDOWS_USER_SID,
-      windowsPipeSecurityAdapter: {
-        async harden() {
-          const preCutoverSocket = createConnection(endpoint);
-          preCutoverClosed = readUntilClosed(preCutoverSocket);
-          preCutoverSocket.end(runtimeStopFrame("windows-security-cutover"));
-          const barrierSocket = await connect(endpoint);
-          const acknowledgement = readUntilClosed(barrierSocket);
-          barrierSocket.end("TEGO_WINDOWS_PIPE_SECURITY_BARRIER_V1\n");
-          assert.equal(await acknowledgement, "TEGO_WINDOWS_PIPE_SECURITY_BARRIER_ACK_V1\n");
-          return allowedWindowsPipeSecurityDescriptor();
-        },
-      },
-    });
-    try {
-      assert.ok(preCutoverClosed !== undefined);
-      assert.equal(await preCutoverClosed, "");
-      assert.equal(stopCalls, 0);
-    } finally {
-      await server.close();
-    }
-  });
-});
-
-test("Windows pipe startup rejects an adapter without a deterministic admission barrier", async () => {
-  const originalPlatform = process.platform;
-  Object.defineProperty(process, "platform", { value: "win32" });
-  try {
-    await withEndpoint(async (endpoint) => {
-      const outcome = await startControlServer({
-        endpoint,
-        operations: fakeOperations(),
-        windowsPipeCurrentUserSid: TEST_WINDOWS_USER_SID,
-        windowsPipeSecurityAdapter: {
-          harden: async () => allowedWindowsPipeSecurityDescriptor(),
-          usesAdmissionBarrier: false,
-        } as never,
-      }).then(
-        (server) => ({ ok: true as const, server }),
-        (error: unknown) => ({ error, ok: false as const }),
-      );
-      if (outcome.ok) await outcome.server.close();
-
-      assert.equal(outcome.ok, false);
-      if (!outcome.ok) {
-        assert.ok(outcome.error instanceof DiagnosticError);
-        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-      }
-    });
-  } finally {
-    Object.defineProperty(process, "platform", { value: originalPlatform });
+  override _write(
+    chunk: Buffer | string,
+    encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    this.output.push(typeof chunk === "string" ? Buffer.from(chunk, encoding) : Buffer.from(chunk));
+    callback();
   }
-});
 
-for (const [name, mutate] of [
-  [
-    "missing owner",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({ ...descriptor, ownerSid: undefined }),
-  ],
-  [
-    "wrong owner",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-      ...descriptor,
-      ownerSid: "S-1-5-21-1000-1000-1000-2002",
-    }),
-  ],
-  [
-    "unprotected DACL",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-      ...descriptor,
-      protectedDacl: false,
-    }),
-  ],
-  ...(
-    [
-      ["Everyone", "S-1-1-0"],
-      ["Anonymous", "S-1-5-7"],
-      ["Authenticated Users", "S-1-5-11"],
-      ["an unexpected principal", "S-1-5-21-1000-1000-1000-3003"],
-    ] as const
-  ).map(
-    ([label, sid]) =>
-      [
-        `${label} allow ACE`,
-        (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-          ...descriptor,
-          accessSids: [...descriptor.accessSids, sid],
-          accessRules: [
-            ...descriptor.accessRules,
-            { accessMask: 1, inherited: false, sid, type: "allow" as const },
-          ],
-        }),
-      ] as const,
-  ),
-  [
-    "deny ACE",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-      ...descriptor,
-      accessRules: descriptor.accessRules.map((rule, index) =>
-        index === 0 ? { ...rule, type: "deny" as const } : rule,
-      ),
-    }),
-  ],
-  [
-    "inherited ACE",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-      ...descriptor,
-      accessRules: descriptor.accessRules.map((rule, index) =>
-        index === 0 ? { ...rule, inherited: true } : rule,
-      ),
-    }),
-  ],
-  [
-    "noncanonical ACE order",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-      ...descriptor,
-      accessSids: descriptor.accessSids.toReversed(),
-      accessRules: descriptor.accessRules.toReversed(),
-    }),
-  ],
-  [
-    "current user without pipe control",
-    (descriptor: TestWindowsPipeSecurityDescriptor) => ({
-      ...descriptor,
-      accessRules: descriptor.accessRules.map((rule, index) =>
-        index === 0 ? { ...rule, accessMask: 0x3 } : rule,
-      ),
-    }),
-  ],
-] as const) {
-  test(`Windows pipe hardening rejects ${name} and rolls back queued sockets`, async () => {
-    await withEndpoint(async (endpoint) => {
-      const hardeningEntered = Promise.withResolvers<void>();
-      const hardeningRelease = Promise.withResolvers<void>();
-      const startup = startWithWindowsSecurity({
-        endpoint,
-        operations: fakeOperations(),
-        windowsPipeCurrentUserSid: TEST_WINDOWS_USER_SID,
-        windowsPipeSecurityAdapter: {
-          async harden() {
-            hardeningEntered.resolve();
-            await hardeningRelease.promise;
-            return mutate(allowedWindowsPipeSecurityDescriptor());
-          },
-        },
-      });
+  override _final(callback: (error?: Error | null) => void): void {
+    callback();
+    queueMicrotask(() => this.destroy());
+  }
 
-      const adapterWasInvoked = await Promise.race([
-        hardeningEntered.promise.then(() => true),
-        startup.then(() => false),
-      ]);
-      if (!adapterWasInvoked) {
-        await (await startup).close();
-        assert.equal(adapterWasInvoked, true, "Windows security adapter must gate readiness");
-        return;
-      }
-
-      const socket = await connect(endpoint);
-      const closed = readUntilClosed(socket);
-      socket.end(runtimeStopFrame("windows-security-rejected"));
-      hardeningRelease.resolve();
-      const outcome = await startup.then(
-        (server) => ({ ok: true as const, server }),
-        (error: unknown) => ({ error, ok: false as const }),
-      );
-      const response = await closed;
-      if (outcome.ok) await outcome.server.close();
-
-      assert.equal(outcome.ok, false);
-      if (!outcome.ok) {
-        assert.ok(outcome.error instanceof DiagnosticError);
-        assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-        assert.equal(outcome.error.diagnostic.message, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-      }
-      assert.equal(response, "");
-      await assert.rejects(connect(endpoint));
-    });
-  });
+  inject(value: string): void {
+    this.push(Buffer.from(value));
+  }
 }
 
-test("Windows pipe hardening reports adapter failure with a stable unsafe diagnostic", async () => {
-  await withEndpoint(async (endpoint) => {
-    const outcome = await startWithWindowsSecurity({
-      endpoint,
-      operations: fakeOperations(),
-      windowsPipeCurrentUserSid: TEST_WINDOWS_USER_SID,
-      windowsPipeSecurityAdapter: {
-        harden: () => Promise.reject(new Error("sensitive helper detail")),
-      },
-    }).then(
-      (server) => ({ ok: true as const, server }),
-      (error: unknown) => ({ error, ok: false as const }),
-    );
-    if (outcome.ok) await outcome.server.close();
+class FakeWindowsBroker implements WindowsControlBroker {
+  readonly endpoint: string;
+  closeCalls = 0;
+  readonly started = Promise.withResolvers<void>();
+  readonly startGate = Promise.withResolvers<void>();
+  #connectionListener: ((connection: ControlConnection) => void) | undefined;
+  #errorListener: ((error: Error) => void) | undefined;
+  #startFailure: Error | undefined;
 
-    assert.equal(outcome.ok, false);
-    if (!outcome.ok) {
-      assert.ok(outcome.error instanceof DiagnosticError);
-      assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-      assert.equal(outcome.error.diagnostic.message, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-      assert.doesNotMatch(JSON.stringify(outcome.error.diagnostic), /sensitive helper detail/u);
+  constructor(endpoint: string) {
+    this.endpoint = endpoint;
+  }
+
+  failStart(error: Error): void {
+    this.#startFailure = error;
+    this.startGate.resolve();
+  }
+
+  async start(): Promise<void> {
+    this.started.resolve();
+    await this.startGate.promise;
+    if (this.#startFailure !== undefined) throw this.#startFailure;
+  }
+
+  onConnection(listener: (connection: ControlConnection) => void): void {
+    this.#connectionListener = listener;
+  }
+
+  onError(listener: (error: Error) => void): void {
+    this.#errorListener = listener;
+  }
+
+  emitConnection(connection: ControlConnection): void {
+    this.#connectionListener?.(connection);
+  }
+
+  emitError(error: Error): void {
+    this.#errorListener?.(error);
+  }
+
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+  }
+}
+
+test("Windows broker owns the endpoint and gates connection dispatch until READY", async () => {
+  await withEndpoint(async (endpoint) => {
+    const broker = new FakeWindowsBroker(endpoint);
+    const connection = new FakeBrokerConnection();
+    let stopCalls = 0;
+    const operations = fakeOperations();
+    let factoryOptions:
+      | { readonly maxConnections: number; readonly maxQueuedBytes: number }
+      | undefined;
+    const startup = startControlServer({
+      endpoint,
+      operations: {
+        ...operations,
+        stop: async () => {
+          stopCalls += 1;
+        },
+      },
+      windowsBrokerArchitecture: "x64",
+      windowsControlBrokerFactory(options) {
+        factoryOptions = options;
+        return broker;
+      },
+    });
+    await broker.started.promise;
+    await assert.rejects(access(endpoint));
+    broker.emitConnection(connection);
+    connection.inject(runtimeStopFrame("windows-broker-gated"));
+    assert.equal(await settlesBeforeDeadline(startup), false);
+    assert.equal(stopCalls, 0);
+
+    broker.startGate.resolve();
+    const server = await startup;
+    await new Promise<void>((resolve) => connection.once("close", resolve));
+    try {
+      const response = JSON.parse(Buffer.concat(connection.output).toString("utf8"));
+      assert.equal(response.ok, true);
+      assert.equal(stopCalls, 1);
+      assert.deepEqual(factoryOptions, {
+        endpoint,
+        maxConnections: 64,
+        maxQueuedBytes: 256 * 1024,
+      });
+      await assert.rejects(access(endpoint));
+    } finally {
+      await server.close();
     }
-    await assert.rejects(connect(endpoint));
+    assert.equal(broker.closeCalls, 1);
   });
 });
 
-test("Windows pipe helper output is exactly one strict JSON descriptor line", () => {
-  const inspection = allowedWindowsPipeSecurityDescriptor();
-  const line = JSON.stringify({ currentUserSid: TEST_WINDOWS_USER_SID, ...inspection });
-  assert.deepEqual(parseWindowsPipeSecurityHelperOutput(`${line}\r\n`), inspection);
-  for (const output of [
-    "",
-    "not-json\n",
-    `${line}\n${line}\n`,
-    `notice\n${line}\n`,
-    `${JSON.stringify({
-      currentUserSid: TEST_WINDOWS_USER_SID,
-      ...inspection,
-      accessRules: {},
-    })}\n`,
-    `${JSON.stringify({ currentUserSid: TEST_WINDOWS_USER_SID, ...inspection, extra: true })}\n`,
-    `${JSON.stringify({
-      currentUserSid: "S-1-5-21-1000-1000-1000-2002",
-      ...inspection,
-    })}\n`,
-  ]) {
-    assert.throws(
-      () => parseWindowsPipeSecurityHelperOutput(output),
+test("Windows broker startup failure waits for cleanup and leaves no reachable endpoint", async () => {
+  await withEndpoint(async (endpoint) => {
+    const broker = new FakeWindowsBroker(endpoint);
+    const cleanup = Promise.withResolvers<void>();
+    broker.close = async () => {
+      broker.closeCalls += 1;
+      await cleanup.promise;
+    };
+    const startup = startControlServer({
+      endpoint,
+      operations: fakeOperations(),
+      windowsBrokerArchitecture: "x64",
+      windowsControlBrokerFactory: () => broker,
+    });
+    await broker.started.promise;
+    broker.failStart(new Error("sensitive broker failure"));
+    assert.equal(await settlesBeforeDeadline(startup), false);
+    await assert.rejects(access(endpoint));
+    cleanup.resolve();
+    await assert.rejects(
+      startup,
+      (error: unknown) =>
+        error instanceof DiagnosticError &&
+        error.diagnostic.code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&
+        !JSON.stringify(error).includes("sensitive broker failure"),
+    );
+    assert.equal(broker.closeCalls, 1);
+  });
+});
+
+test("unsupported Windows architecture fails before broker or Node endpoint creation", async () => {
+  await withEndpoint(async (endpoint) => {
+    let factoryCalls = 0;
+    await assert.rejects(
+      startControlServer({
+        endpoint,
+        operations: fakeOperations(),
+        windowsBrokerArchitecture: "arm64",
+        windowsControlBrokerFactory: () => {
+          factoryCalls += 1;
+          return new FakeWindowsBroker(endpoint);
+        },
+      }),
       (error: unknown) =>
         error instanceof DiagnosticError &&
         error.diagnostic.code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
     );
-  }
-});
-
-test("Windows pipe helper uses fixed shell-free arguments and an admission barrier", async () => {
-  const { child, stderr, stdout } = fakeWindowsPipeSecurityHelperProcess();
-  let invocation: { readonly args: readonly string[]; readonly command: string } | undefined;
-  const adapter = createWindowsPipeSecurityAdapter({
-    spawnHelper(command, args) {
-      invocation = { args, command };
-      queueMicrotask(() => {
-        stdout.end(
-          `${JSON.stringify({
-            currentUserSid: TEST_WINDOWS_USER_SID,
-            ...allowedWindowsPipeSecurityDescriptor(),
-          })}\n`,
-        );
-        stderr.end();
-        (child as unknown as EventEmitter).emit("close", 0, null);
-      });
-      return child;
-    },
-  });
-  const endpoint = "\\\\.\\pipe\\tego-helper-contract";
-
-  await adapter.harden(endpoint);
-
-  assert.ok(invocation !== undefined);
-  assert.equal(invocation.command, "pwsh");
-  assert.deepEqual(invocation.args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-File"]);
-  assert.deepEqual(invocation.args.slice(-6), [
-    "-Endpoint",
-    endpoint,
-    "-Operation",
-    "harden",
-    "-BarrierCount",
-    "2",
-  ]);
-});
-
-test("Windows pipe helper exposes only fixed failure stages", async () => {
-  const fixed = fakeWindowsPipeSecurityHelperProcess();
-  const stages: string[] = [];
-  const fixedAdapter = createWindowsPipeSecurityAdapter({
-    onHelperFailure: (stage) => stages.push(stage),
-    spawnHelper() {
-      queueMicrotask(() => {
-        fixed.stdout.end();
-        fixed.stderr.end("TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED\n");
-        (fixed.child as unknown as EventEmitter).emit("close", 1, null);
-      });
-      return fixed.child;
-    },
-  });
-
-  await assert.rejects(
-    fixedAdapter.harden("\\\\.\\pipe\\tego-helper-fixed-failure"),
-    (error: unknown) =>
-      error instanceof DiagnosticError &&
-      error.diagnostic.code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&
-      error.message === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
-  );
-  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED"]);
-
-  const unsafe = fakeWindowsPipeSecurityHelperProcess();
-  const unsafeAdapter = createWindowsPipeSecurityAdapter({
-    onHelperFailure: (stage) => stages.push(stage),
-    spawnHelper() {
-      queueMicrotask(() => {
-        unsafe.stdout.end();
-        unsafe.stderr.end("sensitive helper detail: \\\\.\\pipe\\private-endpoint\n");
-        (unsafe.child as unknown as EventEmitter).emit("close", 1, null);
-      });
-      return unsafe.child;
-    },
-  });
-  const outcome = await unsafeAdapter.harden("\\\\.\\pipe\\tego-helper-unsafe-failure").then(
-    () => ({ ok: true as const }),
-    (error: unknown) => ({ error, ok: false as const }),
-  );
-
-  assert.equal(outcome.ok, false);
-  if (!outcome.ok) {
-    assert.ok(outcome.error instanceof DiagnosticError);
-    assert.equal(outcome.error.diagnostic.code, "PROTOCOL_CONTROL_ENDPOINT_UNSAFE");
-    assert.doesNotMatch(JSON.stringify(outcome.error), /sensitive|private-endpoint/u);
-  }
-  assert.deepEqual(stages, ["TEGO_WINDOWS_PIPE_SECURITY_INITIAL_OPEN_FAILED"]);
-});
-
-test("Windows pipe helper abort waits for observed child close", async () => {
-  const { child } = fakeWindowsPipeSecurityHelperProcess();
-  let killCalls = 0;
-  child.kill = () => {
-    killCalls += 1;
-    return true;
-  };
-  const controller = new AbortController();
-  const adapter = createWindowsPipeSecurityAdapter({ spawnHelper: () => child });
-  const hardening = adapter.harden("\\\\.\\pipe\\tego-helper-abort", controller.signal);
-  controller.abort();
-
-  const settledBeforeClose = await settlesBeforeDeadline(hardening);
-  (child as unknown as EventEmitter).emit("close", null, "SIGKILL");
-
-  await assert.rejects(hardening, { name: "AbortError" });
-  assert.equal(killCalls, 1);
-  assert.equal(settledBeforeClose, false);
-});
-
-test("Windows pipe policy rejects a descriptor that omits ACE inspection detail", () => {
-  const { accessRules: _accessRules, ...descriptor } = allowedWindowsPipeSecurityDescriptor();
-  assert.throws(
-    () => validateWindowsPipeSecurityDescriptor(descriptor, TEST_WINDOWS_USER_SID),
-    (error: unknown) =>
-      error instanceof DiagnosticError &&
-      error.diagnostic.code === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
-  );
-});
-
-test("Windows pipe policy accepts LocalSystem as the current user without duplicate ACEs", () => {
-  const accessSids = [WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID];
-  const descriptor = {
-    ownerSid: WINDOWS_SYSTEM_SID,
-    accessSids,
-    protectedDacl: true,
-    accessRules: accessSids.map((sid) => ({
-      accessMask: WINDOWS_PIPE_FULL_CONTROL,
-      inherited: false,
-      sid,
-      type: "allow" as const,
-    })),
-  };
-
-  const { accessRules: _accessRules, ...expected } = descriptor;
-  assert.deepEqual(validateWindowsPipeSecurityDescriptor(descriptor, WINDOWS_SYSTEM_SID), expected);
-});
-
-test("Windows pipe startup waits for adapter abort cleanup before rollback settles", async () => {
-  await withEndpoint(async (endpoint) => {
-    const hardeningEntered = Promise.withResolvers<void>();
-    const cleanupRelease = Promise.withResolvers<void>();
-    const controller = new AbortController();
-    const startup = startWithWindowsSecurity({
-      endpoint,
-      operations: fakeOperations(),
-      signal: controller.signal,
-      windowsPipeCurrentUserSid: TEST_WINDOWS_USER_SID,
-      windowsPipeSecurityAdapter: {
-        async harden(_endpoint, signal) {
-          hardeningEntered.resolve();
-          await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve()));
-          await cleanupRelease.promise;
-          throw new DOMException("Aborted", "AbortError");
-        },
-      },
-    });
-    await hardeningEntered.promise;
-    controller.abort();
-    const settledBeforeCleanup = await settlesBeforeDeadline(startup);
-    cleanupRelease.resolve();
-
-    await assert.rejects(startup, { name: "AbortError" });
-    assert.equal(settledBeforeCleanup, false);
-    await assert.rejects(connect(endpoint));
+    assert.equal(factoryCalls, 0);
+    await assert.rejects(access(endpoint));
   });
 });

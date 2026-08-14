@@ -101,12 +101,13 @@ Windows, startup fails closed until the named pipe has the current Windows user
 as owner and a protected DACL. Explicit allow ACEs grant full pipe access only
 to the current Windows user, LocalSystem, and Administrators; inherited, deny,
 broad, duplicate, reordered, underprivileged, or unexpected ACEs are rejected.
-Connections accepted before the two-acknowledgement admission barrier completes
-are destroyed without dispatch. Each later connection carries one bounded
-request.
+The broker creates every pipe instance with that descriptor, reads the server
+handle descriptor back, and reports the canonical descriptor in its framed
+`READY` payload. TypeScript validates every reported field before dispatching
+queued connections. Each connection carries one bounded request.
 
-The packaged PowerShell/Win32 helper uses fixed shell-free arguments, strict
-single-line JSON inspection, bounded output, and parent/child watchdogs. Real
+The packaged PowerShell/Win32 broker uses fixed shell-free arguments, strict
+framed stdout, allowlisted stderr, bounded queues, and parent/child watchdogs. Real
 Windows named-pipe execution is still pending the mandatory Task 10
 `windows-control` CI evidence; if ACL application or inspection fails there,
 the alpha release remains blocked.

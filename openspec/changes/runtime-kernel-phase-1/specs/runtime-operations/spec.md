@@ -83,7 +83,7 @@ broad, duplicate, or unexpected ACE. Windows connections accepted before the har
 barrier completes SHALL be destroyed rather than dispatched.
 
 #### Scenario: Windows descriptor cannot be proven safe
-- **WHEN** applying, inspecting, parsing, or validating the Windows named-pipe descriptor or admission barrier fails or times out
+- **WHEN** creating or reading back the Windows named-pipe descriptor, decoding or validating the broker `READY` descriptor, or broker startup fails or times out
 - **THEN** startup rolls back, every queued socket closes, and no control request is dispatched
 
 ### Requirement: Deterministic readiness and test cleanup

@@ -3,12 +3,6 @@ import { randomUUID } from "node:crypto";
 import { parseRuntimeStatus, type RuntimeOperations } from "@tego/contracts";
 import { requestControl } from "../src/control/client.js";
 import { type ControlRuntimeOperations, startControlServer } from "../src/control/server.js";
-import {
-  createWindowsPipeSecurityAdapter,
-  validateWindowsPipeSecurityDescriptor,
-  WINDOWS_ADMINISTRATORS_SID,
-  WINDOWS_SYSTEM_SID,
-} from "../src/control/windows-pipe-security.js";
 
 const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
 
@@ -43,24 +37,11 @@ function gateOperations(): ControlRuntimeOperations {
 async function runWindowsControlSecurityContract(): Promise<void> {
   assert.equal(process.platform, "win32", "Windows control gate cannot run on another platform");
   const endpoint = `\\\\.\\pipe\\tego-windows-control-gate-${process.pid}-${randomUUID()}`;
-  const productionAdapter = createWindowsPipeSecurityAdapter();
   const server = await startControlServer({
     endpoint,
     operations: gateOperations(),
-    onWindowsPipeSecurityHelperFailure: (stage) => process.stderr.write(`${stage}\n`),
   });
   try {
-    const inspection = await productionAdapter.inspect(endpoint);
-    const { accessRules: _accessRules, ...publicDescriptor } = inspection;
-    assert.deepEqual(
-      validateWindowsPipeSecurityDescriptor(inspection, inspection.ownerSid),
-      publicDescriptor,
-    );
-    assert.deepEqual(
-      new Set(inspection.accessSids),
-      new Set([inspection.ownerSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID]),
-    );
-    assert.equal(inspection.protectedDacl, true);
     const response = await requestControl({
       endpoint,
       operation: "runtime.status",
