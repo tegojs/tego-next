@@ -73,6 +73,8 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
+let diagnosticStage = "powershell-csharp-self-test";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -294,10 +296,12 @@ async function runPowerShellSelfTest(): Promise<void> {
 }
 
 async function startLiveDescriptor(): Promise<void> {
+  diagnosticStage = "live-server-handle-descriptor";
   liveServer = await startTrackedServer("live-descriptor");
 }
 
 async function runStatusRequest(): Promise<void> {
+  diagnosticStage = "status-request";
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
 }
@@ -312,6 +316,7 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 }
 
 async function runMalformedFrameFailure(): Promise<void> {
+  diagnosticStage = "malformed-broker-frame-fail-closed";
   const tracked = await startTrackedServer("malformed-frame");
   try {
     await writeMalformedFrame(tracked.broker);
@@ -357,6 +362,7 @@ function isParentFixtureReady(value: unknown): value is ParentFixtureReady {
 }
 
 async function runParentCrashCleanup(): Promise<void> {
+  diagnosticStage = "parent-crash-cleanup";
   const fixture = spawn(
     process.execPath,
     [fileURLToPath(import.meta.url), "--parent-crash-fixture"],
@@ -400,6 +406,7 @@ async function runParentCrashCleanup(): Promise<void> {
 }
 
 async function runBrokerCrashCleanup(): Promise<void> {
+  diagnosticStage = "broker-crash-cleanup";
   const tracked = await startTrackedServer("broker-crash");
   try {
     assert.equal(tracked.broker.kill("SIGKILL"), true);
@@ -414,6 +421,7 @@ async function runBrokerCrashCleanup(): Promise<void> {
 }
 
 async function runReconnectFailure(): Promise<void> {
+  diagnosticStage = "reconnect-failure";
   assert.ok(liveServer !== undefined);
   const tracked = liveServer;
   liveServer = undefined;
@@ -423,6 +431,7 @@ async function runReconnectFailure(): Promise<void> {
 }
 
 async function runTwentyLifecycleRounds(): Promise<void> {
+  diagnosticStage = "twenty-lifecycle-rounds";
   for (let round = 0; round < 20; round += 1) {
     const tracked = await startTrackedServer(`round-${String(round)}`);
     try {
@@ -451,6 +460,7 @@ if (process.argv[2] === "--parent-crash-fixture") {
   try {
     await runParentCrashFixture();
   } catch {
+    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
     process.exitCode = 1;
   }
 } else {
