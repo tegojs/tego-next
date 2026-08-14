@@ -74,6 +74,8 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
+let nonAuthoritativeStage = "powershell-csharp-self-test";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -245,9 +247,10 @@ async function assertStatus(endpoint: string, requestId: string): Promise<void> 
 }
 
 async function runWindowsControlGateStage(
-  _stage: string,
+  stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
+  nonAuthoritativeStage = stage;
   await operation();
 }
 
@@ -466,6 +469,7 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
+    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${nonAuthoritativeStage}\n`);
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {

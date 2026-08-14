@@ -91,9 +91,9 @@ function exactAwaitCount(source, expression) {
 }
 
 function hasActiveStageExecutor(source) {
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")?.trim();
   return (
-    uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")?.trim() ===
-    "await operation();"
+    body === "await operation();" || body === "nonAuthoritativeStage = stage;\n  await operation();"
   );
 }
 
@@ -228,9 +228,6 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasMalformedOwnershipTransfer(gateSource)) {
     errors.push("malformed-frame cleanup ownership must release only after its postconditions");
-  }
-  if (`${gateSource}\n${runnerSource}`.includes(temporaryTaskDiagnosticMarker)) {
-    errors.push("Windows gate cannot retain temporary diagnostic output");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(

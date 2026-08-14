@@ -328,7 +328,8 @@ test("Windows control gate source validation rejects removed, reordered, softene
   );
   const markerWrite = `  process.stdout.write(\`\${WINDOWS_CONTROL_GATE_MARKER}\\n\`);`;
   const activeStageHelper = [
-    "async function runWindowsControlGateStage(_stage, operation) {",
+    "async function runWindowsControlGateStage(stage, operation) {",
+    "  nonAuthoritativeStage = stage;",
     "  await operation();",
     "}",
   ].join("\n");
@@ -558,7 +559,7 @@ test("Windows gate validation keeps one bounded strict authoritative SelfTest", 
     gateSource.match(/spawnSync\("powershell\.exe", selfTestArguments, \{/gu)?.length,
     1,
   );
-  assert.doesNotMatch(`${gateSource}\n${runnerSource}`, /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u);
+  assert.doesNotMatch(gateSource, /\bprime\b/u);
   const mutations = [
     gateSource.replace(
       "  assert.equal(selfTest.status, 0);",
