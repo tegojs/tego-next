@@ -129,9 +129,7 @@ function hasActiveStageExecutor(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
     ?.replaceAll("\r\n", "\n")
     .trim();
-  return (
-    body === "await operation();" || body === "nonAuthoritativeStage = stage;\n  await operation();"
-  );
+  return body === "await operation();";
 }
 
 function hasForbiddenGateFlow(body) {
@@ -223,6 +221,27 @@ function hasMalformedOwnershipTransfer(source) {
   return true;
 }
 
+function hasBrokerCrashOwnershipTransfer(source) {
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runBrokerCrashCleanup");
+  if (body === undefined || body.includes("waitForProcessExit(")) return false;
+  const requiredInOrder = [
+    'let tracked: TrackedServer | undefined = await startTrackedServer("broker-crash");',
+    'tracked.broker.kill("SIGKILL")',
+    "isExpectedMalformedServerClose(error, failure)",
+    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await assertPipeUnavailable(tracked.endpoint);",
+    "tracked = undefined;",
+    "} finally {",
+    "if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+  ];
+  let cursor = -1;
+  for (const token of requiredInOrder) {
+    cursor = body.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return true;
+}
+
 export function validateWindowsControlGateContract({ gateSource, runnerSource }) {
   const errors = [];
   if (typeof gateSource !== "string" || typeof runnerSource !== "string") {
@@ -265,6 +284,9 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasMalformedOwnershipTransfer(gateSource)) {
     errors.push("malformed-frame cleanup ownership must release only after its postconditions");
+  }
+  if (!hasBrokerCrashOwnershipTransfer(gateSource)) {
+    errors.push("broker-crash cleanup ownership must release only after exact child close");
   }
   const gateCloseMatcher = uniqueTopLevelSyncFunctionBody(
     gateSource,

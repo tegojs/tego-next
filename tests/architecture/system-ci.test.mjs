@@ -72,7 +72,19 @@ const windowsControlGateImplementationFixtureBodies = new Map([
   ],
   [
     "runBrokerCrashCleanup",
-    ['  tracked.broker.kill("SIGKILL");', "  await assertPipeUnavailable();"],
+    [
+      '  let tracked: TrackedServer | undefined = await startTrackedServer("broker-crash");',
+      "  try {",
+      '    tracked.broker.kill("SIGKILL");',
+      "    const failure = new Error();",
+      "    isExpectedMalformedServerClose(error, failure);",
+      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "    await assertPipeUnavailable(tracked.endpoint);",
+      "    tracked = undefined;",
+      "  } finally {",
+      "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+      "  }",
+    ],
   ],
   ["runReconnectFailure", ["  await tracked.server.close();", "  await assertPipeUnavailable();"]],
   [
@@ -102,6 +114,21 @@ function replaceTopLevelAsyncFunctionBody(source, name, body) {
   const bodyEnd = bodyEndMatch.exec(source)?.index ?? -1;
   assert.notEqual(bodyEnd, -1, `${name} body must end`);
   return `${source.slice(0, bodyStart + 1)}\n${body}\n${source.slice(bodyEnd)}`;
+}
+
+function replaceInTopLevelAsyncFunctionBody(source, name, from, to) {
+  const declaration = new RegExp(`^async function ${name}\\b`, "mu").exec(source);
+  assert.ok(declaration !== null, `${name} declaration must exist`);
+  const bodyStart = source.indexOf("{", declaration.index);
+  assert.notEqual(bodyStart, -1, `${name} body must start`);
+  const bodyEndMatch = /^\}\r?$/gmu;
+  bodyEndMatch.lastIndex = bodyStart;
+  const bodyEnd = bodyEndMatch.exec(source)?.index ?? -1;
+  assert.notEqual(bodyEnd, -1, `${name} body must end`);
+  const body = source.slice(bodyStart + 1, bodyEnd);
+  const mutatedBody = body.replace(from, to);
+  assert.notEqual(mutatedBody, body, `${name} mutation must change its body`);
+  return `${source.slice(0, bodyStart + 1)}${mutatedBody}${source.slice(bodyEnd)}`;
 }
 const requiredStepsByJob = {
   integration: [
@@ -651,6 +678,58 @@ test("Windows malformed close matcher requires the ordered unsafe aggregate", as
     new AggregateError([brokerCleanup, other]),
   ]) {
     assert.equal(isExpectedMalformedServerClose(error, observedFailure), false);
+  }
+});
+
+test("Windows broker-crash cleanup reuses the exact aggregate and releases captured ownership", async (t) => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?broker-crash-ownership=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+  assert.match(
+    gateSource,
+    /async function runBrokerCrashCleanup\(\): Promise<void> \{[\s\S]+let tracked: TrackedServer \| undefined = await startTrackedServer\("broker-crash"\);[\s\S]+isExpectedMalformedServerClose\(error, failure\)[\s\S]+await withDeadline\(tracked\.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+tracked = undefined;[\s\S]+if \(tracked !== undefined\) await cleanupTrackedServer\(tracked\);/u,
+  );
+  for (const [name, from, to] of [
+    [
+      "direct close matcher",
+      "isExpectedMalformedServerClose(error, failure)",
+      "/PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u.test(error.message)",
+    ],
+    [
+      "numeric PID polling",
+      "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "await waitForProcessExit(tracked.brokerPid);",
+    ],
+    ["missing release", "    tracked = undefined;", ""],
+    [
+      "early release",
+      "    await assertPipeUnavailable(tracked.endpoint);\n    tracked = undefined;",
+      "    tracked = undefined;\n    await assertPipeUnavailable(tracked.endpoint);",
+    ],
+    [
+      "unconditional fallback",
+      "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+      "    await cleanupTrackedServer(tracked);",
+    ],
+  ]) {
+    await t.test(name, () => {
+      const mutation = replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "runBrokerCrashCleanup",
+        from,
+        to,
+      );
+      assert.ok(
+        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+      );
+    });
   }
 });
 
