@@ -68,9 +68,10 @@ pause state transitions, graceful terminal frames, and `CancelIoEx`; every mutat
   IDs match Task 1. Parent EOF, malformed input, parent signal, close-all, and internal failure all
   fail closed and settle owned handles.
 - `SelfTest` is a fixed script mode which exercises constants, descriptor construction,
-  parent-watch cancellation, invalid-frame rejection, and repeated handle cleanup without creating
-  a named-pipe endpoint. The normal CLI does not expose this mode. The implementation does not claim
-  that another direct script caller is technically unable to invoke it.
+  parent-watch cancellation, invalid-frame rejection, private test-pipe I/O cancellation, and
+  repeated handle cleanup. It does not create or announce a public broker endpoint. The normal CLI
+  does not expose this mode. The implementation does not claim that another direct script caller is
+  technically unable to invoke it.
 - stdout is used only through the binary frame writer. stderr is centralized on fixed enumerated
   codes; endpoint, SID, payload, and exception text are never written.
 - The obsolete `windows-pipe-security.ps1` helper remains copied and packaged for Task 3 to replace.
@@ -109,3 +110,75 @@ The C# compatibility and Win32 behavior are statically constrained but not execu
 host. Do not treat this report as evidence that Windows PowerShell 5.1 compiled the source, that the
 real descriptor readback passed, or that Windows process/pipe cleanup is leak-free. The fixed
 `SelfTest` and authoritative Windows gate must establish those facts on `windows-2025`.
+
+## Independent-review remediation
+
+Root's independent review rejected the first implementation despite the earlier internal approval.
+That rejection identified a PAUSE/immediate-RESUME race, premature SafeHandle closure around native
+overlapped operations, callback ACE acceptance, and insufficient real-Windows self-testing. This
+section supersedes the earlier review statement for those findings and records the second strict TDD
+cycle.
+
+The first remediation test run was against the unchanged `18dc466` implementation:
+
+```text
+node --test tests/architecture/windows-control-broker-source.test.mjs
+
+tests 5; pass 3; fail 2; skipped 0
+```
+
+The failures were the intended RED signals: there was no per-read cancellation token/generation and
+no `DangerousAddRef` lifetime ownership. The lifecycle mutation did not find its target because the
+required ownership code did not exist. A small cancellation model was then added to prove that a
+PAUSE-bound cancellation still requests another read after an immediate RESUME, while CLOSE and
+shutdown stay terminal.
+
+The requested internal re-review then found one C# definite-assignment compile blocker in the new
+read loop. A source assertion was added first and failed 5/6 because `transferred` was not initialized;
+initializing it to zero made the test green, and a mutation back to the uninitialized declaration is
+now rejected. The reviewer rechecked the fix and approved with no remaining blocking finding.
+
+The remediation changes are:
+
+- each pending read owns a monotonic generation plus immutable `ReadCancellationReason`; PAUSE binds
+  to that operation, so `ERROR_OPERATION_ABORTED` retries through the pause gate even when RESUME has
+  already arrived, while close/shutdown remains terminal;
+- every accept/read/write `OverlappedOperation` takes a `SafeFileHandle.DangerousAddRef` before the
+  Win32 call, cancels and settles through `GetOverlappedResult` on that same valid handle, then frees
+  native OVERLAPPED memory, pinned data, and event before `DangerousRelease`;
+- disposal continues through every cleanup step before returning a fixed failure. A settlement
+  deadline instead emits `TEGO_WINDOWS_CONTROL_BROKER_RESOURCE_FAILED` and terminates/fail-fasts,
+  never freeing memory which the kernel may still reference;
+- connection owners cancel tracked read/write operations, wait on bounded thread/operation-idle
+  signals, and only then dispose the pipe SafeHandle. The accept owner signals its dedicated cancel
+  event, waits for accept-thread exit, and only then disposes any pending accept handle;
+- descriptor validation now explicitly rejects callback `CommonAce` instances and non-empty opaque
+  data in addition to requiring `AceType.AccessAllowed`, access-allowed qualifier, and exact
+  flags/mask/SID/order;
+- `CreateNamedPipeW` and the private-self-test `CreateFileW` import use `ExactSpelling = true`;
+- the fixed `SelfTest` now uses randomized private pipe names to cancel real pending accept, read, and
+  write operations, exercises PAUSE then immediate RESUME followed by a successful new read, repeats
+  close/dispose, constructs and rejects a callback ACE with the same SID/mask, and waits until the
+  watchdog thread has actually entered. It never publishes READY or a public endpoint.
+
+Fresh post-remediation verification:
+
+```text
+focused source/model: 6/6 passed
+focused architecture + real tarball clean-consumer package contract: 26/26 passed
+npm run build --workspace @tego/cli: passed
+npm run typecheck --workspace @tego/cli: passed
+Biome on the changed JavaScript test: passed
+repository source vs emitted .ps1/.cs cmp: passed
+Task 2 scoped git diff --check: passed
+```
+
+The package run builds actual tarballs, validates the nine-package allowlist, installs into a clean
+consumer, and checks the broker `.ps1` and `.cs` assets. The source test parses both Task 1 and C#
+protocol maps and includes in-memory mutations for SafeHandle add-ref/release, settlement-before-free,
+per-read cancellation reason/generation, callback/opaque ACE rejection, and explicit wide-import
+spelling.
+
+The evidence boundary is unchanged: this macOS host has no `powershell`, `pwsh`, `dotnet`, `csc`, or
+`mcs`. The new private-pipe SelfTest and Windows PowerShell 5.1 `Add-Type` path were therefore not
+executed here and must be run on the authoritative Windows worker.

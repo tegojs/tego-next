@@ -60,8 +60,11 @@ public static class TegoWindowsControlBroker
     private const uint PipeFullControl = 0x001F01FF;
     private const uint Synchronize = 0x00100000;
     private const uint PipeAccessDuplex = 0x00000003;
+    private const uint GenericRead = 0x80000000;
+    private const uint GenericWrite = 0x40000000;
     private const uint FileFlagFirstPipeInstance = 0x00080000;
     private const uint FileFlagOverlapped = 0x40000000;
+    private const uint OpenExisting = 3;
     private const uint PipeTypeByte = 0x00000000;
     private const uint PipeReadModeByte = 0x00000000;
     private const uint PipeWait = 0x00000000;
@@ -92,6 +95,13 @@ public static class TegoWindowsControlBroker
         Start
     }
 
+    private enum ReadCancellationReason
+    {
+        None,
+        Pause,
+        Close
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct SECURITY_ATTRIBUTES
     {
@@ -110,7 +120,7 @@ public static class TegoWindowsControlBroker
         internal IntPtr EventHandle;
     }
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern SafeFileHandle CreateNamedPipeW(
         string name,
         uint openMode,
@@ -120,6 +130,16 @@ public static class TegoWindowsControlBroker
         uint inputBufferSize,
         uint defaultTimeout,
         ref SECURITY_ATTRIBUTES securityAttributes);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
 
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -414,36 +434,124 @@ public static class TegoWindowsControlBroker
     {
         private readonly SafeFileHandle _pipeHandle;
         private readonly ManualResetEvent _shutdown;
-        private readonly ManualResetEvent _completed;
+        private readonly object _stateGate = new object();
+        private ManualResetEvent _completed;
         private GCHandle _bufferPin;
         private bool _bufferPinned;
+        private bool _safeFileReference;
+        private bool _issued;
+        private bool _settled;
+        private bool _disposeStarted;
         private bool _disposed;
-        private readonly IntPtr _nativeOverlapped;
+        private IntPtr _nativeOverlapped;
 
         internal OverlappedOperation(SafeFileHandle handle, byte[] buffer, ManualResetEvent shutdown)
         {
             _pipeHandle = handle;
             _shutdown = shutdown;
-            _completed = new ManualResetEvent(false);
-            if (buffer != null)
+            bool addRef = false;
+            try
             {
-                _bufferPin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-                _bufferPinned = true;
-                BufferPointer = _bufferPin.AddrOfPinnedObject();
+                _pipeHandle.DangerousAddRef(ref addRef);
+                _safeFileReference = addRef;
+                _completed = new ManualResetEvent(false);
+                if (buffer != null)
+                {
+                    _bufferPin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                    _bufferPinned = true;
+                    BufferPointer = _bufferPin.AddrOfPinnedObject();
+                }
+                _nativeOverlapped = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NATIVE_OVERLAPPED)));
+                NATIVE_OVERLAPPED native = new NATIVE_OVERLAPPED();
+                native.EventHandle = _completed.SafeWaitHandle.DangerousGetHandle();
+                Marshal.StructureToPtr(native, _nativeOverlapped, false);
             }
-            _nativeOverlapped = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NATIVE_OVERLAPPED)));
-            NATIVE_OVERLAPPED native = new NATIVE_OVERLAPPED();
-            native.EventHandle = _completed.SafeWaitHandle.DangerousGetHandle();
-            Marshal.StructureToPtr(native, _nativeOverlapped, false);
+            catch
+            {
+                if (_nativeOverlapped != IntPtr.Zero)
+                {
+                    try
+                    {
+                        Marshal.FreeHGlobal(_nativeOverlapped);
+                    }
+                    catch
+                    {
+                    }
+                }
+                if (_bufferPinned)
+                {
+                    try
+                    {
+                        _bufferPin.Free();
+                    }
+                    catch
+                    {
+                    }
+                    _bufferPinned = false;
+                }
+                if (_completed != null)
+                {
+                    try
+                    {
+                        _completed.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
+                if (_safeFileReference)
+                {
+                    try
+                    {
+                        _pipeHandle.DangerousRelease();
+                    }
+                    catch
+                    {
+                    }
+                    _safeFileReference = false;
+                }
+                throw;
+            }
         }
 
         internal IntPtr BufferPointer { get; private set; }
         internal IntPtr Pointer { get { return _nativeOverlapped; } }
         internal int ErrorCode { get; private set; }
 
+        internal void MarkIssued()
+        {
+            lock (_stateGate)
+            {
+                if (_disposed || _issued || _settled)
+                    throw new InvalidOperationException();
+                _issued = true;
+            }
+        }
+
         internal void MarkCompletedWithoutIo()
         {
-            _completed.Set();
+            MarkCompletedWithoutIo(0);
+        }
+
+        internal void MarkCompletedWithoutIo(int errorCode)
+        {
+            lock (_stateGate)
+            {
+                _issued = false;
+                _settled = true;
+                ErrorCode = errorCode;
+                _completed.Set();
+            }
+        }
+
+        internal void RequestCancellation()
+        {
+            lock (_stateGate)
+            {
+                if (_disposed || !_issued || _settled)
+                    return;
+                CancelIoEx(_pipeHandle, _nativeOverlapped);
+            }
         }
 
         internal bool Complete(int timeoutMilliseconds, out uint transferred)
@@ -451,46 +559,133 @@ public static class TegoWindowsControlBroker
             WaitHandle[] waitHandles = new WaitHandle[] { _completed, _shutdown };
             int result = timeoutMilliseconds == Timeout.Infinite
                 ? WaitHandle.WaitAny(waitHandles)
-                : WaitHandle.WaitAny(waitHandles, OperationTimeoutMilliseconds);
+                : WaitHandle.WaitAny(waitHandles, timeoutMilliseconds);
             if (result != 0)
             {
-                CancelIoEx(_pipeHandle, _nativeOverlapped);
-                _completed.WaitOne(OperationTimeoutMilliseconds);
-                ErrorCode = ErrorOperationAborted;
-                transferred = 0;
-                return false;
+                RequestCancellation();
+                if (!_completed.WaitOne(OperationTimeoutMilliseconds))
+                    FailFastResource();
             }
-            if (!GetOverlappedResult(_pipeHandle, _nativeOverlapped, out transferred, false))
+            return SettleKernelOperation(out transferred);
+        }
+
+        private bool SettleKernelOperation(out uint transferred)
+        {
+            lock (_stateGate)
             {
-                int error = Marshal.GetLastWin32Error();
+                transferred = 0;
+                if (_settled)
+                    return ErrorCode == 0;
+                if (!_issued)
+                {
+                    _settled = true;
+                    return ErrorCode == 0;
+                }
+                bool success = GetOverlappedResult(
+                    _pipeHandle,
+                    _nativeOverlapped,
+                    out transferred,
+                    false);
+                int error = success ? 0 : Marshal.GetLastWin32Error();
                 ErrorCode = error;
-                if (error == ErrorBrokenPipe || error == ErrorNoData || error == ErrorOperationAborted)
-                    return false;
-                throw new IOException();
+                _settled = true;
+                if (!success && error != ErrorBrokenPipe && error != ErrorNoData &&
+                    error != ErrorOperationAborted)
+                    throw new IOException();
+                return success;
             }
-            return true;
         }
 
         public void Dispose()
         {
-            if (_disposed)
-                return;
-            _disposed = true;
-            CancelIoEx(_pipeHandle, _nativeOverlapped);
-            bool safeToRelease = _completed.WaitOne(ShutdownTimeoutMilliseconds);
-            if (!safeToRelease)
+            Exception settlementFailure = null;
+            bool cleanupFailure = false;
+            lock (_stateGate)
+            {
+                if (_disposed || _disposeStarted)
+                    return;
+                _disposeStarted = true;
+            }
+            try
+            {
+                bool needsSettlement;
+                lock (_stateGate)
+                {
+                    needsSettlement = _issued && !_settled;
+                }
+                if (needsSettlement)
+                {
+                    RequestCancellation();
+                    if (!_completed.WaitOne(ShutdownTimeoutMilliseconds))
+                        FailFastResource();
+                    uint ignored;
+                    SettleKernelOperation(out ignored);
+                }
+            }
+            catch
+            {
+                settlementFailure = new InvalidOperationException();
+            }
+            finally
+            {
+                lock (_stateGate)
+                {
+                    _disposed = true;
+                }
+                if (_nativeOverlapped != IntPtr.Zero)
+                {
+                    try
+                    {
+                        Marshal.FreeHGlobal(_nativeOverlapped);
+                    }
+                    catch
+                    {
+                        cleanupFailure = true;
+                    }
+                    _nativeOverlapped = IntPtr.Zero;
+                }
+                if (_bufferPinned)
+                {
+                    try
+                    {
+                        _bufferPin.Free();
+                    }
+                    catch
+                    {
+                        cleanupFailure = true;
+                    }
+                    _bufferPinned = false;
+                }
+                if (_completed != null)
+                {
+                    try
+                    {
+                        _completed.Dispose();
+                    }
+                    catch
+                    {
+                        cleanupFailure = true;
+                    }
+                    _completed = null;
+                }
+                if (_safeFileReference)
+                {
+                    try
+                    {
+                        _pipeHandle.DangerousRelease();
+                    }
+                    catch
+                    {
+                        cleanupFailure = true;
+                    }
+                    _safeFileReference = false;
+                }
+            }
+            if (settlementFailure != null || cleanupFailure)
             {
                 EmitStage(FailureStage.Resource);
-                TerminateProcess(GetCurrentProcess(), 1);
                 throw new InvalidOperationException();
             }
-            Marshal.FreeHGlobal(_nativeOverlapped);
-            if (_bufferPinned)
-            {
-                _bufferPin.Free();
-                _bufferPinned = false;
-            }
-            _completed.Dispose();
         }
     }
 
@@ -499,6 +694,7 @@ public static class TegoWindowsControlBroker
         private readonly SafeWaitHandle _parentHandle;
         private readonly Action _parentExited;
         private readonly ManualResetEvent _stop = new ManualResetEvent(false);
+        private readonly ManualResetEvent _entered = new ManualResetEvent(false);
         private readonly Thread _thread;
         private bool _disposed;
 
@@ -516,8 +712,14 @@ public static class TegoWindowsControlBroker
             _thread.Start();
         }
 
+        internal bool WaitUntilWatchdogEntered()
+        {
+            return _entered.WaitOne(OperationTimeoutMilliseconds);
+        }
+
         private void Watch()
         {
+            _entered.Set();
             while (!_stop.WaitOne(0))
             {
                 uint result = WaitForSingleObject(_parentHandle, 100);
@@ -540,10 +742,48 @@ public static class TegoWindowsControlBroker
                 return;
             _disposed = true;
             _stop.Set();
-            if (_thread.IsAlive)
-                _thread.Join(ShutdownTimeoutMilliseconds);
+            if (_thread.IsAlive && !_thread.Join(ShutdownTimeoutMilliseconds))
+                FailFastResource();
             _parentHandle.Dispose();
+            _entered.Dispose();
             _stop.Dispose();
+        }
+    }
+
+    private sealed class PendingReadOperation
+    {
+        private readonly object _gate = new object();
+        private readonly OverlappedOperation _operation;
+        private ReadCancellationReason _cancellationReason;
+
+        internal PendingReadOperation(long generation, OverlappedOperation operation)
+        {
+            Generation = generation;
+            _operation = operation;
+            _cancellationReason = ReadCancellationReason.None;
+        }
+
+        internal long Generation { get; private set; }
+
+        internal ReadCancellationReason CancellationReason
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _cancellationReason;
+                }
+            }
+        }
+
+        internal void Cancel(ReadCancellationReason reason)
+        {
+            lock (_gate)
+            {
+                if (_cancellationReason == ReadCancellationReason.None)
+                    _cancellationReason = reason;
+                _operation.RequestCancellation();
+            }
         }
     }
 
@@ -552,12 +792,20 @@ public static class TegoWindowsControlBroker
         private readonly Broker _broker;
         private readonly SafeFileHandle _pipeHandle;
         private readonly ManualResetEvent _pauseGate = new ManualResetEvent(true);
+        private readonly ManualResetEvent _readStopped = new ManualResetEvent(true);
+        private readonly ManualResetEvent _writeIdle = new ManualResetEvent(true);
         private readonly object _readGate = new object();
+        private readonly object _writeGate = new object();
+        private readonly object _startGate = new object();
         private readonly Thread _readThread;
-        private IntPtr _activeReadOverlapped;
+        private PendingReadOperation _pendingRead;
+        private OverlappedOperation _activeWrite;
+        private long _readGeneration;
         private int _closed;
         private int _paused;
-        private int _pauseGateDisposed;
+        private int _started;
+        private int _synchronizationDisposed;
+        private int _disposeSynchronizationOnReadExit;
 
         internal PipeConnection(Broker broker, SafeFileHandle handle, ulong id)
         {
@@ -573,7 +821,15 @@ public static class TegoWindowsControlBroker
 
         internal void Start()
         {
-            _readThread.Start();
+            lock (_startGate)
+            {
+                if (Interlocked.CompareExchange(ref _closed, 0, 0) != 0)
+                    return;
+                if (Interlocked.Exchange(ref _started, 1) != 0)
+                    throw new InvalidOperationException();
+                _readStopped.Reset();
+                _readThread.Start();
+            }
         }
 
         internal void Pause()
@@ -584,8 +840,9 @@ public static class TegoWindowsControlBroker
                     throw new InvalidDataException();
                 _paused = 1;
                 _pauseGate.Reset();
-                if (_activeReadOverlapped != IntPtr.Zero)
-                    CancelIoEx(_pipeHandle, _activeReadOverlapped);
+                PendingReadOperation pendingRead = _pendingRead;
+                if (pendingRead != null)
+                    pendingRead.Cancel(ReadCancellationReason.Pause);
             }
         }
 
@@ -602,10 +859,18 @@ public static class TegoWindowsControlBroker
 
         internal bool Write(byte[] payload)
         {
-            if (Interlocked.CompareExchange(ref _closed, 0, 0) != 0)
-                return false;
-            using (OverlappedOperation operation = new OverlappedOperation(_pipeHandle, payload, _broker.Shutdown))
+            OverlappedOperation operation;
+            lock (_writeGate)
             {
+                if (Interlocked.CompareExchange(ref _closed, 0, 0) != 0 || _activeWrite != null)
+                    return false;
+                operation = new OverlappedOperation(_pipeHandle, payload, _broker.Shutdown);
+                _activeWrite = operation;
+                _writeIdle.Reset();
+            }
+            try
+            {
+                operation.MarkIssued();
                 bool synchronous = WriteFile(
                     _pipeHandle,
                     operation.BufferPointer,
@@ -617,7 +882,7 @@ public static class TegoWindowsControlBroker
                     int error = Marshal.GetLastWin32Error();
                     if (error != ErrorIoPending)
                     {
-                        operation.MarkCompletedWithoutIo();
+                        operation.MarkCompletedWithoutIo(error);
                         return false;
                     }
                 }
@@ -625,6 +890,22 @@ public static class TegoWindowsControlBroker
                 if (!operation.Complete(OperationTimeoutMilliseconds, out transferred))
                     return false;
                 return transferred == payload.Length;
+            }
+            finally
+            {
+                try
+                {
+                    operation.Dispose();
+                }
+                finally
+                {
+                    lock (_writeGate)
+                    {
+                        if (Object.ReferenceEquals(_activeWrite, operation))
+                            _activeWrite = null;
+                        _writeIdle.Set();
+                    }
+                }
             }
         }
 
@@ -638,11 +919,12 @@ public static class TegoWindowsControlBroker
                     int pauseResult = WaitHandle.WaitAny(new WaitHandle[] { _pauseGate, _broker.Shutdown });
                     if (pauseResult != 0)
                         return;
-                    uint transferred;
+                    uint transferred = 0;
                     using (OverlappedOperation operation = new OverlappedOperation(_pipeHandle, buffer, _broker.Shutdown))
                     {
                         bool synchronous;
                         int readError = 0;
+                        PendingReadOperation pendingRead;
                         lock (_readGate)
                         {
                             if (_paused != 0)
@@ -650,6 +932,12 @@ public static class TegoWindowsControlBroker
                                 operation.MarkCompletedWithoutIo();
                                 continue;
                             }
+                            if (_readGeneration == long.MaxValue)
+                                throw new InvalidOperationException();
+                            _readGeneration += 1;
+                            pendingRead = new PendingReadOperation(_readGeneration, operation);
+                            _pendingRead = pendingRead;
+                            operation.MarkIssued();
                             synchronous = ReadFile(
                                 _pipeHandle,
                                 operation.BufferPointer,
@@ -657,43 +945,36 @@ public static class TegoWindowsControlBroker
                                 IntPtr.Zero,
                                 operation.Pointer);
                             if (!synchronous)
-                            {
                                 readError = Marshal.GetLastWin32Error();
-                                if (readError == ErrorIoPending)
-                                    _activeReadOverlapped = operation.Pointer;
-                            }
                         }
-                        if (!synchronous)
-                        {
-                            if (readError == ErrorBrokenPipe || readError == ErrorNoData)
-                            {
-                                operation.MarkCompletedWithoutIo();
-                                _broker.ClientEof(this);
-                                return;
-                            }
-                            if (readError != ErrorIoPending)
-                            {
-                                operation.MarkCompletedWithoutIo();
-                                throw new IOException();
-                            }
-                        }
-                        bool completed;
+                        bool completed = false;
                         try
                         {
-                            completed = operation.Complete(Timeout.Infinite, out transferred);
+                            if (!synchronous && readError != ErrorIoPending)
+                            {
+                                operation.MarkCompletedWithoutIo(readError);
+                            }
+                            else
+                            {
+                                completed = operation.Complete(Timeout.Infinite, out transferred);
+                            }
                         }
                         finally
                         {
                             lock (_readGate)
                             {
-                                if (_activeReadOverlapped == operation.Pointer)
-                                    _activeReadOverlapped = IntPtr.Zero;
+                                if (_pendingRead != null &&
+                                    _pendingRead.Generation == pendingRead.Generation)
+                                    _pendingRead = null;
                             }
                         }
                         if (!completed)
                         {
-                            if (operation.ErrorCode == ErrorOperationAborted &&
-                                Interlocked.CompareExchange(ref _paused, 0, 0) != 0)
+                            if (ShouldRetryCanceledRead(
+                                operation.ErrorCode,
+                                pendingRead,
+                                Interlocked.CompareExchange(ref _closed, 0, 0) != 0,
+                                _broker.Shutdown.WaitOne(0)))
                                 continue;
                             if (operation.ErrorCode == ErrorBrokenPipe || operation.ErrorCode == ErrorNoData)
                                 _broker.ClientEof(this);
@@ -720,7 +1001,11 @@ public static class TegoWindowsControlBroker
                                 prepared = _broker.PrepareClientData(this, payload);
                         }
                         if (prepared == null)
+                        {
+                            if (Interlocked.CompareExchange(ref _paused, 0, 0) != 0)
+                                continue;
                             return;
+                        }
                         _broker.WriteClientData(prepared, payload.Length);
                         forwarded = true;
                     }
@@ -732,30 +1017,83 @@ public static class TegoWindowsControlBroker
             }
             finally
             {
-                if (Interlocked.CompareExchange(ref _closed, 0, 0) != 0)
-                    DisposePauseGate();
+                _readStopped.Set();
+                if (Interlocked.CompareExchange(ref _disposeSynchronizationOnReadExit, 0, 0) != 0)
+                    DisposeSynchronizationObjects();
             }
         }
 
-        private void DisposePauseGate()
+        private void RequestIoCancellation()
         {
-            if (Interlocked.Exchange(ref _pauseGateDisposed, 1) == 0)
-                _pauseGate.Dispose();
+            _pauseGate.Set();
+            lock (_readGate)
+            {
+                PendingReadOperation pendingRead = _pendingRead;
+                if (pendingRead != null)
+                    pendingRead.Cancel(ReadCancellationReason.Close);
+            }
+            lock (_writeGate)
+            {
+                if (_activeWrite != null)
+                    _activeWrite.RequestCancellation();
+            }
+        }
+
+        private void WaitForIoSettlement()
+        {
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(ShutdownTimeoutMilliseconds);
+            bool onReadThread = Thread.CurrentThread == _readThread;
+            if (!onReadThread && Interlocked.CompareExchange(ref _started, 0, 0) != 0 &&
+                !WaitUntil(_readStopped, deadline))
+                FailFastResource();
+            if (!WaitUntil(_writeIdle, deadline))
+                FailFastResource();
+        }
+
+        private static bool WaitUntil(WaitHandle waitHandle, DateTime deadline)
+        {
+            TimeSpan remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                return waitHandle.WaitOne(0);
+            return waitHandle.WaitOne(remaining);
+        }
+
+        private void DisposeSynchronizationObjects()
+        {
+            if (Interlocked.Exchange(ref _synchronizationDisposed, 1) != 0)
+                return;
+            _pauseGate.Dispose();
+            _readStopped.Dispose();
+            _writeIdle.Dispose();
         }
 
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _closed, 1) != 0)
                 return;
-            _pauseGate.Set();
-            CancelIoEx(_pipeHandle, IntPtr.Zero);
+            lock (_startGate)
+            {
+            }
+            RequestIoCancellation();
+            WaitForIoSettlement();
             _pipeHandle.Dispose();
-            bool canDisposePauseGate = !_readThread.IsAlive;
-            if (_readThread.IsAlive && Thread.CurrentThread != _readThread)
-                canDisposePauseGate = _readThread.Join(ConnectionJoinTimeoutMilliseconds);
-            if (canDisposePauseGate)
-                DisposePauseGate();
+            if (Thread.CurrentThread == _readThread)
+                Interlocked.Exchange(ref _disposeSynchronizationOnReadExit, 1);
+            else
+                DisposeSynchronizationObjects();
         }
+    }
+
+    private static bool ShouldRetryCanceledRead(
+        int errorCode,
+        PendingReadOperation pendingRead,
+        bool closing,
+        bool shuttingDown)
+    {
+        return errorCode == ErrorOperationAborted &&
+            pendingRead.CancellationReason == ReadCancellationReason.Pause &&
+            !closing &&
+            !shuttingDown;
     }
 
     private sealed class Broker : IDisposable
@@ -770,6 +1108,8 @@ public static class TegoWindowsControlBroker
         private readonly ManualResetEvent _readyGate = new ManualResetEvent(false);
         private readonly ManualResetEvent _firstAcceptArmed = new ManualResetEvent(false);
         private readonly AutoResetEvent _connectionSlot = new AutoResetEvent(false);
+        private readonly ManualResetEvent _acceptCancellation = new ManualResetEvent(false);
+        private readonly ManualResetEvent _acceptStopped = new ManualResetEvent(true);
         private readonly ManualResetEvent _shutdown = new ManualResetEvent(false);
         private ParentProcessWatchdog _watchdog;
         private SafeFileHandle _firstPipe;
@@ -808,6 +1148,7 @@ public static class TegoWindowsControlBroker
             _acceptThread = new Thread(new ThreadStart(AcceptLoop));
             _acceptThread.IsBackground = true;
             _acceptThread.Name = "tego-broker-accept";
+            _acceptStopped.Reset();
             _acceptThread.Start();
             if (!_firstAcceptArmed.WaitOne(OperationTimeoutMilliseconds))
             {
@@ -858,7 +1199,7 @@ public static class TegoWindowsControlBroker
                     bool connected = WaitForConnection(
                         pipe,
                         first ? _firstAcceptArmed : null,
-                        _shutdown);
+                        _acceptCancellation);
                     first = false;
                     lock (_gate)
                     {
@@ -900,6 +1241,10 @@ public static class TegoWindowsControlBroker
                 _firstAcceptArmed.Set();
                 if (!IsClosing())
                     Fail(FailureStage.Connect);
+            }
+            finally
+            {
+                _acceptStopped.Set();
             }
         }
 
@@ -1167,24 +1512,45 @@ public static class TegoWindowsControlBroker
         private void CloseEveryPipe()
         {
             PipeConnection[] connections;
-            SafeFileHandle pending;
             lock (_gate)
             {
                 _closing = true;
                 connections = new PipeConnection[_connections.Count];
                 _connections.Values.CopyTo(connections, 0);
                 _connections.Clear();
+            }
+            StopAcceptLoop();
+            for (int index = 0; index < connections.Length; index += 1)
+                connections[index].Dispose();
+            _connectionSlot.Set();
+        }
+
+        private void StopAcceptLoop()
+        {
+            _acceptCancellation.Set();
+            _readyGate.Set();
+            _connectionSlot.Set();
+            Thread acceptThread = _acceptThread;
+            if (acceptThread != null && Thread.CurrentThread != acceptThread)
+            {
+                if (!_acceptStopped.WaitOne(ShutdownTimeoutMilliseconds))
+                    FailFastResource();
+                if (acceptThread.IsAlive && !acceptThread.Join(0))
+                    FailFastResource();
+            }
+            DisposePendingAcceptHandle();
+        }
+
+        private void DisposePendingAcceptHandle()
+        {
+            SafeFileHandle pending;
+            lock (_gate)
+            {
                 pending = _pendingPipe;
                 _pendingPipe = null;
             }
             if (pending != null)
-            {
-                CancelIoEx(pending, IntPtr.Zero);
                 pending.Dispose();
-            }
-            for (int index = 0; index < connections.Length; index += 1)
-                connections[index].Dispose();
-            _connectionSlot.Set();
         }
 
         private int ConnectionCount()
@@ -1264,8 +1630,32 @@ public static class TegoWindowsControlBroker
             _readyGate.Dispose();
             _firstAcceptArmed.Dispose();
             _connectionSlot.Dispose();
+            _acceptStopped.Dispose();
+            _acceptCancellation.Dispose();
             _shutdown.Dispose();
             _writer.Dispose();
+        }
+    }
+
+    private sealed class SelfTestPipePair : IDisposable
+    {
+        private int _disposed;
+
+        internal SelfTestPipePair(SafeFileHandle server, SafeFileHandle client)
+        {
+            Server = server;
+            Client = client;
+        }
+
+        internal SafeFileHandle Server { get; private set; }
+        internal SafeFileHandle Client { get; private set; }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            Client.Dispose();
+            Server.Dispose();
         }
     }
 
@@ -1380,6 +1770,13 @@ public static class TegoWindowsControlBroker
             out lengthNeeded))
             throw new InvalidOperationException();
         RawSecurityDescriptor descriptor = new RawSecurityDescriptor(bytes, 0);
+        ValidateDescriptor(descriptor, expectedSids);
+    }
+
+    private static void ValidateDescriptor(
+        RawSecurityDescriptor descriptor,
+        SecurityIdentifier[] expectedSids)
+    {
         if (descriptor.Owner == null || !descriptor.Owner.Equals(expectedSids[0]))
             throw new InvalidOperationException();
         if ((descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0)
@@ -1391,8 +1788,12 @@ public static class TegoWindowsControlBroker
         for (int index = 0; index < descriptor.DiscretionaryAcl.Count; index += 1)
         {
             CommonAce ace = descriptor.DiscretionaryAcl[index] as CommonAce;
+            byte[] opaque = ace == null ? null : ace.GetOpaque();
             if (ace == null ||
+                ace.AceType != AceType.AccessAllowed ||
                 ace.AceQualifier != AceQualifier.AccessAllowed ||
+                ace.IsCallback ||
+                (opaque != null && opaque.Length != 0) ||
                 ace.AceFlags != AceFlags.None ||
                 (uint)ace.AccessMask != PipeFullControl ||
                 ace.SecurityIdentifier == null ||
@@ -1408,11 +1809,17 @@ public static class TegoWindowsControlBroker
     {
         using (OverlappedOperation operation = new OverlappedOperation(handle, null, shutdown))
         {
+            operation.MarkIssued();
             bool synchronous = ConnectNamedPipe(handle, operation.Pointer);
             int error = synchronous ? 0 : Marshal.GetLastWin32Error();
             if (armed != null)
                 armed.Set();
-            if (synchronous || error == ErrorPipeConnected)
+            if (synchronous)
+            {
+                uint synchronousBytes;
+                return operation.Complete(OperationTimeoutMilliseconds, out synchronousBytes);
+            }
+            if (error == ErrorPipeConnected)
             {
                 operation.MarkCompletedWithoutIo();
                 return true;
@@ -1526,6 +1933,13 @@ public static class TegoWindowsControlBroker
         Console.Error.WriteLine(StageCode(stage));
     }
 
+    private static void FailFastResource()
+    {
+        EmitStage(FailureStage.Resource);
+        TerminateProcess(GetCurrentProcess(), 1);
+        Environment.FailFast(StageCode(FailureStage.Resource));
+    }
+
     private static bool IsX64Process()
     {
         ushort processMachine;
@@ -1600,6 +2014,9 @@ public static class TegoWindowsControlBroker
             TestParentWatchCancellation();
             TestInvalidFrameRejection();
             TestRepeatedResourceCleanup();
+            TestPrivatePipeCancellation();
+            TestPauseImmediateResume();
+            TestRepeatedPipeCleanup();
             return 0;
         }
         catch
@@ -1630,6 +2047,7 @@ public static class TegoWindowsControlBroker
             byte[] bytes = new byte[context.DescriptorLength];
             Marshal.Copy(attributes.lpSecurityDescriptor, bytes, 0, bytes.Length);
             RawSecurityDescriptor descriptor = new RawSecurityDescriptor(bytes, 0);
+            ValidateDescriptor(descriptor, context.ExpectedSids);
             if (descriptor.Owner == null || !descriptor.Owner.Equals(context.ExpectedSids[0]) ||
                 (descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
                 descriptor.DiscretionaryAcl == null ||
@@ -1643,6 +2061,37 @@ public static class TegoWindowsControlBroker
                     !ace.SecurityIdentifier.Equals(context.ExpectedSids[index]))
                     throw new InvalidOperationException();
             }
+
+            RawAcl callbackDacl = new RawAcl(GenericAcl.AclRevision, context.ExpectedSids.Length);
+            for (int index = 0; index < context.ExpectedSids.Length; index += 1)
+            {
+                bool callback = index == 0;
+                CommonAce callbackAce = new CommonAce(
+                    AceFlags.None,
+                    AceQualifier.AccessAllowed,
+                    (int)PipeFullControl,
+                    context.ExpectedSids[index],
+                    callback,
+                    callback ? new byte[] { 1 } : null);
+                callbackDacl.InsertAce(index, callbackAce);
+            }
+            RawSecurityDescriptor callbackDescriptor = new RawSecurityDescriptor(
+                ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+                context.ExpectedSids[0],
+                null,
+                null,
+                callbackDacl);
+            bool callbackRejected = false;
+            try
+            {
+                ValidateDescriptor(callbackDescriptor, context.ExpectedSids);
+            }
+            catch (InvalidOperationException)
+            {
+                callbackRejected = true;
+            }
+            if (!callbackRejected)
+                throw new InvalidOperationException();
         }
     }
 
@@ -1655,6 +2104,8 @@ public static class TegoWindowsControlBroker
             delegate { called = true; }))
         {
             watchdog.Start();
+            if (!watchdog.WaitUntilWatchdogEntered())
+                throw new InvalidOperationException();
         }
         if (called)
             throw new InvalidOperationException();
@@ -1700,7 +2151,324 @@ public static class TegoWindowsControlBroker
                 delegate { throw new InvalidOperationException(); }))
             {
                 watchdog.Start();
+                if (!watchdog.WaitUntilWatchdogEntered())
+                    throw new InvalidOperationException();
             }
+        }
+    }
+
+    private static void TestPrivatePipeCancellation()
+    {
+        string endpoint = "\\\\.\\pipe\\tego-self-test-accept-" + Guid.NewGuid().ToString("N");
+        using (SecurityDescriptorContext descriptor = CreateSecurityDescriptor())
+        using (SafeFileHandle server = CreateVerifiedPipe(endpoint, descriptor, true))
+        using (ManualResetEvent cancellation = new ManualResetEvent(false))
+        using (ManualResetEvent armed = new ManualResetEvent(false))
+        {
+            bool connected = true;
+            bool failed = false;
+            Thread acceptThread = new Thread(delegate()
+            {
+                try
+                {
+                    connected = WaitForConnection(server, armed, cancellation);
+                }
+                catch
+                {
+                    failed = true;
+                }
+            });
+            acceptThread.IsBackground = true;
+            acceptThread.Name = "tego-broker-self-test-accept-cancel";
+            acceptThread.Start();
+            if (!armed.WaitOne(OperationTimeoutMilliseconds))
+                FailFastResource();
+            cancellation.Set();
+            if (!acceptThread.Join(ShutdownTimeoutMilliseconds))
+                FailFastResource();
+            if (connected || failed)
+                throw new InvalidOperationException();
+        }
+
+        using (SelfTestPipePair pair = CreateConnectedSelfTestPipe())
+        {
+            TestPendingReadCancellation(pair.Server);
+        }
+        using (SelfTestPipePair pair = CreateConnectedSelfTestPipe())
+        {
+            TestPendingWriteCancellation(pair.Server);
+        }
+    }
+
+    private static void TestPauseImmediateResume()
+    {
+        using (SelfTestPipePair pair = CreateConnectedSelfTestPipe())
+        using (ManualResetEvent shutdown = new ManualResetEvent(false))
+        using (ManualResetEvent pauseGate = new ManualResetEvent(true))
+        {
+            byte[] firstBuffer = new byte[1];
+            using (OverlappedOperation operation = new OverlappedOperation(
+                pair.Server,
+                firstBuffer,
+                shutdown))
+            {
+                PendingReadOperation pendingRead = new PendingReadOperation(1, operation);
+                operation.MarkIssued();
+                bool synchronous = ReadFile(
+                    pair.Server,
+                    operation.BufferPointer,
+                    1,
+                    IntPtr.Zero,
+                    operation.Pointer);
+                int error = synchronous ? 0 : Marshal.GetLastWin32Error();
+                if (synchronous || error != ErrorIoPending)
+                {
+                    operation.MarkCompletedWithoutIo(error);
+                    throw new InvalidOperationException();
+                }
+                pauseGate.Reset();
+                pendingRead.Cancel(ReadCancellationReason.Pause);
+                pauseGate.Set();
+                uint transferred;
+                bool completed = operation.Complete(OperationTimeoutMilliseconds, out transferred);
+                bool resumed = pauseGate.WaitOne(0);
+                if (completed || operation.ErrorCode != ErrorOperationAborted || !resumed ||
+                    !ShouldRetryCanceledRead(operation.ErrorCode, pendingRead, false, false))
+                    throw new InvalidOperationException();
+            }
+
+            WriteSelfTestPayload(pair.Client, new byte[] { 42 });
+            byte[] resumedBuffer = new byte[1];
+            using (OverlappedOperation resumedRead = new OverlappedOperation(
+                pair.Server,
+                resumedBuffer,
+                shutdown))
+            {
+                resumedRead.MarkIssued();
+                bool synchronous = ReadFile(
+                    pair.Server,
+                    resumedRead.BufferPointer,
+                    1,
+                    IntPtr.Zero,
+                    resumedRead.Pointer);
+                int error = synchronous ? 0 : Marshal.GetLastWin32Error();
+                if (!synchronous && error != ErrorIoPending)
+                {
+                    resumedRead.MarkCompletedWithoutIo(error);
+                    throw new InvalidOperationException();
+                }
+                uint transferred;
+                if (!resumedRead.Complete(OperationTimeoutMilliseconds, out transferred) ||
+                    transferred != 1 || resumedBuffer[0] != 42)
+                    throw new InvalidOperationException();
+            }
+        }
+    }
+
+    private static void TestRepeatedPipeCleanup()
+    {
+        for (int index = 0; index < 16; index += 1)
+        {
+            SelfTestPipePair pair = CreateConnectedSelfTestPipe();
+            try
+            {
+                TestPendingReadDispose(pair.Server);
+            }
+            finally
+            {
+                pair.Dispose();
+                pair.Dispose();
+            }
+        }
+    }
+
+    private static void TestPendingReadDispose(SafeFileHandle server)
+    {
+        using (ManualResetEvent shutdown = new ManualResetEvent(false))
+        {
+            OverlappedOperation operation = new OverlappedOperation(server, new byte[1], shutdown);
+            operation.MarkIssued();
+            bool synchronous = ReadFile(
+                server,
+                operation.BufferPointer,
+                1,
+                IntPtr.Zero,
+                operation.Pointer);
+            int error = synchronous ? 0 : Marshal.GetLastWin32Error();
+            if (synchronous || error != ErrorIoPending)
+            {
+                operation.MarkCompletedWithoutIo(error);
+                operation.Dispose();
+                throw new InvalidOperationException();
+            }
+            operation.Dispose();
+            operation.Dispose();
+        }
+    }
+
+    private static SelfTestPipePair CreateConnectedSelfTestPipe()
+    {
+        string endpoint = "\\\\.\\pipe\\tego-self-test-pair-" + Guid.NewGuid().ToString("N");
+        SafeFileHandle server = null;
+        SafeFileHandle client = null;
+        ManualResetEvent cancellation = new ManualResetEvent(false);
+        ManualResetEvent armed = new ManualResetEvent(false);
+        Thread acceptThread = null;
+        bool connected = false;
+        bool failed = false;
+        try
+        {
+            using (SecurityDescriptorContext descriptor = CreateSecurityDescriptor())
+            {
+                server = CreateVerifiedPipe(endpoint, descriptor, true);
+            }
+            SafeFileHandle acceptServer = server;
+            acceptThread = new Thread(delegate()
+            {
+                try
+                {
+                    connected = WaitForConnection(acceptServer, armed, cancellation);
+                }
+                catch
+                {
+                    failed = true;
+                }
+            });
+            acceptThread.IsBackground = true;
+            acceptThread.Name = "tego-broker-self-test-connect";
+            acceptThread.Start();
+            if (!armed.WaitOne(OperationTimeoutMilliseconds))
+                FailFastResource();
+            client = CreateFileW(
+                endpoint,
+                GenericRead | GenericWrite,
+                0,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagOverlapped,
+                IntPtr.Zero);
+            if (client == null || client.IsInvalid)
+                throw new InvalidOperationException();
+            if (!acceptThread.Join(ShutdownTimeoutMilliseconds))
+            {
+                cancellation.Set();
+                if (!acceptThread.Join(ShutdownTimeoutMilliseconds))
+                    FailFastResource();
+            }
+            if (!connected || failed)
+                throw new InvalidOperationException();
+            SelfTestPipePair pair = new SelfTestPipePair(server, client);
+            server = null;
+            client = null;
+            return pair;
+        }
+        finally
+        {
+            cancellation.Set();
+            if (acceptThread != null && acceptThread.IsAlive &&
+                !acceptThread.Join(ShutdownTimeoutMilliseconds))
+                FailFastResource();
+            armed.Dispose();
+            cancellation.Dispose();
+            if (client != null)
+                client.Dispose();
+            if (server != null)
+                server.Dispose();
+        }
+    }
+
+    private static void TestPendingReadCancellation(SafeFileHandle server)
+    {
+        using (ManualResetEvent shutdown = new ManualResetEvent(false))
+        using (OverlappedOperation operation = new OverlappedOperation(
+            server,
+            new byte[1],
+            shutdown))
+        {
+            operation.MarkIssued();
+            bool synchronous = ReadFile(
+                server,
+                operation.BufferPointer,
+                1,
+                IntPtr.Zero,
+                operation.Pointer);
+            int error = synchronous ? 0 : Marshal.GetLastWin32Error();
+            if (synchronous || error != ErrorIoPending)
+            {
+                operation.MarkCompletedWithoutIo(error);
+                throw new InvalidOperationException();
+            }
+            operation.RequestCancellation();
+            uint transferred;
+            if (operation.Complete(OperationTimeoutMilliseconds, out transferred) ||
+                operation.ErrorCode != ErrorOperationAborted)
+                throw new InvalidOperationException();
+        }
+    }
+
+    private static void TestPendingWriteCancellation(SafeFileHandle server)
+    {
+        using (ManualResetEvent shutdown = new ManualResetEvent(false))
+        {
+            byte[] payload = new byte[MaxFrameBytes];
+            for (int attempt = 0; attempt < 8; attempt += 1)
+            {
+                using (OverlappedOperation operation = new OverlappedOperation(server, payload, shutdown))
+                {
+                    operation.MarkIssued();
+                    bool synchronous = WriteFile(
+                        server,
+                        operation.BufferPointer,
+                        (uint)payload.Length,
+                        IntPtr.Zero,
+                        operation.Pointer);
+                    int error = synchronous ? 0 : Marshal.GetLastWin32Error();
+                    if (!synchronous && error == ErrorIoPending)
+                    {
+                        operation.RequestCancellation();
+                        uint canceledBytes;
+                        if (operation.Complete(OperationTimeoutMilliseconds, out canceledBytes) ||
+                            operation.ErrorCode != ErrorOperationAborted)
+                            throw new InvalidOperationException();
+                        return;
+                    }
+                    if (!synchronous)
+                    {
+                        operation.MarkCompletedWithoutIo(error);
+                        throw new InvalidOperationException();
+                    }
+                    uint transferred;
+                    if (!operation.Complete(OperationTimeoutMilliseconds, out transferred) ||
+                        transferred != payload.Length)
+                        throw new InvalidOperationException();
+                }
+            }
+            throw new InvalidOperationException();
+        }
+    }
+
+    private static void WriteSelfTestPayload(SafeFileHandle client, byte[] payload)
+    {
+        using (ManualResetEvent shutdown = new ManualResetEvent(false))
+        using (OverlappedOperation operation = new OverlappedOperation(client, payload, shutdown))
+        {
+            operation.MarkIssued();
+            bool synchronous = WriteFile(
+                client,
+                operation.BufferPointer,
+                (uint)payload.Length,
+                IntPtr.Zero,
+                operation.Pointer);
+            int error = synchronous ? 0 : Marshal.GetLastWin32Error();
+            if (!synchronous && error != ErrorIoPending)
+            {
+                operation.MarkCompletedWithoutIo(error);
+                throw new InvalidOperationException();
+            }
+            uint transferred;
+            if (!operation.Complete(OperationTimeoutMilliseconds, out transferred) ||
+                transferred != payload.Length)
+                throw new InvalidOperationException();
         }
     }
 }

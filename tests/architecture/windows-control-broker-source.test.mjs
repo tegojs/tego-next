@@ -226,13 +226,20 @@ function assertCSharpContract(source) {
     "private static SecurityDescriptorContext CreateSecurityDescriptor(",
   );
   const verify = balancedBlock(source, "private static void VerifyDescriptor(");
+  const validate = balancedBlock(source, "private static void ValidateDescriptor(");
   const openParent = balancedBlock(source, "private static SafeWaitHandle OpenParentProcess(");
   const overlapped = balancedBlock(source, "sealed class OverlappedOperation");
+  const overlappedDispose = balancedBlock(overlapped, "public void Dispose(");
   const writer = balancedBlock(source, "sealed class ParentFrameWriter");
   const selfTest = balancedBlock(source, "public static int SelfTest(");
   const x64Guard = balancedBlock(source, "private static bool IsX64Process(");
   const pipeConnection = balancedBlock(source, "private sealed class PipeConnection");
+  const readLoop = balancedBlock(pipeConnection, "private void ReadLoop(");
   const closeAll = balancedBlock(source, "private void CloseAllFromParent(");
+  const pendingRead = balancedBlock(source, "private sealed class PendingReadOperation");
+  const retryCanceledRead = balancedBlock(source, "private static bool ShouldRetryCanceledRead(");
+  const connectionDispose = balancedBlock(pipeConnection, "public void Dispose(");
+  const acceptCleanup = balancedBlock(source, "private void StopAcceptLoop(");
 
   assert.match(
     entry,
@@ -247,17 +254,41 @@ function assertCSharpContract(source) {
   assert.match(descriptor, /DiscretionaryAclProtected/u);
   assert.match(descriptor, /RawSecurityDescriptor\([\s\S]+currentUserSid[\s\S]+dacl/u);
   assert.match(verify, /GetKernelObjectSecurity/u);
-  assert.match(verify, /descriptor\.Owner\.Equals\(expectedSids\[0\]\)/u);
-  assert.match(verify, /DiscretionaryAclProtected/u);
-  assert.match(verify, /DiscretionaryAcl\.Count != expectedSids\.Length/u);
-  assert.match(verify, /AceQualifier\.AccessAllowed/u);
-  assert.match(verify, /AceFlags\.None/u);
-  assert.match(verify, /ace\.AccessMask != PipeFullControl/u);
-  assert.match(verify, /ace\.SecurityIdentifier\.Equals\(expectedSids\[index\]\)/u);
+  assert.match(verify, /ValidateDescriptor\(descriptor, expectedSids\)/u);
+  assert.match(validate, /descriptor\.Owner\.Equals\(expectedSids\[0\]\)/u);
+  assert.match(validate, /DiscretionaryAclProtected/u);
+  assert.match(validate, /DiscretionaryAcl\.Count != expectedSids\.Length/u);
+  assert.match(validate, /AceQualifier\.AccessAllowed/u);
+  assert.match(validate, /ace\.AceType != AceType\.AccessAllowed/u);
+  assert.match(validate, /ace\.IsCallback/u);
+  assert.match(validate, /ace\.GetOpaque\(\)/u);
+  assert.match(validate, /AceFlags\.None/u);
+  assert.match(validate, /ace\.AccessMask != PipeFullControl/u);
+  assert.match(validate, /ace\.SecurityIdentifier\.Equals\(expectedSids\[index\]\)/u);
   assert.match(overlapped, /CancelIoEx/u);
   assert.match(overlapped, /WaitAny\([\s\S]+OperationTimeoutMilliseconds/u);
   assert.match(overlapped, /GetOverlappedResult/u);
-  assert.match(overlapped, /TerminateProcess\(GetCurrentProcess\(\), 1\)/u);
+  assert.match(overlapped, /FailFastResource/u);
+  assert.match(source, /TerminateProcess\(GetCurrentProcess\(\), 1\)/u);
+  assert.match(overlapped, /DangerousAddRef/u);
+  assert.match(overlapped, /DangerousRelease/u);
+  assert.equal(overlapped.match(/DangerousRelease/gu)?.length, 2);
+  assert.match(overlapped, /SettleKernelOperation/u);
+  assert.match(overlapped, /GetOverlappedResult/u);
+  assert.match(overlapped, /ErrorOperationAborted/u);
+  assert.ok(
+    overlappedDispose.indexOf("RequestCancellation") <
+      overlappedDispose.indexOf("SettleKernelOperation"),
+  );
+  assert.ok(
+    overlappedDispose.indexOf("SettleKernelOperation") <
+      overlappedDispose.indexOf("Marshal.FreeHGlobal"),
+  );
+  assert.ok(
+    overlappedDispose.indexOf("Marshal.FreeHGlobal") <
+      overlappedDispose.lastIndexOf("DangerousRelease"),
+  );
+  assert.doesNotMatch(overlapped, /_pipeHandle\.Dispose/u);
   assert.match(writer, /PrepareFrame/u);
   assert.match(writer, /_servingTicket/u);
   assert.match(writer, /Monitor\.Wait/u);
@@ -284,9 +315,34 @@ function assertCSharpContract(source) {
   assert.match(x64Guard, /nativeMachine != ImageFileMachineAmd64/u);
   assert.match(pipeConnection, /_paused = 1/u);
   assert.match(pipeConnection, /_paused = 0/u);
-  assert.match(pipeConnection, /CancelIoEx\(_pipeHandle, _activeReadOverlapped\)/u);
+  assert.match(readLoop, /uint transferred = 0;/u);
+  assert.match(pipeConnection, /pendingRead\.Cancel\(ReadCancellationReason\.Pause\)/u);
+  assert.match(pipeConnection, /_pendingRead\.Generation == pendingRead\.Generation/u);
+  assert.match(pendingRead, /long Generation/u);
+  assert.match(pendingRead, /ReadCancellationReason CancellationReason/u);
+  assert.match(pendingRead, /_cancellationReason == ReadCancellationReason\.None/u);
+  assert.match(pipeConnection, /pendingRead\.Cancel\(ReadCancellationReason\.Pause\)/u);
+  assert.match(
+    retryCanceledRead,
+    /pendingRead\.CancellationReason == ReadCancellationReason\.Pause/u,
+  );
+  assert.match(pipeConnection, /ShouldRetryCanceledRead\([\s\S]+continue/u);
+  assert.doesNotMatch(
+    pipeConnection,
+    /ErrorOperationAborted[\s\S]{0,200}Interlocked\.CompareExchange\(ref _paused/u,
+  );
   assert.match(pipeConnection, /MarkCompletedWithoutIo\(\)/u);
   assert.doesNotMatch(pipeConnection, /_readThread\.Join\(ShutdownTimeoutMilliseconds\)/u);
+  assert.ok(
+    connectionDispose.indexOf("RequestIoCancellation") <
+      connectionDispose.indexOf("WaitForIoSettlement"),
+  );
+  assert.ok(
+    connectionDispose.indexOf("WaitForIoSettlement") <
+      connectionDispose.indexOf("_pipeHandle.Dispose"),
+  );
+  assert.ok(acceptCleanup.indexOf("Set()") < acceptCleanup.indexOf("Join("));
+  assert.ok(acceptCleanup.indexOf("Join(") < acceptCleanup.indexOf("DisposePendingAcceptHandle"));
   assert.match(
     closeAll,
     /lock \(_outputGate\)[\s\S]+FrameClose[\s\S]+CloseEveryPipe\(\)[\s\S]+lock \(_outputGate\)[\s\S]+FrameCloseAllAck/u,
@@ -304,11 +360,20 @@ function assertCSharpContract(source) {
   assert.match(selfTest, /TestParentWatchCancellation\(\)/u);
   assert.match(selfTest, /TestInvalidFrameRejection\(\)/u);
   assert.match(selfTest, /TestRepeatedResourceCleanup\(\)/u);
+  assert.match(selfTest, /TestPrivatePipeCancellation\(\)/u);
+  assert.match(selfTest, /TestPauseImmediateResume\(\)/u);
+  assert.match(selfTest, /TestRepeatedPipeCleanup\(\)/u);
+  assert.match(source, /WaitUntilWatchdogEntered/u);
   assert.doesNotMatch(selfTest, /CreateNamedPipeW|CreateVerifiedPipe|\\\\\.\\pipe/u);
   assert.doesNotMatch(
     source,
     /Console\.Out|Console\.Write|Console\.Error\.WriteLine\((?:exception|error|message)|System\.Net|TcpListener|NamedPipeServerStream|_handle|bootstrap|fallback/iu,
   );
+  const explicitWideImports = ["CreateNamedPipeW", "CreateFileW"];
+  for (const importName of explicitWideImports) {
+    const declaration = source.slice(source.indexOf(`extern SafeFileHandle ${importName}`) - 180);
+    assert.match(declaration.slice(0, 260), /ExactSpelling = true/u);
+  }
   assert.doesNotMatch(
     source,
     /\$"|\busing var\b|\bout var\b|\bnameof\s*\(|\?\.|\bis\s+[A-Za-z0-9_.<>]+\s+[a-z][A-Za-z0-9_]*\b|=>/u,
@@ -320,6 +385,20 @@ function mutateOnce(source, before, after) {
   assert.notEqual(mutated, source, `mutation target must exist: ${String(before)}`);
   return mutated;
 }
+
+function cancelledReadModel(cancellationReason, resumed, closing) {
+  if (closing || cancellationReason !== "pause") {
+    return "stop";
+  }
+  return resumed ? "issue-next-read" : "wait-for-resume";
+}
+
+test("pending-read cancellation reason survives an immediate resume", () => {
+  assert.equal(cancelledReadModel("pause", true, false), "issue-next-read");
+  assert.equal(cancelledReadModel("pause", false, false), "wait-for-resume");
+  assert.equal(cancelledReadModel("close", true, false), "stop");
+  assert.equal(cancelledReadModel("pause", true, true), "stop");
+});
 
 test("Windows broker protocol constants and directions exactly match Task 1", async () => {
   const [taskOne, csharp] = await Promise.all([
@@ -343,7 +422,7 @@ test("C# owns creation-time security, strict readback, bounded I/O, and stable p
 
 test("source contracts reject security and lifecycle mutations", async () => {
   const csharp = await readFile(brokerCSharpPath, "utf8");
-  for (const mutation of [
+  const mutations = [
     mutateOnce(
       csharp,
       "            ref securityAttributes);",
@@ -357,7 +436,7 @@ test("source contracts reject security and lifecycle mutations", async () => {
       "OpenProcess(0, false, parentProcessId)",
     ),
     mutateOnce(csharp, "PipeAccessDuplex | FileFlagOverlapped", "PipeAccessDuplex"),
-    mutateOnce(csharp, "CancelIoEx(_pipeHandle, _activeReadOverlapped);", ""),
+    mutateOnce(csharp, "pendingRead.Cancel(ReadCancellationReason.Pause);", ""),
     mutateOnce(
       csharp,
       "IsWow64Process2(GetCurrentProcess(), out processMachine, out nativeMachine)",
@@ -372,13 +451,32 @@ test("source contracts reject security and lifecycle mutations", async () => {
     mutateOnce(csharp, "_closeAllAcknowledged = true;", ""),
     mutateOnce(csharp, "_closeAllAckQueued = true;", ""),
     mutateOnce(csharp, "TerminateProcess(GetCurrentProcess(), 1);", ""),
+    mutateOnce(csharp, "_pipeHandle.DangerousAddRef(ref addRef);", "addRef = true;"),
+    mutateOnce(csharp, "_pipeHandle.DangerousRelease();", ""),
+    mutateOnce(csharp, "SettleKernelOperation(out ignored);", ""),
+    mutateOnce(
+      csharp,
+      "pendingRead.CancellationReason == ReadCancellationReason.Pause",
+      "Interlocked.CompareExchange(ref _paused, 0, 0) != 0",
+    ),
+    mutateOnce(csharp, "ace.IsCallback", "false"),
+    mutateOnce(csharp, "ace.AceType != AceType.AccessAllowed ||", ""),
+    mutateOnce(csharp, "ace.GetOpaque()", "null"),
+    mutateOnce(csharp, "_pendingRead.Generation == pendingRead.Generation", "true"),
+    mutateOnce(csharp, "uint transferred = 0;", "uint transferred;"),
+    mutateOnce(
+      csharp,
+      "SetLastError = true, ExactSpelling = true)]\n    private static extern SafeFileHandle CreateNamedPipeW",
+      "SetLastError = true)]\n    private static extern SafeFileHandle CreateNamedPipeW",
+    ),
     mutateOnce(
       csharp,
       "private static extern bool CancelIoEx(",
       "private static extern bool CancelIoDisabled(",
     ),
-  ]) {
-    assert.throws(() => assertCSharpContract(mutation));
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    assert.throws(() => assertCSharpContract(mutation), `mutation ${index} must fail`);
   }
 });
 
