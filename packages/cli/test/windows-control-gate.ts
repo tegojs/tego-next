@@ -77,6 +77,7 @@ let liveServer: TrackedServer | undefined;
 // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
 const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
 let nonAuthoritativeStage = "not-entered";
+let nonAuthoritativeBrokerCrashStage = "not-entered";
 
 function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
   return (
@@ -424,14 +425,21 @@ async function runParentCrashCleanup(): Promise<void> {
 }
 
 async function runBrokerCrashCleanup(): Promise<void> {
+  nonAuthoritativeBrokerCrashStage = "start";
   const tracked = await startTrackedServer("broker-crash");
   try {
+    nonAuthoritativeBrokerCrashStage = "broker-kill";
     assert.equal(tracked.broker.kill("SIGKILL"), true);
+    nonAuthoritativeBrokerCrashStage = "observer-failure";
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    nonAuthoritativeBrokerCrashStage = "server-close";
     await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    nonAuthoritativeBrokerCrashStage = "child-close";
     await waitForProcessExit(tracked.brokerPid);
+    nonAuthoritativeBrokerCrashStage = "pipe-proof";
     await assertPipeUnavailable(tracked.endpoint);
+    nonAuthoritativeBrokerCrashStage = "complete";
   } finally {
     await cleanupTrackedServer(tracked);
   }
@@ -483,6 +491,9 @@ if (process.argv[2] === "--parent-crash-fixture") {
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
     process.stderr.write(`${task4DiagnosticMarker}_STAGE:${nonAuthoritativeStage}\n`);
+    process.stderr.write(
+      `${task4DiagnosticMarker}_BROKER_CRASH_STAGE:${nonAuthoritativeBrokerCrashStage}\n`,
+    );
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {
