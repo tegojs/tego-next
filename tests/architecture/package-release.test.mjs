@@ -242,6 +242,29 @@ test("package packing rejects emitted test assets and missing declarations", asy
   }
 });
 
+test("Windows packed-consumer verification does not require a POSIX CLI mode", async () => {
+  const { assertPackedFiles } = await import(
+    new URL("../../scripts/package-contract.mjs", import.meta.url)
+  );
+  const files = [
+    { path: "package/package.json" },
+    { path: "package/README.md" },
+    { path: "package/LICENSE" },
+    { mode: 0o644, path: "package/dist/src/bin.js" },
+    { path: "package/dist/src/index.d.ts" },
+    { path: "package/dist/src/control/windows-control-broker.ps1" },
+    { path: "package/dist/src/control/windows-control-broker.cs" },
+  ];
+
+  assert.doesNotThrow(() =>
+    assertPackedFiles("@tego/cli", files, "package/dist/src/bin.js", "win32"),
+  );
+  assert.throws(
+    () => assertPackedFiles("@tego/cli", files, "package/dist/src/bin.js", "linux"),
+    /mode 0755/u,
+  );
+});
+
 test("clean-consumer verification rejects broad targets before deletion", async () => {
   const { verifyPackedConsumer } = await import(
     new URL("../../scripts/package-contract.mjs", import.meta.url)

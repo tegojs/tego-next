@@ -150,7 +150,7 @@ async function npm(root, arguments_, options = {}) {
   });
 }
 
-export function assertPackedFiles(name, files, entryPoint) {
+export function assertPackedFiles(name, files, entryPoint, platform = process.platform) {
   for (const file of files) {
     if (forbiddenPackedPath.test(file.path))
       throw new Error(`${name} packs forbidden path: ${file.path}`);
@@ -169,7 +169,9 @@ export function assertPackedFiles(name, files, entryPoint) {
   }
   if (name === "@tego/cli") {
     const executable = files.find((file) => file.path === "package/dist/src/bin.js");
-    if (executable?.mode !== 0o755) throw new Error(`${name} CLI binary must have mode 0755`);
+    if (platform !== "win32" && executable?.mode !== 0o755) {
+      throw new Error(`${name} CLI binary must have mode 0755`);
+    }
     for (const asset of ["windows-control-broker.ps1", "windows-control-broker.cs"]) {
       if (!files.some((file) => file.path === `package/dist/src/control/${asset}`)) {
         throw new Error(`${name} omits the Windows control broker asset: ${asset}`);
