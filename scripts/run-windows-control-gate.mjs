@@ -10,8 +10,22 @@ import { packWorkspaceSet, withPackedConsumer } from "./package-contract.mjs";
 export const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
 export const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const temporaryTaskDiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
+const temporaryTaskDiagnosticTokens = [
+  ["TEGO", "TASK4"].join("_"),
+  ["TASK4", "NON", "AUTHORITATIVE"].join("_"),
+  ["Task", "4", "Diagnostic"].join(""),
+  ["TEGO", "WINDOWS", "CONTROL", "DIAGNOSTIC"].join("_"),
+];
 const expectedParentCrashCleanupSha256 =
   "bac041802252245f8a4a01f1270699a67282dde9bbb65c66dec80fbbaefbf3ef";
+const expectedWindowsGateSourceSha256 =
+  "4582710987275134e89caa87036b1db60d6ca24d40b68f7efc55516cd6ea5f0b";
+const expectedWindowsBrokerCSharpSourceSha256 =
+  "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4";
+const expectedWindowsBrokerPowerShellSourceSha256 =
+  "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53";
+const expectedWindowsGateRunnerSourceSha256 =
+  "5d21024ab51c37376987790b541de050e6b8ff510d655df7864fef88edb7addd";
 const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -102,6 +116,12 @@ const expectedRunStatusRequestBody = [
 const root = fileURLToPath(new URL("../", import.meta.url));
 const gateSourcePath = fileURLToPath(
   new URL("../packages/cli/test/windows-control-gate.ts", import.meta.url),
+);
+const brokerCSharpSourcePath = fileURLToPath(
+  new URL("./windows-control-broker.cs", import.meta.url),
+);
+const brokerPowerShellSourcePath = fileURLToPath(
+  new URL("./windows-control-broker.ps1", import.meta.url),
 );
 const runnerSourcePath = fileURLToPath(import.meta.url);
 
@@ -236,6 +256,40 @@ function normalizedContractText(source) {
 
 function canonicalBodyDigest(source) {
   return createHash("sha256").update(normalizedContractText(source)).digest("hex");
+}
+
+function canonicalSourceDigest(source) {
+  return createHash("sha256").update(source.replaceAll("\r\n", "\n")).digest("hex");
+}
+
+function canonicalWindowsGateRunnerSource(source) {
+  const canonical = source.replaceAll("\r\n", "\n");
+  const declaration =
+    /^const expectedWindowsGateRunnerSourceSha256 =\s*\n?\s*"([0-9a-f]{64})";$/gmu;
+  const matches = [...canonical.matchAll(declaration)];
+  if (matches.length !== 1 || matches[0][1] !== expectedWindowsGateRunnerSourceSha256) {
+    return undefined;
+  }
+  return canonical.replace(
+    declaration,
+    'const expectedWindowsGateRunnerSourceSha256 = "<WINDOWS_GATE_RUNNER_SOURCE_SHA256>";',
+  );
+}
+
+function hasCanonicalWindowsGateSources({
+  brokerCSharpSource,
+  brokerPowerShellSource,
+  gateSource,
+  runnerSource,
+}) {
+  const canonicalRunnerSource = canonicalWindowsGateRunnerSource(runnerSource);
+  return (
+    canonicalRunnerSource !== undefined &&
+    canonicalSourceDigest(gateSource) === expectedWindowsGateSourceSha256 &&
+    canonicalSourceDigest(brokerCSharpSource) === expectedWindowsBrokerCSharpSourceSha256 &&
+    canonicalSourceDigest(brokerPowerShellSource) === expectedWindowsBrokerPowerShellSourceSha256 &&
+    canonicalSourceDigest(canonicalRunnerSource) === expectedWindowsGateRunnerSourceSha256
+  );
 }
 
 function hasCanonicalParentCrashContractSource(source) {
@@ -642,10 +696,30 @@ function hasLifecycleOwnershipTransfer(source) {
   return true;
 }
 
-export function validateWindowsControlGateContract({ gateSource, runnerSource }) {
+export function validateWindowsControlGateContract({
+  brokerCSharpSource,
+  brokerPowerShellSource,
+  gateSource,
+  runnerSource,
+}) {
   const errors = [];
-  if (typeof gateSource !== "string" || typeof runnerSource !== "string") {
+  if (
+    typeof brokerCSharpSource !== "string" ||
+    typeof brokerPowerShellSource !== "string" ||
+    typeof gateSource !== "string" ||
+    typeof runnerSource !== "string"
+  ) {
     return ["Windows gate sources must be text"];
+  }
+  if (
+    !hasCanonicalWindowsGateSources({
+      brokerCSharpSource,
+      brokerPowerShellSource,
+      gateSource,
+      runnerSource,
+    })
+  ) {
+    errors.push("Windows gate executable sources must match the canonical reviewed contract");
   }
   const expectedOuter = requiredWindowsControlGateStages.slice(0, 1);
   const expectedInner = requiredWindowsControlGateStages.slice(1);
@@ -723,7 +797,11 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   ) {
     errors.push("malformed-frame server close must retain its exact ordered unsafe aggregate");
   }
-  if (`${gateSource}\n${runnerSource}`.includes(temporaryTaskDiagnosticMarker)) {
+  const allSources = `${brokerCSharpSource}\n${brokerPowerShellSource}\n${gateSource}\n${runnerSource}`;
+  if (
+    allSources.includes(temporaryTaskDiagnosticMarker) ||
+    temporaryTaskDiagnosticTokens.some((token) => allSources.includes(token))
+  ) {
     errors.push("Windows gate cannot retain temporary diagnostic output");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
@@ -846,11 +924,21 @@ export async function runWindowsControlGate(platform = process.platform) {
     throw new Error("Windows control security gate requires Windows");
   }
   try {
-    const [gateSource, runnerSource] = await Promise.all([
-      readFile(gateSourcePath, "utf8"),
-      readFile(runnerSourcePath, "utf8"),
-    ]);
-    if (validateWindowsControlGateContract({ gateSource, runnerSource }).length > 0) {
+    const [brokerCSharpSource, brokerPowerShellSource, gateSource, runnerSource] =
+      await Promise.all([
+        readFile(brokerCSharpSourcePath, "utf8"),
+        readFile(brokerPowerShellSourcePath, "utf8"),
+        readFile(gateSourcePath, "utf8"),
+        readFile(runnerSourcePath, "utf8"),
+      ]);
+    if (
+      validateWindowsControlGateContract({
+        brokerCSharpSource,
+        brokerPowerShellSource,
+        gateSource,
+        runnerSource,
+      }).length > 0
+    ) {
       throw new Error("Windows gate source contract is incomplete");
     }
     await runWindowsControlGateStage("packed-clean-consumer", preparePackedWindowsControlConsumer);

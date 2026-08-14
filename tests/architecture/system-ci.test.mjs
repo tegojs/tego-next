@@ -15,6 +15,36 @@ const windowsControlGateChildMarker = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const windowsControlGateMarker = "TEGO_WINDOWS_CONTROL_GATE_OK";
 const windowsControlGateRunner = join(root, "scripts", "run-windows-control-gate.mjs");
 const windowsControlGateSource = join(root, "packages", "cli", "test", "windows-control-gate.ts");
+const windowsControlBrokerCSharpSource = join(root, "scripts", "windows-control-broker.cs");
+const windowsControlBrokerPowerShellSource = join(root, "scripts", "windows-control-broker.ps1");
+const [canonicalWindowsControlBrokerCSharpSource, canonicalWindowsControlBrokerPowerShellSource] =
+  await Promise.all([
+    readFile(windowsControlBrokerCSharpSource, "utf8"),
+    readFile(windowsControlBrokerPowerShellSource, "utf8"),
+  ]);
+
+function validateWindowsControlGateSources(validate, sources) {
+  return validate({
+    brokerCSharpSource: canonicalWindowsControlBrokerCSharpSource,
+    brokerPowerShellSource: canonicalWindowsControlBrokerPowerShellSource,
+    ...sources,
+  });
+}
+
+function windowsControlSourceDigest(source) {
+  return createHash("sha256").update(source.replaceAll("\r\n", "\n")).digest("hex");
+}
+
+function canonicalWindowsControlRunnerForDigest(source) {
+  const normalized = source.replaceAll("\r\n", "\n");
+  const declaration = /^const expectedWindowsGateRunnerSourceSha256 =\s*\n?\s*"[0-9a-f]{64}";$/gmu;
+  assert.equal([...normalized.matchAll(declaration)].length, 1);
+  return normalized.replace(
+    declaration,
+    'const expectedWindowsGateRunnerSourceSha256 = "<WINDOWS_GATE_RUNNER_SOURCE_SHA256>";',
+  );
+}
+
 const requiredWindowsControlGateStages = [
   ["packed-clean-consumer", "preparePackedWindowsControlConsumer"],
   ["powershell-csharp-self-test", "runPowerShellSelfTest"],
@@ -247,7 +277,127 @@ test("Windows control gate source contract fixes every real stage before the sol
     "function",
     "Windows gate runner must export its structural source validator",
   );
-  assert.deepEqual(validateWindowsControlGateContract({ gateSource, runnerSource }), []);
+  assert.deepEqual(
+    validateWindowsControlGateSources(validateWindowsControlGateContract, {
+      gateSource,
+      runnerSource,
+    }),
+    [],
+  );
+});
+
+test("Windows gate executable source digests are independently fixed", async (t) => {
+  const [
+    { validateWindowsControlGateContract },
+    gateSource,
+    runnerSource,
+    brokerCSharpSource,
+    brokerPowerShellSource,
+  ] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?independent-digests=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateSource, "utf8"),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlBrokerCSharpSource, "utf8"),
+    readFile(windowsControlBrokerPowerShellSource, "utf8"),
+  ]);
+  const expectedDigests = {
+    brokerCSharpSource: "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4",
+    brokerPowerShellSource: "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53",
+    gateSource: "4582710987275134e89caa87036b1db60d6ca24d40b68f7efc55516cd6ea5f0b",
+    runnerSource: "5d21024ab51c37376987790b541de050e6b8ff510d655df7864fef88edb7addd",
+  };
+  const sources = { brokerCSharpSource, brokerPowerShellSource, gateSource, runnerSource };
+  assert.deepEqual(
+    validateWindowsControlGateContract(
+      Object.fromEntries(
+        Object.entries(sources).map(([sourceName, source]) => [
+          sourceName,
+          source.replaceAll("\n", "\r\n"),
+        ]),
+      ),
+    ),
+    [],
+  );
+  for (const [sourceName, source] of Object.entries(sources)) {
+    const canonical =
+      sourceName === "runnerSource" ? canonicalWindowsControlRunnerForDigest(source) : source;
+    assert.equal(windowsControlSourceDigest(canonical), expectedDigests[sourceName]);
+    assert.equal(
+      windowsControlSourceDigest(canonical.replaceAll("\n", "\r\n")),
+      expectedDigests[sourceName],
+    );
+  }
+
+  for (const [sourceName, expectedDeclaration] of [
+    ["gateSource", "expectedWindowsGateSourceSha256"],
+    ["brokerCSharpSource", "expectedWindowsBrokerCSharpSourceSha256"],
+    ["brokerPowerShellSource", "expectedWindowsBrokerPowerShellSourceSha256"],
+  ]) {
+    await t.test(`${sourceName} and validator hashes cannot change together`, () => {
+      const mutatedSource = `${sources[sourceName]}// coordinated mutation\n`;
+      const mutatedSourceDigest = windowsControlSourceDigest(mutatedSource);
+      let mutatedRunner = runnerSource.replace(expectedDigests[sourceName], mutatedSourceDigest);
+      assert.notEqual(mutatedRunner, runnerSource);
+      const mutatedRunnerDigest = windowsControlSourceDigest(
+        canonicalWindowsControlRunnerForDigest(mutatedRunner),
+      );
+      mutatedRunner = mutatedRunner.replace(expectedDigests.runnerSource, mutatedRunnerDigest);
+      assert.match(
+        mutatedRunner,
+        new RegExp(`${expectedDeclaration}[\\s\\S]+${mutatedSourceDigest}`, "u"),
+      );
+      assert.notEqual(
+        windowsControlSourceDigest(canonicalWindowsControlRunnerForDigest(mutatedRunner)),
+        expectedDigests.runnerSource,
+      );
+      assert.ok(
+        validateWindowsControlGateContract({
+          ...sources,
+          [sourceName]: mutatedSource,
+          runnerSource: mutatedRunner,
+        }).length > 0,
+      );
+    });
+  }
+
+  await t.test("runner source and self hash cannot change together", () => {
+    let mutatedRunner = `${runnerSource}// coordinated runner mutation\n`;
+    const mutatedRunnerDigest = windowsControlSourceDigest(
+      canonicalWindowsControlRunnerForDigest(mutatedRunner),
+    );
+    mutatedRunner = mutatedRunner.replace(expectedDigests.runnerSource, mutatedRunnerDigest);
+    assert.notEqual(
+      windowsControlSourceDigest(canonicalWindowsControlRunnerForDigest(mutatedRunner)),
+      expectedDigests.runnerSource,
+    );
+    assert.ok(
+      validateWindowsControlGateContract({ ...sources, runnerSource: mutatedRunner }).length > 0,
+    );
+  });
+
+  await t.test("runner self digest literal cannot change", () => {
+    const mutatedRunner = runnerSource.replace(expectedDigests.runnerSource, "0".repeat(64));
+    assert.notEqual(mutatedRunner, runnerSource);
+    assert.ok(
+      validateWindowsControlGateContract({ ...sources, runnerSource: mutatedRunner }).length > 0,
+    );
+    assert.ok(
+      validateWindowsControlGateContract({
+        ...Object.fromEntries(
+          Object.entries(sources).map(([sourceName, source]) => [
+            sourceName,
+            source.replaceAll("\n", "\r\n"),
+          ]),
+        ),
+        runnerSource: mutatedRunner.replaceAll("\n", "\r\n"),
+      }).length > 0,
+    );
+  });
 });
 
 test("Windows gate proves the current-user descriptor without a redundant PowerShell SID query", async () => {
@@ -426,10 +576,13 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
       const mutation = gateSource.replace(from, to);
       assert.notEqual(mutation, gateSource);
       assert.ok(
-        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
+          gateSource: mutation,
+          runnerSource,
+        }).length > 0,
       );
       assert.ok(
-        validateWindowsControlGateContract({
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutation.replaceAll("\n", "\r\n"),
           runnerSource: runnerSource.replaceAll("\n", "\r\n"),
         }).length > 0,
@@ -458,9 +611,15 @@ test("Windows gate rolls back partial acquisition and owns parent-crash processe
   assert.match(gateSource, /"-ParentProcessId"/u);
   assert.doesNotMatch(gateSource, /function processExists|waitForProcessExit|process\.kill\(/u);
   assert.doesNotMatch(gateSource, /brokerPid/u);
-  assert.deepEqual(validateWindowsControlGateContract({ gateSource, runnerSource }), []);
   assert.deepEqual(
-    validateWindowsControlGateContract({
+    validateWindowsControlGateSources(validateWindowsControlGateContract, {
+      gateSource,
+      runnerSource,
+    }),
+    [],
+  );
+  assert.deepEqual(
+    validateWindowsControlGateSources(validateWindowsControlGateContract, {
       gateSource: gateSource.replaceAll("\n", "\r\n"),
       runnerSource: runnerSource.replaceAll("\n", "\r\n"),
     }),
@@ -678,10 +837,13 @@ test("Windows gate rolls back partial acquisition and owns parent-crash processe
     await t.test(name, () => {
       assert.notEqual(mutation, gateSource);
       assert.ok(
-        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
+          gateSource: mutation,
+          runnerSource,
+        }).length > 0,
       );
       assert.ok(
-        validateWindowsControlGateContract({
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutation.replaceAll("\n", "\r\n"),
           runnerSource: runnerSource.replaceAll("\n", "\r\n"),
         }).length > 0,
@@ -726,13 +888,13 @@ test("Windows gate rolls back partial acquisition and owns parent-crash processe
     await t.test(name, () => {
       assert.notEqual(mutatedRunner, runnerSource);
       assert.ok(
-        validateWindowsControlGateContract({
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutatedGate,
           runnerSource: mutatedRunner,
         }).length > 0,
       );
       assert.ok(
-        validateWindowsControlGateContract({
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutatedGate.replaceAll("\n", "\r\n"),
           runnerSource: mutatedRunner.replaceAll("\n", "\r\n"),
         }).length > 0,
@@ -764,11 +926,14 @@ test("Windows control gate source validation rejects removed, reordered, softene
     readFile(windowsControlGateSource, "utf8"),
   ]);
   assert.deepEqual(
-    validateWindowsControlGateContract({ gateSource: gateFixture, runnerSource: runnerFixture }),
+    validateWindowsControlGateSources(validateWindowsControlGateContract, {
+      gateSource: gateFixture,
+      runnerSource: runnerFixture,
+    }),
     [],
   );
   assert.deepEqual(
-    validateWindowsControlGateContract({
+    validateWindowsControlGateSources(validateWindowsControlGateContract, {
       gateSource: gateFixture.replaceAll("\n", "\r\n"),
       runnerSource: runnerFixture.replaceAll("\n", "\r\n"),
     }),
@@ -808,21 +973,24 @@ test("Windows control gate source validation rejects removed, reordered, softene
     ]) {
       await t.test(`${stage}: ${mutationName}`, () => {
         assert.notEqual(mutation, original);
-        const diagnostics = validateWindowsControlGateContract({
+        const diagnostics = validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: sourceName === "gateSource" ? mutation : gateFixture,
           runnerSource: sourceName === "runnerSource" ? mutation : runnerFixture,
         });
         assert.ok(diagnostics.length > 0, `${stage} ${mutationName} must fail closed`);
-        const crlfDiagnostics = validateWindowsControlGateContract({
-          gateSource: (sourceName === "gateSource" ? mutation : gateFixture).replaceAll(
-            "\n",
-            "\r\n",
-          ),
-          runnerSource: (sourceName === "runnerSource" ? mutation : runnerFixture).replaceAll(
-            "\n",
-            "\r\n",
-          ),
-        });
+        const crlfDiagnostics = validateWindowsControlGateSources(
+          validateWindowsControlGateContract,
+          {
+            gateSource: (sourceName === "gateSource" ? mutation : gateFixture).replaceAll(
+              "\n",
+              "\r\n",
+            ),
+            runnerSource: (sourceName === "runnerSource" ? mutation : runnerFixture).replaceAll(
+              "\n",
+              "\r\n",
+            ),
+          },
+        );
         assert.ok(
           crlfDiagnostics.length > 0,
           `${stage} ${mutationName} must fail closed with CRLF`,
@@ -842,8 +1010,10 @@ test("Windows control gate source validation rejects removed, reordered, softene
     runnerFixture.replace(markerWrite, `${markerWrite}\n  await runInstalledWindowsControlGate();`),
   ]) {
     assert.ok(
-      validateWindowsControlGateContract({ gateSource: gateFixture, runnerSource: runnerMutation })
-        .length > 0,
+      validateWindowsControlGateSources(validateWindowsControlGateContract, {
+        gateSource: gateFixture,
+        runnerSource: runnerMutation,
+      }).length > 0,
       "installed execution and the sole marker must remain ordered and non-noop",
     );
   }
@@ -852,7 +1022,7 @@ test("Windows control gate source validation rejects removed, reordered, softene
     const source = sourceName === "gateSource" ? gateFixture : runnerFixture;
     const noOpHelper = source.replace("  await operation();", "  await Promise.resolve();");
     assert.ok(
-      validateWindowsControlGateContract({
+      validateWindowsControlGateSources(validateWindowsControlGateContract, {
         gateSource: sourceName === "gateSource" ? noOpHelper : gateFixture,
         runnerSource: sourceName === "runnerSource" ? noOpHelper : runnerFixture,
       }).length > 0,
@@ -886,7 +1056,10 @@ test("Windows control gate validation rejects hidden control flow and implementa
     await t.test(name, () => {
       assert.notEqual(mutation, gateSource);
       assert.ok(
-        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
+          gateSource: mutation,
+          runnerSource,
+        }).length > 0,
       );
     });
   }
@@ -901,11 +1074,264 @@ test("Windows control gate validation rejects hidden control flow and implementa
     );
     await t.test(`${implementation} implementation no-op`, () => {
       assert.ok(
-        validateWindowsControlGateContract({
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: sourceName === "gateSource" ? mutation : gateSource,
           runnerSource: sourceName === "runnerSource" ? mutation : runnerSource,
         }).length > 0,
       );
+    });
+  }
+});
+
+test("Windows gate validator rejects executable bypasses and temporary diagnostics in every source", async (t) => {
+  const [
+    { validateWindowsControlGateContract },
+    gateSource,
+    runnerSource,
+    brokerCSharpSource,
+    brokerPowerShellSource,
+  ] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?executable-contract=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateSource, "utf8"),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlBrokerCSharpSource, "utf8"),
+    readFile(windowsControlBrokerPowerShellSource, "utf8"),
+  ]);
+  const innerStatusStage =
+    '  await runWindowsControlGateStage("status-request", runStatusRequest);';
+  const outerPackedStage =
+    '    await runWindowsControlGateStage("packed-clean-consumer", preparePackedWindowsControlConsumer);';
+  const mutations = [
+    {
+      gateSource: gateSource.replace(
+        "async function runInstalledWindowsControlGate(): Promise<void> {",
+        "async function runInstalledWindowsControlGate(): Promise<void> {\n  if (true) return;",
+      ),
+      name: "inner orchestrator early return",
+    },
+    {
+      gateSource: gateSource.replace(innerStatusStage, `  if (0) {\n${innerStatusStage}\n  }`),
+      name: "inner stage hidden behind conditional",
+    },
+    {
+      gateSource: gateSource.replace(innerStatusStage, `  /*\n${innerStatusStage}\n  */`),
+      name: "inner stage moved into block comment",
+    },
+    {
+      name: "outer orchestrator early return",
+      runnerSource: runnerSource.replace(
+        "export async function runWindowsControlGate(platform = process.platform) {",
+        "export async function runWindowsControlGate(platform = process.platform) {\n  if (true) return;",
+      ),
+    },
+    {
+      name: "outer stage hidden behind conditional",
+      runnerSource: runnerSource.replace(
+        outerPackedStage,
+        `    if (0) {\n${outerPackedStage}\n    }`,
+      ),
+    },
+    {
+      gateSource: replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "startLiveDescriptor",
+        '  liveServer = await startTrackedServer("live-descriptor");',
+        '  // liveServer = await startTrackedServer("live-descriptor");\n  await Promise.resolve();',
+      ),
+      name: "implementation proof moved into comment",
+    },
+    {
+      gateSource: replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "startLiveDescriptor",
+        '  liveServer = await startTrackedServer("live-descriptor");',
+        '  try {\n    liveServer = await startTrackedServer("live-descriptor");\n  } catch {}',
+      ),
+      name: "implementation swallows failure",
+    },
+    {
+      gateSource: replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "runBrokerCrashCleanup",
+        "    await assertPipeUnavailable(tracked.endpoint);",
+        "    /* await assertPipeUnavailable(tracked.endpoint); */",
+      ),
+      name: "broker crash pipe proof moved into comment",
+    },
+    {
+      gateSource: replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "runBrokerCrashCleanup",
+        "    await assertPipeUnavailable(tracked.endpoint);",
+        "    try {\n      await assertPipeUnavailable(tracked.endpoint);\n    } catch {}",
+      ),
+      name: "broker crash pipe proof failure swallowed",
+    },
+    {
+      gateSource: replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "runMalformedFrameFailure",
+        '  let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
+        '  if (true) return;\n  let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
+      ),
+      name: "implementation returns before evidence",
+    },
+    {
+      gateSource: replaceInTopLevelAsyncFunctionBody(
+        gateSource,
+        "runTwentyLifecycleRounds",
+        "  for (let round = 0; round < 20; round += 1) {",
+        "  for (let round = 0; round < 20; round += 1) {\n    continue;",
+      ),
+      name: "lifecycle loop continues before evidence",
+    },
+    {
+      name: "packed consumer returns before pack",
+      runnerSource: replaceInTopLevelAsyncFunctionBody(
+        runnerSource,
+        "preparePackedWindowsControlConsumer",
+        '  const directory = await mkdtemp(join(tmpdir(), "tego-windows-control-gate-"));',
+        '  if (true) return;\n  const directory = await mkdtemp(join(tmpdir(), "tego-windows-control-gate-"));',
+      ),
+    },
+    {
+      gateSource: gateSource.replace(
+        '  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
+        '  spawnSync(\n    "powershell.exe",\n    selfTestArguments,\n    {},\n  );\n  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
+      ),
+      name: "second multiline SelfTest spawn",
+    },
+    {
+      brokerCSharpSource: brokerCSharpSource.replace(
+        "WindowsIdentity.GetCurrent().User",
+        "new SecurityIdentifier(LocalSystemSid) // WindowsIdentity.GetCurrent().User",
+      ),
+      name: "C sharp current user bypassed with comment decoy",
+    },
+    {
+      brokerCSharpSource: brokerCSharpSource.replace(
+        "        ValidateDescriptor(descriptor, expectedSids);\n\n        byte[] ownerSid =",
+        "        // ValidateDescriptor(descriptor, expectedSids);\n\n        byte[] ownerSid =",
+      ),
+      name: "C sharp descriptor readback validation moved into comment",
+    },
+    {
+      brokerCSharpSource: brokerCSharpSource.replace(
+        "        ValidateDescriptor(descriptor, expectedSids);\n\n        byte[] ownerSid =",
+        "        if (false) ValidateDescriptor(descriptor, expectedSids);\n\n        byte[] ownerSid =",
+      ),
+      name: "C sharp descriptor readback validation disabled",
+    },
+    {
+      brokerPowerShellSource: brokerPowerShellSource.replace(
+        "if ($SelfTest) {\n  if (",
+        "if ($SelfTest) {\n  exit 0\n  if (",
+      ),
+      name: "PowerShell SelfTest exits before Add-Type",
+    },
+    {
+      brokerPowerShellSource: brokerPowerShellSource.replace(
+        "  $SelfTest -and (",
+        "  $false -and $SelfTest -and (",
+      ),
+      name: "PowerShell 5.1 guard disabled",
+    },
+    {
+      brokerPowerShellSource: brokerPowerShellSource.replace(
+        "  Add-Type -Path $sourcePath",
+        "  # Add-Type -Path $sourcePath",
+      ),
+      name: "PowerShell Add-Type moved into comment",
+    },
+    {
+      brokerPowerShellSource: brokerPowerShellSource.replace(
+        "  Add-Type -Path $sourcePath",
+        "  if ($false) { Add-Type -Path $sourcePath }",
+      ),
+      name: "PowerShell Add-Type disabled",
+    },
+    {
+      brokerPowerShellSource: brokerPowerShellSource.replace(
+        "  Add-Type -Path $sourcePath",
+        "  Add-Type -Path $sourcePath\n  Add-Type -Path $sourcePath",
+      ),
+      name: "PowerShell Add-Type duplicated",
+    },
+    {
+      gateSource: `${gateSource}\nprocess.stderr.write(["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_") + "\\n");\n`,
+      name: "gate split temporary diagnostic reintroduced",
+    },
+    {
+      name: "runner split temporary diagnostic reintroduced",
+      runnerSource: runnerSource.replace(
+        '    process.stderr.write("TEGO_WINDOWS_CONTROL_GATE_FAILED\\n");',
+        '    process.stderr.write(["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_") + "\\n");',
+      ),
+    },
+    {
+      brokerCSharpSource: `${brokerCSharpSource}\n// TEGO_TASK4_NON_AUTHORITATIVE_DIAGNOSTIC\n`,
+      name: "C sharp temporary diagnostic reintroduced",
+    },
+    {
+      brokerPowerShellSource: `${brokerPowerShellSource}\n# TEGO_TASK4_NON_AUTHORITATIVE_DIAGNOSTIC\n`,
+      name: "PowerShell temporary diagnostic reintroduced",
+    },
+  ];
+
+  for (const mutation of mutations) {
+    const sources = {
+      brokerCSharpSource,
+      brokerPowerShellSource,
+      gateSource,
+      runnerSource,
+      ...mutation,
+    };
+    delete sources.name;
+    assert.notDeepEqual(sources, {
+      brokerCSharpSource,
+      brokerPowerShellSource,
+      gateSource,
+      runnerSource,
+    });
+    await t.test(mutation.name, () => {
+      assert.ok(
+        validateWindowsControlGateSources(validateWindowsControlGateContract, sources).length > 0,
+      );
+      assert.ok(
+        validateWindowsControlGateSources(
+          validateWindowsControlGateContract,
+          Object.fromEntries(
+            Object.entries(sources).map(([sourceName, source]) => [
+              sourceName,
+              source.replaceAll("\n", "\r\n"),
+            ]),
+          ),
+        ).length > 0,
+      );
+    });
+  }
+
+  for (const missingSource of [
+    "brokerCSharpSource",
+    "brokerPowerShellSource",
+    "gateSource",
+    "runnerSource",
+  ]) {
+    await t.test(`${missingSource} is required text`, () => {
+      const sources = { brokerCSharpSource, brokerPowerShellSource, gateSource, runnerSource };
+      delete sources[missingSource];
+      assert.deepEqual(validateWindowsControlGateContract(sources), [
+        "Windows gate sources must be text",
+      ]);
+      sources[missingSource] = null;
+      assert.deepEqual(validateWindowsControlGateContract(sources), [
+        "Windows gate sources must be text",
+      ]);
     });
   }
 });
@@ -951,7 +1377,10 @@ test("Windows malformed-frame cleanup transfers ownership only after exact child
     await t.test(`malformed ownership mutation ${String(index + 1)}`, () => {
       assert.notEqual(mutation, gateSource);
       assert.ok(
-        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
+          gateSource: mutation,
+          runnerSource,
+        }).length > 0,
       );
     });
   }
@@ -980,7 +1409,7 @@ test("Windows malformed-frame cleanup transfers ownership only after exact child
       assert.notEqual(mutatedGate, gateSource);
       assert.notEqual(mutatedRunner, runnerSource);
       assert.ok(
-        validateWindowsControlGateContract({
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutatedGate,
           runnerSource: mutatedRunner,
         }).length > 0,
@@ -1073,7 +1502,10 @@ test("Windows broker-crash cleanup reuses the exact aggregate and releases captu
         to,
       );
       assert.ok(
-        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
+          gateSource: mutation,
+          runnerSource,
+        }).length > 0,
       );
     });
   }
@@ -1144,7 +1576,10 @@ test("Windows reconnect and lifecycle close retain ownership through captured cl
       await t.test(`${implementation}: ${name}`, () => {
         const mutation = replaceInTopLevelAsyncFunctionBody(gateSource, implementation, from, to);
         assert.ok(
-          validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+          validateWindowsControlGateSources(validateWindowsControlGateContract, {
+            gateSource: mutation,
+            runnerSource,
+          }).length > 0,
         );
       });
     }
@@ -1191,7 +1626,10 @@ test("Windows gate validation keeps one bounded strict authoritative SelfTest", 
     await t.test(`SelfTest mutation ${String(index + 1)}`, () => {
       assert.notEqual(mutation, gateSource);
       assert.ok(
-        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+        validateWindowsControlGateSources(validateWindowsControlGateContract, {
+          gateSource: mutation,
+          runnerSource,
+        }).length > 0,
       );
     });
   }
