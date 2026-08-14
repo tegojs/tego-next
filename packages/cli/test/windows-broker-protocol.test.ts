@@ -38,10 +38,10 @@ test("Windows broker frames use the fixed big-endian 24-byte header", () => {
 test("Windows broker decoder handles split and coalesced frames without sharing payload storage", () => {
   const first = encodeWindowsBrokerFrame(dataFrame(Uint8Array.from([1, 2])));
   const second = encodeWindowsBrokerFrame(dataFrame(Uint8Array.from([3]), 8n));
-  const combined = Buffer.concat([first, second]);
-  const backing = new Uint8Array(combined.byteLength + 6);
-  const input = new Uint8Array(backing.buffer, 3, combined.byteLength);
-  input.set(combined);
+  const backing = new Uint8Array(first.byteLength + second.byteLength + 6);
+  const input = new Uint8Array(backing.buffer, 3, first.byteLength + second.byteLength);
+  input.set(first, 0);
+  input.set(second, first.byteLength);
   const decoder = new WindowsBrokerFrameDecoder();
 
   assert.equal(Buffer.isBuffer(input), false);
@@ -50,6 +50,10 @@ test("Windows broker decoder handles split and coalesced frames without sharing 
   backing.fill(0);
   decoder.finish();
 
+  assert.notEqual(frames[0]?.payload.buffer, input.buffer);
+  assert.equal(frames[0]?.payload.byteOffset, 0);
+  assert.equal(frames[0]?.payload.buffer.byteLength, 2);
+  assert.equal(frames[1]?.payload.buffer.byteLength, 1);
   assert.deepEqual(frames, [
     dataFrame(Uint8Array.from([1, 2])),
     dataFrame(Uint8Array.from([3]), 8n),
@@ -163,7 +167,7 @@ test("EOF only closes its own direction while CLOSE terminally closes both direc
   );
   assert.throws(() => accept(state, brokerToParent, "eof", 1n), PROTOCOL_ERROR);
   accept(state, parentToBroker, "data", 1n, Uint8Array.from([3]));
-  accept(state, parentToBroker, "close", 1n);
+  accept(state, brokerToParent, "close", 1n);
   assert.throws(
     () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([4])),
     PROTOCOL_ERROR,
@@ -174,17 +178,26 @@ test("EOF only closes its own direction while CLOSE terminally closes both direc
 test("PAUSE pauses only the opposite direction until its matching RESUME", () => {
   const state = new WindowsBrokerConnectionState();
   readyAndOpen(state);
-  assert.throws(() => accept(state, brokerToParent, "resume", 1n), PROTOCOL_ERROR);
-  accept(state, brokerToParent, "pause", 1n);
+  assert.throws(() => accept(state, parentToBroker, "resume", 1n), PROTOCOL_ERROR);
+  accept(state, parentToBroker, "pause", 1n);
   assert.throws(
-    () => accept(state, parentToBroker, "data", 1n, Uint8Array.from([1])),
+    () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([1])),
     PROTOCOL_ERROR,
   );
-  accept(state, brokerToParent, "data", 1n, Uint8Array.from([2]));
+  accept(state, parentToBroker, "data", 1n, Uint8Array.from([2]));
+  assert.throws(() => accept(state, parentToBroker, "pause", 1n), PROTOCOL_ERROR);
+  accept(state, parentToBroker, "resume", 1n);
+  accept(state, brokerToParent, "data", 1n, Uint8Array.from([3]));
+  assert.throws(() => accept(state, brokerToParent, "resume", 1n), PROTOCOL_ERROR);
+});
+
+test("the approved frame direction allowlist rejects inverted EOF and backpressure frames", () => {
+  const state = new WindowsBrokerConnectionState();
+  readyAndOpen(state);
+
+  assert.throws(() => accept(state, parentToBroker, "eof", 1n), PROTOCOL_ERROR);
   assert.throws(() => accept(state, brokerToParent, "pause", 1n), PROTOCOL_ERROR);
-  accept(state, brokerToParent, "resume", 1n);
-  accept(state, parentToBroker, "data", 1n, Uint8Array.from([3]));
-  assert.throws(() => accept(state, parentToBroker, "resume", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "resume", 1n), PROTOCOL_ERROR);
 });
 
 test("queue limits are direction-aware, drain requires the matching active direction, and CLOSE discards both", () => {
@@ -199,11 +212,23 @@ test("queue limits are direction-aware, drain requires the matching active direc
   );
   assert.throws(() => state.drain(1n, parentToBroker, 2), PROTOCOL_ERROR);
   state.drain(1n, brokerToParent, 1);
+  state.drain(1n, parentToBroker, 1);
   accept(state, brokerToParent, "data", 1n, Uint8Array.from([4, 5]));
   accept(state, brokerToParent, "close", 1n);
   assert.throws(() => state.drain(1n, brokerToParent, 1), PROTOCOL_ERROR);
   accept(state, brokerToParent, "open", 2n);
   accept(state, brokerToParent, "data", 2n, Uint8Array.from([6, 7, 8]));
+});
+
+test("maxConnectionBytes caps the aggregate queue of both directions", () => {
+  const state = new WindowsBrokerConnectionState({ maxConnectionBytes: 3, maxTotalBytes: 8 });
+  readyAndOpen(state);
+  accept(state, brokerToParent, "data", 1n, Uint8Array.from([1, 2]));
+
+  assert.throws(
+    () => accept(state, parentToBroker, "data", 1n, Uint8Array.from([3, 4])),
+    PROTOCOL_ERROR,
+  );
 });
 
 test("CLOSE_ALL requires parent ownership, drains all terminals before broker acknowledgement, then fences every frame", () => {
@@ -212,13 +237,16 @@ test("CLOSE_ALL requires parent ownership, drains all terminals before broker ac
   accept(state, brokerToParent, "open", 2n);
   accept(state, parentToBroker, "close-all", 0n);
   assert.throws(() => accept(state, brokerToParent, "open", 3n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "close", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "pause", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "pause", 1n), PROTOCOL_ERROR);
   assert.throws(
     () => accept(state, parentToBroker, "data", 1n, Uint8Array.from([1])),
     PROTOCOL_ERROR,
   );
   assert.throws(() => accept(state, brokerToParent, "close-all-ack", 0n), PROTOCOL_ERROR);
   accept(state, brokerToParent, "eof", 1n);
-  accept(state, parentToBroker, "close", 1n);
+  accept(state, brokerToParent, "close", 1n);
   accept(state, brokerToParent, "close", 2n);
   accept(state, brokerToParent, "close-all-ack", 0n);
   assert.throws(() => accept(state, brokerToParent, "fatal", 0n), PROTOCOL_ERROR);

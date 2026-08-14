@@ -175,6 +175,25 @@ function oppositeDirection(direction: WindowsBrokerFrameDirection): WindowsBroke
   return direction === "broker-to-parent" ? "parent-to-broker" : "broker-to-parent";
 }
 
+function directionAllows(
+  type: WindowsBrokerFrameType,
+  direction: WindowsBrokerFrameDirection,
+): boolean {
+  if (direction === "broker-to-parent") {
+    return ["ready", "open", "data", "eof", "close", "fatal", "close-all-ack"].includes(type);
+  }
+  return ["data", "close", "pause", "resume", "close-all"].includes(type);
+}
+
+function allowedAfterCloseAll(
+  type: WindowsBrokerFrameType,
+  direction: WindowsBrokerFrameDirection,
+): boolean {
+  return (
+    direction === "broker-to-parent" && ["eof", "close", "fatal", "close-all-ack"].includes(type)
+  );
+}
+
 export class WindowsBrokerConnectionState {
   #closeAllAcknowledged = false;
   #closeAllRequested = false;
@@ -198,6 +217,10 @@ export class WindowsBrokerConnectionState {
     assertFrame(frame);
     assertDirection(direction);
     if (this.#fatal || this.#closeAllAcknowledged) throw protocolError();
+    if (!directionAllows(frame.type, direction)) throw protocolError();
+    if (this.#closeAllRequested && !allowedAfterCloseAll(frame.type, direction)) {
+      throw protocolError();
+    }
     switch (frame.type) {
       case "ready":
         if (direction !== "broker-to-parent" || this.#ready || this.#closeAllRequested) {
@@ -256,7 +279,11 @@ export class WindowsBrokerConnectionState {
         const connection = this.#activeConnection(frame.connectionId);
         const channel = connection.directions[direction];
         if (channel.eof || connection.pausedBy[oppositeDirection(direction)]) throw protocolError();
-        const nextConnectionBytes = channel.queuedBytes + frame.payload.byteLength;
+        const nextDirectionBytes = channel.queuedBytes + frame.payload.byteLength;
+        const nextConnectionBytes =
+          connection.directions["broker-to-parent"].queuedBytes +
+          connection.directions["parent-to-broker"].queuedBytes +
+          frame.payload.byteLength;
         const nextTotalBytes = this.#totalQueuedBytes + frame.payload.byteLength;
         if (
           !Number.isSafeInteger(nextConnectionBytes) ||
@@ -266,7 +293,7 @@ export class WindowsBrokerConnectionState {
         ) {
           throw protocolError();
         }
-        channel.queuedBytes = nextConnectionBytes;
+        channel.queuedBytes = nextDirectionBytes;
         this.#totalQueuedBytes = nextTotalBytes;
         return;
       }
