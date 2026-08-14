@@ -11,7 +11,9 @@ const ACCESS_RULE_HEADER_BYTES = 12;
 const DESCRIPTOR_MAGIC = "TGSD";
 const DESCRIPTOR_PROTECTED_DACL = 1;
 const ACCESS_RULE_ALLOW = 1;
-const WINDOWS_SID = /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u;
+const CANONICAL_DECIMAL = /^(?:0|[1-9]\d*)$/u;
+const MAX_IDENTIFIER_AUTHORITY = "281474976710655";
+const MAX_SUBAUTHORITY = "4294967295";
 
 export interface WindowsBrokerSecurityAccessRule {
   readonly accessMask: number;
@@ -33,12 +35,31 @@ function endpointUnsafe(): DiagnosticError {
   );
 }
 
+function canonicalBoundedDecimal(value: string, maximum: string): boolean {
+  return (
+    CANONICAL_DECIMAL.test(value) &&
+    (value.length < maximum.length || (value.length === maximum.length && value <= maximum))
+  );
+}
+
+function isCanonicalSid(sid: string): boolean {
+  const [prefix, revision, authority, ...subauthorities] = sid.split("-");
+  return (
+    prefix === "S" &&
+    revision === "1" &&
+    canonicalBoundedDecimal(authority ?? "", MAX_IDENTIFIER_AUTHORITY) &&
+    subauthorities.length >= 1 &&
+    subauthorities.length <= 15 &&
+    subauthorities.every((value) => canonicalBoundedDecimal(value, MAX_SUBAUTHORITY))
+  );
+}
+
 function readCanonicalSid(payload: Buffer, offset: number, length: number): string {
   if (length < 1 || offset < 0 || offset + length > payload.byteLength) throw endpointUnsafe();
   const encoded = payload.subarray(offset, offset + length);
   if (encoded.some((byte) => byte < 0x20 || byte > 0x7e)) throw endpointUnsafe();
   const sid = encoded.toString("ascii");
-  if (!WINDOWS_SID.test(sid) || !Buffer.from(sid, "ascii").equals(encoded)) {
+  if (!isCanonicalSid(sid) || !Buffer.from(sid, "ascii").equals(encoded)) {
     throw endpointUnsafe();
   }
   return sid;

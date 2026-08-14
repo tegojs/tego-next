@@ -255,6 +255,12 @@ public static class TegoWindowsControlBroker
         internal byte[] Payload;
     }
 
+    private sealed class ClosedConnectionState
+    {
+        internal bool BrokerCloseSeen;
+        internal bool ParentCloseSeen;
+    }
+
     private sealed class ParentFrameReader
     {
         private readonly Stream _stream;
@@ -1276,6 +1282,8 @@ public static class TegoWindowsControlBroker
         private readonly object _gate = new object();
         private readonly object _outputGate = new object();
         private readonly Dictionary<ulong, PipeConnection> _connections = new Dictionary<ulong, PipeConnection>();
+        private readonly Dictionary<ulong, ClosedConnectionState> _closedConnections = new Dictionary<ulong, ClosedConnectionState>();
+        private readonly Queue<ulong> _closedConnectionOrder = new Queue<ulong>();
         private readonly ManualResetEvent _readyGate = new ManualResetEvent(false);
         private readonly ManualResetEvent _firstAcceptArmed = new ManualResetEvent(false);
         private readonly AutoResetEvent _connectionSlot = new AutoResetEvent(false);
@@ -1439,15 +1447,16 @@ public static class TegoWindowsControlBroker
                         CloseAllFromParent();
                         return;
                     }
+                    if (frame.Type == FrameClose)
+                    {
+                        CloseFromParent(frame.ConnectionId);
+                        continue;
+                    }
                     PipeConnection connection = FindConnection(frame.ConnectionId);
                     if (frame.Type == FrameData)
                     {
                         if (frame.Payload.Length > MaxConnectionBytes || !connection.Write(frame.Payload))
                             CloseConnection(connection, true);
-                    }
-                    else if (frame.Type == FrameClose)
-                    {
-                        CloseConnection(connection, false);
                     }
                     else if (frame.Type == FramePause)
                     {
@@ -1549,6 +1558,10 @@ public static class TegoWindowsControlBroker
                 {
                     removed = _connections.Remove(connection.Id);
                     endpointClosing = _closing;
+                    if (removed)
+                        RememberFirstCloseLocked(connection.Id, notifyParent);
+                    else if (!notifyParent)
+                        AcceptLateParentCloseLocked(connection.Id);
                 }
                 if (removed && notifyParent && !endpointClosing && !_shutdown.WaitOne(0))
                     closeFrame = _writer.PrepareFrame(FrameClose, connection.Id, new byte[0]);
@@ -1568,6 +1581,45 @@ public static class TegoWindowsControlBroker
             }
             connection.Dispose();
             _connectionSlot.Set();
+        }
+
+        private void CloseFromParent(ulong id)
+        {
+            PipeConnection connection;
+            lock (_gate)
+            {
+                if (!_connections.TryGetValue(id, out connection))
+                {
+                    AcceptLateParentCloseLocked(id);
+                    return;
+                }
+            }
+            CloseConnection(connection, false);
+        }
+
+        private void RememberFirstCloseLocked(ulong id, bool brokerToParent)
+        {
+            ClosedConnectionState state = new ClosedConnectionState();
+            state.BrokerCloseSeen = brokerToParent;
+            state.ParentCloseSeen = !brokerToParent;
+            _closedConnections.Add(id, state);
+            _closedConnectionOrder.Enqueue(id);
+            while (_closedConnectionOrder.Count > MaxConnections)
+            {
+                ulong expired = _closedConnectionOrder.Dequeue();
+                _closedConnections.Remove(expired);
+            }
+        }
+
+        private void AcceptLateParentCloseLocked(ulong id)
+        {
+            ClosedConnectionState state;
+            if (!_closedConnections.TryGetValue(id, out state) ||
+                state.ParentCloseSeen ||
+                !state.BrokerCloseSeen)
+                throw new InvalidDataException();
+            state.ParentCloseSeen = true;
+            _closedConnections.Remove(id);
         }
 
         private void CloseAllFromParent()
@@ -1691,6 +1743,8 @@ public static class TegoWindowsControlBroker
                 connections = new PipeConnection[_connections.Count];
                 _connections.Values.CopyTo(connections, 0);
                 _connections.Clear();
+                _closedConnections.Clear();
+                _closedConnectionOrder.Clear();
             }
             StopAcceptLoop();
             for (int index = 0; index < connections.Length; index += 1)

@@ -1224,6 +1224,42 @@ test("Windows broker startup failure waits for cleanup and leaves no reachable e
   });
 });
 
+test("Windows server close keeps broker cleanup primary before its stored observer error", async () => {
+  await withEndpoint(async (endpoint) => {
+    const broker = new FakeWindowsBroker(endpoint);
+    const brokerCloseError = new Error("broker close failed");
+    const observerError = new Error("observer failed");
+    broker.close = async () => {
+      broker.closeCalls += 1;
+      throw brokerCloseError;
+    };
+    const startup = startControlServer({
+      endpoint,
+      onServerError: () => {
+        throw observerError;
+      },
+      operations: fakeOperations(),
+      windowsBrokerArchitecture: "x64",
+      windowsControlBrokerFactory: () => broker,
+    });
+    await broker.started.promise;
+    broker.startGate.resolve();
+    const server = await startup;
+    broker.emitError(new Error("broker observer trigger"));
+
+    await assert.rejects(server.close(), (error: unknown) => {
+      if (!(error instanceof AggregateError)) return false;
+      const stored = error.errors[1];
+      return (
+        error.errors[0] === brokerCloseError &&
+        stored instanceof AggregateError &&
+        stored.errors[1] === observerError
+      );
+    });
+    assert.equal(broker.closeCalls, 1);
+  });
+});
+
 test("unsupported Windows architecture fails before broker or Node endpoint creation", async () => {
   await withEndpoint(async (endpoint) => {
     let factoryCalls = 0;

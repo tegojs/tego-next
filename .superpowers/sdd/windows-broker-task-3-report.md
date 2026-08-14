@@ -109,3 +109,62 @@ Do not interpret static source contracts or macOS fake-child tests as evidence t
 PowerShell 5.1 compiles the updated C#, that `GetKernelObjectSecurity` returns the expected live
 descriptor on Windows, or that real Win32 process/pipe cleanup is leak-free. Task 4 must run the
 packaged broker and control gate on the authoritative Windows worker.
+
+## Root-review remediation
+
+Root review rejected the first Task 3 commit for four lifecycle/security gaps. This section
+supersedes the affected completion claims above while preserving the real-Windows evidence
+boundary.
+
+### Directional close convergence
+
+Task 1 now records `CLOSE` independently for broker-to-parent and parent-to-broker directions. The
+first close releases both queues once and fences later data/EOF/backpressure; one opposite close is
+accepted, while same-direction duplicates remain invalid. The C# broker keeps a fixed recent-64-ID
+tombstone window after disposing a connection. It consumes one queued parent close after its own
+close, rejects never-opened IDs and duplicate parent closes, and clears both tombstone structures
+during shutdown.
+
+A fake-child race test queues response `DATA`, delivers broker `CLOSE` first, observes the later
+parent `CLOSE`, then opens and serves a second connection without a broker error. Source mutations
+require the C# input loop to route `CLOSE` before active lookup, retain directional tombstones,
+bound both the dictionary and FIFO by `MaxConnections`, and clear them at shutdown.
+
+### Child and stdio settlement
+
+`exitCode` and `signalCode` now suppress only redundant terminate/kill signals. They never bypass a
+bounded wait for the child `close` event, which is Node's post-stdio settlement event. The fake child
+can publish exit state separately from ending stdin/stdout/stderr and emitting close; startup
+rollback and terminal broker close both remain pending until that explicit settlement. A missing
+close becomes an ordered cleanup timeout error.
+
+### Exact SID parsing
+
+The READY decoder now accepts only uppercase canonical `S-1-...` text, revision exactly 1, a
+canonical decimal identifier authority no greater than `2^48-1`, and 1 through 15 canonical decimal
+subauthorities no greater than `2^32-1`. Tests cover both maximum legal bounds and reject lowercase,
+wrong/zero-padded revision or authority, authority/subauthority overflow, missing subauthorities,
+zero-padded subauthorities, and sixteen subauthorities. Exact LocalSystem/Administrators identity,
+ACE order, and full-control mask validation remain unchanged.
+
+### Close error ordering
+
+Windows server close now always observes broker cleanup before deciding its result. If broker close
+fails after an error was already stored by the broker observer or `onServerError`, the thrown
+`AggregateError` orders the broker close failure first and the stored listener error second. The
+observer error cannot mask cleanup failure.
+
+Each item began with a focused failing test for the reported behavior. The remaining platform
+concern is unchanged.
+
+Fresh post-remediation verification:
+
+```text
+focused control + Task 1 protocol + broker adapter: 52/52 passed
+focused C# source/mutation contract: 7/7 passed
+all CLI unit tests: 194/194 passed
+all architecture/package tests: 352/352 passed
+CLI build and typecheck: passed
+repository Biome lint and format: 261 files passed
+repository source versus emitted broker .ps1/.cs: byte-for-byte equal
+```

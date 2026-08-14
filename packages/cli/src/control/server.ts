@@ -586,7 +586,19 @@ async function startWindowsBrokerControlServer(
       closePromise ??= (async () => {
         dispatcher.markClosing();
         await dispatcher.closeConnections();
-        await broker.close();
+        let brokerCloseError: unknown;
+        try {
+          await broker.close();
+        } catch (error) {
+          brokerCloseError = error;
+        }
+        if (brokerCloseError !== undefined && terminalError !== undefined) {
+          throw new AggregateError(
+            [brokerCloseError, terminalError],
+            "Windows control broker close failed after an observed listener error",
+          );
+        }
+        if (brokerCloseError !== undefined) throw brokerCloseError;
         if (terminalError !== undefined) throw terminalError;
       })();
       return closePromise;

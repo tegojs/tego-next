@@ -150,7 +150,7 @@ interface DirectionState {
 }
 
 interface ConnectionState {
-  closed: boolean;
+  readonly closeSeen: Record<WindowsBrokerFrameDirection, boolean>;
   readonly directions: Record<WindowsBrokerFrameDirection, DirectionState>;
   readonly pausedBy: Record<WindowsBrokerFrameDirection, boolean>;
 }
@@ -244,7 +244,9 @@ export class WindowsBrokerConnectionState {
         if (
           direction !== "broker-to-parent" ||
           !this.#closeAllRequested ||
-          ![...this.#connections.values()].every((connection) => connection.closed)
+          ![...this.#connections.values()].every((connection) =>
+            directions.some((currentDirection) => connection.closeSeen[currentDirection]),
+          )
         ) {
           throw protocolError();
         }
@@ -263,7 +265,10 @@ export class WindowsBrokerConnectionState {
         }
         this.#lastConnectionId = frame.connectionId;
         this.#connections.set(frame.connectionId, {
-          closed: false,
+          closeSeen: {
+            "broker-to-parent": false,
+            "parent-to-broker": false,
+          },
           directions: {
             "broker-to-parent": { eof: false, queuedBytes: 0 },
             "parent-to-broker": { eof: false, queuedBytes: 0 },
@@ -307,12 +312,15 @@ export class WindowsBrokerConnectionState {
       }
       case "close": {
         requireEmptyPayload(frame);
-        const connection = this.#activeConnection(frame.connectionId);
-        for (const currentDirection of directions) {
-          this.#totalQueuedBytes -= connection.directions[currentDirection].queuedBytes;
-          connection.directions[currentDirection].queuedBytes = 0;
+        const connection = this.#connection(frame.connectionId);
+        if (connection.closeSeen[direction]) throw protocolError();
+        if (!directions.some((currentDirection) => connection.closeSeen[currentDirection])) {
+          for (const currentDirection of directions) {
+            this.#totalQueuedBytes -= connection.directions[currentDirection].queuedBytes;
+            connection.directions[currentDirection].queuedBytes = 0;
+          }
         }
-        connection.closed = true;
+        connection.closeSeen[direction] = true;
         return;
       }
       case "pause": {
@@ -345,13 +353,14 @@ export class WindowsBrokerConnectionState {
   }
 
   #activeConnection(connectionId: bigint): ConnectionState {
+    const connection = this.#connection(connectionId);
+    if (directions.some((direction) => connection.closeSeen[direction])) throw protocolError();
+    return connection;
+  }
+
+  #connection(connectionId: bigint): ConnectionState {
     const connection = this.#connections.get(connectionId);
-    if (
-      connection === undefined ||
-      connection.closed ||
-      this.#fatal ||
-      this.#closeAllAcknowledged
-    ) {
+    if (connection === undefined || this.#fatal || this.#closeAllAcknowledged) {
       throw protocolError();
     }
     return connection;

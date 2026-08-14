@@ -156,7 +156,7 @@ test("Windows broker state limits global frames and opens to their owning direct
   assert.throws(() => accept(state, parentToBroker, "close-all-ack", 0n), PROTOCOL_ERROR);
 });
 
-test("EOF only closes its own direction while CLOSE terminally closes both directions", () => {
+test("EOF is directional and opposite CLOSE frames converge exactly once", () => {
   const state = new WindowsBrokerConnectionState();
   readyAndOpen(state);
   accept(state, brokerToParent, "data", 1n, Uint8Array.from([1]));
@@ -172,7 +172,12 @@ test("EOF only closes its own direction while CLOSE terminally closes both direc
     () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([4])),
     PROTOCOL_ERROR,
   );
+  assert.throws(() => accept(state, brokerToParent, "eof", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "pause", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "resume", 1n), PROTOCOL_ERROR);
   assert.throws(() => accept(state, brokerToParent, "close", 1n), PROTOCOL_ERROR);
+  accept(state, parentToBroker, "close", 1n);
+  assert.throws(() => accept(state, parentToBroker, "close", 1n), PROTOCOL_ERROR);
 });
 
 test("PAUSE pauses only the opposite direction until its matching RESUME", () => {

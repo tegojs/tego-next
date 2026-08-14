@@ -613,16 +613,18 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
       try {
         await withDeadline(this.#childClosed.promise, this.#shutdownTimeoutMs);
         return errors;
-      } catch {
+      } catch (error) {
+        if (signal === "SIGKILL" || child.exitCode !== null || child.signalCode !== null) {
+          errors.push(error);
+          return errors;
+        }
         // Escalate once from terminate to kill while retaining cleanup errors.
       }
     }
-    if (child.exitCode === null && child.signalCode === null) {
-      try {
-        await withDeadline(this.#childClosed.promise, this.#shutdownTimeoutMs);
-      } catch (error) {
-        errors.push(error);
-      }
+    try {
+      await withDeadline(this.#childClosed.promise, this.#shutdownTimeoutMs);
+    } catch (error) {
+      errors.push(error);
     }
     return errors;
   }

@@ -221,6 +221,7 @@ function assertPowerShellContract(source) {
 function assertCSharpContract(source) {
   const entry = balancedBlock(source, "public static int Run(");
   const execute = balancedBlock(source, "internal int Execute(");
+  const inputLoop = balancedBlock(source, "private void InputLoop(");
   const createPipe = balancedBlock(source, "private static SafeFileHandle CreateVerifiedPipe(");
   const descriptor = balancedBlock(
     source,
@@ -242,6 +243,11 @@ function assertCSharpContract(source) {
   const pipeConnection = balancedBlock(source, "private sealed class PipeConnection");
   const readLoop = balancedBlock(pipeConnection, "private void ReadLoop(");
   const closeAll = balancedBlock(source, "private void CloseAllFromParent(");
+  const closeConnection = balancedBlock(source, "private void CloseConnection(");
+  const closeFromParent = balancedBlock(source, "private void CloseFromParent(");
+  const rememberFirstClose = balancedBlock(source, "private void RememberFirstCloseLocked(");
+  const acceptLateParentClose = balancedBlock(source, "private void AcceptLateParentCloseLocked(");
+  const closeEveryPipe = balancedBlock(source, "private void CloseEveryPipe(");
   const pendingRead = balancedBlock(source, "private sealed class PendingReadOperation");
   const retryCanceledRead = balancedBlock(source, "private static bool ShouldRetryCanceledRead(");
   const connectionDispose = balancedBlock(pipeConnection, "public void Dispose(");
@@ -387,6 +393,22 @@ function assertCSharpContract(source) {
   );
   assert.match(closeAll, /_closeAllAcknowledged = true/u);
   assert.match(closeAll, /_closeAllAckQueued = true/u);
+  assert.match(source, /Dictionary<ulong, ClosedConnectionState> _closedConnections/u);
+  assert.match(source, /Queue<ulong> _closedConnectionOrder/u);
+  assert.match(closeConnection, /RememberFirstCloseLocked\(connection\.Id, notifyParent\)/u);
+  assert.match(closeConnection, /AcceptLateParentCloseLocked\(connection\.Id\)/u);
+  assert.match(closeFromParent, /AcceptLateParentCloseLocked\(id\)/u);
+  assert.match(rememberFirstClose, /_closedConnections\.Add/u);
+  assert.match(rememberFirstClose, /while \(_closedConnectionOrder\.Count > MaxConnections\)/u);
+  assert.match(acceptLateParentClose, /state\.ParentCloseSeen/u);
+  assert.match(acceptLateParentClose, /state\.BrokerCloseSeen/u);
+  assert.match(closeEveryPipe, /_closedConnections\.Clear\(\)/u);
+  assert.match(closeEveryPipe, /_closedConnectionOrder\.Clear\(\)/u);
+  assert.match(inputLoop, /CloseFromParent\(frame\.ConnectionId\)/u);
+  assert.ok(
+    inputLoop.indexOf("CloseFromParent(frame.ConnectionId)") <
+      inputLoop.indexOf("FindConnection(frame.ConnectionId)"),
+  );
   assert.match(source, /PrepareClientData\([\s\S]+lock \(_outputGate\)[\s\S]+ContainsConnection/u);
   const outputCriticalSections = repeatedBalancedBlocks(source, "lock (_outputGate)");
   assert.ok(outputCriticalSections.length >= 6);
@@ -517,6 +539,15 @@ test("source contracts reject security and lifecycle mutations", async () => {
     ),
     mutateOnce(csharp, "_closeAllAcknowledged = true;", ""),
     mutateOnce(csharp, "_closeAllAckQueued = true;", ""),
+    mutateOnce(csharp, "RememberFirstCloseLocked(connection.Id, notifyParent);", ""),
+    mutateOnce(csharp, "AcceptLateParentCloseLocked(connection.Id);", ""),
+    mutateOnce(
+      csharp,
+      "CloseFromParent(frame.ConnectionId);",
+      "FindConnection(frame.ConnectionId);",
+    ),
+    mutateOnce(csharp, "while (_closedConnectionOrder.Count > MaxConnections)", "while (false)"),
+    mutateOnce(csharp, "_closedConnections.Clear();", ""),
     mutateOnce(csharp, "TerminateProcess(GetCurrentProcess(), 1);", ""),
     mutateOnce(csharp, "Environment.FailFast(StageCode(FailureStage.Resource));", ""),
     mutateOnce(csharp, "_pipeHandle.DangerousAddRef(ref addRef);", "addRef = true;"),

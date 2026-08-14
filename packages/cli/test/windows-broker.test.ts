@@ -30,7 +30,9 @@ interface FakeBrokerChild extends WindowsBrokerChildProcess {
   readonly stderr: PassThrough;
   readonly stdin: PassThrough;
   readonly stdout: PassThrough;
+  beginExit(code?: number | null, signal?: NodeJS.Signals | null): void;
   exit(code?: number | null, signal?: NodeJS.Signals | null): void;
+  settleClose(): void;
 }
 
 function createFakeBrokerChild(options: { readonly exitOnKill?: boolean } = {}): FakeBrokerChild {
@@ -45,16 +47,25 @@ function createFakeBrokerChild(options: { readonly exitOnKill?: boolean } = {}):
     stdin: new PassThrough(),
     stdout: new PassThrough(),
   });
-  let exited = false;
-  child.exit = (code = 0, signal = null) => {
-    if (exited) return;
-    exited = true;
+  let exitStarted = false;
+  let closed = false;
+  child.beginExit = (code = 0, signal = null) => {
+    if (exitStarted) return;
+    exitStarted = true;
     Object.assign(child, { exitCode: code, signalCode: signal });
+    child.emit("exit", code, signal);
+  };
+  child.settleClose = () => {
+    if (closed) return;
+    closed = true;
     child.stdout.end();
     child.stderr.end();
     child.stdin.end();
-    child.emit("exit", code, signal);
-    setImmediate(() => child.emit("close", code, signal));
+    setImmediate(() => child.emit("close", child.exitCode, child.signalCode));
+  };
+  child.exit = (code = 0, signal = null) => {
+    child.beginExit(code, signal);
+    child.settleClose();
   };
   child.kill = (signal) => {
     child.kills.push(signal);
@@ -202,6 +213,28 @@ test("READY descriptor is a strict canonical versioned binary readback", () => {
   const wrongMagic = encodeReadyDescriptor();
   wrongMagic.write("FAIL", 0, "ascii");
   assert.throws(() => decodeWindowsBrokerReadyDescriptor(wrongMagic), UNSAFE);
+
+  const maximumSid = `S-1-281474976710655-${Array.from({ length: 15 }, (_, index) => index).join("-")}`;
+  assert.equal(
+    decodeWindowsBrokerReadyDescriptor(encodeReadyDescriptor({ ownerSid: maximumSid })).ownerSid,
+    maximumSid,
+  );
+  for (const invalidSid of [
+    "s-1-5-21",
+    "S-2-5-21",
+    "S-01-5-21",
+    "S-1-05-21",
+    "S-1-281474976710656-1",
+    "S-1-5",
+    "S-1-5-01",
+    "S-1-5-4294967296",
+    `S-1-5-${Array.from({ length: 16 }, (_, index) => index).join("-")}`,
+  ]) {
+    assert.throws(
+      () => decodeWindowsBrokerReadyDescriptor(encodeReadyDescriptor({ ownerSid: invalidSid })),
+      UNSAFE,
+    );
+  }
 });
 
 test("broker spawn uses the packaged absolute script and fixed shell-free PowerShell arguments", async () => {
@@ -295,6 +328,45 @@ test("broker converts OPEN/DATA/EOF and virtual connection response DATA/CLOSE f
   await closeGracefully(broker, child, parentFrames);
 });
 
+test("broker and parent CLOSE frames converge without poisoning later connections", async () => {
+  const { broker, child, startup } = createStartedBroker();
+  const parentFrames = collectParentFrames(child);
+  const connections: Parameters<Parameters<typeof broker.onConnection>[0]>[0][] = [];
+  const failures: Error[] = [];
+  broker.onConnection((connection) => connections.push(connection));
+  broker.onError((error) => failures.push(error));
+  await startup;
+
+  child.stdout.write(brokerFrame("open", 11n));
+  const first = connections[0];
+  assert.ok(first !== undefined);
+  first.write("response");
+  await eventually(() =>
+    parentFrames.some(({ connectionId, type }) => connectionId === 11n && type === "data"),
+  );
+  first.end();
+  child.stdout.write(brokerFrame("close", 11n));
+  await eventually(() =>
+    parentFrames.some(({ connectionId, type }) => connectionId === 11n && type === "close"),
+  );
+
+  child.stdout.write(brokerFrame("open", 12n));
+  const second = connections[1];
+  assert.ok(second !== undefined);
+  const received: Buffer[] = [];
+  second.on("data", (chunk: Buffer) => received.push(chunk));
+  const ended = once(second, "end");
+  child.stdout.write(
+    Buffer.concat([brokerFrame("data", 12n, Buffer.from("healthy")), brokerFrame("eof", 12n)]),
+  );
+  await ended;
+  assert.equal(Buffer.concat(received).toString("utf8"), "healthy");
+  assert.deepEqual(failures, []);
+
+  child.stdout.write(brokerFrame("close", 12n));
+  await closeGracefully(broker, child, parentFrames);
+});
+
 test("virtual connection propagates readable backpressure with PAUSE and RESUME", async () => {
   const { broker, child, startup } = createStartedBroker(createFakeBrokerChild(), {
     maxConnections: 2,
@@ -341,6 +413,34 @@ test("startup abort and READY timeout wait for child and stream settlement", asy
     assert.equal(child.stdout.readableEnded, true);
     assert.equal(child.stderr.readableEnded, true);
   }
+});
+
+test("rollback and terminal close wait after exit state until stdio and child close settle", async () => {
+  const startupChild = createFakeBrokerChild({ exitOnKill: false });
+  const controller = new AbortController();
+  const starting = createWindowsControlBroker({
+    endpoint: "\\\\.\\pipe\\tego-exit-before-startup-close",
+    maxConnections: 1,
+    maxQueuedBytes: 1024,
+    shutdownTimeoutMs: 50,
+    spawnBroker: () => startupChild,
+    startupTimeoutMs: 100,
+  }).start(controller.signal);
+  startupChild.beginExit(1);
+  controller.abort();
+  assert.equal(await settlesImmediately(starting), false);
+  startupChild.settleClose();
+  await assert.rejects(starting, { name: "AbortError" });
+
+  const terminalChild = createFakeBrokerChild({ exitOnKill: false });
+  const terminal = createStartedBroker(terminalChild);
+  await terminal.startup;
+  terminalChild.beginExit(1);
+  terminalChild.stdout.write(Buffer.alloc(24, 0xff));
+  const closing = terminal.broker.close();
+  assert.equal(await settlesImmediately(closing), false);
+  terminalChild.settleClose();
+  await assert.rejects(closing, UNSAFE);
 });
 
 test("malformed stdout, FATAL, child crash, and non-allowlisted stderr fail closed", async () => {
