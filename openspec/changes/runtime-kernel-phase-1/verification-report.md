@@ -5,7 +5,8 @@
 - Release target: `2be6a7ad7d470fe77fdf2cee6ba8269ef517cbe3`
 - Local verification: passed on 2026-08-15 (Asia/Shanghai)
 - Reviewed Windows broker gate: passed on source `ae83ef4c303842a7f4567fbdd4b3ebb19435329b`
-- Fresh authoritative GitHub Actions for the Task 5 evidence commit: pending
+- Fresh authoritative GitHub Actions: passed on first evidence commit
+  `1d401c76ee437bdebaf6c73f3c1595cd0297496a`
 - npm publication, Git tag, GitHub prerelease, spec sync, and OpenSpec archive: pending Task 11
 
 The release target is the exact documentation/specification source tested locally. Commits after
@@ -163,20 +164,37 @@ The transient logs are retained outside the repository at `/tmp/tego-task5-evide
 
 ## Fresh Authoritative CI
 
-Pending. This local-evidence commit will be the first allowlisted commit after the release target.
-It must pass the exact `CI` workflow with all four required jobs:
+The first allowlisted evidence commit `1d401c76ee437bdebaf6c73f3c1595cd0297496a`
+passed exact-SHA [run 31839785333](https://github.com/tegojs/tego-next/actions/runs/31839785333).
+GitHub reported that exact `headSha`, overall `success`, and four successful required jobs.
+Canonical sorted run metadata SHA-256:
+`e74ae0a73bdf3548582726b443579ada5fe7d18f7c42c589c23870f953efa123`.
 
-- `quality`
-- `windows-control` on `windows-2025`, with the packed broker gate and one success marker
-- `integration` with PostgreSQL 16.14
-- `system-e2e` with real single-Main and multi-Main flows
+| Job | Result | Lines | Frozen log SHA-256 |
+| --- | --- | ---: | --- |
+| [Quality / 94893940998](https://github.com/tegojs/tego-next/actions/runs/31839785333/job/94893940998) | PASS | 2,140 | `b84b5aec7afa5acc75d9fef56f71ca62f79c78eb393f4185b29af2e1042a9b21` |
+| [PostgreSQL integration / 94893941077](https://github.com/tegojs/tego-next/actions/runs/31839785333/job/94893941077) | PASS | 827 | `c663cc100c705d9bfb795c452e4dfa60a9398c103629deaa7259e56427d7b2da` |
+| [Main and Worker process E2E / 94893941127](https://github.com/tegojs/tego-next/actions/runs/31839785333/job/94893941127) | PASS | 489 | `cc8e89ca46c3d1b837d97bd0a83812b2a5b435edb2dad68b09179bd5dc931362` |
+| [Windows control-pipe security / 94893941139](https://github.com/tegojs/tego-next/actions/runs/31839785333/job/94893941139) | PASS; exactly one `TEGO_WINDOWS_CONTROL_GATE_OK` | 227 | `e4985b7458714f7944fc585ee7329b78cc36e830378d5acacedb2ee83f871a2c` |
 
-After those jobs pass, one final allowlisted follow-up will record immutable run/job URLs and
-metadata/log hashes. That follow-up must then pass its exact-SHA documentation/quality gate.
+The final allowlisted evidence follow-up containing this section must pass its exact-SHA
+documentation/quality gate before Task 11 may use preflight.
+
+## Evidence-only Chain
+
+| Position | SHA | Contents |
+| --- | --- | --- |
+| release target | `2be6a7ad7d470fe77fdf2cee6ba8269ef517cbe3` | reviewed docs/specs/tests and unchanged package sources |
+| evidence 1 | `1d401c76ee437bdebaf6c73f3c1595cd0297496a` | local verification and pending-CI metadata; source of four-job run 31839785333 |
+| evidence 2 | this final follow-up commit | immutable CI URLs/hashes and completed metadata only |
+
+Both evidence commits are linear and touch only this report and `.comet.yaml`, the exact publisher
+allowlist. The chain contains no package, executable, test, workflow, release-note, or spec change.
 
 ## Machine-readable Release Evidence
 
-Task 11 preflight must continue to fail closed until fresh authoritative CI is passed.
+The exact release target has local verification, and the first allowlisted evidence commit has
+fresh authoritative four-job CI.
 
 ```release-evidence
 {
@@ -187,9 +205,9 @@ Task 11 preflight must continue to fail closed until fresh authoritative CI is p
     "sourceSha": "2be6a7ad7d470fe77fdf2cee6ba8269ef517cbe3"
   },
   "authoritativeCi": {
-    "status": "pending",
-    "sourceSha": null,
-    "url": null
+    "status": "passed",
+    "sourceSha": "1d401c76ee437bdebaf6c73f3c1595cd0297496a",
+    "url": "https://github.com/tegojs/tego-next/actions/runs/31839785333"
   }
 }
 ```
