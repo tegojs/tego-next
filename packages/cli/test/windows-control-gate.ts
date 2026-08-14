@@ -207,9 +207,20 @@ function runNativePipeProbe(endpoint: string): number {
     timeout: PROCESS_CLEANUP_TIMEOUT_MS,
     windowsHide: true,
   });
+  const probeErrorCode = (probe.error as NodeJS.ErrnoException | undefined)?.code;
   task4NonAuthoritativeStageDetail =
     probe.error !== undefined
-      ? "powershell-spawn-error"
+      ? probeErrorCode === "ETIMEDOUT"
+        ? "powershell-spawn-timeout"
+        : probeErrorCode === "ENOBUFS"
+          ? "powershell-spawn-buffer"
+          : probeErrorCode === "ENOENT"
+            ? "powershell-spawn-missing"
+            : probeErrorCode === "EACCES"
+              ? "powershell-spawn-denied"
+              : probeErrorCode === "EINVAL"
+                ? "powershell-spawn-invalid"
+                : "powershell-spawn-other"
       : probe.signal !== null
         ? "powershell-signal"
         : probe.stdout !== ""

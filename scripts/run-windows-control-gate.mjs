@@ -19,13 +19,13 @@ const temporaryTaskDiagnosticTokens = [
 const expectedParentCrashCleanupSha256 =
   "bac041802252245f8a4a01f1270699a67282dde9bbb65c66dec80fbbaefbf3ef";
 const expectedWindowsGateSourceSha256 =
-  "0965ff9d074096e56fbdb8b953a27797e8f3420633cd42c4f7d5664999521df1";
+  "d06fa0b6d7209b3bc1795b437d2a17598c0e105959300629ea9c0f18d6ffb41b";
 const expectedWindowsBrokerCSharpSourceSha256 =
   "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4";
 const expectedWindowsBrokerPowerShellSourceSha256 =
   "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53";
 const expectedWindowsGateRunnerSourceSha256 =
-  "dc24428c857726edf71593723661e61ff576b7309b48bdc0e6c0e7aad3385a36";
+  "5060aeb4d7b80583446fd45897717c0fe18f8bd7e218b3d8af58a59325ec63a6";
 const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -90,9 +90,20 @@ const expectedRunNativePipeProbeBody = [
   "    timeout: PROCESS_CLEANUP_TIMEOUT_MS,",
   "    windowsHide: true,",
   "  });",
+  "  const probeErrorCode = (probe.error as NodeJS.ErrnoException | undefined)?.code;",
   "  task4NonAuthoritativeStageDetail =",
   "    probe.error !== undefined",
-  '      ? "powershell-spawn-error"',
+  '      ? probeErrorCode === "ETIMEDOUT"',
+  '        ? "powershell-spawn-timeout"',
+  '        : probeErrorCode === "ENOBUFS"',
+  '          ? "powershell-spawn-buffer"',
+  '          : probeErrorCode === "ENOENT"',
+  '            ? "powershell-spawn-missing"',
+  '            : probeErrorCode === "EACCES"',
+  '              ? "powershell-spawn-denied"',
+  '              : probeErrorCode === "EINVAL"',
+  '                ? "powershell-spawn-invalid"',
+  '                : "powershell-spawn-other"',
   "      : probe.signal !== null",
   '        ? "powershell-signal"',
   '        : probe.stdout !== ""',
