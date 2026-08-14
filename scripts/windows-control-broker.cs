@@ -2421,22 +2421,34 @@ public static class TegoWindowsControlBroker
             EmitStage(FailureStage.SelfTest);
             return 1;
         }
+        // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after localizing this Windows RED.
+        string selfTestStage = "CODEC";
         try
         {
             TestCodecConstants();
+            selfTestStage = "DESCRIPTOR";
             TestDescriptorConstruction();
+            selfTestStage = "PARENT_WATCH";
             TestParentWatchCancellation();
+            selfTestStage = "INVALID_FRAME";
             TestInvalidFrameRejection();
+            selfTestStage = "RESOURCE_CLEANUP";
             TestRepeatedResourceCleanup();
+            selfTestStage = "PRIVATE_PIPE";
             TestPrivatePipeCancellation();
+            selfTestStage = "WRITE_CANCEL";
             TestWritePreIssueCancellation();
+            selfTestStage = "PENDING_CLOSE";
             TestPendingCloseAdmission();
+            selfTestStage = "PAUSE_RESUME";
             TestPauseImmediateResume();
+            selfTestStage = "PIPE_CLEANUP";
             TestRepeatedPipeCleanup();
             return 0;
         }
         catch
         {
+            Console.Error.WriteLine("TEGO_TASK4_NON_AUTHORITATIVE_SELFTEST_" + selfTestStage);
             EmitStage(FailureStage.SelfTest);
             return 1;
         }

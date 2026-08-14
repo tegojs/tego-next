@@ -293,11 +293,21 @@ async function runPowerShellSelfTest(): Promise<void> {
   else if (selfTest.status !== 0) {
     if (/^TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED\r?\n$/u.test(selfTest.stderr)) {
       diagnosticStage = "powershell-selftest-compile";
-    } else if (/^TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED\r?\n$/u.test(selfTest.stderr)) {
-      diagnosticStage = "powershell-selftest-native";
-    } else if (/^TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED\r?\n$/u.test(selfTest.stderr)) {
-      diagnosticStage = "powershell-selftest-version";
-    } else diagnosticStage = "powershell-selftest-nonzero-other";
+    } else {
+      const nativeDiagnostic =
+        /^TEGO_TASK4_NON_AUTHORITATIVE_SELFTEST_(CODEC|DESCRIPTOR|PARENT_WATCH|INVALID_FRAME|RESOURCE_CLEANUP|PRIVATE_PIPE|WRITE_CANCEL|PENDING_CLOSE|PAUSE_RESUME|PIPE_CLEANUP)\r?\nTEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED\r?\n$/u.exec(
+          selfTest.stderr,
+        );
+      if (nativeDiagnostic !== null) {
+        diagnosticStage = `powershell-selftest-native-${nativeDiagnostic[1]?.toLowerCase().replaceAll("_", "-")}`;
+      } else if (/^TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED\r?\n$/u.test(selfTest.stderr)) {
+        diagnosticStage = "powershell-selftest-native-unclassified";
+      } else if (
+        /^TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED\r?\n$/u.test(selfTest.stderr)
+      ) {
+        diagnosticStage = "powershell-selftest-version";
+      } else diagnosticStage = "powershell-selftest-nonzero-other";
+    }
   } else if (selfTest.stdout !== "" || selfTest.stderr !== "") {
     diagnosticStage = "powershell-selftest-output";
   } else diagnosticStage = "powershell-selftest-complete";
