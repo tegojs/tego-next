@@ -91,7 +91,9 @@ function exactAwaitCount(source, expression) {
 }
 
 function hasActiveStageExecutor(source) {
-  const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")?.trim();
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
+    ?.replaceAll("\r\n", "\n")
+    .trim();
   return (
     body === "await operation();" || body === "nonAuthoritativeStage = stage;\n  await operation();"
   );
@@ -277,6 +279,8 @@ const gateProgram = fileURLToPath(
 );
 
 let preparedConsumer;
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
+let nonAuthoritativeOuterStage = "source-contract";
 
 async function runWindowsControlGateStage(_stage, operation) {
   await operation();
@@ -356,7 +360,9 @@ export async function runWindowsControlGate(platform = process.platform) {
     if (validateWindowsControlGateContract({ gateSource, runnerSource }).length > 0) {
       throw new Error("Windows gate source contract is incomplete");
     }
+    nonAuthoritativeOuterStage = "packed-clean-consumer";
     await runWindowsControlGateStage("packed-clean-consumer", preparePackedWindowsControlConsumer);
+    nonAuthoritativeOuterStage = "installed-consumer-execution";
     await runInstalledWindowsControlGate();
   } finally {
     if (preparedConsumer !== undefined) {
@@ -371,6 +377,9 @@ if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.
   try {
     await runWindowsControlGate();
   } catch {
+    process.stderr.write(
+      `TEGO_TASK4_NON_AUTHORITATIVE_OUTER_STAGE:${nonAuthoritativeOuterStage}\n`,
+    );
     process.stderr.write("TEGO_WINDOWS_CONTROL_GATE_FAILED\n");
     process.exitCode = 1;
   }

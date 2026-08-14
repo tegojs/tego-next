@@ -378,6 +378,13 @@ test("Windows control gate source validation rejects removed, reordered, softene
     validateWindowsControlGateContract({ gateSource: gateFixture, runnerSource: runnerFixture }),
     [],
   );
+  assert.deepEqual(
+    validateWindowsControlGateContract({
+      gateSource: gateFixture.replaceAll("\n", "\r\n"),
+      runnerSource: runnerFixture.replaceAll("\n", "\r\n"),
+    }),
+    [],
+  );
 
   for (const [index, [stage, implementation]] of requiredWindowsControlGateStages.entries()) {
     const sourceName = index === 0 ? "runnerSource" : "gateSource";
@@ -416,6 +423,20 @@ test("Windows control gate source validation rejects removed, reordered, softene
           runnerSource: sourceName === "runnerSource" ? mutation : runnerFixture,
         });
         assert.ok(diagnostics.length > 0, `${stage} ${mutationName} must fail closed`);
+        const crlfDiagnostics = validateWindowsControlGateContract({
+          gateSource: (sourceName === "gateSource" ? mutation : gateFixture).replaceAll(
+            "\n",
+            "\r\n",
+          ),
+          runnerSource: (sourceName === "runnerSource" ? mutation : runnerFixture).replaceAll(
+            "\n",
+            "\r\n",
+          ),
+        });
+        assert.ok(
+          crlfDiagnostics.length > 0,
+          `${stage} ${mutationName} must fail closed with CRLF`,
+        );
       });
     }
 
