@@ -188,7 +188,11 @@ export async function runWindowsControlGate(platform = process.platform) {
 if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
   try {
     await runWindowsControlGate();
-  } catch {
+  } catch (error) {
+    // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after the first Windows RED is localized.
+    process.stderr.write(
+      `TEGO_TASK4_NON_AUTHORITATIVE_DIAGNOSTIC:${error instanceof Error ? error.stack : typeof error}\n`,
+    );
     process.stderr.write("TEGO_WINDOWS_CONTROL_GATE_FAILED\n");
     process.exitCode = 1;
   }
