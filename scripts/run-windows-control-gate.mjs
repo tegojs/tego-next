@@ -3,6 +3,7 @@ import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { diagnosticCode } from "@tego/contracts";
 import { packWorkspaceSet, withPackedConsumer } from "./package-contract.mjs";
 
 export const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
@@ -14,6 +15,26 @@ const gateSourcePath = fileURLToPath(
   new URL("../packages/cli/test/windows-control-gate.ts", import.meta.url),
 );
 const runnerSourcePath = fileURLToPath(import.meta.url);
+
+export function isExpectedMalformedServerClose(error, observedFailure) {
+  return (
+    error instanceof AggregateError &&
+    error.errors.length === 2 &&
+    diagnosticCode(error.errors[0]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&
+    error.errors[1] === observedFailure &&
+    diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"
+  );
+}
+
+const expectedMalformedServerCloseBody = [
+  "return (",
+  "    error instanceof AggregateError &&",
+  "    error.errors.length === 2 &&",
+  '    diagnosticCode(error.errors[0]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&',
+  "    error.errors[1] === observedFailure &&",
+  '    diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"',
+  "  );",
+].join("\n");
 
 const requiredWindowsControlGateStages = [
   [
@@ -77,6 +98,20 @@ function uniqueTopLevelAsyncFunctionBody(source, name) {
   return bodyEnd === -1 ? undefined : source.slice(bodyStart + 1, bodyEnd);
 }
 
+function uniqueTopLevelSyncFunctionBody(source, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const declarations = [
+    ...source.matchAll(new RegExp(`^(?:export\\s+)?function ${escaped}\\b`, "gmu")),
+  ];
+  if (declarations.length !== 1) return undefined;
+  const bodyStart = source.indexOf("{", declarations[0].index);
+  if (bodyStart === -1) return undefined;
+  const bodyEndPattern = /^\}\r?$/gmu;
+  bodyEndPattern.lastIndex = bodyStart;
+  const bodyEnd = bodyEndPattern.exec(source)?.index ?? -1;
+  return bodyEnd === -1 ? undefined : source.slice(bodyStart + 1, bodyEnd);
+}
+
 function stageCalls(body) {
   return [
     ...body.matchAll(
@@ -94,9 +129,7 @@ function hasActiveStageExecutor(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
     ?.replaceAll("\r\n", "\n")
     .trim();
-  return (
-    body === "await operation();" || body === "nonAuthoritativeStage = stage;\n  await operation();"
-  );
+  return body === "await operation();";
 }
 
 function hasForbiddenGateFlow(body) {
@@ -173,7 +206,7 @@ function hasMalformedOwnershipTransfer(source) {
   const requiredInOrder = [
     'let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
     "await writeMalformedFrame(tracked.broker);",
-    "closeRejected ? Promise.reject(closeError) : Promise.resolve(),",
+    "isExpectedMalformedServerClose(error, failure),",
     "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
     "await assertPipeUnavailable(tracked.endpoint);",
     "tracked = undefined;",
@@ -231,6 +264,29 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   if (!hasMalformedOwnershipTransfer(gateSource)) {
     errors.push("malformed-frame cleanup ownership must release only after its postconditions");
   }
+  const gateCloseMatcher = uniqueTopLevelSyncFunctionBody(
+    gateSource,
+    "isExpectedMalformedServerClose",
+  )
+    ?.replaceAll("\r\n", "\n")
+    .trim();
+  const runnerCloseMatcher = uniqueTopLevelSyncFunctionBody(
+    runnerSource,
+    "isExpectedMalformedServerClose",
+  )
+    ?.replaceAll("\r\n", "\n")
+    .trim();
+  if (
+    gateCloseMatcher === undefined ||
+    runnerCloseMatcher === undefined ||
+    gateCloseMatcher !== expectedMalformedServerCloseBody ||
+    runnerCloseMatcher !== expectedMalformedServerCloseBody
+  ) {
+    errors.push("malformed-frame server close must retain its exact ordered unsafe aggregate");
+  }
+  if (`${gateSource}\n${runnerSource}`.includes(temporaryTaskDiagnosticMarker)) {
+    errors.push("Windows gate cannot retain temporary diagnostic output");
+  }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(
       stage === "packed-clean-consumer" ? runnerSource : gateSource,
@@ -279,8 +335,6 @@ const gateProgram = fileURLToPath(
 );
 
 let preparedConsumer;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let nonAuthoritativeOuterStage = "source-contract";
 
 async function runWindowsControlGateStage(_stage, operation) {
   await operation();
@@ -360,9 +414,7 @@ export async function runWindowsControlGate(platform = process.platform) {
     if (validateWindowsControlGateContract({ gateSource, runnerSource }).length > 0) {
       throw new Error("Windows gate source contract is incomplete");
     }
-    nonAuthoritativeOuterStage = "packed-clean-consumer";
     await runWindowsControlGateStage("packed-clean-consumer", preparePackedWindowsControlConsumer);
-    nonAuthoritativeOuterStage = "installed-consumer-execution";
     await runInstalledWindowsControlGate();
   } finally {
     if (preparedConsumer !== undefined) {
@@ -377,9 +429,6 @@ if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.
   try {
     await runWindowsControlGate();
   } catch {
-    process.stderr.write(
-      `TEGO_TASK4_NON_AUTHORITATIVE_OUTER_STAGE:${nonAuthoritativeOuterStage}\n`,
-    );
     process.stderr.write("TEGO_WINDOWS_CONTROL_GATE_FAILED\n");
     process.exitCode = 1;
   }

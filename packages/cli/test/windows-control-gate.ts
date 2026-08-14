@@ -14,7 +14,7 @@ import {
   startControlServer,
   type WindowsBrokerSecurityDescriptor,
 } from "@tego/cli";
-import { parseRuntimeStatus, type RuntimeOperations } from "@tego/contracts";
+import { diagnosticCode, parseRuntimeStatus, type RuntimeOperations } from "@tego/contracts";
 
 const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
@@ -74,10 +74,16 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let nonAuthoritativeStage = "powershell-csharp-self-test";
-let nonAuthoritativeMalformedStage = "not-entered";
-let nonAuthoritativeCleanupStage = "not-entered";
+
+function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
+  return (
+    error instanceof AggregateError &&
+    error.errors.length === 2 &&
+    diagnosticCode(error.errors[0]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&
+    error.errors[1] === observedFailure &&
+    diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"
+  );
+}
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -226,19 +232,14 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
 }
 
 async function cleanupTrackedServer(tracked: TrackedServer): Promise<void> {
-  nonAuthoritativeCleanupStage = "server-close";
   try {
     await tracked.server.close();
   } catch {}
-  nonAuthoritativeCleanupStage = "child-kill";
   if (tracked.broker.exitCode === null && tracked.broker.signalCode === null) {
     tracked.broker.kill("SIGKILL");
   }
-  nonAuthoritativeCleanupStage = "child-close";
   await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
-  nonAuthoritativeCleanupStage = "pipe-proof";
   await assertPipeUnavailable(tracked.endpoint);
-  nonAuthoritativeCleanupStage = "complete";
 }
 
 async function assertStatus(endpoint: string, requestId: string): Promise<void> {
@@ -254,10 +255,9 @@ async function assertStatus(endpoint: string, requestId: string): Promise<void> 
 }
 
 async function runWindowsControlGateStage(
-  stage: string,
+  _stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
-  nonAuthoritativeStage = stage;
   await operation();
 }
 
@@ -329,47 +329,17 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 }
 
 async function runMalformedFrameFailure(): Promise<void> {
-  nonAuthoritativeMalformedStage = "start";
-  nonAuthoritativeCleanupStage = "not-entered";
   let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");
   try {
-    nonAuthoritativeMalformedStage = "write";
     await writeMalformedFrame(tracked.broker);
-    nonAuthoritativeMalformedStage = "broker-failure";
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
-    nonAuthoritativeMalformedStage = "server-close";
-    let closeError: unknown;
-    let closeRejected = false;
-    try {
-      await tracked.server.close();
-    } catch (error) {
-      closeRejected = true;
-      closeError = error;
-    }
-    if (!closeRejected) {
-      nonAuthoritativeMalformedStage = "server-close-resolved";
-    } else if (closeError instanceof AggregateError) {
-      nonAuthoritativeMalformedStage = "server-close-aggregate";
-    } else if (
-      closeError instanceof Error &&
-      /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u.test(closeError.message)
-    ) {
-      nonAuthoritativeMalformedStage = "server-close-direct-unsafe";
-    } else {
-      nonAuthoritativeMalformedStage = "server-close-other";
-    }
-    await assert.rejects(
-      closeRejected ? Promise.reject(closeError) : Promise.resolve(),
-      /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u,
+    await assert.rejects(tracked.server.close(), (error: unknown) =>
+      isExpectedMalformedServerClose(error, failure),
     );
-    nonAuthoritativeMalformedStage = "child-close";
     await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
-    nonAuthoritativeMalformedStage = "pipe-proof";
     await assertPipeUnavailable(tracked.endpoint);
-    nonAuthoritativeMalformedStage = "ownership-release";
     tracked = undefined;
-    nonAuthoritativeMalformedStage = "complete";
   } finally {
     if (tracked !== undefined) await cleanupTrackedServer(tracked);
   }
@@ -508,13 +478,6 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${nonAuthoritativeStage}\n`);
-    process.stderr.write(
-      `TEGO_TASK4_NON_AUTHORITATIVE_MALFORMED_STAGE:${nonAuthoritativeMalformedStage}\n`,
-    );
-    process.stderr.write(
-      `TEGO_TASK4_NON_AUTHORITATIVE_CLEANUP_STAGE:${nonAuthoritativeCleanupStage}\n`,
-    );
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {

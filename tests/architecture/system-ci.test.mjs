@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { DiagnosticError, runtimeDiagnostic } from "@tego/contracts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const workflowPath = join(root, ".github", "workflows", "ci.yml");
@@ -51,18 +52,11 @@ const windowsControlGateImplementationFixtureBodies = new Map([
       '  let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
       "  try {",
       "    await writeMalformedFrame(tracked.broker);",
+      "    const failure = new Error();",
       '    "PROTOCOL_CONTROL_ENDPOINT_UNSAFE";',
-      "    let closeError;",
-      "    let closeRejected = false;",
-      "    try {",
-      "      await tracked.server.close();",
-      "    } catch (error) {",
-      "      closeRejected = true;",
-      "      closeError = error;",
-      "    }",
       "    await assert.rejects(",
-      "      closeRejected ? Promise.reject(closeError) : Promise.resolve(),",
-      "      /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u,",
+      "      tracked.server.close(),",
+      "      (error) => isExpectedMalformedServerClose(error, failure),",
       "    );",
       "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
       "    await assertPipeUnavailable(tracked.endpoint);",
@@ -339,12 +333,23 @@ test("Windows control gate source validation rejects removed, reordered, softene
   );
   const markerWrite = `  process.stdout.write(\`\${WINDOWS_CONTROL_GATE_MARKER}\\n\`);`;
   const activeStageHelper = [
-    "async function runWindowsControlGateStage(stage, operation) {",
-    "  nonAuthoritativeStage = stage;",
+    "async function runWindowsControlGateStage(_stage, operation) {",
     "  await operation();",
     "}",
   ].join("\n");
+  const closeMatcherFixture = [
+    "function isExpectedMalformedServerClose(error, observedFailure) {",
+    "  return (",
+    "    error instanceof AggregateError &&",
+    "    error.errors.length === 2 &&",
+    '    diagnosticCode(error.errors[0]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&',
+    "    error.errors[1] === observedFailure &&",
+    '    diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"',
+    "  );",
+    "}",
+  ].join("\n");
   const runnerFixture = [
+    closeMatcherFixture,
     activeStageHelper,
     windowsControlGateImplementationFixture(requiredWindowsControlGateStages[0][1]),
     "async function runWindowsControlGate() {",
@@ -354,6 +359,7 @@ test("Windows control gate source validation rejects removed, reordered, softene
     "}",
   ].join("\n");
   const gateFixture = [
+    closeMatcherFixture,
     activeStageHelper,
     [
       "async function startTrackedServer() {",
@@ -576,6 +582,76 @@ test("Windows malformed-frame cleanup transfers ownership only after exact child
       );
     });
   }
+
+  for (const [name, replaceFrom, replaceWith] of [
+    ["aggregate cardinality", "error.errors.length === 2", "error.errors.length >= 1"],
+    [
+      "primary diagnostic",
+      'diagnosticCode(error.errors[0]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"',
+      "error.errors[0] instanceof Error",
+    ],
+    [
+      "observer identity",
+      "error.errors[1] === observedFailure",
+      "error.errors[0] === observedFailure",
+    ],
+    [
+      "observer diagnostic",
+      'diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"',
+      "error.errors[1] instanceof Error",
+    ],
+  ]) {
+    await t.test(`malformed close matcher ${name}`, () => {
+      const mutatedGate = gateSource.replace(replaceFrom, replaceWith);
+      const mutatedRunner = runnerSource.replace(replaceFrom, replaceWith);
+      assert.notEqual(mutatedGate, gateSource);
+      assert.notEqual(mutatedRunner, runnerSource);
+      assert.ok(
+        validateWindowsControlGateContract({
+          gateSource: mutatedGate,
+          runnerSource: mutatedRunner,
+        }).length > 0,
+      );
+    });
+  }
+});
+
+test("Windows malformed close matcher requires the ordered unsafe aggregate", async () => {
+  const { isExpectedMalformedServerClose } = await import(
+    new URL(
+      `../../scripts/run-windows-control-gate.mjs?close-aggregate=${Date.now()}`,
+      import.meta.url,
+    )
+  );
+  assert.equal(typeof isExpectedMalformedServerClose, "function");
+  const endpointUnsafe = () =>
+    new DiagnosticError(
+      runtimeDiagnostic({
+        code: "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+        message: "PROTOCOL_CONTROL_ENDPOINT_UNSAFE",
+        source: { kind: "protocol" },
+      }),
+    );
+  const brokerCleanup = endpointUnsafe();
+  const observedFailure = endpointUnsafe();
+  const other = new Error("other close failure");
+
+  assert.equal(
+    isExpectedMalformedServerClose(
+      new AggregateError([brokerCleanup, observedFailure]),
+      observedFailure,
+    ),
+    true,
+  );
+  for (const error of [
+    brokerCleanup,
+    new AggregateError([observedFailure, brokerCleanup]),
+    new AggregateError([brokerCleanup, observedFailure, endpointUnsafe()]),
+    new AggregateError([other, observedFailure]),
+    new AggregateError([brokerCleanup, other]),
+  ]) {
+    assert.equal(isExpectedMalformedServerClose(error, observedFailure), false);
+  }
 });
 
 test("Windows gate validation keeps one bounded strict authoritative SelfTest", async (t) => {
@@ -593,7 +669,7 @@ test("Windows gate validation keeps one bounded strict authoritative SelfTest", 
     gateSource.match(/spawnSync\("powershell\.exe", selfTestArguments, \{/gu)?.length,
     1,
   );
-  assert.doesNotMatch(gateSource, /\bprime\b/u);
+  assert.doesNotMatch(`${gateSource}\n${runnerSource}`, /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u);
   const mutations = [
     gateSource.replace(
       "  assert.equal(selfTest.status, 0);",
