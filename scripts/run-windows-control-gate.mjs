@@ -173,7 +173,7 @@ function hasMalformedOwnershipTransfer(source) {
   const requiredInOrder = [
     'let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
     "await writeMalformedFrame(tracked.broker);",
-    "await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);",
+    "closeRejected ? Promise.reject(closeError) : Promise.resolve(),",
     "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
     "await assertPipeUnavailable(tracked.endpoint);",
     "tracked = undefined;",

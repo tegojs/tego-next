@@ -339,7 +339,30 @@ async function runMalformedFrameFailure(): Promise<void> {
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
     nonAuthoritativeMalformedStage = "server-close";
-    await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    let closeError: unknown;
+    let closeRejected = false;
+    try {
+      await tracked.server.close();
+    } catch (error) {
+      closeRejected = true;
+      closeError = error;
+    }
+    if (!closeRejected) {
+      nonAuthoritativeMalformedStage = "server-close-resolved";
+    } else if (closeError instanceof AggregateError) {
+      nonAuthoritativeMalformedStage = "server-close-aggregate";
+    } else if (
+      closeError instanceof Error &&
+      /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u.test(closeError.message)
+    ) {
+      nonAuthoritativeMalformedStage = "server-close-direct-unsafe";
+    } else {
+      nonAuthoritativeMalformedStage = "server-close-other";
+    }
+    await assert.rejects(
+      closeRejected ? Promise.reject(closeError) : Promise.resolve(),
+      /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u,
+    );
     nonAuthoritativeMalformedStage = "child-close";
     await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
     nonAuthoritativeMalformedStage = "pipe-proof";
