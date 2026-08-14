@@ -687,11 +687,29 @@ test("close gives bounded C# settlement a separate acknowledgement deadline", as
   await closing;
 });
 
-test("close keeps post-ACK child settlement on the shorter shutdown deadline", async () => {
+test("close gives post-ACK native disposal a deadline independent of forced termination", async () => {
+  const gracefulChild = createFakeBrokerChild();
+  const graceful = createStartedBroker(gracefulChild, {
+    closeAcknowledgementTimeoutMs: 500,
+    postAcknowledgementTimeoutMs: 50,
+    shutdownTimeoutMs: 5,
+  });
+  const gracefulFrames = collectParentFrames(gracefulChild);
+  await graceful.startup;
+
+  const gracefulClose = graceful.broker.close();
+  await eventually(() => gracefulFrames.some(({ type }) => type === "close-all"));
+  gracefulChild.stdout.write(brokerFrame("close-all-ack"));
+  await wait(15);
+  assert.deepEqual(gracefulChild.kills, []);
+  gracefulChild.exit();
+  await gracefulClose;
+
   const child = createFakeBrokerChild();
   const { broker, startup } = createStartedBroker(child, {
     closeAcknowledgementTimeoutMs: 500,
-    shutdownTimeoutMs: 5,
+    postAcknowledgementTimeoutMs: 5,
+    shutdownTimeoutMs: 50,
   });
   const frames = collectParentFrames(child);
   await startup;

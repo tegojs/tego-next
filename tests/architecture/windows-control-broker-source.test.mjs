@@ -613,10 +613,54 @@ test("Node close acknowledgement deadline covers native write and global settlem
       .match(/WINDOWS_BROKER_CLOSE_ACKNOWLEDGEMENT_TIMEOUT_MS = ([\d_]+);/u)?.[1]
       ?.replaceAll("_", ""),
   );
+  const postAcknowledgementTimeout = Number(
+    adapter
+      .match(/WINDOWS_BROKER_POST_ACKNOWLEDGEMENT_TIMEOUT_MS = ([\d_]+);/u)?.[1]
+      ?.replaceAll("_", ""),
+  );
+  const forcedTerminationTimeout = Number(
+    adapter.match(/WINDOWS_BROKER_SHUTDOWN_TIMEOUT_MS = ([\d_]+);/u)?.[1]?.replaceAll("_", ""),
+  );
   const operationTimeout = Number(csharp.match(/OperationTimeoutMilliseconds = (\d+);/u)?.[1]);
   const shutdownTimeout = Number(csharp.match(/ShutdownTimeoutMilliseconds = (\d+);/u)?.[1]);
+  const constructorBody = balancedBlock(
+    adapter,
+    "constructor(options: WindowsControlBrokerOptions)",
+  );
+  const closeBody = balancedBlock(adapter, "async #closeOnce()");
+  const terminateBody = balancedBlock(adapter, "async #terminateChild()");
 
   assert.equal(acknowledgementTimeout, operationTimeout + shutdownTimeout + 1_000);
+  assert.equal(forcedTerminationTimeout, shutdownTimeout);
+  assert.equal(postAcknowledgementTimeout, shutdownTimeout * 3 + 1_000);
+  assert.equal(
+    constructorBody.includes(
+      [
+        "this.#postAcknowledgementTimeoutMs = duration(",
+        "      options.postAcknowledgementTimeoutMs,",
+        "      WINDOWS_BROKER_POST_ACKNOWLEDGEMENT_TIMEOUT_MS,",
+        "    );",
+      ].join("\n"),
+    ),
+    true,
+  );
+  assert.equal(
+    closeBody.split(
+      "await withDeadline(this.#childClosed.promise, this.#postAcknowledgementTimeoutMs);",
+    ).length - 1,
+    1,
+  );
+  assert.equal(
+    closeBody.split("await withDeadline(this.#childClosed.promise, this.#shutdownTimeoutMs);")
+      .length - 1,
+    0,
+  );
+  assert.equal(
+    terminateBody.split("await withDeadline(this.#childClosed.promise, this.#shutdownTimeoutMs);")
+      .length - 1,
+    2,
+  );
+  assert.equal(terminateBody.includes("#postAcknowledgementTimeoutMs"), false);
 });
 
 test("PowerShell is a fixed validating adjacent-source entry point", async () => {
