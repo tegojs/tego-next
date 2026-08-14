@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,8 @@ import { packWorkspaceSet, withPackedConsumer } from "./package-contract.mjs";
 export const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
 export const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const temporaryTaskDiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
+const expectedParentCrashCleanupSha256 =
+  "bac041802252245f8a4a01f1270699a67282dde9bbb65c66dec80fbbaefbf3ef";
 const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -151,12 +154,17 @@ const requiredWindowsControlGateStages = [
   [
     "parent-crash-cleanup",
     "runParentCrashCleanup",
-    ['"--parent-crash-fixture"', "details.brokerPid", "await assertPipeUnavailable("],
+    [
+      '"--parent-crash-fixture"',
+      'startTrackedServer("parent-crash", fixture)',
+      "await sendParentFixtureChallenge(",
+      "await assertPipeUnavailable(",
+    ],
   ],
   [
     "broker-crash-cleanup",
     "runBrokerCrashCleanup",
-    ['tracked.broker.kill("SIGKILL")', "await assertPipeUnavailable("],
+    ['tracked.broker.child.kill("SIGKILL")', "await assertPipeUnavailable("],
   ],
   [
     "reconnect-failure",
@@ -224,6 +232,21 @@ function uniqueTopLevelArrayBody(source, name) {
 
 function normalizedContractText(source) {
   return source.replaceAll("\r\n", "\n").trim();
+}
+
+function canonicalBodyDigest(source) {
+  return createHash("sha256").update(normalizedContractText(source)).digest("hex");
+}
+
+function hasCanonicalParentCrashContractSource(source) {
+  const normalizedSource = source.replaceAll("\r\n", "\n");
+  const declaration = `const expectedParentCrashCleanupSha256 =\n  "${expectedParentCrashCleanupSha256}";`;
+  const digestBody = uniqueTopLevelSyncFunctionBody(normalizedSource, "canonicalBodyDigest");
+  return (
+    normalizedSource.split(declaration).length - 1 === 1 &&
+    normalizedContractText(digestBody ?? "") ===
+      'return createHash("sha256").update(normalizedContractText(source)).digest("hex");'
+  );
 }
 
 function stageCalls(body) {
@@ -314,32 +337,221 @@ function hasExactNativePipeAbsence(source) {
 }
 
 function hasCapturedTrackedBrokerClose(source) {
+  if (
+    /\b(?:processExists|waitForProcessExit|brokerPid)\b/u.test(source) ||
+    /\bprocess\.kill\s*\(/u.test(source)
+  ) {
+    return false;
+  }
+  const ownBody = uniqueTopLevelSyncFunctionBody(source, "ownChild");
   const startBody = uniqueTopLevelAsyncFunctionBody(source, "startTrackedServer");
+  const rollbackBody = uniqueTopLevelAsyncFunctionBody(source, "rollbackTrackedServerAcquisition");
   const cleanupBody = uniqueTopLevelAsyncFunctionBody(source, "cleanupTrackedServer");
-  if (startBody === undefined || cleanupBody === undefined) return false;
+  const argumentsBody = uniqueTopLevelSyncFunctionBody(source, "brokerArgumentsForParent");
+  if (
+    ownBody === undefined ||
+    startBody === undefined ||
+    rollbackBody === undefined ||
+    cleanupBody === undefined ||
+    argumentsBody === undefined
+  )
+    return false;
+  if (
+    normalizedContractText(ownBody) !==
+    [
+      "const failed = Promise.withResolvers<Error>();",
+      '  child.once("error", (error) => failed.resolve(error));',
+      "  const closed = new Promise<void>((resolveClose) => {",
+      '    child.once("close", () => resolveClose());',
+      "  });",
+      "  return { child, closed, spawnError: failed.promise };",
+    ].join("\n")
+  )
+    return false;
   const startTokens = [
-    "let brokerClosed:",
+    "let broker: OwnedChild | undefined;",
+    "let server: ControlServer | undefined;",
+    "try {",
+    "server = await startControlServer({",
     "const spawned = spawn(",
-    "brokerClosed = new Promise<void>((resolveClose) => {",
-    'spawned.once("close", resolveClose);',
-    "broker = spawned;",
+    "broker = ownChild(spawned);",
     "return spawned as never;",
-    "assert.ok(brokerClosed !== undefined);",
-    "brokerClosed,",
+    "assert.ok(broker !== undefined);",
+    "assertDescriptor(descriptor);",
+    "return {",
+    "} catch (primary) {",
+    "return await rollbackTrackedServerAcquisition({ broker, endpoint, server }, primary);",
   ];
   let cursor = -1;
   for (const token of startTokens) {
     cursor = startBody.indexOf(token, cursor + 1);
     if (cursor === -1) return false;
   }
+  const rollbackTokens = [
+    "await withDeadline(pending.server.close(), PROCESS_CLEANUP_TIMEOUT_MS);",
+    "const { child } = pending.broker;",
+    'child.kill("SIGKILL")',
+    "await withDeadline(pending.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await assertPipeUnavailable(pending.endpoint);",
+    "[primary, ...cleanupErrors]",
+    "throw primary;",
+  ];
+  cursor = -1;
+  for (const token of rollbackTokens) {
+    cursor = rollbackBody.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  const argumentTokens = [
+    "const brokerArguments = [...args];",
+    'argument === "-ParentProcessId" ? [index] : []',
+    "assert.deepEqual(parentProcessIdIndexes, [9]);",
+    "assert.equal(brokerArguments[parentProcessIdIndex + 1], String(process.pid));",
+    "const watchedProcessId = watchedParent.child.pid;",
+    "assert.equal(watchedParent.child.exitCode, null);",
+    "assert.equal(watchedParent.child.signalCode, null);",
+    "brokerArguments[parentProcessIdIndex + 1] = String(watchedProcessId);",
+    "return brokerArguments;",
+  ];
+  cursor = -1;
+  for (const token of argumentTokens) {
+    cursor = argumentsBody.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return [
+    "await withDeadline(tracked.server.close(), PROCESS_CLEANUP_TIMEOUT_MS);",
+    "tracked.broker.child.exitCode === null && tracked.broker.child.signalCode === null",
+    'tracked.broker.child.kill("SIGKILL");',
+    "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await assertPipeUnavailable(tracked.endpoint);",
+  ].every((token) => cleanupBody.includes(token));
+}
+
+function hasTokensInOrder(body, tokens) {
+  let cursor = -1;
+  for (const token of tokens) {
+    cursor = body.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return true;
+}
+
+function hasParentCrashHandleOwnership(source) {
+  const normalizedSource = source.replaceAll("\r\n", "\n");
+  const fixtureBody = uniqueTopLevelAsyncFunctionBody(normalizedSource, "runParentCrashFixture");
+  const readyBody = uniqueTopLevelSyncFunctionBody(normalizedSource, "isParentFixtureReady");
+  const challengeBody = uniqueTopLevelSyncFunctionBody(
+    normalizedSource,
+    "isParentFixtureChallenge",
+  );
+  const acknowledgementBody = uniqueTopLevelSyncFunctionBody(
+    normalizedSource,
+    "isParentFixtureAcknowledgement",
+  );
+  const waitBody = uniqueTopLevelAsyncFunctionBody(normalizedSource, "waitForParentFixtureMessage");
+  const sendBody = uniqueTopLevelAsyncFunctionBody(normalizedSource, "sendParentFixtureChallenge");
+  const cleanupBody = uniqueTopLevelAsyncFunctionBody(normalizedSource, "cleanupParentCrashOwners");
+  const parentBody = uniqueTopLevelAsyncFunctionBody(normalizedSource, "runParentCrashCleanup");
+  if (
+    fixtureBody === undefined ||
+    readyBody === undefined ||
+    challengeBody === undefined ||
+    acknowledgementBody === undefined ||
+    waitBody === undefined ||
+    sendBody === undefined ||
+    cleanupBody === undefined ||
+    parentBody === undefined
+  )
+    return false;
+  if (canonicalBodyDigest(parentBody) !== expectedParentCrashCleanupSha256) return false;
+  if (
+    /\b(?:processExists|waitForProcessExit|brokerPid)\b/u.test(normalizedSource) ||
+    /\bprocess\.kill\s*\(/u.test(normalizedSource) ||
+    /tracked\.broker\.child\.(?:kill|disconnect)\s*\(/u.test(parentBody) ||
+    /tracked\.broker\.child\.stdin\??\.(?:destroy|end|write)\s*\(/u.test(parentBody) ||
+    parentBody.includes("writeMalformedFrame(") ||
+    parentBody.includes("cleanupTrackedServer(tracked)") ||
+    parentBody.split("tracked.broker.child").length - 1 !== 4 ||
+    parentBody.split("tracked.server").length - 1 !== 1 ||
+    parentBody.split("tracked.server.close()").length - 1 !== 1 ||
+    parentBody.split("tracked.broker.closed").length - 1 !== 1 ||
+    parentBody.split("tracked.failure").length - 1 !== 1
+  )
+    return false;
+  if (
+    !hasTokensInOrder(fixtureBody, [
+      'requiredEnvironment("TEGO_WINDOWS_PARENT_FIXTURE_NONCE")',
+      'process.on("message"',
+      "isParentFixtureChallenge(message, nonce)",
+      '{ nonce, type: "ack" }',
+      '{\n        nonce,\n        parentPid: process.pid,\n        type: "ready",',
+      "await stopped.promise;",
+    ]) ||
+    !readyBody.includes('Object.keys(value).sort().join(",") === "nonce,parentPid,type"') ||
+    !readyBody.includes('candidate.type === "ready"') ||
+    !readyBody.includes("candidate.nonce === nonce") ||
+    !challengeBody.includes('candidate.type === "challenge"') ||
+    !challengeBody.includes("candidate.nonce === nonce") ||
+    !acknowledgementBody.includes('candidate.type === "ack"') ||
+    !acknowledgementBody.includes("candidate.nonce === nonce") ||
+    !waitBody.includes("fixture.spawnError.then(") ||
+    !waitBody.includes("fixture.closed.then(") ||
+    !waitBody.includes('fixture.child.off("message", onMessage);') ||
+    !sendBody.includes("await withDeadline(") ||
+    !sendBody.includes('{ nonce, type: "challenge" }')
+  )
+    return false;
+  if (
+    !hasTokensInOrder(cleanupBody, [
+      "await cleanupTrackedServer(tracked);",
+      "errors.push(error);",
+      "await cleanupOwnedChild(fixture);",
+      "errors.push(error);",
+      "return errors;",
+    ])
+  )
+    return false;
+  if (
+    !hasTokensInOrder(parentBody, [
+      "const nonce = randomUUID();",
+      '"--parent-crash-fixture"',
+      "TEGO_WINDOWS_PARENT_FIXTURE_NONCE: nonce",
+      "ownChild(spawnedFixture)",
+      "captureFixtureOutput(fixtureStdout, chunk)",
+      "captureFixtureOutput(fixtureStderr, chunk)",
+      "await waitForParentFixtureMessage(fixture",
+      "assert.equal(ready.parentPid, fixture.child.pid);",
+      'tracked = await startTrackedServer("parent-crash", fixture);',
+      "await assertStatus(tracked.endpoint",
+      "assert.equal(tracked.broker.child.exitCode, null);",
+      "assert.equal(tracked.broker.child.signalCode, null);",
+      "assert.equal(tracked.broker.child.stdin?.writableEnded, false);",
+      "assert.equal(tracked.broker.child.stdin?.destroyed, false);",
+      "const acknowledged = waitForParentFixtureMessage(",
+      "await sendParentFixtureChallenge(fixture, nonce);",
+      "await acknowledged;",
+      "assert.equal(fixture.child.exitCode, null);",
+      "assert.equal(fixture.child.signalCode, null);",
+      'assert.equal(fixture.child.kill("SIGKILL"), true);',
+      "await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "assert.equal(fixtureOutputBytes, 0);",
+      "assert.equal(Buffer.concat(fixtureStdout).length, 0);",
+      "assert.equal(Buffer.concat(fixtureStderr).length, 0);",
+      "fixture = undefined;",
+      "const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "await assert.rejects(tracked.server.close()",
+      "isExpectedMalformedServerClose(error, failure)",
+      "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "await assertPipeUnavailable(tracked.endpoint);",
+      "tracked = undefined;",
+      "const cleanupErrors = await cleanupParentCrashOwners(tracked, fixture);",
+      "[primary, ...cleanupErrors]",
+    ])
+  )
+    return false;
   return (
-    cleanupBody.includes(
-      "tracked.broker.exitCode === null && tracked.broker.signalCode === null",
-    ) &&
-    cleanupBody.includes('tracked.broker.kill("SIGKILL");') &&
-    cleanupBody.includes("await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);") &&
-    !cleanupBody.includes("processExists(") &&
-    !cleanupBody.includes("waitForProcessExit(")
+    normalizedSource.includes(
+      "await cleanupTrackedServer(owned);\n        if (liveServer === owned) liveServer = undefined;",
+    ) && !/const owned = liveServer;\s*liveServer = undefined;/u.test(normalizedSource)
   );
 }
 
@@ -348,9 +560,9 @@ function hasMalformedOwnershipTransfer(source) {
   if (body === undefined) return false;
   const requiredInOrder = [
     'let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
-    "await writeMalformedFrame(tracked.broker);",
+    "await writeMalformedFrame(tracked.broker.child);",
     "isExpectedMalformedServerClose(error, failure),",
-    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
     "await assertPipeUnavailable(tracked.endpoint);",
     "tracked = undefined;",
     "} finally {",
@@ -369,9 +581,9 @@ function hasBrokerCrashOwnershipTransfer(source) {
   if (body === undefined || body.includes("waitForProcessExit(")) return false;
   const requiredInOrder = [
     'let tracked: TrackedServer | undefined = await startTrackedServer("broker-crash");',
-    'tracked.broker.kill("SIGKILL")',
+    'tracked.broker.child.kill("SIGKILL")',
     "isExpectedMalformedServerClose(error, failure)",
-    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
     "await assertPipeUnavailable(tracked.endpoint);",
     "tracked = undefined;",
     "} finally {",
@@ -391,7 +603,7 @@ function hasReconnectOwnershipTransfer(source) {
   const requiredInOrder = [
     "const tracked = liveServer;",
     "await tracked.server.close();",
-    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
     "await assertPipeUnavailable(tracked.endpoint);",
     "assert.equal(liveServer, tracked);",
     "liveServer = undefined;",
@@ -416,7 +628,7 @@ function hasLifecycleOwnershipTransfer(source) {
     "let tracked: TrackedServer | undefined = await startTrackedServer(",
     "await assertStatus(",
     "await tracked.server.close();",
-    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
     "await assertPipeUnavailable(tracked.endpoint);",
     "tracked = undefined;",
     "} finally {",
@@ -472,6 +684,12 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasCapturedTrackedBrokerClose(gateSource)) {
     errors.push("Windows gate must capture and await the exact spawned broker close event");
+  }
+  if (!hasParentCrashHandleOwnership(gateSource)) {
+    errors.push("parent-crash cleanup must retain exact handle ownership and watchdog proof");
+  }
+  if (!hasCanonicalParentCrashContractSource(runnerSource)) {
+    errors.push("parent-crash canonical body contract cannot be changed or bypassed");
   }
   if (!hasMalformedOwnershipTransfer(gateSource)) {
     errors.push("malformed-frame cleanup ownership must release only after its postconditions");

@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
 import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
   type ControlRuntimeOperations,
@@ -97,20 +95,33 @@ const expectedStatus = parseRuntimeStatus({
 });
 
 interface TrackedServer {
-  readonly broker: ChildProcess;
-  readonly brokerClosed: Promise<void>;
-  readonly brokerPid: number;
+  readonly broker: OwnedChild;
   readonly descriptor: WindowsBrokerSecurityDescriptor;
   readonly endpoint: string;
   readonly failure: Promise<Error>;
   readonly server: ControlServer;
 }
 
+interface OwnedChild {
+  readonly child: ChildProcess;
+  readonly closed: Promise<void>;
+  readonly spawnError: Promise<Error>;
+}
+
 interface ParentFixtureReady {
-  readonly brokerPid: number;
-  readonly endpoint: string;
+  readonly nonce: string;
   readonly parentPid: number;
   readonly type: "ready";
+}
+
+interface ParentFixtureChallenge {
+  readonly nonce: string;
+  readonly type: "challenge";
+}
+
+interface ParentFixtureAcknowledgement {
+  readonly nonce: string;
+  readonly type: "ack";
 }
 
 let liveServer: TrackedServer | undefined;
@@ -158,26 +169,13 @@ async function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<
   }
 }
 
-function processExists(processId: number): boolean {
-  try {
-    process.kill(processId, 0);
-    return true;
-  } catch (error) {
-    const code =
-      typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-    if (code === "ESRCH") return false;
-    if (code === "EPERM") return true;
-    throw new Error("Windows process probe failed");
-  }
-}
-
-async function waitForProcessExit(processId: number): Promise<void> {
-  const deadline = Date.now() + PROCESS_CLEANUP_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (!processExists(processId)) return;
-    await delay(25);
-  }
-  assert.equal(processExists(processId), false, "exact Windows process remained alive");
+function ownChild(child: ChildProcess): OwnedChild {
+  const failed = Promise.withResolvers<Error>();
+  child.once("error", (error) => failed.resolve(error));
+  const closed = new Promise<void>((resolveClose) => {
+    child.once("close", () => resolveClose());
+  });
+  return { child, closed, spawnError: failed.promise };
 }
 
 function runNativePipeProbe(endpoint: string): number {
@@ -249,69 +247,132 @@ function assertDescriptor(descriptor: WindowsBrokerSecurityDescriptor): void {
   );
 }
 
-async function startTrackedServer(label: string): Promise<TrackedServer> {
+interface PendingTrackedServer {
+  readonly broker: OwnedChild | undefined;
+  readonly endpoint: string;
+  readonly server: ControlServer | undefined;
+}
+
+async function rollbackTrackedServerAcquisition(
+  pending: PendingTrackedServer,
+  primary: unknown,
+): Promise<never> {
+  const cleanupErrors: unknown[] = [];
+  if (pending.server !== undefined) {
+    try {
+      await withDeadline(pending.server.close(), PROCESS_CLEANUP_TIMEOUT_MS);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (pending.broker !== undefined) {
+    try {
+      const { child } = pending.broker;
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      await withDeadline(pending.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  try {
+    await assertPipeUnavailable(pending.endpoint);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [primary, ...cleanupErrors],
+      "Windows tracked server acquisition rollback failed",
+    );
+  }
+  throw primary;
+}
+
+function brokerArgumentsForParent(args: readonly string[], watchedParent?: OwnedChild): string[] {
+  const brokerArguments = [...args];
+  if (watchedParent === undefined) return brokerArguments;
+  const parentProcessIdIndexes = brokerArguments.flatMap((argument, index) =>
+    argument === "-ParentProcessId" ? [index] : [],
+  );
+  assert.deepEqual(parentProcessIdIndexes, [9]);
+  const parentProcessIdIndex = parentProcessIdIndexes[0] as number;
+  assert.equal(brokerArguments[parentProcessIdIndex + 1], String(process.pid));
+  const watchedProcessId = watchedParent.child.pid;
+  assert.ok(Number.isSafeInteger(watchedProcessId) && (watchedProcessId ?? 0) > 0);
+  assert.equal(watchedParent.child.exitCode, null);
+  assert.equal(watchedParent.child.signalCode, null);
+  brokerArguments[parentProcessIdIndex + 1] = String(watchedProcessId);
+  return brokerArguments;
+}
+
+async function startTrackedServer(
+  label: string,
+  watchedParent?: OwnedChild,
+): Promise<TrackedServer> {
   const endpoint = `\\\\.\\pipe\\tego-windows-control-${label}-${process.pid}-${randomUUID()}`;
   const failed = Promise.withResolvers<Error>();
-  let broker: ChildProcess | undefined;
-  let brokerClosed: Promise<void> | undefined;
+  let broker: OwnedChild | undefined;
   let descriptor: WindowsBrokerSecurityDescriptor | undefined;
-  const server = await startControlServer({
-    endpoint,
-    onServerError(error) {
-      failed.resolve(error);
-    },
-    operations: gateOperations(),
-    windowsControlBrokerFactory(options) {
-      return createWindowsControlBroker({
-        ...options,
-        onReadyDescriptor(value) {
-          descriptor = value;
-        },
-        spawnBroker(command, args, spawnOptions) {
-          assert.equal(command, "powershell.exe");
-          assert.deepEqual(spawnOptions, {
-            shell: false,
-            stdio: ["pipe", "pipe", "pipe"],
-            windowsHide: true,
-          });
-          const spawned = spawn(command, [...args], {
-            shell: false,
-            stdio: ["pipe", "pipe", "pipe"],
-            windowsHide: true,
-          });
-          brokerClosed = new Promise<void>((resolveClose) => {
-            spawned.once("close", resolveClose);
-          });
-          broker = spawned;
-          return spawned as never;
-        },
-      });
-    },
-  });
-  assert.ok(broker !== undefined);
-  assert.ok(brokerClosed !== undefined);
-  assert.ok(Number.isSafeInteger(broker.pid) && (broker.pid ?? 0) > 0);
-  assert.ok(descriptor !== undefined);
-  assertDescriptor(descriptor);
-  return {
-    broker,
-    brokerClosed,
-    brokerPid: broker.pid as number,
-    descriptor,
-    endpoint,
-    failure: failed.promise,
-    server,
-  };
+  let server: ControlServer | undefined;
+  try {
+    server = await startControlServer({
+      endpoint,
+      onServerError(error) {
+        failed.resolve(error);
+      },
+      operations: gateOperations(),
+      windowsControlBrokerFactory(options) {
+        return createWindowsControlBroker({
+          ...options,
+          onReadyDescriptor(value) {
+            descriptor = value;
+          },
+          spawnBroker(command, args, spawnOptions) {
+            assert.equal(command, "powershell.exe");
+            assert.deepEqual(spawnOptions, {
+              shell: false,
+              stdio: ["pipe", "pipe", "pipe"],
+              windowsHide: true,
+            });
+            const spawned = spawn(command, brokerArgumentsForParent(args, watchedParent), {
+              shell: false,
+              stdio: ["pipe", "pipe", "pipe"],
+              windowsHide: true,
+            });
+            broker = ownChild(spawned);
+            return spawned as never;
+          },
+        });
+      },
+    });
+    assert.ok(broker !== undefined);
+    assert.ok(Number.isSafeInteger(broker.child.pid) && (broker.child.pid ?? 0) > 0);
+    assert.ok(descriptor !== undefined);
+    assertDescriptor(descriptor);
+    return {
+      broker,
+      descriptor,
+      endpoint,
+      failure: failed.promise,
+      server,
+    };
+  } catch (primary) {
+    return await rollbackTrackedServerAcquisition({ broker, endpoint, server }, primary);
+  }
 }
 
 async function cleanupTrackedServer(tracked: TrackedServer): Promise<void> {
   try {
-    await tracked.server.close();
+    await withDeadline(tracked.server.close(), PROCESS_CLEANUP_TIMEOUT_MS);
   } catch {}
-  if (tracked.broker.exitCode === null && tracked.broker.signalCode === null) {
-    tracked.broker.kill("SIGKILL");
+  if (tracked.broker.child.exitCode === null && tracked.broker.child.signalCode === null) {
+    tracked.broker.child.kill("SIGKILL");
   }
-  await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+  await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
   await assertPipeUnavailable(tracked.endpoint);
 }
 
@@ -405,13 +466,13 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 async function runMalformedFrameFailure(): Promise<void> {
   let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");
   try {
-    await writeMalformedFrame(tracked.broker);
+    await writeMalformedFrame(tracked.broker.child);
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
     await assert.rejects(tracked.server.close(), (error: unknown) =>
       isExpectedMalformedServerClose(error, failure),
     );
-    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
     await assertPipeUnavailable(tracked.endpoint);
     tracked = undefined;
   } finally {
@@ -420,89 +481,242 @@ async function runMalformedFrameFailure(): Promise<void> {
 }
 
 async function runParentCrashFixture(): Promise<void> {
-  const tracked = await startTrackedServer("parent-crash");
   if (process.send === undefined) throw new Error("Windows parent fixture requires IPC");
+  const nonce = requiredEnvironment("TEGO_WINDOWS_PARENT_FIXTURE_NONCE");
+  assert.match(nonce, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  const stopped = Promise.withResolvers<never>();
+  let challengeSeen = false;
+  process.on("message", (message) => {
+    if (!isParentFixtureChallenge(message, nonce) || challengeSeen) {
+      stopped.reject(new Error("Windows parent fixture received invalid IPC"));
+      return;
+    }
+    challengeSeen = true;
+    process.send?.({ nonce, type: "ack" } satisfies ParentFixtureAcknowledgement, (error) => {
+      if (error !== null) stopped.reject(new Error("Windows parent fixture IPC failed"));
+    });
+  });
+  process.once("disconnect", () =>
+    stopped.reject(new Error("Windows parent fixture IPC disconnected")),
+  );
   await new Promise<void>((resolveSend, rejectSend) => {
     process.send?.(
       {
-        brokerPid: tracked.brokerPid,
-        endpoint: tracked.endpoint,
+        nonce,
         parentPid: process.pid,
         type: "ready",
       } satisfies ParentFixtureReady,
       (error) => (error === null ? resolveSend() : rejectSend(error)),
     );
   });
-  await new Promise<never>(() => undefined);
+  await stopped.promise;
 }
 
-function isParentFixtureReady(value: unknown): value is ParentFixtureReady {
+function isParentFixtureReady(value: unknown, nonce: string): value is ParentFixtureReady {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<ParentFixtureReady>;
   return (
+    Object.keys(value).sort().join(",") === "nonce,parentPid,type" &&
     candidate.type === "ready" &&
+    candidate.nonce === nonce &&
     Number.isSafeInteger(candidate.parentPid) &&
-    (candidate.parentPid ?? 0) > 0 &&
-    Number.isSafeInteger(candidate.brokerPid) &&
-    (candidate.brokerPid ?? 0) > 0 &&
-    typeof candidate.endpoint === "string" &&
-    /^\\\\\.\\pipe\\/u.test(candidate.endpoint)
+    (candidate.parentPid ?? 0) > 0
   );
 }
 
+function isParentFixtureChallenge(value: unknown, nonce: string): value is ParentFixtureChallenge {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<ParentFixtureChallenge>;
+  return (
+    Object.keys(value).sort().join(",") === "nonce,type" &&
+    candidate.type === "challenge" &&
+    candidate.nonce === nonce
+  );
+}
+
+function isParentFixtureAcknowledgement(
+  value: unknown,
+  nonce: string,
+): value is ParentFixtureAcknowledgement {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<ParentFixtureAcknowledgement>;
+  return (
+    Object.keys(value).sort().join(",") === "nonce,type" &&
+    candidate.type === "ack" &&
+    candidate.nonce === nonce
+  );
+}
+
+async function waitForParentFixtureMessage<T>(
+  fixture: OwnedChild,
+  isExpected: (value: unknown) => value is T,
+): Promise<T> {
+  const received = Promise.withResolvers<unknown>();
+  const onMessage = (message: unknown) => received.resolve(message);
+  fixture.child.once("message", onMessage);
+  try {
+    const message = await withDeadline(
+      Promise.race([
+        received.promise,
+        fixture.spawnError.then(() => {
+          throw new Error("Windows parent fixture failed");
+        }),
+        fixture.closed.then(() => {
+          throw new Error("Windows parent fixture exited early");
+        }),
+      ]),
+      PROCESS_CLEANUP_TIMEOUT_MS,
+    );
+    if (!isExpected(message)) throw new Error("Windows parent fixture emitted invalid IPC");
+    return message;
+  } finally {
+    fixture.child.off("message", onMessage);
+  }
+}
+
+async function sendParentFixtureChallenge(fixture: OwnedChild, nonce: string): Promise<void> {
+  assert.equal(fixture.child.connected, true);
+  await withDeadline(
+    new Promise<void>((resolveSend, rejectSend) => {
+      fixture.child.send({ nonce, type: "challenge" } satisfies ParentFixtureChallenge, (error) =>
+        error === null ? resolveSend() : rejectSend(new Error("Windows parent fixture IPC failed")),
+      );
+    }),
+    PROCESS_CLEANUP_TIMEOUT_MS,
+  );
+}
+
+async function cleanupOwnedChild(owned: OwnedChild): Promise<void> {
+  let killError: unknown;
+  try {
+    if (owned.child.exitCode === null && owned.child.signalCode === null) {
+      owned.child.kill("SIGKILL");
+    }
+  } catch (error) {
+    killError = error;
+  }
+  let closeError: unknown;
+  try {
+    await withDeadline(owned.closed, PROCESS_CLEANUP_TIMEOUT_MS);
+  } catch (error) {
+    closeError = error;
+  }
+  if (killError !== undefined && closeError !== undefined) {
+    throw new AggregateError([killError, closeError], "Windows child cleanup failed");
+  }
+  if (killError !== undefined) throw killError;
+  if (closeError !== undefined) throw closeError;
+}
+
+async function cleanupParentCrashOwners(
+  tracked: TrackedServer | undefined,
+  fixture: OwnedChild | undefined,
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  if (tracked !== undefined) {
+    try {
+      await cleanupTrackedServer(tracked);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (fixture !== undefined) {
+    try {
+      await cleanupOwnedChild(fixture);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
 async function runParentCrashCleanup(): Promise<void> {
-  const fixture = spawn(
+  const nonce = randomUUID();
+  const spawnedFixture = spawn(
     process.execPath,
     [fileURLToPath(import.meta.url), "--parent-crash-fixture"],
     {
-      env: { ...process.env, NODE_PATH: "" },
+      env: { ...process.env, NODE_PATH: "", TEGO_WINDOWS_PARENT_FIXTURE_NONCE: nonce },
       stdio: ["ignore", "pipe", "pipe", "ipc"],
       windowsHide: true,
     },
   );
-  const ready = Promise.withResolvers<ParentFixtureReady>();
-  const closed = once(fixture, "close");
-  fixture.on("message", (message) => {
-    if (isParentFixtureReady(message)) ready.resolve(message);
-    else ready.reject(new Error("Windows parent fixture emitted invalid IPC"));
-  });
-  fixture.once("error", () => ready.reject(new Error("Windows parent fixture failed")));
-  fixture.once("exit", () => ready.reject(new Error("Windows parent fixture exited early")));
-  let details: ParentFixtureReady | undefined;
+  let fixture: OwnedChild | undefined = ownChild(spawnedFixture);
+  const fixtureStdout: Buffer[] = [];
+  const fixtureStderr: Buffer[] = [];
+  let fixtureOutputBytes = 0;
+  const captureFixtureOutput = (target: Buffer[], chunk: Buffer): void => {
+    fixtureOutputBytes += chunk.length;
+    if (fixtureOutputBytes <= POWERSHELL_STARTUP_STDERR_MAX_BYTES) target.push(chunk);
+    else spawnedFixture.kill("SIGKILL");
+  };
+  spawnedFixture.stdout?.on("data", (chunk: Buffer) => captureFixtureOutput(fixtureStdout, chunk));
+  spawnedFixture.stderr?.on("data", (chunk: Buffer) => captureFixtureOutput(fixtureStderr, chunk));
+  let tracked: TrackedServer | undefined;
+  let primary: unknown;
+  let primaryFailed = false;
   try {
-    details = await withDeadline(ready.promise, PROCESS_CLEANUP_TIMEOUT_MS);
-    assert.equal(details.parentPid, fixture.pid);
-    assert.equal(fixture.kill("SIGKILL"), true);
-    await withDeadline(
-      closed.then(() => undefined),
-      PROCESS_CLEANUP_TIMEOUT_MS,
+    const ready = await waitForParentFixtureMessage(fixture, (value): value is ParentFixtureReady =>
+      isParentFixtureReady(value, nonce),
     );
-    await waitForProcessExit(details.parentPid);
-    await waitForProcessExit(details.brokerPid);
-    await assertPipeUnavailable(details.endpoint);
-    assert.equal(fixture.stdout?.readableEnded, true);
-    assert.equal(fixture.stderr?.readableEnded, true);
-  } finally {
-    if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
-    if (details !== undefined && processExists(details.brokerPid)) {
-      try {
-        process.kill(details.brokerPid, "SIGKILL");
-      } catch {}
-      await waitForProcessExit(details.brokerPid);
+    assert.equal(ready.parentPid, fixture.child.pid);
+    tracked = await startTrackedServer("parent-crash", fixture);
+    await assertStatus(tracked.endpoint, "windows-control-gate-parent-crash-status");
+    assert.equal(tracked.broker.child.exitCode, null);
+    assert.equal(tracked.broker.child.signalCode, null);
+    assert.equal(tracked.broker.child.stdin?.writableEnded, false);
+    assert.equal(tracked.broker.child.stdin?.destroyed, false);
+    const acknowledged = waitForParentFixtureMessage(
+      fixture,
+      (value): value is ParentFixtureAcknowledgement =>
+        isParentFixtureAcknowledgement(value, nonce),
+    );
+    await sendParentFixtureChallenge(fixture, nonce);
+    await acknowledged;
+    assert.equal(fixture.child.exitCode, null);
+    assert.equal(fixture.child.signalCode, null);
+    assert.equal(fixture.child.kill("SIGKILL"), true);
+    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);
+    assert.equal(fixture.child.stdout?.readableEnded, true);
+    assert.equal(fixture.child.stderr?.readableEnded, true);
+    assert.equal(fixtureOutputBytes, 0);
+    assert.equal(Buffer.concat(fixtureStdout).length, 0);
+    assert.equal(Buffer.concat(fixtureStderr).length, 0);
+    fixture = undefined;
+    const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
+    assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    await assert.rejects(tracked.server.close(), (error: unknown) =>
+      isExpectedMalformedServerClose(error, failure),
+    );
+    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
+    await assertPipeUnavailable(tracked.endpoint);
+    tracked = undefined;
+  } catch (error) {
+    primary = error;
+    primaryFailed = true;
+  }
+  const cleanupErrors = await cleanupParentCrashOwners(tracked, fixture);
+  if (primaryFailed) {
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([primary, ...cleanupErrors], "Windows parent crash gate failed");
     }
+    throw primary;
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Windows parent crash cleanup failed");
   }
 }
 
 async function runBrokerCrashCleanup(): Promise<void> {
   let tracked: TrackedServer | undefined = await startTrackedServer("broker-crash");
   try {
-    assert.equal(tracked.broker.kill("SIGKILL"), true);
+    assert.equal(tracked.broker.child.kill("SIGKILL"), true);
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
     await assert.rejects(tracked.server.close(), (error: unknown) =>
       isExpectedMalformedServerClose(error, failure),
     );
-    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
     await assertPipeUnavailable(tracked.endpoint);
     tracked = undefined;
   } finally {
@@ -515,7 +729,7 @@ async function runReconnectFailure(): Promise<void> {
   const tracked = liveServer;
   try {
     await tracked.server.close();
-    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
     await assertPipeUnavailable(tracked.endpoint);
     assert.equal(liveServer, tracked);
     liveServer = undefined;
@@ -533,7 +747,7 @@ async function runTwentyLifecycleRounds(): Promise<void> {
     try {
       await assertStatus(tracked.endpoint, `windows-control-gate-round-${String(round)}`);
       await tracked.server.close();
-      await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+      await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);
       await assertPipeUnavailable(tracked.endpoint);
       tracked = undefined;
     } finally {
@@ -564,11 +778,11 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    const owned = liveServer;
-    liveServer = undefined;
-    if (owned !== undefined) {
+    if (liveServer !== undefined) {
+      const owned = liveServer;
       try {
         await cleanupTrackedServer(owned);
+        if (liveServer === owned) liveServer = undefined;
       } catch {}
     }
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);

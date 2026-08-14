@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -258,7 +259,7 @@ test("Windows gate proves the current-user descriptor without a redundant PowerS
   );
   assert.match(
     gateSource,
-    /async function runParentCrashFixture\(\): Promise<void> \{\s+const tracked = await startTrackedServer\("parent-crash"\);/u,
+    /async function runParentCrashCleanup\(\): Promise<void> \{[\s\S]+tracked = await startTrackedServer\("parent-crash", fixture\);/u,
   );
 });
 
@@ -431,6 +432,309 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
         validateWindowsControlGateContract({
           gateSource: mutation.replaceAll("\n", "\r\n"),
           runnerSource: runnerSource.replaceAll("\n", "\r\n"),
+        }).length > 0,
+      );
+    });
+  }
+});
+
+test("Windows gate rolls back partial acquisition and owns parent-crash processes by handle", async (t) => {
+  const [{ validateWindowsControlGateContract }, gateSource, runnerSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?handle-ownership=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateSource, "utf8"),
+    readFile(windowsControlGateRunner, "utf8"),
+  ]);
+  assert.match(gateSource, /interface OwnedChild/u);
+  assert.match(gateSource, /async function rollbackTrackedServerAcquisition/u);
+  assert.match(gateSource, /catch \(primary\) \{[\s\S]+rollbackTrackedServerAcquisition/u);
+  assert.match(gateSource, /TEGO_WINDOWS_PARENT_FIXTURE_NONCE/u);
+  assert.match(gateSource, /type: "challenge"/u);
+  assert.match(gateSource, /type: "ack"/u);
+  assert.match(gateSource, /"-ParentProcessId"/u);
+  assert.doesNotMatch(gateSource, /function processExists|waitForProcessExit|process\.kill\(/u);
+  assert.doesNotMatch(gateSource, /brokerPid/u);
+  assert.deepEqual(validateWindowsControlGateContract({ gateSource, runnerSource }), []);
+  assert.deepEqual(
+    validateWindowsControlGateContract({
+      gateSource: gateSource.replaceAll("\n", "\r\n"),
+      runnerSource: runnerSource.replaceAll("\n", "\r\n"),
+    }),
+    [],
+  );
+
+  const bodyMutation = (name, from, to) =>
+    replaceInTopLevelAsyncFunctionBody(gateSource, name, from, to);
+  const mutations = [
+    [
+      "close event replaced by exit",
+      gateSource.replace(
+        'child.once("close", () => resolveClose());',
+        'child.once("exit", () => resolveClose());',
+      ),
+    ],
+    [
+      "acquisition rollback bypassed",
+      bodyMutation(
+        "startTrackedServer",
+        "return await rollbackTrackedServerAcquisition({ broker, endpoint, server }, primary);",
+        "throw primary;",
+      ),
+    ],
+    [
+      "descriptor assertion escapes acquisition",
+      bodyMutation("startTrackedServer", "    assertDescriptor(descriptor);\n", ""),
+    ],
+    [
+      "rollback server close removed",
+      bodyMutation(
+        "rollbackTrackedServerAcquisition",
+        "      await withDeadline(pending.server.close(), PROCESS_CLEANUP_TIMEOUT_MS);",
+        "      await Promise.resolve();",
+      ),
+    ],
+    [
+      "rollback broker kill removed",
+      bodyMutation(
+        "rollbackTrackedServerAcquisition",
+        '      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");',
+        "      void child;",
+      ),
+    ],
+    [
+      "rollback captured close removed",
+      bodyMutation(
+        "rollbackTrackedServerAcquisition",
+        "      await withDeadline(pending.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+        "      await Promise.resolve();",
+      ),
+    ],
+    [
+      "rollback exact pipe proof removed",
+      bodyMutation(
+        "rollbackTrackedServerAcquisition",
+        "    await assertPipeUnavailable(pending.endpoint);",
+        "    await Promise.resolve();",
+      ),
+    ],
+    [
+      "rollback primary reordered",
+      bodyMutation(
+        "rollbackTrackedServerAcquisition",
+        "      [primary, ...cleanupErrors],",
+        "      [...cleanupErrors, primary],",
+      ),
+    ],
+    [
+      "ParentProcessId uniqueness removed",
+      gateSource.replace("  assert.deepEqual(parentProcessIdIndexes, [9]);", ""),
+    ],
+    [
+      "ParentProcessId default binding removed",
+      gateSource.replace(
+        "  assert.equal(brokerArguments[parentProcessIdIndex + 1], String(process.pid));",
+        "",
+      ),
+    ],
+    [
+      "fixture parent is not watched",
+      bodyMutation(
+        "runParentCrashCleanup",
+        'tracked = await startTrackedServer("parent-crash", fixture);',
+        'tracked = await startTrackedServer("parent-crash");',
+      ),
+    ],
+    [
+      "ready nonce comparison removed",
+      gateSource.replace("    candidate.nonce === nonce &&", "    nonce.length > 0 &&"),
+    ],
+    [
+      "challenge nonce comparison removed",
+      gateSource.replace("    candidate.nonce === nonce\n  );", "    nonce.length > 0\n  );"),
+    ],
+    [
+      "ack nonce comparison removed",
+      gateSource.replace(
+        '    candidate.type === "ack" &&\n    candidate.nonce === nonce',
+        '    candidate.type === "ack" &&\n    nonce.length > 0',
+      ),
+    ],
+    [
+      "challenge round trip removed",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await sendParentFixtureChallenge(fixture, nonce);",
+        "    await Promise.resolve();",
+      ),
+    ],
+    [
+      "broker stdin closed before watchdog",
+      bodyMutation(
+        "runParentCrashCleanup",
+        '    assert.equal(fixture.child.kill("SIGKILL"), true);',
+        '    tracked.broker.child.stdin?.end();\n    assert.equal(fixture.child.kill("SIGKILL"), true);',
+      ),
+    ],
+    [
+      "broker killed instead of watchdog",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+        '    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);\n    tracked.broker.child.kill("SIGKILL");',
+      ),
+    ],
+    [
+      "server closed before watchdog",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await acknowledged;",
+        "    await acknowledged;\n    await tracked.server.close();",
+      ),
+    ],
+    [
+      "malformed broker frame replaces watchdog",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+        "    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);\n    await writeMalformedFrame(tracked.broker.child);",
+      ),
+    ],
+    [
+      "broker error emission replaces watchdog",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+        '    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);\n    tracked.broker.child.emit("error", new Error("forced"));',
+      ),
+    ],
+    [
+      "bracket alias kills broker instead of watchdog",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+        '    await withDeadline(fixture.closed, PROCESS_CLEANUP_TIMEOUT_MS);\n    const injectedBrokerChild = tracked.broker["child"];\n    injectedBrokerChild.kill("SIGKILL");',
+      ),
+    ],
+    [
+      "broker close proof removed",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+        "    await Promise.resolve();",
+      ),
+    ],
+    [
+      "pipe proof removed",
+      bodyMutation(
+        "runParentCrashCleanup",
+        "    await assertPipeUnavailable(tracked.endpoint);",
+        "    await Promise.resolve();",
+      ),
+    ],
+    [
+      "tracked fallback removed",
+      gateSource.replace(
+        "      await cleanupTrackedServer(tracked);",
+        "      await Promise.resolve();",
+      ),
+    ],
+    [
+      "fixture fallback removed",
+      gateSource.replace(
+        "      await cleanupOwnedChild(fixture);",
+        "      await Promise.resolve();",
+      ),
+    ],
+    [
+      "top-level ownership released early",
+      gateSource.replace(
+        "      const owned = liveServer;\n      try {",
+        "      const owned = liveServer;\n      liveServer = undefined;\n      try {",
+      ),
+    ],
+    [
+      "numeric process kill introduced",
+      gateSource.replace("let liveServer", "process.kill(1, 0);\n\nlet liveServer"),
+    ],
+    [
+      "numeric process probe introduced",
+      gateSource.replace("let liveServer", "processExists(1);\n\nlet liveServer"),
+    ],
+    [
+      "numeric process wait introduced",
+      gateSource.replace("let liveServer", "waitForProcessExit(1);\n\nlet liveServer"),
+    ],
+    [
+      "broker PID IPC reintroduced",
+      gateSource.replace("let liveServer", "const brokerPid = 1;\n\nlet liveServer"),
+    ],
+  ];
+
+  for (const [name, mutation] of mutations) {
+    await t.test(name, () => {
+      assert.notEqual(mutation, gateSource);
+      assert.ok(
+        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+      );
+      assert.ok(
+        validateWindowsControlGateContract({
+          gateSource: mutation.replaceAll("\n", "\r\n"),
+          runnerSource: runnerSource.replaceAll("\n", "\r\n"),
+        }).length > 0,
+      );
+    });
+  }
+
+  const hashMatch = /const expectedParentCrashCleanupSha256 =\s+"([0-9a-f]{64})";/u.exec(
+    runnerSource,
+  );
+  assert.ok(hashMatch !== null);
+  const originalHash = hashMatch[1];
+  const bracketAliasMutation = mutations.find(
+    ([name]) => name === "bracket alias kills broker instead of watchdog",
+  )?.[1];
+  assert.ok(bracketAliasMutation !== undefined);
+  const declaration = /^async function runParentCrashCleanup\b/mu.exec(bracketAliasMutation);
+  assert.ok(declaration !== null);
+  const bodyStart = bracketAliasMutation.indexOf("{", declaration.index);
+  const bodyEndPattern = /^\}$/gmu;
+  bodyEndPattern.lastIndex = bodyStart;
+  const bodyEnd = bodyEndPattern.exec(bracketAliasMutation)?.index ?? -1;
+  assert.notEqual(bodyEnd, -1);
+  const mutatedBody = bracketAliasMutation.slice(bodyStart + 1, bodyEnd).trim();
+  const mutatedHash = createHash("sha256").update(mutatedBody).digest("hex");
+  const runnerMutations = [
+    ["canonical hash changed", runnerSource.replace(originalHash, "0".repeat(64))],
+    [
+      "canonical digest calculation bypassed",
+      runnerSource.replace(
+        'return createHash("sha256").update(normalizedContractText(source)).digest("hex");',
+        "return expectedParentCrashCleanupSha256;",
+      ),
+    ],
+    [
+      "gate body and hash changed together",
+      runnerSource.replace(originalHash, mutatedHash),
+      bracketAliasMutation,
+    ],
+  ];
+  for (const [name, mutatedRunner, mutatedGate = gateSource] of runnerMutations) {
+    await t.test(name, () => {
+      assert.notEqual(mutatedRunner, runnerSource);
+      assert.ok(
+        validateWindowsControlGateContract({
+          gateSource: mutatedGate,
+          runnerSource: mutatedRunner,
+        }).length > 0,
+      );
+      assert.ok(
+        validateWindowsControlGateContract({
+          gateSource: mutatedGate.replaceAll("\n", "\r\n"),
+          runnerSource: mutatedRunner.replaceAll("\n", "\r\n"),
         }).length > 0,
       );
     });
@@ -619,16 +923,16 @@ test("Windows malformed-frame cleanup transfers ownership only after exact child
   ]);
   const mutations = [
     gateSource.replace(
-      '            spawned.once("close", resolveClose);',
-      '            spawned.once("exit", resolveClose);',
+      '    child.once("close", () => resolveClose());',
+      '    child.once("exit", () => resolveClose());',
     ),
     gateSource.replace(
-      "  await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "  await waitForProcessExit(tracked.brokerPid);",
+      "    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "    await waitForProcessExit(1);",
     ),
     gateSource.replace(
-      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "    await Promise.resolve();",
+      "    await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "    await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);",
     ),
     gateSource.replace("    tracked = undefined;\n", ""),
     gateSource
@@ -736,7 +1040,7 @@ test("Windows broker-crash cleanup reuses the exact aggregate and releases captu
   ]);
   assert.match(
     gateSource,
-    /async function runBrokerCrashCleanup\(\): Promise<void> \{[\s\S]+let tracked: TrackedServer \| undefined = await startTrackedServer\("broker-crash"\);[\s\S]+isExpectedMalformedServerClose\(error, failure\)[\s\S]+await withDeadline\(tracked\.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+tracked = undefined;[\s\S]+if \(tracked !== undefined\) await cleanupTrackedServer\(tracked\);/u,
+    /async function runBrokerCrashCleanup\(\): Promise<void> \{[\s\S]+let tracked: TrackedServer \| undefined = await startTrackedServer\("broker-crash"\);[\s\S]+isExpectedMalformedServerClose\(error, failure\)[\s\S]+await withDeadline\(tracked\.broker\.closed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+tracked = undefined;[\s\S]+if \(tracked !== undefined\) await cleanupTrackedServer\(tracked\);/u,
   );
   for (const [name, from, to] of [
     [
@@ -746,8 +1050,8 @@ test("Windows broker-crash cleanup reuses the exact aggregate and releases captu
     ],
     [
       "numeric PID polling",
-      "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "await waitForProcessExit(tracked.brokerPid);",
+      "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "await waitForProcessExit(1);",
     ],
     ["missing release", "    tracked = undefined;", ""],
     [
@@ -788,11 +1092,11 @@ test("Windows reconnect and lifecycle close retain ownership through captured cl
   ]);
   assert.match(
     gateSource,
-    /async function runReconnectFailure\(\): Promise<void> \{[\s\S]+await tracked\.server\.close\(\);[\s\S]+await withDeadline\(tracked\.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+liveServer = undefined;[\s\S]+if \(liveServer === tracked\) \{[\s\S]+await cleanupTrackedServer\(tracked\);[\s\S]+liveServer = undefined;/u,
+    /async function runReconnectFailure\(\): Promise<void> \{[\s\S]+await tracked\.server\.close\(\);[\s\S]+await withDeadline\(tracked\.broker\.closed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+liveServer = undefined;[\s\S]+if \(liveServer === tracked\) \{[\s\S]+await cleanupTrackedServer\(tracked\);[\s\S]+liveServer = undefined;/u,
   );
   assert.match(
     gateSource,
-    /async function runTwentyLifecycleRounds\(\): Promise<void> \{[\s\S]+let tracked: TrackedServer \| undefined = await startTrackedServer[\s\S]+await tracked\.server\.close\(\);[\s\S]+await withDeadline\(tracked\.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+tracked = undefined;[\s\S]+if \(tracked !== undefined\) await cleanupTrackedServer\(tracked\);/u,
+    /async function runTwentyLifecycleRounds\(\): Promise<void> \{[\s\S]+let tracked: TrackedServer \| undefined = await startTrackedServer[\s\S]+await tracked\.server\.close\(\);[\s\S]+await withDeadline\(tracked\.broker\.closed, PROCESS_CLEANUP_TIMEOUT_MS\);[\s\S]+await assertPipeUnavailable\(tracked\.endpoint\);[\s\S]+tracked = undefined;[\s\S]+if \(tracked !== undefined\) await cleanupTrackedServer\(tracked\);/u,
   );
   for (const [implementation, mutations] of [
     [
@@ -800,8 +1104,8 @@ test("Windows reconnect and lifecycle close retain ownership through captured cl
       [
         [
           "numeric PID polling",
-          "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-          "await waitForProcessExit(tracked.brokerPid);",
+          "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+          "await waitForProcessExit(1);",
         ],
         [
           "early release",
@@ -820,8 +1124,8 @@ test("Windows reconnect and lifecycle close retain ownership through captured cl
       [
         [
           "numeric PID polling",
-          "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-          "await waitForProcessExit(tracked.brokerPid);",
+          "await withDeadline(tracked.broker.closed, PROCESS_CLEANUP_TIMEOUT_MS);",
+          "await waitForProcessExit(1);",
         ],
         [
           "early release",
