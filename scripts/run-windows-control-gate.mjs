@@ -9,6 +9,92 @@ import { packWorkspaceSet, withPackedConsumer } from "./package-contract.mjs";
 export const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
 export const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const temporaryTaskDiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
+const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Set-StrictMode -Version Latest
+try {
+$null = Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class TegoWindowsPipeProbe
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WaitNamedPipeW(string name, uint timeout);
+
+    public static int Probe(string endpoint)
+    {
+        if (String.IsNullOrEmpty(endpoint)) return 3;
+        if (WaitNamedPipeW(endpoint, 1)) return 2;
+        int error = Marshal.GetLastWin32Error();
+        if (error == 2) return 0;
+        if (error == 121 || error == 231) return 2;
+        return 3;
+    }
+}
+'@
+$probeResult = [TegoWindowsPipeProbe]::Probe($env:TEGO_WINDOWS_PIPE_PROBE_ENDPOINT)
+exit $probeResult
+} catch {
+exit 3
+}`;
+const expectedWindowsPipeProbeArgumentsBody = [
+  '"-NoLogo",',
+  '  "-NoProfile",',
+  '  "-NonInteractive",',
+  '  "-ExecutionPolicy",',
+  '  "Bypass",',
+  '  "-EncodedCommand",',
+  '  Buffer.from(windowsPipeProbeSource, "utf16le").toString("base64"),',
+].join("\n");
+const expectedRunNativePipeProbeBody = [
+  'const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));',
+  "  assert.equal(isAbsolute(systemRoot), true);",
+  "  assert.match(systemRoot, /^[A-Za-z]:\\\\[^\\r\\n]+$/u);",
+  "  const powershellExecutable = realpathSync(",
+  '    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),',
+  "  );",
+  "  assert.equal(isContained(systemRoot, powershellExecutable), true);",
+  "  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {",
+  '    encoding: "utf8",',
+  "    env: {",
+  "      SystemRoot: systemRoot,",
+  "      TEGO_WINDOWS_PIPE_PROBE_ENDPOINT: endpoint,",
+  '      TEMP: requiredEnvironment("TEMP"),',
+  '      TMP: requiredEnvironment("TMP"),',
+  "      WINDIR: systemRoot,",
+  "    },",
+  "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
+  "    shell: false,",
+  '    stdio: ["ignore", "pipe", "pipe"],',
+  "    timeout: PROCESS_CLEANUP_TIMEOUT_MS,",
+  "    windowsHide: true,",
+  "  });",
+  "  assert.equal(probe.error, undefined);",
+  "  assert.equal(probe.signal, null);",
+  '  assert.equal(probe.stdout, "");',
+  '  assert.equal(probe.stderr, "");',
+  "  assert.ok(probe.status === 0 || probe.status === 2 || probe.status === 3);",
+  "  return probe.status;",
+].join("\n");
+const expectedAssertPipeUnavailableBody = [
+  "assertNativePipeAbsent(endpoint);",
+  "  await assert.rejects(",
+  "    requestControl({",
+  "      endpoint,",
+  '      operation: "runtime.status",',
+  "      input: {},",
+  ["      requestId: `windows-control-unavailable-", "$", "{randomUUID()}`,"].join(""),
+  "      timeoutMs: 250,",
+  "    }),",
+  "  );",
+].join("\n");
+const expectedRunStatusRequestBody = [
+  "assert.ok(liveServer !== undefined);",
+  '  await assertStatus(liveServer.endpoint, "windows-control-gate-status");',
+  "  assertNativePipePresent(liveServer.endpoint);",
+].join("\n");
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const gateSourcePath = fileURLToPath(
@@ -112,6 +198,34 @@ function uniqueTopLevelSyncFunctionBody(source, name) {
   return bodyEnd === -1 ? undefined : source.slice(bodyStart + 1, bodyEnd);
 }
 
+function uniqueTopLevelTemplateLiteral(source, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const prefix = `const ${name} = \``;
+  const templateMarker = String.fromCodePoint(96);
+  const declarations = [
+    ...source.matchAll(new RegExp(`^const ${escaped} = ${templateMarker}`, "gmu")),
+  ];
+  if (declarations.length !== 1) return undefined;
+  const valueStart = (declarations[0].index ?? -1) + prefix.length;
+  const valueEnd = source.indexOf("`;", valueStart);
+  return valueEnd === -1 ? undefined : source.slice(valueStart, valueEnd);
+}
+
+function uniqueTopLevelArrayBody(source, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const declarations = [...source.matchAll(new RegExp(`^const ${escaped} = \\[`, "gmu"))];
+  if (declarations.length !== 1) return undefined;
+  const bodyStart = source.indexOf("[", declarations[0].index) + 1;
+  const bodyEndPattern = /^\];\r?$/gmu;
+  bodyEndPattern.lastIndex = bodyStart;
+  const bodyEnd = bodyEndPattern.exec(source)?.index ?? -1;
+  return bodyEnd === -1 ? undefined : source.slice(bodyStart, bodyEnd);
+}
+
+function normalizedContractText(source) {
+  return source.replaceAll("\r\n", "\n").trim();
+}
+
 function stageCalls(body) {
   return [
     ...body.matchAll(
@@ -168,6 +282,35 @@ function hasStrictPowerShellSelfTest(source) {
     if (cursor === -1) return false;
   }
   return true;
+}
+
+function hasExactNativePipeAbsence(source) {
+  const probeSource = uniqueTopLevelTemplateLiteral(source, "windowsPipeProbeSource");
+  const probeArguments = uniqueTopLevelArrayBody(source, "windowsPipeProbeArguments");
+  const probeBody = uniqueTopLevelSyncFunctionBody(source, "runNativePipeProbe");
+  const absentBody = uniqueTopLevelSyncFunctionBody(source, "assertNativePipeAbsent");
+  const presentBody = uniqueTopLevelSyncFunctionBody(source, "assertNativePipePresent");
+  const unavailableBody = uniqueTopLevelAsyncFunctionBody(source, "assertPipeUnavailable");
+  const statusBody = uniqueTopLevelAsyncFunctionBody(source, "runStatusRequest");
+  if (
+    probeSource === undefined ||
+    probeArguments === undefined ||
+    probeBody === undefined ||
+    absentBody === undefined ||
+    presentBody === undefined ||
+    unavailableBody === undefined ||
+    statusBody === undefined
+  )
+    return false;
+  return (
+    normalizedContractText(probeSource) === expectedWindowsPipeProbeSource &&
+    normalizedContractText(probeArguments) === expectedWindowsPipeProbeArgumentsBody &&
+    normalizedContractText(probeBody) === expectedRunNativePipeProbeBody &&
+    normalizedContractText(absentBody) === "assert.equal(runNativePipeProbe(endpoint), 0);" &&
+    normalizedContractText(presentBody) === "assert.equal(runNativePipeProbe(endpoint), 2);" &&
+    normalizedContractText(unavailableBody) === expectedAssertPipeUnavailableBody &&
+    normalizedContractText(statusBody) === expectedRunStatusRequestBody
+  );
 }
 
 function hasCapturedTrackedBrokerClose(source) {
@@ -323,6 +466,9 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasStrictPowerShellSelfTest(gateSource)) {
     errors.push("Windows gate must retain one bounded strict authoritative SelfTest");
+  }
+  if (!hasExactNativePipeAbsence(gateSource)) {
+    errors.push("Windows gate must prove exact native pipe absence and fail closed");
   }
   if (!hasCapturedTrackedBrokerClose(gateSource)) {
     errors.push("Windows gate must capture and await the exact spawned broker close event");

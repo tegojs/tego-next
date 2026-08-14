@@ -25,110 +25,6 @@ const requiredWindowsControlGateStages = [
   ["reconnect-failure", "runReconnectFailure"],
   ["twenty-lifecycle-rounds", "runTwentyLifecycleRounds"],
 ];
-const windowsControlGateImplementationFixtureBodies = new Map([
-  [
-    "preparePackedWindowsControlConsumer",
-    ["  await packWorkspaceSet();", "  preparedConsumer = {};"],
-  ],
-  [
-    "runPowerShellSelfTest",
-    [
-      '  const selfTestArguments = ["-SelfTest"];',
-      '  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
-      "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
-      "  });",
-      "  assert.equal(selfTest.error, undefined);",
-      "  assert.equal(selfTest.signal, null);",
-      "  assert.equal(selfTest.status, 0);",
-      '  assert.equal(selfTest.stdout, "");',
-      '  assert.equal(selfTest.stderr, "");',
-    ],
-  ],
-  ["startLiveDescriptor", ['  startTrackedServer("live-descriptor");']],
-  ["runStatusRequest", ["  await assertStatus();"]],
-  [
-    "runMalformedFrameFailure",
-    [
-      '  let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
-      "  try {",
-      "    await writeMalformedFrame(tracked.broker);",
-      "    const failure = new Error();",
-      '    "PROTOCOL_CONTROL_ENDPOINT_UNSAFE";',
-      "    await assert.rejects(",
-      "      tracked.server.close(),",
-      "      (error) => isExpectedMalformedServerClose(error, failure),",
-      "    );",
-      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "    await assertPipeUnavailable(tracked.endpoint);",
-      "    tracked = undefined;",
-      "  } finally {",
-      "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
-      "  }",
-    ],
-  ],
-  [
-    "runParentCrashCleanup",
-    ['  "--parent-crash-fixture";', "  details.brokerPid;", "  await assertPipeUnavailable();"],
-  ],
-  [
-    "runBrokerCrashCleanup",
-    [
-      '  let tracked: TrackedServer | undefined = await startTrackedServer("broker-crash");',
-      "  try {",
-      '    tracked.broker.kill("SIGKILL");',
-      "    const failure = new Error();",
-      "    isExpectedMalformedServerClose(error, failure);",
-      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "    await assertPipeUnavailable(tracked.endpoint);",
-      "    tracked = undefined;",
-      "  } finally {",
-      "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
-      "  }",
-    ],
-  ],
-  [
-    "runReconnectFailure",
-    [
-      "  const tracked = liveServer;",
-      "  try {",
-      "    await tracked.server.close();",
-      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "    await assertPipeUnavailable(tracked.endpoint);",
-      "    assert.equal(liveServer, tracked);",
-      "    liveServer = undefined;",
-      "  } finally {",
-      "    if (liveServer === tracked) {",
-      "      await cleanupTrackedServer(tracked);",
-      "      liveServer = undefined;",
-      "    }",
-      "  }",
-    ],
-  ],
-  [
-    "runTwentyLifecycleRounds",
-    [
-      "  for (let round = 0; round < 20; round += 1) {",
-      "    let tracked: TrackedServer | undefined = await startTrackedServer();",
-      "    try {",
-      "      await assertStatus();",
-      "      await tracked.server.close();",
-      "      await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "      await assertPipeUnavailable(tracked.endpoint);",
-      "      tracked = undefined;",
-      "    } finally {",
-      "      if (tracked !== undefined) await cleanupTrackedServer(tracked);",
-      "    }",
-      "  }",
-    ],
-  ],
-]);
-
-function windowsControlGateImplementationFixture(name) {
-  const body = windowsControlGateImplementationFixtureBodies.get(name);
-  assert.ok(body !== undefined, `${name} fixture body must exist`);
-  return [`async function ${name}() {`, ...body, "}"].join("\n");
-}
-
 function replaceTopLevelAsyncFunctionBody(source, name, body) {
   const declaration = new RegExp(`^async function ${name}\\b`, "mu").exec(source);
   assert.ok(declaration !== null, `${name} declaration must exist`);
@@ -366,6 +262,181 @@ test("Windows gate proves the current-user descriptor without a redundant PowerS
   );
 });
 
+test("Windows gate proves exact native pipe absence and fails closed on every other result", async () => {
+  const gateSource = await readFile(windowsControlGateSource, "utf8");
+  assert.match(gateSource, /realpathSync\(requiredEnvironment\("SystemRoot"\)\)/u);
+  assert.match(
+    gateSource,
+    /join\(systemRoot, "System32", "WindowsPowerShell", "v1\.0", "powershell\.exe"\)/u,
+  );
+  assert.doesNotMatch(gateSource, /Path: requiredEnvironment\("Path"\)/u);
+  assert.match(gateSource, /WaitNamedPipeW/u);
+  assert.match(gateSource, /SetLastError = true/u);
+  assert.match(gateSource, /Marshal\.GetLastWin32Error\(\)/u);
+  assert.match(gateSource, /if \(error == 2\) return 0;/u);
+  assert.match(gateSource, /if \(error == 121 \|\| error == 231\) return 2;/u);
+  assert.match(
+    gateSource,
+    /assertNativePipeAbsent\(endpoint\);[\s\S]+await assert\.rejects\([\s\S]+requestControl/u,
+  );
+  assert.match(
+    gateSource,
+    /async function runStatusRequest\(\): Promise<void> \{[\s\S]+await assertStatus\([\s\S]+assertNativePipePresent\(liveServer\.endpoint\);/u,
+  );
+});
+
+test("Windows gate source validation rejects weakened native pipe absence proofs", async (t) => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?pipe-proof=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+  const mutations = [
+    [
+      "native probe early return",
+      "function runNativePipeProbe(endpoint: string): number {",
+      "function runNativePipeProbe(endpoint: string): number {\n  return 0;",
+    ],
+    [
+      "pipe proof early return",
+      "async function assertPipeUnavailable(endpoint: string): Promise<void> {",
+      "async function assertPipeUnavailable(endpoint: string): Promise<void> {\n  return;",
+    ],
+    [
+      "status calibration early return",
+      "async function runStatusRequest(): Promise<void> {",
+      "async function runStatusRequest(): Promise<void> {\n  return;",
+    ],
+    ["PowerShell success shortcut", "try {\n$null = Add-Type", "try {\nexit 0\n$null = Add-Type"],
+    [
+      "C sharp success shortcut",
+      "    public static int Probe(string endpoint)\n    {",
+      "    public static int Probe(string endpoint)\n    {\n        return 0;",
+    ],
+    [
+      "secret parent environment added",
+      "    env: {",
+      "    env: {\n      EXTRA: process.env.GITHUB_TOKEN,",
+    ],
+    [
+      "SystemRoot not canonicalized",
+      'const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));',
+      'const systemRoot = requiredEnvironment("SystemRoot");',
+    ],
+    ["SystemRoot absolute check removed", "  assert.equal(isAbsolute(systemRoot), true);", ""],
+    [
+      "SystemRoot drive check removed",
+      "  assert.match(systemRoot, /^[A-Za-z]:\\\\[^\\r\\n]+$/u);",
+      "",
+    ],
+    [
+      "PowerShell executable not canonicalized",
+      [
+        "  const powershellExecutable = realpathSync(",
+        '    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),',
+        "  );",
+      ].join("\n"),
+      [
+        "  const powershellExecutable = join(",
+        '    systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe",',
+        "  );",
+      ].join("\n"),
+    ],
+    [
+      "PowerShell executable escapes SystemRoot",
+      '    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),',
+      '    join(requiredEnvironment("TEMP"), "powershell.exe"),',
+    ],
+    [
+      "PowerShell containment check removed",
+      "  assert.equal(isContained(systemRoot, powershellExecutable), true);",
+      "",
+    ],
+    [
+      "PowerShell executable resolved through PATH",
+      "  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {",
+      '  const probe = spawnSync("powershell.exe", windowsPipeProbeArguments, {',
+    ],
+    [
+      "request rejection skipped",
+      "  assertNativePipeAbsent(endpoint);\n  await assert.rejects(",
+      "  assertNativePipeAbsent(endpoint);\n  return;\n  await assert.rejects(",
+    ],
+    ["native probe removed", "  assertNativePipeAbsent(endpoint);", ""],
+    ["live present calibration removed", "  assertNativePipePresent(liveServer.endpoint);", ""],
+    ["last-error capture disabled", "SetLastError = true", "SetLastError = false"],
+    [
+      "available pipe treated as absent",
+      "if (WaitNamedPipeW(endpoint, 1)) return 2;",
+      "if (WaitNamedPipeW(endpoint, 1)) return 0;",
+    ],
+    ["missing pipe treated as present", "if (error == 2) return 0;", "if (error == 2) return 2;"],
+    [
+      "busy pipe treated as absent",
+      "if (error == 121 || error == 231) return 2;",
+      "if (error == 121 || error == 231) return 0;",
+    ],
+    [
+      "unknown native error treated as absent",
+      "        return 3;\n    }\n}",
+      "        return 0;\n    }\n}",
+    ],
+    ["probe errors ignored", "  assert.equal(probe.error, undefined);", ""],
+    ["probe signals ignored", "  assert.equal(probe.signal, null);", ""],
+    [
+      "probe status allowlist removed",
+      "  assert.ok(probe.status === 0 || probe.status === 2 || probe.status === 3);",
+      "",
+    ],
+    [
+      "absent assertion accepts present",
+      "  assert.equal(runNativePipeProbe(endpoint), 0);",
+      "  assert.notEqual(runNativePipeProbe(endpoint), 3);",
+    ],
+    [
+      "present assertion accepts absent",
+      "  assert.equal(runNativePipeProbe(endpoint), 2);",
+      "  assert.notEqual(runNativePipeProbe(endpoint), 3);",
+    ],
+    ["probe stdout ignored", '  assert.equal(probe.stdout, "");', ""],
+    ["probe stderr ignored", '  assert.equal(probe.stderr, "");', ""],
+    [
+      "endpoint interpolated into encoded source",
+      'Buffer.from(windowsPipeProbeSource, "utf16le")',
+      "Buffer.from(`" + "$" + "{windowsPipeProbeSource}" + "$" + '{endpoint}`, "utf16le")',
+    ],
+    ["endpoint data channel removed", "      TEGO_WINDOWS_PIPE_PROBE_ENDPOINT: endpoint,", ""],
+    ["full parent environment inherited", "    env: {", "    env: {\n      ...process.env,"],
+    ["encoded command replaced", '  "-EncodedCommand",', '  "-File",'],
+    ["probe output bound removed", "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,", ""],
+    ["shell enabled", "    shell: false,", "    shell: true,"],
+    ["probe stdio contract removed", '    stdio: ["ignore", "pipe", "pipe"],', ""],
+    ["timeout removed", "    timeout: PROCESS_CLEANUP_TIMEOUT_MS,", ""],
+    ["hidden window contract removed", "    windowsHide: true,", ""],
+  ];
+
+  for (const [name, from, to] of mutations) {
+    await t.test(name, () => {
+      const mutation = gateSource.replace(from, to);
+      assert.notEqual(mutation, gateSource);
+      assert.ok(
+        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+      );
+      assert.ok(
+        validateWindowsControlGateContract({
+          gateSource: mutation.replaceAll("\n", "\r\n"),
+          runnerSource: runnerSource.replaceAll("\n", "\r\n"),
+        }).length > 0,
+      );
+    });
+  }
+});
+
 test("Windows control gate source validation rejects removed, reordered, softened, or no-op stages", async (t) => {
   const { validateWindowsControlGateContract } = await import(
     new URL(
@@ -380,69 +451,14 @@ test("Windows control gate source validation rejects removed, reordered, softene
   );
 
   const stageLines = requiredWindowsControlGateStages.map(
-    ([stage, implementation]) =>
-      `  await runWindowsControlGateStage("${stage}", ${implementation});`,
+    ([stage, implementation], index) =>
+      `${index === 0 ? "    " : "  "}await runWindowsControlGateStage("${stage}", ${implementation});`,
   );
   const markerWrite = `  process.stdout.write(\`\${WINDOWS_CONTROL_GATE_MARKER}\\n\`);`;
-  const activeStageHelper = [
-    "async function runWindowsControlGateStage(_stage, operation) {",
-    "  await operation();",
-    "}",
-  ].join("\n");
-  const closeMatcherFixture = [
-    "function isExpectedMalformedServerClose(error, observedFailure) {",
-    "  return (",
-    "    error instanceof AggregateError &&",
-    "    error.errors.length === 2 &&",
-    '    diagnosticCode(error.errors[0]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE" &&',
-    "    error.errors[1] === observedFailure &&",
-    '    diagnosticCode(error.errors[1]) === "PROTOCOL_CONTROL_ENDPOINT_UNSAFE"',
-    "  );",
-    "}",
-  ].join("\n");
-  const runnerFixture = [
-    closeMatcherFixture,
-    activeStageHelper,
-    windowsControlGateImplementationFixture(requiredWindowsControlGateStages[0][1]),
-    "async function runWindowsControlGate() {",
-    stageLines[0],
-    "  await runInstalledWindowsControlGate();",
-    markerWrite,
-    "}",
-  ].join("\n");
-  const gateFixture = [
-    closeMatcherFixture,
-    activeStageHelper,
-    [
-      "async function startTrackedServer() {",
-      "  let brokerClosed: Promise<void> | undefined;",
-      "  let broker;",
-      "  const spawned = spawn();",
-      "  brokerClosed = new Promise<void>((resolveClose) => {",
-      '    spawned.once("close", resolveClose);',
-      "  });",
-      "  broker = spawned;",
-      "  return spawned as never;",
-      "  assert.ok(brokerClosed !== undefined);",
-      "  return {",
-      "    broker,",
-      "    brokerClosed,",
-      "  };",
-      "}",
-      "async function cleanupTrackedServer(tracked) {",
-      "  if (tracked.broker.exitCode === null && tracked.broker.signalCode === null) {",
-      '    tracked.broker.kill("SIGKILL");',
-      "  }",
-      "  await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
-      "}",
-    ].join("\n"),
-    ...requiredWindowsControlGateStages
-      .slice(1)
-      .map(([_stage, implementation]) => windowsControlGateImplementationFixture(implementation)),
-    "async function runInstalledWindowsControlGate() {",
-    ...stageLines.slice(1),
-    "}",
-  ].join("\n");
+  const [runnerFixture, gateFixture] = await Promise.all([
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
   assert.deepEqual(
     validateWindowsControlGateContract({ gateSource: gateFixture, runnerSource: runnerFixture }),
     [],
@@ -457,19 +473,20 @@ test("Windows control gate source validation rejects removed, reordered, softene
 
   for (const [index, [stage, implementation]] of requiredWindowsControlGateStages.entries()) {
     const sourceName = index === 0 ? "runnerSource" : "gateSource";
+    const indent = index === 0 ? "    " : "  ";
     const original = sourceName === "runnerSource" ? runnerFixture : gateFixture;
     const line = stageLines[index];
     const removed = original.replace(`${line}\n`, "");
     const noOp = original.replace(
       line,
-      `  await runWindowsControlGateStage("${stage}", async () => undefined);`,
+      `${indent}await runWindowsControlGateStage("${stage}", async () => undefined);`,
     );
-    const softened = original.replace(line, `  if (false) ${line.trim()}`);
+    const softened = original.replace(line, `${indent}if (false) ${line.trim()}`);
     let reordered;
     if (index === 0) {
       reordered = original.replace(
-        `${line}\n  await runInstalledWindowsControlGate();`,
-        `  await runInstalledWindowsControlGate();\n${line}`,
+        `${line}\n    await runInstalledWindowsControlGate();`,
+        `    await runInstalledWindowsControlGate();\n${line}`,
       );
     } else if (index === requiredWindowsControlGateStages.length - 1) {
       const previousLine = stageLines[index - 1];
@@ -513,10 +530,10 @@ test("Windows control gate source validation rejects removed, reordered, softene
   }
 
   for (const runnerMutation of [
-    runnerFixture.replace("  await runInstalledWindowsControlGate();\n", ""),
+    runnerFixture.replace("    await runInstalledWindowsControlGate();\n", ""),
     runnerFixture.replace(
-      "  await runInstalledWindowsControlGate();",
-      "  await Promise.resolve();",
+      "    await runInstalledWindowsControlGate();",
+      "    await Promise.resolve();",
     ),
     runnerFixture.replace(markerWrite, `${markerWrite}\n  await runInstalledWindowsControlGate();`),
   ]) {

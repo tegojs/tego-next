@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -23,6 +24,45 @@ const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
 const PROCESS_CLEANUP_TIMEOUT_MS = 15_000;
 const POWERSHELL_STARTUP_STDERR_MAX_BYTES = 64 * 1024;
+const windowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Set-StrictMode -Version Latest
+try {
+$null = Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class TegoWindowsPipeProbe
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WaitNamedPipeW(string name, uint timeout);
+
+    public static int Probe(string endpoint)
+    {
+        if (String.IsNullOrEmpty(endpoint)) return 3;
+        if (WaitNamedPipeW(endpoint, 1)) return 2;
+        int error = Marshal.GetLastWin32Error();
+        if (error == 2) return 0;
+        if (error == 121 || error == 231) return 2;
+        return 3;
+    }
+}
+'@
+$probeResult = [TegoWindowsPipeProbe]::Probe($env:TEGO_WINDOWS_PIPE_PROBE_ENDPOINT)
+exit $probeResult
+} catch {
+exit 3
+}`;
+const windowsPipeProbeArguments = [
+  "-NoLogo",
+  "-NoProfile",
+  "-NonInteractive",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-EncodedCommand",
+  Buffer.from(windowsPipeProbeSource, "utf16le").toString("base64"),
+];
 const expectedPackageNames = [
   "@tego/cli",
   "@tego/contracts",
@@ -140,23 +180,56 @@ async function waitForProcessExit(processId: number): Promise<void> {
   assert.equal(processExists(processId), false, "exact Windows process remained alive");
 }
 
+function runNativePipeProbe(endpoint: string): number {
+  const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));
+  assert.equal(isAbsolute(systemRoot), true);
+  assert.match(systemRoot, /^[A-Za-z]:\\[^\r\n]+$/u);
+  const powershellExecutable = realpathSync(
+    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+  );
+  assert.equal(isContained(systemRoot, powershellExecutable), true);
+  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {
+    encoding: "utf8",
+    env: {
+      SystemRoot: systemRoot,
+      TEGO_WINDOWS_PIPE_PROBE_ENDPOINT: endpoint,
+      TEMP: requiredEnvironment("TEMP"),
+      TMP: requiredEnvironment("TMP"),
+      WINDIR: systemRoot,
+    },
+    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: PROCESS_CLEANUP_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  assert.equal(probe.error, undefined);
+  assert.equal(probe.signal, null);
+  assert.equal(probe.stdout, "");
+  assert.equal(probe.stderr, "");
+  assert.ok(probe.status === 0 || probe.status === 2 || probe.status === 3);
+  return probe.status;
+}
+
+function assertNativePipeAbsent(endpoint: string): void {
+  assert.equal(runNativePipeProbe(endpoint), 0);
+}
+
+function assertNativePipePresent(endpoint: string): void {
+  assert.equal(runNativePipeProbe(endpoint), 2);
+}
+
 async function assertPipeUnavailable(endpoint: string): Promise<void> {
-  const deadline = Date.now() + PROCESS_CLEANUP_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    try {
-      await requestControl({
-        endpoint,
-        operation: "runtime.status",
-        input: {},
-        requestId: `windows-control-unavailable-${randomUUID()}`,
-        timeoutMs: 250,
-      });
-    } catch {
-      return;
-    }
-    await delay(25);
-  }
-  assert.fail("Windows control pipe remained reachable");
+  assertNativePipeAbsent(endpoint);
+  await assert.rejects(
+    requestControl({
+      endpoint,
+      operation: "runtime.status",
+      input: {},
+      requestId: `windows-control-unavailable-${randomUUID()}`,
+      timeoutMs: 250,
+    }),
+  );
 }
 
 function assertDescriptor(descriptor: WindowsBrokerSecurityDescriptor): void {
@@ -317,6 +390,7 @@ async function startLiveDescriptor(): Promise<void> {
 async function runStatusRequest(): Promise<void> {
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
+  assertNativePipePresent(liveServer.endpoint);
 }
 
 async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
