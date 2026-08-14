@@ -78,6 +78,7 @@ let liveServer: TrackedServer | undefined;
 const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
 let nonAuthoritativeStage = "not-entered";
 let nonAuthoritativeReconnectStage = "not-entered";
+let nonAuthoritativeReconnectCleanupStage = "not-entered";
 let nonAuthoritativeRound = -1;
 let nonAuthoritativeRoundStage = "not-entered";
 
@@ -458,10 +459,11 @@ async function runReconnectFailure(): Promise<void> {
     liveServer = undefined;
     nonAuthoritativeReconnectStage = "complete";
   } finally {
-    if (liveServer === tracked) nonAuthoritativeReconnectStage = "fallback-cleanup";
+    if (liveServer === tracked) nonAuthoritativeReconnectCleanupStage = "start";
     if (liveServer === tracked) {
       await cleanupTrackedServer(tracked);
       liveServer = undefined;
+      nonAuthoritativeReconnectCleanupStage = "complete";
     }
   }
 }
@@ -514,6 +516,9 @@ if (process.argv[2] === "--parent-crash-fixture") {
     process.stderr.write(`${task4DiagnosticMarker}_STAGE:${nonAuthoritativeStage}\n`);
     process.stderr.write(
       `${task4DiagnosticMarker}_RECONNECT_STAGE:${nonAuthoritativeReconnectStage}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_CLEANUP:${nonAuthoritativeReconnectCleanupStage}\n`,
     );
     process.stderr.write(
       `${task4DiagnosticMarker}_ROUND:${String(nonAuthoritativeRound)}:${nonAuthoritativeRoundStage}\n`,
