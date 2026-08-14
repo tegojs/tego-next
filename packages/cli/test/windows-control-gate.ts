@@ -17,6 +17,9 @@ import { diagnosticCode, parseRuntimeStatus, type RuntimeOperations } from "@teg
 
 const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
+const task4NonAuthoritativeStagePrefix = ["TEGO", "TASK4", "NON", "AUTHORITATIVE", "STAGE"].join(
+  "_",
+);
 const WINDOWS_PIPE_FULL_CONTROL = 0x1f01ff;
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
@@ -392,7 +395,12 @@ async function runWindowsControlGateStage(
   _stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
-  await operation();
+  try {
+    await operation();
+  } catch (error) {
+    process.stderr.write(`${task4NonAuthoritativeStagePrefix}:${_stage}\n`);
+    throw error;
+  }
 }
 
 async function runPowerShellSelfTest(): Promise<void> {

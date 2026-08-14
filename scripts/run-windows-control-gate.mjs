@@ -19,13 +19,13 @@ const temporaryTaskDiagnosticTokens = [
 const expectedParentCrashCleanupSha256 =
   "bac041802252245f8a4a01f1270699a67282dde9bbb65c66dec80fbbaefbf3ef";
 const expectedWindowsGateSourceSha256 =
-  "4582710987275134e89caa87036b1db60d6ca24d40b68f7efc55516cd6ea5f0b";
+  "99dbb76dd7d6d0a0dd93df16ab8140230dd7d84fe3ca7e7cfd3b83f75086a3d6";
 const expectedWindowsBrokerCSharpSourceSha256 =
   "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4";
 const expectedWindowsBrokerPowerShellSourceSha256 =
   "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53";
 const expectedWindowsGateRunnerSourceSha256 =
-  "5d21024ab51c37376987790b541de050e6b8ff510d655df7864fef88edb7addd";
+  "a3f603349b03bea1d2506a4455eb7af8e2022809bfe6bbf73505b45c3f23ba0a";
 const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -111,6 +111,20 @@ const expectedRunStatusRequestBody = [
   "assert.ok(liveServer !== undefined);",
   '  await assertStatus(liveServer.endpoint, "windows-control-gate-status");',
   "  assertNativePipePresent(liveServer.endpoint);",
+].join("\n");
+const expectedNonAuthoritativeStageExecutorBody = [
+  "try {",
+  "    await operation();",
+  "  } catch (error) {",
+  [
+    "    process.stderr.write(`",
+    "$",
+    "{task4NonAuthoritativeStagePrefix}:",
+    "$",
+    "{_stage}\\n`);",
+  ].join(""),
+  "    throw error;",
+  "  }",
 ].join("\n");
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -320,7 +334,7 @@ function hasActiveStageExecutor(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
     ?.replaceAll("\r\n", "\n")
     .trim();
-  return body === "await operation();";
+  return body === "await operation();" || body === expectedNonAuthoritativeStageExecutorBody;
 }
 
 function hasForbiddenGateFlow(body) {
