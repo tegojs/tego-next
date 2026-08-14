@@ -58,6 +58,7 @@ const expectedStatus = parseRuntimeStatus({
 
 interface TrackedServer {
   readonly broker: ChildProcess;
+  readonly brokerClosed: Promise<void>;
   readonly brokerPid: number;
   readonly descriptor: WindowsBrokerSecurityDescriptor;
   readonly endpoint: string;
@@ -73,8 +74,6 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let diagnosticStage = "powershell-csharp-self-test";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -171,6 +170,7 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
   const endpoint = `\\\\.\\pipe\\tego-windows-control-${label}-${process.pid}-${randomUUID()}`;
   const failed = Promise.withResolvers<Error>();
   let broker: ChildProcess | undefined;
+  let brokerClosed: Promise<void> | undefined;
   let descriptor: WindowsBrokerSecurityDescriptor | undefined;
   const server = await startControlServer({
     endpoint,
@@ -196,6 +196,9 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
           });
+          brokerClosed = new Promise<void>((resolveClose) => {
+            spawned.once("close", resolveClose);
+          });
           broker = spawned;
           return spawned as never;
         },
@@ -203,11 +206,13 @@ async function startTrackedServer(label: string): Promise<TrackedServer> {
     },
   });
   assert.ok(broker !== undefined);
+  assert.ok(brokerClosed !== undefined);
   assert.ok(Number.isSafeInteger(broker.pid) && (broker.pid ?? 0) > 0);
   assert.ok(descriptor !== undefined);
   assertDescriptor(descriptor);
   return {
     broker,
+    brokerClosed,
     brokerPid: broker.pid as number,
     descriptor,
     endpoint,
@@ -220,10 +225,10 @@ async function cleanupTrackedServer(tracked: TrackedServer): Promise<void> {
   try {
     await tracked.server.close();
   } catch {}
-  if (processExists(tracked.brokerPid)) {
+  if (tracked.broker.exitCode === null && tracked.broker.signalCode === null) {
     tracked.broker.kill("SIGKILL");
   }
-  await waitForProcessExit(tracked.brokerPid);
+  await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
   await assertPipeUnavailable(tracked.endpoint);
 }
 
@@ -296,12 +301,10 @@ async function runPowerShellSelfTest(): Promise<void> {
 }
 
 async function startLiveDescriptor(): Promise<void> {
-  diagnosticStage = "live-server-handle-descriptor";
   liveServer = await startTrackedServer("live-descriptor");
 }
 
 async function runStatusRequest(): Promise<void> {
-  diagnosticStage = "status-request";
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
 }
@@ -316,23 +319,17 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 }
 
 async function runMalformedFrameFailure(): Promise<void> {
-  diagnosticStage = "malformed-start";
-  const tracked = await startTrackedServer("malformed-frame");
+  let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");
   try {
-    diagnosticStage = "malformed-write";
     await writeMalformedFrame(tracked.broker);
-    diagnosticStage = "malformed-broker-failure";
     const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
     assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
-    diagnosticStage = "malformed-server-close";
     await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
-    diagnosticStage = "malformed-process-exit";
-    await waitForProcessExit(tracked.brokerPid);
-    diagnosticStage = "malformed-pipe-absence";
+    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
     await assertPipeUnavailable(tracked.endpoint);
+    tracked = undefined;
   } finally {
-    diagnosticStage = "malformed-cleanup";
-    await cleanupTrackedServer(tracked);
+    if (tracked !== undefined) await cleanupTrackedServer(tracked);
   }
 }
 
@@ -368,7 +365,6 @@ function isParentFixtureReady(value: unknown): value is ParentFixtureReady {
 }
 
 async function runParentCrashCleanup(): Promise<void> {
-  diagnosticStage = "parent-crash-cleanup";
   const fixture = spawn(
     process.execPath,
     [fileURLToPath(import.meta.url), "--parent-crash-fixture"],
@@ -412,7 +408,6 @@ async function runParentCrashCleanup(): Promise<void> {
 }
 
 async function runBrokerCrashCleanup(): Promise<void> {
-  diagnosticStage = "broker-crash-cleanup";
   const tracked = await startTrackedServer("broker-crash");
   try {
     assert.equal(tracked.broker.kill("SIGKILL"), true);
@@ -427,7 +422,6 @@ async function runBrokerCrashCleanup(): Promise<void> {
 }
 
 async function runReconnectFailure(): Promise<void> {
-  diagnosticStage = "reconnect-failure";
   assert.ok(liveServer !== undefined);
   const tracked = liveServer;
   liveServer = undefined;
@@ -437,7 +431,6 @@ async function runReconnectFailure(): Promise<void> {
 }
 
 async function runTwentyLifecycleRounds(): Promise<void> {
-  diagnosticStage = "twenty-lifecycle-rounds";
   for (let round = 0; round < 20; round += 1) {
     const tracked = await startTrackedServer(`round-${String(round)}`);
     try {
@@ -473,7 +466,6 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {

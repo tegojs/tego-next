@@ -48,9 +48,17 @@ const windowsControlGateImplementationFixtureBodies = new Map([
   [
     "runMalformedFrameFailure",
     [
-      "  await writeMalformedFrame();",
-      '  "PROTOCOL_CONTROL_ENDPOINT_UNSAFE";',
-      "  await assertPipeUnavailable();",
+      '  let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
+      "  try {",
+      "    await writeMalformedFrame(tracked.broker);",
+      '    "PROTOCOL_CONTROL_ENDPOINT_UNSAFE";',
+      "    await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);",
+      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "    await assertPipeUnavailable(tracked.endpoint);",
+      "    tracked = undefined;",
+      "  } finally {",
+      "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+      "  }",
     ],
   ],
   [
@@ -335,6 +343,29 @@ test("Windows control gate source validation rejects removed, reordered, softene
   ].join("\n");
   const gateFixture = [
     activeStageHelper,
+    [
+      "async function startTrackedServer() {",
+      "  let brokerClosed: Promise<void> | undefined;",
+      "  let broker;",
+      "  const spawned = spawn();",
+      "  brokerClosed = new Promise<void>((resolveClose) => {",
+      '    spawned.once("close", resolveClose);',
+      "  });",
+      "  broker = spawned;",
+      "  return spawned as never;",
+      "  assert.ok(brokerClosed !== undefined);",
+      "  return {",
+      "    broker,",
+      "    brokerClosed,",
+      "  };",
+      "}",
+      "async function cleanupTrackedServer(tracked) {",
+      "  if (tracked.broker.exitCode === null && tracked.broker.signalCode === null) {",
+      '    tracked.broker.kill("SIGKILL");',
+      "  }",
+      "  await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "}",
+    ].join("\n"),
     ...requiredWindowsControlGateStages
       .slice(1)
       .map(([_stage, implementation]) => windowsControlGateImplementationFixture(implementation)),
@@ -467,6 +498,51 @@ test("Windows control gate validation rejects hidden control flow and implementa
   }
 });
 
+test("Windows malformed-frame cleanup transfers ownership only after exact child close", async (t) => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?malformed-ownership=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+  const mutations = [
+    gateSource.replace(
+      '            spawned.once("close", resolveClose);',
+      '            spawned.once("exit", resolveClose);',
+    ),
+    gateSource.replace(
+      "  await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "  await waitForProcessExit(tracked.brokerPid);",
+    ),
+    gateSource.replace(
+      "    await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+      "    await Promise.resolve();",
+    ),
+    gateSource.replace("    tracked = undefined;\n", ""),
+    gateSource.replace(
+      "    await assertPipeUnavailable(tracked.endpoint);\n    tracked = undefined;",
+      "    tracked = undefined;\n    await assertPipeUnavailable(tracked.endpoint);",
+    ),
+    gateSource.replace(
+      "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
+      "    await cleanupTrackedServer(tracked);",
+    ),
+  ];
+
+  for (const [index, mutation] of mutations.entries()) {
+    await t.test(`malformed ownership mutation ${String(index + 1)}`, () => {
+      assert.notEqual(mutation, gateSource);
+      assert.ok(
+        validateWindowsControlGateContract({ gateSource: mutation, runnerSource }).length > 0,
+      );
+    });
+  }
+});
+
 test("Windows gate validation keeps one bounded strict authoritative SelfTest", async (t) => {
   const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
     import(
@@ -482,7 +558,7 @@ test("Windows gate validation keeps one bounded strict authoritative SelfTest", 
     gateSource.match(/spawnSync\("powershell\.exe", selfTestArguments, \{/gu)?.length,
     1,
   );
-  assert.doesNotMatch(gateSource, /\bprime\b/u);
+  assert.doesNotMatch(`${gateSource}\n${runnerSource}`, /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u);
   const mutations = [
     gateSource.replace(
       "  assert.equal(selfTest.status, 0);",

@@ -7,6 +7,7 @@ import { packWorkspaceSet, withPackedConsumer } from "./package-contract.mjs";
 
 export const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
 export const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
+const temporaryTaskDiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const gateSourcePath = fileURLToPath(
@@ -106,7 +107,13 @@ function hasForbiddenGateFlow(body) {
 
 function hasStrictPowerShellSelfTest(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runPowerShellSelfTest");
-  if (body === undefined || body.includes('"-Endpoint"') || /\bprime\b/u.test(body)) return false;
+  if (
+    body === undefined ||
+    body.includes('"-Endpoint"') ||
+    /\bprime\b/u.test(body) ||
+    body.includes(temporaryTaskDiagnosticMarker)
+  )
+    return false;
   const spawnExpression = 'spawnSync("powershell.exe", selfTestArguments, {';
   if (body.split(spawnExpression).length - 1 !== 1) return false;
   if (body.split("maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES").length - 1 !== 1) {
@@ -119,6 +126,57 @@ function hasStrictPowerShellSelfTest(source) {
     "assert.equal(selfTest.status, 0);",
     'assert.equal(selfTest.stdout, "");',
     'assert.equal(selfTest.stderr, "");',
+  ];
+  let cursor = -1;
+  for (const token of requiredInOrder) {
+    cursor = body.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return true;
+}
+
+function hasCapturedTrackedBrokerClose(source) {
+  const startBody = uniqueTopLevelAsyncFunctionBody(source, "startTrackedServer");
+  const cleanupBody = uniqueTopLevelAsyncFunctionBody(source, "cleanupTrackedServer");
+  if (startBody === undefined || cleanupBody === undefined) return false;
+  const startTokens = [
+    "let brokerClosed:",
+    "const spawned = spawn(",
+    "brokerClosed = new Promise<void>((resolveClose) => {",
+    'spawned.once("close", resolveClose);',
+    "broker = spawned;",
+    "return spawned as never;",
+    "assert.ok(brokerClosed !== undefined);",
+    "brokerClosed,",
+  ];
+  let cursor = -1;
+  for (const token of startTokens) {
+    cursor = startBody.indexOf(token, cursor + 1);
+    if (cursor === -1) return false;
+  }
+  return (
+    cleanupBody.includes(
+      "tracked.broker.exitCode === null && tracked.broker.signalCode === null",
+    ) &&
+    cleanupBody.includes('tracked.broker.kill("SIGKILL");') &&
+    cleanupBody.includes("await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);") &&
+    !cleanupBody.includes("processExists(") &&
+    !cleanupBody.includes("waitForProcessExit(")
+  );
+}
+
+function hasMalformedOwnershipTransfer(source) {
+  const body = uniqueTopLevelAsyncFunctionBody(source, "runMalformedFrameFailure");
+  if (body === undefined) return false;
+  const requiredInOrder = [
+    'let tracked: TrackedServer | undefined = await startTrackedServer("malformed-frame");',
+    "await writeMalformedFrame(tracked.broker);",
+    "await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);",
+    "await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);",
+    "await assertPipeUnavailable(tracked.endpoint);",
+    "tracked = undefined;",
+    "} finally {",
+    "if (tracked !== undefined) await cleanupTrackedServer(tracked);",
   ];
   let cursor = -1;
   for (const token of requiredInOrder) {
@@ -164,6 +222,15 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasStrictPowerShellSelfTest(gateSource)) {
     errors.push("Windows gate must retain one bounded strict authoritative SelfTest");
+  }
+  if (!hasCapturedTrackedBrokerClose(gateSource)) {
+    errors.push("Windows gate must capture and await the exact spawned broker close event");
+  }
+  if (!hasMalformedOwnershipTransfer(gateSource)) {
+    errors.push("malformed-frame cleanup ownership must release only after its postconditions");
+  }
+  if (`${gateSource}\n${runnerSource}`.includes(temporaryTaskDiagnosticMarker)) {
+    errors.push("Windows gate cannot retain temporary diagnostic output");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(
