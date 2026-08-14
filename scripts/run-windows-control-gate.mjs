@@ -9,8 +9,8 @@ import { packWorkspaceSet, withPackedConsumer } from "./package-contract.mjs";
 
 export const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
 export const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
-const temporaryTaskDiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
-const temporaryTaskDiagnosticTokens = [
+const forbiddenTaskDiagnosticTokens = [
+  ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_"),
   ["TEGO", "TASK4"].join("_"),
   ["TASK4", "NON", "AUTHORITATIVE"].join("_"),
   ["Task", "4", "Diagnostic"].join(""),
@@ -19,43 +19,31 @@ const temporaryTaskDiagnosticTokens = [
 const expectedParentCrashCleanupSha256 =
   "bac041802252245f8a4a01f1270699a67282dde9bbb65c66dec80fbbaefbf3ef";
 const expectedWindowsGateSourceSha256 =
-  "d06fa0b6d7209b3bc1795b437d2a17598c0e105959300629ea9c0f18d6ffb41b";
+  "3a3213ef92bf8152ef9a268a72134e08b5a5f8ad1079fc52687aeb17757a3719";
 const expectedWindowsBrokerCSharpSourceSha256 =
   "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4";
 const expectedWindowsBrokerPowerShellSourceSha256 =
   "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53";
 const expectedWindowsGateRunnerSourceSha256 =
-  "5060aeb4d7b80583446fd45897717c0fe18f8bd7e218b3d8af58a59325ec63a6";
-const expectedWindowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-Set-StrictMode -Version Latest
-try {
-$null = Add-Type -Language CSharp -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class TegoWindowsPipeProbe
-{
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool WaitNamedPipeW(string name, uint timeout);
-
-    public static int Probe(string endpoint)
-    {
-        if (String.IsNullOrEmpty(endpoint)) return 3;
-        if (WaitNamedPipeW(endpoint, 1)) return 2;
-        int error = Marshal.GetLastWin32Error();
-        if (error == 2) return 0;
-        if (error == 121 || error == 231) return 2;
-        return 3;
-    }
-}
-'@
-$probeResult = [TegoWindowsPipeProbe]::Probe($env:TEGO_WINDOWS_PIPE_PROBE_ENDPOINT)
-exit $probeResult
-} catch {
-exit 3
-}`;
+  "62efb675d05de0597478c7bf76b0426b48ec3c86b7589de43e044e1c2f7e8df7";
+const expectedWindowsPipeProbeSourceSha256 =
+  "a95b6eb5c9b6fe637a5d644007c88e0e7201af204eb24c28bbbde28440616961";
+const expectedWindowsNativePipeProbeClientRegionSha256 =
+  "f1878ba9fbacc6a7a5049c5fed6055a09093aaa5e54244c16c8ec8419f712369";
+const expectedPersistentNativePipeProbeBodySha256 = Object.freeze({
+  assertNativePipeAbsent: "553697e13fde797428a67a4f36cbb153ff0c06678e9361fe9fbbb651bf5bd77e",
+  assertNativePipePresent: "b5823131e162ea271256bb226c09ec30c515b48e743b9e4489f8b3e44e64420d",
+  assertPipeUnavailable: "d2585fda10b2f2aa5aaeed46270525137b7ed432e268583df365bf181218f342",
+  closeNativePipeProbeForSuccess:
+    "24a0307df878a275faee3e36669640e6824567b5063d2d0f63ced7adfb8dda24",
+  forceCloseNativePipeProbe: "e436e848c810a118cb7a34aacdc23867a840c483e997246cbb33b1044f4a97e9",
+  queryNativePipeProbe: "9f2ccfa93c653d2a43f0c7e0dfc8e062b0495e3b624a5efaab6cb57f0dcdc8ba",
+  resolveWindowsNativePipeProbeLaunch:
+    "0ccd9345df72e86166b965de75af43c7ec14422399e8f5b7085f8af3ac0c613e",
+  runStatusRequest: "f3a9c45fcc169f38bfbf61282e6a4f80595ead2e7b42c217227a95db81fb5c74",
+  runWindowsControlGateProgram: "a21baf682b9676b26e5f397231a5b16f43a6110eff269cba327cae9445444b4b",
+  startWindowsNativePipeProbe: "de8434c31b30e32bc1ca1c7162d1b8271da43320b3d8de553c5b39ccaab4246b",
+});
 const expectedWindowsPipeProbeArgumentsBody = [
   '"-NoLogo",',
   '  "-NoProfile",',
@@ -64,101 +52,6 @@ const expectedWindowsPipeProbeArgumentsBody = [
   '  "Bypass",',
   '  "-EncodedCommand",',
   '  Buffer.from(windowsPipeProbeSource, "utf16le").toString("base64"),',
-].join("\n");
-const expectedRunNativePipeProbeBody = [
-  'task4NonAuthoritativeStageDetail = "powershell-path";',
-  '  const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));',
-  "  assert.equal(isAbsolute(systemRoot), true);",
-  "  assert.match(systemRoot, /^[A-Za-z]:\\\\[^\\r\\n]+$/u);",
-  "  const powershellExecutable = realpathSync(",
-  '    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),',
-  "  );",
-  "  assert.equal(isContained(systemRoot, powershellExecutable), true);",
-  '  task4NonAuthoritativeStageDetail = "powershell-spawn";',
-  "  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {",
-  '    encoding: "utf8",',
-  "    env: {",
-  "      SystemRoot: systemRoot,",
-  "      TEGO_WINDOWS_PIPE_PROBE_ENDPOINT: endpoint,",
-  '      TEMP: requiredEnvironment("TEMP"),',
-  '      TMP: requiredEnvironment("TMP"),',
-  "      WINDIR: systemRoot,",
-  "    },",
-  "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
-  "    shell: false,",
-  '    stdio: ["ignore", "pipe", "pipe"],',
-  "    timeout: PROCESS_CLEANUP_TIMEOUT_MS,",
-  "    windowsHide: true,",
-  "  });",
-  "  const probeErrorCode = (probe.error as NodeJS.ErrnoException | undefined)?.code;",
-  "  task4NonAuthoritativeStageDetail =",
-  "    probe.error !== undefined",
-  '      ? probeErrorCode === "ETIMEDOUT"',
-  '        ? "powershell-spawn-timeout"',
-  '        : probeErrorCode === "ENOBUFS"',
-  '          ? "powershell-spawn-buffer"',
-  '          : probeErrorCode === "ENOENT"',
-  '            ? "powershell-spawn-missing"',
-  '            : probeErrorCode === "EACCES"',
-  '              ? "powershell-spawn-denied"',
-  '              : probeErrorCode === "EINVAL"',
-  '                ? "powershell-spawn-invalid"',
-  '                : "powershell-spawn-other"',
-  "      : probe.signal !== null",
-  '        ? "powershell-signal"',
-  '        : probe.stdout !== ""',
-  '          ? "powershell-stdout"',
-  '          : probe.stderr !== ""',
-  '            ? "powershell-stderr"',
-  "            : probe.status === 0",
-  '              ? "powershell-status-absent"',
-  "              : probe.status === 2",
-  '                ? "powershell-status-present"',
-  "                : probe.status === 3",
-  '                  ? "powershell-status-error"',
-  '                  : "powershell-status-unknown";',
-  "  assert.equal(probe.error, undefined);",
-  "  assert.equal(probe.signal, null);",
-  '  assert.equal(probe.stdout, "");',
-  '  assert.equal(probe.stderr, "");',
-  "  assert.ok(probe.status === 0 || probe.status === 2 || probe.status === 3);",
-  "  return probe.status;",
-].join("\n");
-const expectedAssertPipeUnavailableBody = [
-  "assertNativePipeAbsent(endpoint);",
-  "  await assert.rejects(",
-  "    requestControl({",
-  "      endpoint,",
-  '      operation: "runtime.status",',
-  "      input: {},",
-  ["      requestId: `windows-control-unavailable-", "$", "{randomUUID()}`,"].join(""),
-  "      timeoutMs: 250,",
-  "    }),",
-  "  );",
-].join("\n");
-const expectedRunStatusRequestBody = [
-  'task4NonAuthoritativeStageDetail = "status-request";',
-  "  assert.ok(liveServer !== undefined);",
-  '  await assertStatus(liveServer.endpoint, "windows-control-gate-status");',
-  "  assertNativePipePresent(liveServer.endpoint);",
-].join("\n");
-const expectedNonAuthoritativeStageExecutorBody = [
-  "try {",
-  "    await operation();",
-  "  } catch (error) {",
-  "    process.stderr.write(",
-  [
-    "      `",
-    "$",
-    "{task4NonAuthoritativeStagePrefix}:",
-    "$",
-    "{_stage}:",
-    "$",
-    "{task4NonAuthoritativeStageDetail}\\n`,",
-  ].join(""),
-  "    );",
-  "    throw error;",
-  "  }",
 ].join("\n");
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -202,7 +95,13 @@ const requiredWindowsControlGateStages = [
   [
     "powershell-csharp-self-test",
     "runPowerShellSelfTest",
-    ["spawnSync(", '"-SelfTest"', "selfTest.status", "selfTest.stderr"],
+    [
+      "spawnSync(",
+      '"-SelfTest"',
+      "selfTest.status",
+      "selfTest.stderr",
+      "nativePipeProbe = await startWindowsNativePipeProbe();",
+    ],
   ],
   [
     "live-server-handle-descriptor",
@@ -298,6 +197,14 @@ function uniqueTopLevelArrayBody(source, name) {
   return bodyEnd === -1 ? undefined : source.slice(bodyStart, bodyEnd);
 }
 
+function uniqueBoundedSourceRegion(source, startMarker, endMarker) {
+  if (source.split(startMarker).length - 1 !== 1 || source.split(endMarker).length - 1 !== 1)
+    return undefined;
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  return start === -1 || end === -1 ? undefined : source.slice(start, end);
+}
+
 function normalizedContractText(source) {
   return source.replaceAll("\r\n", "\n").trim();
 }
@@ -368,7 +275,7 @@ function hasActiveStageExecutor(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runWindowsControlGateStage")
     ?.replaceAll("\r\n", "\n")
     .trim();
-  return body === "await operation();" || body === expectedNonAuthoritativeStageExecutorBody;
+  return body === "await operation();";
 }
 
 function hasForbiddenGateFlow(body) {
@@ -381,13 +288,7 @@ function hasForbiddenGateFlow(body) {
 
 function hasStrictPowerShellSelfTest(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runPowerShellSelfTest");
-  if (
-    body === undefined ||
-    body.includes('"-Endpoint"') ||
-    /\bprime\b/u.test(body) ||
-    body.includes(temporaryTaskDiagnosticMarker)
-  )
-    return false;
+  if (body === undefined || body.includes('"-Endpoint"') || /\bprime\b/u.test(body)) return false;
   const spawnExpression = 'spawnSync("powershell.exe", selfTestArguments, {';
   if (body.split(spawnExpression).length - 1 !== 1) return false;
   if (body.split("maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES").length - 1 !== 1) {
@@ -400,6 +301,8 @@ function hasStrictPowerShellSelfTest(source) {
     "assert.equal(selfTest.status, 0);",
     'assert.equal(selfTest.stdout, "");',
     'assert.equal(selfTest.stderr, "");',
+    "assert.equal(nativePipeProbe, undefined);",
+    "nativePipeProbe = await startWindowsNativePipeProbe();",
   ];
   let cursor = -1;
   for (const token of requiredInOrder) {
@@ -412,29 +315,34 @@ function hasStrictPowerShellSelfTest(source) {
 function hasExactNativePipeAbsence(source) {
   const probeSource = uniqueTopLevelTemplateLiteral(source, "windowsPipeProbeSource");
   const probeArguments = uniqueTopLevelArrayBody(source, "windowsPipeProbeArguments");
-  const probeBody = uniqueTopLevelSyncFunctionBody(source, "runNativePipeProbe");
-  const absentBody = uniqueTopLevelSyncFunctionBody(source, "assertNativePipeAbsent");
-  const presentBody = uniqueTopLevelSyncFunctionBody(source, "assertNativePipePresent");
-  const unavailableBody = uniqueTopLevelAsyncFunctionBody(source, "assertPipeUnavailable");
-  const statusBody = uniqueTopLevelAsyncFunctionBody(source, "runStatusRequest");
+  const clientRegion = uniqueBoundedSourceRegion(
+    source,
+    "function nativePipeProbeFailure(): Error {",
+    "\ninterface WindowsNativePipeProbeLaunch {",
+  );
   if (
     probeSource === undefined ||
     probeArguments === undefined ||
-    probeBody === undefined ||
-    absentBody === undefined ||
-    presentBody === undefined ||
-    unavailableBody === undefined ||
-    statusBody === undefined
+    clientRegion === undefined ||
+    source.includes("runNativePipeProbe")
   )
     return false;
+  if (
+    canonicalBodyDigest(probeSource) !== expectedWindowsPipeProbeSourceSha256 ||
+    normalizedContractText(probeArguments) !== expectedWindowsPipeProbeArgumentsBody ||
+    canonicalBodyDigest(clientRegion) !== expectedWindowsNativePipeProbeClientRegionSha256
+  ) {
+    return false;
+  }
+  for (const [name, digest] of Object.entries(expectedPersistentNativePipeProbeBodySha256)) {
+    const body = uniqueTopLevelAsyncFunctionBody(source, name);
+    if (body === undefined || canonicalBodyDigest(body) !== digest) return false;
+  }
+  const selfTestBody = uniqueTopLevelAsyncFunctionBody(source, "runPowerShellSelfTest") ?? "";
+  const probeEntrypointCount = [...source.matchAll(/\bstartWindowsNativePipeProbe\b/gu)].length;
   return (
-    normalizedContractText(probeSource) === expectedWindowsPipeProbeSource &&
-    normalizedContractText(probeArguments) === expectedWindowsPipeProbeArgumentsBody &&
-    normalizedContractText(probeBody) === expectedRunNativePipeProbeBody &&
-    normalizedContractText(absentBody) === "assert.equal(runNativePipeProbe(endpoint), 0);" &&
-    normalizedContractText(presentBody) === "assert.equal(runNativePipeProbe(endpoint), 2);" &&
-    normalizedContractText(unavailableBody) === expectedAssertPipeUnavailableBody &&
-    normalizedContractText(statusBody) === expectedRunStatusRequestBody
+    selfTestBody.split("nativePipeProbe = await startWindowsNativePipeProbe();").length - 1 === 1 &&
+    probeEntrypointCount === 2
   );
 }
 
@@ -652,7 +560,7 @@ function hasParentCrashHandleOwnership(source) {
     return false;
   return (
     normalizedSource.includes(
-      "await cleanupTrackedServer(owned);\n        if (liveServer === owned) liveServer = undefined;",
+      "await cleanupTrackedServer(ownedServer);\n        if (liveServer === ownedServer) liveServer = undefined;",
     ) && !/const owned = liveServer;\s*liveServer = undefined;/u.test(normalizedSource)
   );
 }
@@ -846,10 +754,7 @@ export function validateWindowsControlGateContract({
     errors.push("malformed-frame server close must retain its exact ordered unsafe aggregate");
   }
   const allSources = `${brokerCSharpSource}\n${brokerPowerShellSource}\n${gateSource}\n${runnerSource}`;
-  if (
-    allSources.includes(temporaryTaskDiagnosticMarker) ||
-    temporaryTaskDiagnosticTokens.some((token) => allSources.includes(token))
-  ) {
+  if (forbiddenTaskDiagnosticTokens.some((token) => allSources.includes(token))) {
     errors.push("Windows gate cannot retain temporary diagnostic output");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {

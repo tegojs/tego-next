@@ -308,8 +308,8 @@ test("Windows gate executable source digests are independently fixed", async (t)
   const expectedDigests = {
     brokerCSharpSource: "26c14d7c78b632a6e9d49369e123a97dd28949e47bda8b7d760f0e4ce312f1c4",
     brokerPowerShellSource: "3b6279a12436f1d21c77f2e45b7b510995b1ad369cd53870483b9c03f33c3b53",
-    gateSource: "d06fa0b6d7209b3bc1795b437d2a17598c0e105959300629ea9c0f18d6ffb41b",
-    runnerSource: "5060aeb4d7b80583446fd45897717c0fe18f8bd7e218b3d8af58a59325ec63a6",
+    gateSource: "3a3213ef92bf8152ef9a268a72134e08b5a5f8ad1079fc52687aeb17757a3719",
+    runnerSource: "62efb675d05de0597478c7bf76b0426b48ec3c86b7589de43e044e1c2f7e8df7",
   };
   const sources = { brokerCSharpSource, brokerPowerShellSource, gateSource, runnerSource };
   assert.deepEqual(
@@ -402,7 +402,7 @@ test("Windows gate executable source digests are independently fixed", async (t)
 
 test("Windows gate proves the current-user descriptor without a redundant PowerShell SID query", async () => {
   const gateSource = await readFile(windowsControlGateSource, "utf8");
-  assert.doesNotMatch(gateSource, /initializeCurrentUserSid|currentUserSid|\$PSVersionTable/u);
+  assert.doesNotMatch(gateSource, /initializeCurrentUserSid|currentUserSid/u);
   assert.match(
     gateSource,
     /function assertDescriptor\([^)]+\)[\s\S]+const ownerSid = descriptor\.ownerSid;[\s\S]+\[ownerSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID\]/u,
@@ -415,12 +415,16 @@ test("Windows gate proves the current-user descriptor without a redundant PowerS
 
 test("Windows gate proves exact native pipe absence and fails closed on every other result", async () => {
   const gateSource = await readFile(windowsControlGateSource, "utf8");
-  assert.match(gateSource, /realpathSync\(requiredEnvironment\("SystemRoot"\)\)/u);
+  assert.match(gateSource, /await realpath\(requiredEnvironment\("SystemRoot"\)\)/u);
   assert.match(
     gateSource,
     /join\(systemRoot, "System32", "WindowsPowerShell", "v1\.0", "powershell\.exe"\)/u,
   );
   assert.doesNotMatch(gateSource, /Path: requiredEnvironment\("Path"\)/u);
+  assert.doesNotMatch(gateSource, /runNativePipeProbe|TEGO_WINDOWS_PIPE_PROBE_ENDPOINT/u);
+  assert.match(gateSource, /new UTF8Encoding\(false, true\)/u);
+  assert.match(gateSource, /ReadExactly\(Stream input, byte\[\] buffer/u);
+  assert.match(gateSource, /length <= 0 \|\| length > MaxEndpointBytes/u);
   assert.match(gateSource, /WaitNamedPipeW/u);
   assert.match(gateSource, /SetLastError = true/u);
   assert.match(gateSource, /Marshal\.GetLastWin32Error\(\)/u);
@@ -428,11 +432,23 @@ test("Windows gate proves exact native pipe absence and fails closed on every ot
   assert.match(gateSource, /if \(error == 121 \|\| error == 231\) return 2;/u);
   assert.match(
     gateSource,
-    /assertNativePipeAbsent\(endpoint\);[\s\S]+await assert\.rejects\([\s\S]+requestControl/u,
+    /await assertNativePipeAbsent\(endpoint\);[\s\S]+await assert\.rejects\([\s\S]+requestControl/u,
   );
   assert.match(
     gateSource,
-    /async function runStatusRequest\(\): Promise<void> \{[\s\S]+await assertStatus\([\s\S]+assertNativePipePresent\(liveServer\.endpoint\);/u,
+    /async function runStatusRequest\(\): Promise<void> \{[\s\S]+await assertStatus\([\s\S]+await assertNativePipePresent\(liveServer\.endpoint\);/u,
+  );
+  assert.equal(
+    gateSource.match(/nativePipeProbe = await startWindowsNativePipeProbe\(\);/gu)?.length,
+    1,
+  );
+  assert.match(
+    gateSource,
+    /await runInstalledWindowsControlGate\(\);[\s\S]+await closeNativePipeProbeForSuccess\(\);[\s\S]+WINDOWS_CONTROL_GATE_CHILD_MARKER/u,
+  );
+  assert.match(
+    gateSource,
+    /if \(liveServer !== undefined\)[\s\S]+await cleanupTrackedServer\(ownedServer\);[\s\S]+await forceCloseNativePipeProbe\(\);/u,
   );
 });
 
@@ -447,12 +463,23 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
     readFile(windowsControlGateRunner, "utf8"),
     readFile(windowsControlGateSource, "utf8"),
   ]);
+  const expectedError = "Windows gate must prove exact native pipe absence and fail closed";
+  const unrelatedMutation = gateSource.replace(
+    "const expectedPackageNames = [",
+    "// Unrelated canonical-source mutation.\nconst expectedPackageNames = [",
+  );
+  assert.notEqual(unrelatedMutation, gateSource);
+  const unrelatedErrors = validateWindowsControlGateSources(validateWindowsControlGateContract, {
+    gateSource: unrelatedMutation,
+    runnerSource,
+  });
+  assert.ok(
+    unrelatedErrors.includes(
+      "Windows gate executable sources must match the canonical reviewed contract",
+    ),
+  );
+  assert.equal(unrelatedErrors.includes(expectedError), false);
   const mutations = [
-    [
-      "native probe early return",
-      "function runNativePipeProbe(endpoint: string): number {",
-      "function runNativePipeProbe(endpoint: string): number {\n  return 0;",
-    ],
     [
       "pipe proof early return",
       "async function assertPipeUnavailable(endpoint: string): Promise<void> {",
@@ -466,17 +493,17 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
     ["PowerShell success shortcut", "try {\n$null = Add-Type", "try {\nexit 0\n$null = Add-Type"],
     [
       "C sharp success shortcut",
-      "    public static int Probe(string endpoint)\n    {",
-      "    public static int Probe(string endpoint)\n    {\n        return 0;",
+      "    private static int Probe(string endpoint)\n    {",
+      "    private static int Probe(string endpoint)\n    {\n        return 0;",
     ],
     [
       "secret parent environment added",
-      "    env: {",
-      "    env: {\n      EXTRA: process.env.GITHUB_TOKEN,",
+      "    environment: {",
+      "    environment: {\n      EXTRA: process.env.GITHUB_TOKEN,",
     ],
     [
       "SystemRoot not canonicalized",
-      'const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));',
+      'const systemRoot = await realpath(requiredEnvironment("SystemRoot"));',
       'const systemRoot = requiredEnvironment("SystemRoot");',
     ],
     ["SystemRoot absolute check removed", "  assert.equal(isAbsolute(systemRoot), true);", ""],
@@ -488,7 +515,7 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
     [
       "PowerShell executable not canonicalized",
       [
-        "  const powershellExecutable = realpathSync(",
+        "  const powershellExecutable = await realpath(",
         '    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),',
         "  );",
       ].join("\n"),
@@ -510,16 +537,20 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
     ],
     [
       "PowerShell executable resolved through PATH",
-      "  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {",
-      '  const probe = spawnSync("powershell.exe", windowsPipeProbeArguments, {',
+      "  const spawned = (options.spawnProbe ?? spawn)(launch.executable, windowsPipeProbeArguments, {",
+      '  const spawned = (options.spawnProbe ?? spawn)("powershell.exe", windowsPipeProbeArguments, {',
     ],
     [
       "request rejection skipped",
-      "  assertNativePipeAbsent(endpoint);\n  await assert.rejects(",
-      "  assertNativePipeAbsent(endpoint);\n  return;\n  await assert.rejects(",
+      "  await assertNativePipeAbsent(endpoint);\n  await assert.rejects(",
+      "  await assertNativePipeAbsent(endpoint);\n  return;\n  await assert.rejects(",
     ],
-    ["native probe removed", "  assertNativePipeAbsent(endpoint);", ""],
-    ["live present calibration removed", "  assertNativePipePresent(liveServer.endpoint);", ""],
+    ["native probe removed", "  await assertNativePipeAbsent(endpoint);", ""],
+    [
+      "live present calibration removed",
+      "  await assertNativePipePresent(liveServer.endpoint);",
+      "",
+    ],
     ["last-error capture disabled", "SetLastError = true", "SetLastError = false"],
     [
       "available pipe treated as absent",
@@ -534,41 +565,127 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
     ],
     [
       "unknown native error treated as absent",
-      "        return 3;\n    }\n}",
-      "        return 0;\n    }\n}",
+      "        return 3;\n    }\n\n    private static bool ReadExactly",
+      "        return 0;\n    }\n\n    private static bool ReadExactly",
     ],
-    ["probe errors ignored", "  assert.equal(probe.error, undefined);", ""],
-    ["probe signals ignored", "  assert.equal(probe.signal, null);", ""],
     [
-      "probe status allowlist removed",
-      "  assert.ok(probe.status === 0 || probe.status === 2 || probe.status === 3);",
-      "",
+      "response allowlist removed",
+      "    if (response !== 0 && response !== 2 && response !== 3) {",
+      "    if (false) {",
     ],
     [
       "absent assertion accepts present",
-      "  assert.equal(runNativePipeProbe(endpoint), 0);",
-      "  assert.notEqual(runNativePipeProbe(endpoint), 3);",
+      "  assert.equal(await queryNativePipeProbe(endpoint), 0);",
+      "  assert.notEqual(await queryNativePipeProbe(endpoint), 3);",
     ],
     [
       "present assertion accepts absent",
-      "  assert.equal(runNativePipeProbe(endpoint), 2);",
-      "  assert.notEqual(runNativePipeProbe(endpoint), 3);",
+      "  assert.equal(await queryNativePipeProbe(endpoint), 2);",
+      "  assert.notEqual(await queryNativePipeProbe(endpoint), 3);",
     ],
-    ["probe stdout ignored", '  assert.equal(probe.stdout, "");', ""],
-    ["probe stderr ignored", '  assert.equal(probe.stderr, "");', ""],
+    ["probe stderr ignored", '    child.stderr.on("data", () => this.#fail());', ""],
+    ["probe output coalescing accepted", "chunk.length !== 1", "chunk.length < 1"],
     [
       "endpoint interpolated into encoded source",
       'Buffer.from(windowsPipeProbeSource, "utf16le")',
-      "Buffer.from(`" + "$" + "{windowsPipeProbeSource}" + "$" + '{endpoint}`, "utf16le")',
+      "Buffer.from(`" + "$" + "{windowsPipeProbeSource}" + "$" + '{process.pid}`, "utf16le")',
     ],
-    ["endpoint data channel removed", "      TEGO_WINDOWS_PIPE_PROBE_ENDPOINT: endpoint,", ""],
-    ["full parent environment inherited", "    env: {", "    env: {\n      ...process.env,"],
+    [
+      "full parent environment inherited",
+      "    env: { ...launch.environment },",
+      "    env: { ...process.env },",
+    ],
     ["encoded command replaced", '  "-EncodedCommand",', '  "-File",'],
-    ["probe output bound removed", "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,", ""],
     ["shell enabled", "    shell: false,", "    shell: true,"],
-    ["probe stdio contract removed", '    stdio: ["ignore", "pipe", "pipe"],', ""],
-    ["timeout removed", "    timeout: PROCESS_CLEANUP_TIMEOUT_MS,", ""],
+    ["probe stdio contract removed", '    stdio: ["pipe", "pipe", "pipe"],', ""],
     ["hidden window contract removed", "    windowsHide: true,", ""],
+    [
+      "request serialization removed",
+      "    const result = this.#tail.then",
+      "    const result = Promise.resolve().then",
+    ],
+    [
+      "request deadline removed",
+      "await withDeadline(Promise.all([written, response.promise]), timeoutMs)",
+      "await Promise.all([written, response.promise])",
+    ],
+    [
+      "startup deadline removed",
+      "options.startupTimeoutMs ?? WINDOWS_NATIVE_PIPE_PROBE_STARTUP_TIMEOUT_MS",
+      "Number.POSITIVE_INFINITY",
+    ],
+    [
+      "startup calibration accepts present",
+      "      0,\n    );\n    return client;",
+      "      2,\n    );\n    return client;",
+    ],
+    [
+      "startup cleanup not awaited",
+      "      await client.forceClose();",
+      "      client.forceClose();",
+    ],
+    [
+      "helper started twice",
+      "  nativePipeProbe = await startWindowsNativePipeProbe();",
+      "  nativePipeProbe = await startWindowsNativePipeProbe();\n  nativePipeProbe = await startWindowsNativePipeProbe();",
+    ],
+    [
+      "helper restarted per lifecycle",
+      "  for (let round = 0; round < 20; round += 1) {",
+      "  for (let round = 0; round < 20; round += 1) {\n    nativePipeProbe = await startWindowsNativePipeProbe();",
+    ],
+    [
+      "discarded helper spawned per lifecycle",
+      "  for (let round = 0; round < 20; round += 1) {",
+      "  for (let round = 0; round < 20; round += 1) {\n    await startWindowsNativePipeProbe();",
+    ],
+    [
+      "parenthesized helper spawned per lifecycle",
+      "  for (let round = 0; round < 20; round += 1) {",
+      "  for (let round = 0; round < 20; round += 1) {\n    await (startWindowsNativePipeProbe)();",
+    ],
+    [
+      "aliased helper spawned per lifecycle",
+      "  for (let round = 0; round < 20; round += 1) {",
+      [
+        "  for (let round = 0; round < 20; round += 1) {",
+        "    const spawnDiscardedProbe = startWindowsNativePipeProbe;",
+        "    await spawnDiscardedProbe();",
+      ].join("\n"),
+    ],
+    [
+      "helper restarted per request",
+      "async function queryNativePipeProbe(endpoint: string): Promise<number> {",
+      "async function queryNativePipeProbe(endpoint: string): Promise<number> {\n  nativePipeProbe = await startWindowsNativePipeProbe();",
+    ],
+    ["success closes helper without await", "  await owned.close();", "  owned.close();"],
+    [
+      "failed force close releases helper ownership",
+      [
+        "  await owned.forceClose();",
+        "  if (nativePipeProbe === owned) nativePipeProbe = undefined;",
+      ].join("\n"),
+      [
+        "  try {",
+        "    await owned.forceClose();",
+        "  } finally {",
+        "    if (nativePipeProbe === owned) nativePipeProbe = undefined;",
+        "  }",
+      ].join("\n"),
+    ],
+    [
+      "failure cleanup does not await helper close",
+      "      await forceCloseNativePipeProbe();",
+      "      forceCloseNativePipeProbe();",
+    ],
+    [
+      "failure closes helper before live owner",
+      "    if (liveServer !== undefined) {",
+      "    await forceCloseNativePipeProbe();\n    if (liveServer !== undefined) {",
+    ],
+    ["partial request reads only once", "while (offset < count)", "if (offset < count)"],
+    ["strict UTF8 disabled", "new UTF8Encoding(false, true)", "new UTF8Encoding(false, false)"],
+    ["response flush removed", "        output.Flush();", ""],
   ];
 
   for (const [name, from, to] of mutations) {
@@ -579,13 +696,13 @@ test("Windows gate source validation rejects weakened native pipe absence proofs
         validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutation,
           runnerSource,
-        }).length > 0,
+        }).includes(expectedError),
       );
       assert.ok(
         validateWindowsControlGateSources(validateWindowsControlGateContract, {
           gateSource: mutation.replaceAll("\n", "\r\n"),
           runnerSource: runnerSource.replaceAll("\n", "\r\n"),
-        }).length > 0,
+        }).includes(expectedError),
       );
     });
   }
@@ -811,8 +928,8 @@ test("Windows gate rolls back partial acquisition and owns parent-crash processe
     [
       "top-level ownership released early",
       gateSource.replace(
-        "      const owned = liveServer;\n      try {",
-        "      const owned = liveServer;\n      liveServer = undefined;\n      try {",
+        "      const ownedServer = liveServer;\n      try {",
+        "      const ownedServer = liveServer;\n      liveServer = undefined;\n      try {",
       ),
     ],
     [

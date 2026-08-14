@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,44 +16,109 @@ import { diagnosticCode, parseRuntimeStatus, type RuntimeOperations } from "@teg
 
 const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
-const task4NonAuthoritativeStagePrefix = ["TEGO", "TASK4", "NON", "AUTHORITATIVE", "STAGE"].join(
-  "_",
-);
-let task4NonAuthoritativeStageDetail = "none";
 const WINDOWS_PIPE_FULL_CONTROL = 0x1f01ff;
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
 const PROCESS_CLEANUP_TIMEOUT_MS = 15_000;
+const WINDOWS_NATIVE_PIPE_PROBE_STARTUP_TIMEOUT_MS = 2 * 60 * 1000;
+const WINDOWS_NATIVE_PIPE_PROBE_MAX_ENDPOINT_BYTES = 512;
 const POWERSHELL_STARTUP_STDERR_MAX_BYTES = 64 * 1024;
 const windowsPipeProbeSource = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+exit 1
+}
 try {
 $null = Add-Type -Language CSharp -TypeDefinition @'
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
 
 public static class TegoWindowsPipeProbe
 {
+    private const int MaxEndpointBytes = 512;
+    private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
+    private static readonly Regex EndpointPattern = new Regex(
+        @"^\\\\\\\\[.]\\\\pipe\\\\tego-windows-control-[a-z0-9-]{1,64}-[1-9][0-9]{0,9}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        RegexOptions.CultureInvariant);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WaitNamedPipeW(string name, uint timeout);
 
-    public static int Probe(string endpoint)
+    private static int Probe(string endpoint)
     {
-        if (String.IsNullOrEmpty(endpoint)) return 3;
         if (WaitNamedPipeW(endpoint, 1)) return 2;
         int error = Marshal.GetLastWin32Error();
         if (error == 2) return 0;
         if (error == 121 || error == 231) return 2;
         return 3;
     }
+
+    private static bool ReadExactly(Stream input, byte[] buffer, int count, bool allowCleanEof)
+    {
+        int offset = 0;
+        while (offset < count)
+        {
+            int read = input.Read(buffer, offset, count - offset);
+            if (read == 0)
+            {
+                if (allowCleanEof && offset == 0) return false;
+                throw new EndOfStreamException();
+            }
+            offset += read;
+        }
+        return true;
+    }
+
+    private static void WriteResponse(Stream output, int response)
+    {
+        output.WriteByte((byte)response);
+        output.Flush();
+    }
+
+    public static int Run()
+    {
+        Stream input = Console.OpenStandardInput();
+        Stream output = Console.OpenStandardOutput();
+        byte[] header = new byte[4];
+        while (ReadExactly(input, header, header.Length, true))
+        {
+            int length = header[0] | (header[1] << 8) | (header[2] << 16) | (header[3] << 24);
+            if (length <= 0 || length > MaxEndpointBytes)
+            {
+                WriteResponse(output, 3);
+                return 1;
+            }
+            byte[] payload = new byte[length];
+            ReadExactly(input, payload, payload.Length, false);
+            string endpoint;
+            try
+            {
+                endpoint = StrictUtf8.GetString(payload);
+            }
+            catch (DecoderFallbackException)
+            {
+                WriteResponse(output, 3);
+                continue;
+            }
+            if (!EndpointPattern.IsMatch(endpoint))
+            {
+                WriteResponse(output, 3);
+                continue;
+            }
+            WriteResponse(output, Probe(endpoint));
+        }
+        return 0;
+    }
 }
 '@
-$probeResult = [TegoWindowsPipeProbe]::Probe($env:TEGO_WINDOWS_PIPE_PROBE_ENDPOINT)
-exit $probeResult
+exit [TegoWindowsPipeProbe]::Run()
 } catch {
-exit 3
+exit 1
 }`;
 const windowsPipeProbeArguments = [
   "-NoLogo",
@@ -129,6 +193,7 @@ interface ParentFixtureAcknowledgement {
 }
 
 let liveServer: TrackedServer | undefined;
+let nativePipeProbe: WindowsNativePipeProbeClient | undefined;
 
 function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
   return (
@@ -182,76 +247,261 @@ function ownChild(child: ChildProcess): OwnedChild {
   return { child, closed, spawnError: failed.promise };
 }
 
-function runNativePipeProbe(endpoint: string): number {
-  task4NonAuthoritativeStageDetail = "powershell-path";
-  const systemRoot = realpathSync(requiredEnvironment("SystemRoot"));
+function nativePipeProbeFailure(): Error {
+  return new Error("Windows native pipe probe failed");
+}
+
+function assertNativePipeProbeEndpoint(endpoint: string): Buffer {
+  assert.match(
+    endpoint,
+    /^\\\\\.\\pipe\\tego-windows-control-[a-z0-9-]{1,64}-[1-9]\d{0,9}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  );
+  const payload = Buffer.from(endpoint, "utf8");
+  assert.ok(payload.length > 0 && payload.length <= WINDOWS_NATIVE_PIPE_PROBE_MAX_ENDPOINT_BYTES);
+  return payload;
+}
+
+export class WindowsNativePipeProbeClient {
+  readonly #child: ChildProcess;
+  readonly #closed: Promise<void>;
+  readonly #requestTimeoutMs: number;
+  #accepting = true;
+  #closing = false;
+  #killRequested = false;
+  #pending: PromiseWithResolvers<number> | undefined;
+  #tail = Promise.resolve();
+  #terminalError: Error | undefined;
+
+  constructor(child: ChildProcess, requestTimeoutMs = PROCESS_CLEANUP_TIMEOUT_MS) {
+    this.#child = child;
+    this.#requestTimeoutMs = requestTimeoutMs;
+    this.#closed = new Promise<void>((resolveClose) => {
+      child.once("close", () => {
+        if (!this.#closing) this.#fail();
+        resolveClose();
+      });
+    });
+    child.once("error", () => this.#fail());
+    if (child.stdin === null || child.stdout === null || child.stderr === null) {
+      this.#fail();
+      return;
+    }
+    child.stdout.on("data", (chunk: Buffer) => this.#receive(chunk));
+    child.stdout.once("error", () => this.#fail());
+    child.stdout.once("end", () => {
+      if (!this.#closing) this.#fail();
+    });
+    child.stderr.on("data", () => this.#fail());
+    child.stderr.once("error", () => this.#fail());
+    child.stderr.once("end", () => {
+      if (!this.#closing) this.#fail();
+    });
+  }
+
+  #fail(): Error {
+    if (this.#terminalError !== undefined) return this.#terminalError;
+    const failure = nativePipeProbeFailure();
+    this.#terminalError = failure;
+    this.#accepting = false;
+    const pending = this.#pending;
+    this.#pending = undefined;
+    pending?.reject(failure);
+    if (!this.#killRequested && this.#child.exitCode === null && this.#child.signalCode === null) {
+      this.#killRequested = true;
+      try {
+        this.#child.kill("SIGKILL");
+      } catch {}
+    }
+    return failure;
+  }
+
+  #receive(chunk: Buffer): void {
+    if (!Buffer.isBuffer(chunk) || chunk.length !== 1 || this.#pending === undefined) {
+      this.#fail();
+      return;
+    }
+    const response = chunk[0];
+    if (response !== 0 && response !== 2 && response !== 3) {
+      this.#fail();
+      return;
+    }
+    const pending = this.#pending;
+    this.#pending = undefined;
+    pending.resolve(response);
+  }
+
+  async #probe(endpoint: string, timeoutMs: number): Promise<number> {
+    if (this.#terminalError !== undefined) throw this.#terminalError;
+    let payload: Buffer;
+    try {
+      payload = assertNativePipeProbeEndpoint(endpoint);
+    } catch {
+      throw this.#fail();
+    }
+    const stdin = this.#child.stdin;
+    if (stdin === null || this.#pending !== undefined) throw this.#fail();
+    const frame = Buffer.allocUnsafe(4 + payload.length);
+    frame.writeUInt32LE(payload.length, 0);
+    payload.copy(frame, 4);
+    const response = Promise.withResolvers<number>();
+    this.#pending = response;
+    const written = new Promise<void>((resolveWrite, rejectWrite) => {
+      stdin.write(frame, (error) =>
+        error === undefined || error === null
+          ? resolveWrite()
+          : rejectWrite(nativePipeProbeFailure()),
+      );
+    });
+    try {
+      const [, result] = await withDeadline(Promise.all([written, response.promise]), timeoutMs);
+      return result;
+    } catch {
+      throw this.#fail();
+    } finally {
+      if (this.#pending === response) this.#pending = undefined;
+    }
+  }
+
+  probe(endpoint: string, timeoutMs = this.#requestTimeoutMs): Promise<number> {
+    if (!this.#accepting) return Promise.reject(this.#terminalError ?? nativePipeProbeFailure());
+    const result = this.#tail.then(() => this.#probe(endpoint, timeoutMs));
+    this.#tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async close(timeoutMs = PROCESS_CLEANUP_TIMEOUT_MS): Promise<void> {
+    this.#accepting = false;
+    await this.#tail;
+    if (this.#terminalError !== undefined || this.#pending !== undefined) {
+      throw this.#terminalError ?? nativePipeProbeFailure();
+    }
+    this.#closing = true;
+    const stdin = this.#child.stdin;
+    if (stdin === null) throw this.#fail();
+    try {
+      await withDeadline(
+        new Promise<void>((resolveEnd, rejectEnd) => {
+          stdin.end((error?: Error | null) =>
+            error === undefined || error === null
+              ? resolveEnd()
+              : rejectEnd(nativePipeProbeFailure()),
+          );
+        }),
+        timeoutMs,
+      );
+      await withDeadline(this.#closed, timeoutMs);
+      assert.equal(this.#child.exitCode, 0);
+      assert.equal(this.#child.signalCode, null);
+      assert.equal(stdin.writableEnded, true);
+      assert.equal(this.#child.stdout?.readableEnded, true);
+      assert.equal(this.#child.stderr?.readableEnded, true);
+      if (this.#terminalError !== undefined) throw this.#terminalError;
+    } catch {
+      const failure = this.#fail();
+      try {
+        await this.forceClose(timeoutMs);
+      } catch {}
+      throw failure;
+    }
+  }
+
+  async forceClose(timeoutMs = PROCESS_CLEANUP_TIMEOUT_MS): Promise<void> {
+    this.#accepting = false;
+    this.#closing = true;
+    if (!this.#killRequested && this.#child.exitCode === null && this.#child.signalCode === null) {
+      this.#killRequested = true;
+      this.#child.kill("SIGKILL");
+    }
+    await withDeadline(this.#closed, timeoutMs);
+  }
+}
+
+interface WindowsNativePipeProbeLaunch {
+  readonly environment: NodeJS.ProcessEnv;
+  readonly executable: string;
+}
+
+export interface WindowsNativePipeProbeStartOptions {
+  readonly requestTimeoutMs?: number;
+  readonly resolveLaunch?: () => Promise<WindowsNativePipeProbeLaunch>;
+  readonly spawnProbe?: typeof spawn;
+  readonly startupEndpoint?: string;
+  readonly startupTimeoutMs?: number;
+}
+
+async function resolveWindowsNativePipeProbeLaunch(): Promise<WindowsNativePipeProbeLaunch> {
+  const systemRoot = await realpath(requiredEnvironment("SystemRoot"));
   assert.equal(isAbsolute(systemRoot), true);
   assert.match(systemRoot, /^[A-Za-z]:\\[^\r\n]+$/u);
-  const powershellExecutable = realpathSync(
+  const powershellExecutable = await realpath(
     join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
   );
   assert.equal(isContained(systemRoot, powershellExecutable), true);
-  task4NonAuthoritativeStageDetail = "powershell-spawn";
-  const probe = spawnSync(powershellExecutable, windowsPipeProbeArguments, {
-    encoding: "utf8",
-    env: {
+  return {
+    environment: {
       SystemRoot: systemRoot,
-      TEGO_WINDOWS_PIPE_PROBE_ENDPOINT: endpoint,
       TEMP: requiredEnvironment("TEMP"),
       TMP: requiredEnvironment("TMP"),
       WINDIR: systemRoot,
     },
-    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,
+    executable: powershellExecutable,
+  };
+}
+
+export async function startWindowsNativePipeProbe(
+  options: WindowsNativePipeProbeStartOptions = {},
+): Promise<WindowsNativePipeProbeClient> {
+  const launch = await (options.resolveLaunch ?? resolveWindowsNativePipeProbeLaunch)();
+  const spawned = (options.spawnProbe ?? spawn)(launch.executable, windowsPipeProbeArguments, {
+    env: { ...launch.environment },
     shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: PROCESS_CLEANUP_TIMEOUT_MS,
+    stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
-  const probeErrorCode = (probe.error as NodeJS.ErrnoException | undefined)?.code;
-  task4NonAuthoritativeStageDetail =
-    probe.error !== undefined
-      ? probeErrorCode === "ETIMEDOUT"
-        ? "powershell-spawn-timeout"
-        : probeErrorCode === "ENOBUFS"
-          ? "powershell-spawn-buffer"
-          : probeErrorCode === "ENOENT"
-            ? "powershell-spawn-missing"
-            : probeErrorCode === "EACCES"
-              ? "powershell-spawn-denied"
-              : probeErrorCode === "EINVAL"
-                ? "powershell-spawn-invalid"
-                : "powershell-spawn-other"
-      : probe.signal !== null
-        ? "powershell-signal"
-        : probe.stdout !== ""
-          ? "powershell-stdout"
-          : probe.stderr !== ""
-            ? "powershell-stderr"
-            : probe.status === 0
-              ? "powershell-status-absent"
-              : probe.status === 2
-                ? "powershell-status-present"
-                : probe.status === 3
-                  ? "powershell-status-error"
-                  : "powershell-status-unknown";
-  assert.equal(probe.error, undefined);
-  assert.equal(probe.signal, null);
-  assert.equal(probe.stdout, "");
-  assert.equal(probe.stderr, "");
-  assert.ok(probe.status === 0 || probe.status === 2 || probe.status === 3);
-  return probe.status;
+  const client = new WindowsNativePipeProbeClient(
+    spawned,
+    options.requestTimeoutMs ?? PROCESS_CLEANUP_TIMEOUT_MS,
+  );
+  const startupEndpoint =
+    options.startupEndpoint ??
+    `\\\\.\\pipe\\tego-windows-control-probe-startup-${process.pid}-${randomUUID()}`;
+  try {
+    assert.equal(
+      await client.probe(
+        startupEndpoint,
+        options.startupTimeoutMs ?? WINDOWS_NATIVE_PIPE_PROBE_STARTUP_TIMEOUT_MS,
+      ),
+      0,
+    );
+    return client;
+  } catch (primary) {
+    try {
+      await client.forceClose();
+    } catch (cleanup) {
+      throw new AggregateError([primary, cleanup], "Windows native pipe probe startup failed");
+    }
+    throw primary;
+  }
 }
 
-function assertNativePipeAbsent(endpoint: string): void {
-  assert.equal(runNativePipeProbe(endpoint), 0);
+async function queryNativePipeProbe(endpoint: string): Promise<number> {
+  assert.ok(nativePipeProbe !== undefined);
+  return await nativePipeProbe.probe(endpoint);
 }
 
-function assertNativePipePresent(endpoint: string): void {
-  assert.equal(runNativePipeProbe(endpoint), 2);
+async function assertNativePipeAbsent(endpoint: string): Promise<void> {
+  assert.equal(await queryNativePipeProbe(endpoint), 0);
+}
+
+async function assertNativePipePresent(endpoint: string): Promise<void> {
+  assert.equal(await queryNativePipeProbe(endpoint), 2);
 }
 
 async function assertPipeUnavailable(endpoint: string): Promise<void> {
-  assertNativePipeAbsent(endpoint);
+  await assertNativePipeAbsent(endpoint);
   await assert.rejects(
     requestControl({
       endpoint,
@@ -425,14 +675,7 @@ async function runWindowsControlGateStage(
   _stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
-  try {
-    await operation();
-  } catch (error) {
-    process.stderr.write(
-      `${task4NonAuthoritativeStagePrefix}:${_stage}:${task4NonAuthoritativeStageDetail}\n`,
-    );
-    throw error;
-  }
+  await operation();
 }
 
 async function runPowerShellSelfTest(): Promise<void> {
@@ -482,6 +725,8 @@ async function runPowerShellSelfTest(): Promise<void> {
   assert.equal(selfTest.status, 0);
   assert.equal(selfTest.stdout, "");
   assert.equal(selfTest.stderr, "");
+  assert.equal(nativePipeProbe, undefined);
+  nativePipeProbe = await startWindowsNativePipeProbe();
 }
 
 async function startLiveDescriptor(): Promise<void> {
@@ -489,10 +734,9 @@ async function startLiveDescriptor(): Promise<void> {
 }
 
 async function runStatusRequest(): Promise<void> {
-  task4NonAuthoritativeStageDetail = "status-request";
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
-  assertNativePipePresent(liveServer.endpoint);
+  await assertNativePipePresent(liveServer.endpoint);
 }
 
 async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
@@ -808,25 +1052,49 @@ async function runInstalledWindowsControlGate(): Promise<void> {
   await runWindowsControlGateStage("twenty-lifecycle-rounds", runTwentyLifecycleRounds);
 }
 
-if (process.argv[2] === "--parent-crash-fixture") {
-  try {
-    await runParentCrashFixture();
-  } catch {
-    process.exitCode = 1;
+async function closeNativePipeProbeForSuccess(): Promise<void> {
+  assert.ok(nativePipeProbe !== undefined);
+  const owned = nativePipeProbe;
+  await owned.close();
+  if (nativePipeProbe === owned) nativePipeProbe = undefined;
+}
+
+async function forceCloseNativePipeProbe(): Promise<void> {
+  if (nativePipeProbe === undefined) return;
+  const owned = nativePipeProbe;
+  await owned.forceClose();
+  if (nativePipeProbe === owned) nativePipeProbe = undefined;
+}
+
+async function runWindowsControlGateProgram(): Promise<void> {
+  if (process.argv[2] === "--parent-crash-fixture") {
+    try {
+      await runParentCrashFixture();
+    } catch {
+      process.exitCode = 1;
+    }
+    return;
   }
-} else {
   try {
     await runInstalledWindowsControlGate();
+    await closeNativePipeProbeForSuccess();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
     if (liveServer !== undefined) {
-      const owned = liveServer;
+      const ownedServer = liveServer;
       try {
-        await cleanupTrackedServer(owned);
-        if (liveServer === owned) liveServer = undefined;
+        await cleanupTrackedServer(ownedServer);
+        if (liveServer === ownedServer) liveServer = undefined;
       } catch {}
     }
+    try {
+      await forceCloseNativePipeProbe();
+    } catch {}
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
     process.exitCode = 1;
   }
+}
+
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await runWindowsControlGateProgram();
 }
