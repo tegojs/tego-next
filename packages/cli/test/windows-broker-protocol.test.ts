@@ -39,11 +39,15 @@ test("Windows broker decoder handles split and coalesced frames without sharing 
   const first = encodeWindowsBrokerFrame(dataFrame(Uint8Array.from([1, 2])));
   const second = encodeWindowsBrokerFrame(dataFrame(Uint8Array.from([3]), 8n));
   const combined = Buffer.concat([first, second]);
+  const backing = new Uint8Array(combined.byteLength + 6);
+  const input = new Uint8Array(backing.buffer, 3, combined.byteLength);
+  input.set(combined);
   const decoder = new WindowsBrokerFrameDecoder();
 
-  assert.deepEqual(decoder.push(combined.subarray(0, 5)), []);
-  const frames = decoder.push(combined.subarray(5));
-  combined.fill(0);
+  assert.equal(Buffer.isBuffer(input), false);
+  assert.deepEqual(decoder.push(input.subarray(0, 5)), []);
+  const frames = decoder.push(input.subarray(5));
+  backing.fill(0);
   decoder.finish();
 
   assert.deepEqual(frames, [
@@ -105,146 +109,125 @@ test("Windows broker decoder fails closed on truncated frames", () => {
   assert.throws(() => decoder.finish(), PROTOCOL_ERROR);
 });
 
-function open(state: WindowsBrokerConnectionState, connectionId: bigint): void {
-  state.accept({ type: "open", connectionId, payload: new Uint8Array() });
+const brokerToParent = "broker-to-parent" as const;
+const parentToBroker = "parent-to-broker" as const;
+
+function accept(
+  state: WindowsBrokerConnectionState,
+  direction: typeof brokerToParent | typeof parentToBroker,
+  type:
+    | "close"
+    | "close-all"
+    | "close-all-ack"
+    | "data"
+    | "eof"
+    | "fatal"
+    | "open"
+    | "pause"
+    | "ready"
+    | "resume",
+  connectionId: bigint,
+  payload = new Uint8Array(),
+): void {
+  state.accept({ type, connectionId, payload }, direction);
 }
 
-function close(state: WindowsBrokerConnectionState, connectionId: bigint): void {
-  state.accept({ type: "close", connectionId, payload: new Uint8Array() });
+function readyAndOpen(state: WindowsBrokerConnectionState, connectionId = 1n): void {
+  accept(state, brokerToParent, "ready", 0n);
+  accept(state, brokerToParent, "open", connectionId);
 }
 
-test("Windows broker state accepts each nonzero connection ID only once and in increasing order", () => {
+test("Windows broker state limits global frames and opens to their owning directions", () => {
   const state = new WindowsBrokerConnectionState();
-
-  open(state, 1n);
-  close(state, 1n);
-  open(state, 2n);
-
-  assert.throws(() => open(state, 1n), PROTOCOL_ERROR);
-  assert.throws(() => open(state, 2n), PROTOCOL_ERROR);
-  assert.throws(() => open(state, 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "ready", 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "open", 1n), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "ready", 0n);
+  assert.throws(() => accept(state, parentToBroker, "open", 1n), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "open", 1n);
+  accept(state, brokerToParent, "close", 1n);
+  accept(state, brokerToParent, "open", 2n);
+  assert.throws(() => accept(state, brokerToParent, "open", 1n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "ready", 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "close-all", 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "close-all-ack", 0n), PROTOCOL_ERROR);
 });
 
-test("Windows broker state rejects data outside an open nonterminal connection", () => {
+test("EOF only closes its own direction while CLOSE terminally closes both directions", () => {
   const state = new WindowsBrokerConnectionState();
-
+  readyAndOpen(state);
+  accept(state, brokerToParent, "data", 1n, Uint8Array.from([1]));
+  accept(state, brokerToParent, "eof", 1n);
   assert.throws(
-    () => state.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1]) }),
+    () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([2])),
     PROTOCOL_ERROR,
   );
-  open(state, 1n);
-  state.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1]) });
-  close(state, 1n);
-
+  assert.throws(() => accept(state, brokerToParent, "eof", 1n), PROTOCOL_ERROR);
+  accept(state, parentToBroker, "data", 1n, Uint8Array.from([3]));
+  accept(state, parentToBroker, "close", 1n);
   assert.throws(
-    () => state.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([2]) }),
+    () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([4])),
     PROTOCOL_ERROR,
   );
-  assert.throws(() => close(state, 1n), PROTOCOL_ERROR);
-  assert.throws(
-    () => state.accept({ type: "eof", connectionId: 1n, payload: new Uint8Array() }),
-    PROTOCOL_ERROR,
-  );
+  assert.throws(() => accept(state, brokerToParent, "close", 1n), PROTOCOL_ERROR);
 });
 
-test("Windows broker state allows one EOF before close but rejects duplicate EOF", () => {
+test("PAUSE pauses only the opposite direction until its matching RESUME", () => {
   const state = new WindowsBrokerConnectionState();
-  open(state, 1n);
-
-  state.accept({ type: "eof", connectionId: 1n, payload: new Uint8Array() });
-  state.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1]) });
-
+  readyAndOpen(state);
+  assert.throws(() => accept(state, brokerToParent, "resume", 1n), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "pause", 1n);
   assert.throws(
-    () => state.accept({ type: "eof", connectionId: 1n, payload: new Uint8Array() }),
+    () => accept(state, parentToBroker, "data", 1n, Uint8Array.from([1])),
     PROTOCOL_ERROR,
   );
+  accept(state, brokerToParent, "data", 1n, Uint8Array.from([2]));
+  assert.throws(() => accept(state, brokerToParent, "pause", 1n), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "resume", 1n);
+  accept(state, parentToBroker, "data", 1n, Uint8Array.from([3]));
+  assert.throws(() => accept(state, parentToBroker, "resume", 1n), PROTOCOL_ERROR);
 });
 
-test("Windows broker state permits only pause then resume backpressure transitions", () => {
+test("queue limits are direction-aware, drain requires the matching active direction, and CLOSE discards both", () => {
+  const state = new WindowsBrokerConnectionState({ maxConnectionBytes: 3, maxTotalBytes: 4 });
+  readyAndOpen(state);
+  accept(state, brokerToParent, "data", 1n, Uint8Array.from([1, 2]));
+  accept(state, parentToBroker, "data", 1n, Uint8Array.from([3]));
+  assert.throws(
+    () => accept(state, brokerToParent, "data", 1n, Uint8Array.from([4, 5])),
+    PROTOCOL_ERROR,
+  );
+  assert.throws(() => state.drain(1n, parentToBroker, 2), PROTOCOL_ERROR);
+  state.drain(1n, brokerToParent, 1);
+  accept(state, brokerToParent, "data", 1n, Uint8Array.from([4, 5]));
+  accept(state, brokerToParent, "close", 1n);
+  assert.throws(() => state.drain(1n, brokerToParent, 1), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "open", 2n);
+  accept(state, brokerToParent, "data", 2n, Uint8Array.from([6, 7, 8]));
+});
+
+test("CLOSE_ALL requires parent ownership, drains all terminals before broker acknowledgement, then fences every frame", () => {
   const state = new WindowsBrokerConnectionState();
-  open(state, 1n);
-
+  readyAndOpen(state, 1n);
+  accept(state, brokerToParent, "open", 2n);
+  accept(state, parentToBroker, "close-all", 0n);
   assert.throws(
-    () => state.accept({ type: "resume", connectionId: 1n, payload: new Uint8Array() }),
+    () => accept(state, parentToBroker, "data", 1n, Uint8Array.from([1])),
     PROTOCOL_ERROR,
   );
-  state.accept({ type: "pause", connectionId: 1n, payload: new Uint8Array() });
-  assert.throws(
-    () => state.accept({ type: "pause", connectionId: 1n, payload: new Uint8Array() }),
-    PROTOCOL_ERROR,
-  );
-  state.accept({ type: "resume", connectionId: 1n, payload: new Uint8Array() });
+  assert.throws(() => accept(state, brokerToParent, "close-all-ack", 0n), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "eof", 1n);
+  accept(state, parentToBroker, "close", 1n);
+  accept(state, brokerToParent, "close", 2n);
+  accept(state, brokerToParent, "close-all-ack", 0n);
+  assert.throws(() => accept(state, brokerToParent, "fatal", 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "ready", 0n), PROTOCOL_ERROR);
 });
 
-test("Windows broker state permits one ready, fences after fatal, and pairs close-all acknowledgement", () => {
-  const ready = new WindowsBrokerConnectionState();
-  ready.accept({ type: "ready", connectionId: 0n, payload: new Uint8Array() });
-  assert.throws(
-    () => ready.accept({ type: "ready", connectionId: 0n, payload: new Uint8Array() }),
-    PROTOCOL_ERROR,
-  );
-
-  const fatal = new WindowsBrokerConnectionState();
-  fatal.accept({ type: "fatal", connectionId: 0n, payload: Uint8Array.from([1]) });
-  assert.throws(() => open(fatal, 1n), PROTOCOL_ERROR);
-
-  const closing = new WindowsBrokerConnectionState();
-  closing.accept({ type: "close-all", connectionId: 0n, payload: new Uint8Array() });
-  assert.throws(() => open(closing, 1n), PROTOCOL_ERROR);
-  closing.accept({ type: "close-all-ack", connectionId: 0n, payload: new Uint8Array() });
-  assert.throws(
-    () => closing.accept({ type: "close-all-ack", connectionId: 0n, payload: new Uint8Array() }),
-    PROTOCOL_ERROR,
-  );
-});
-
-test("Windows broker state rejects data after close-all while permitting connection terminals", () => {
+test("FATAL belongs to the broker, can precede READY, and terminally fences the protocol", () => {
   const state = new WindowsBrokerConnectionState();
-  open(state, 1n);
-  state.accept({ type: "close-all", connectionId: 0n, payload: new Uint8Array() });
-
-  assert.throws(
-    () => state.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1]) }),
-    PROTOCOL_ERROR,
-  );
-  close(state, 1n);
-  state.accept({ type: "close-all-ack", connectionId: 0n, payload: new Uint8Array() });
-});
-
-test("Windows broker state bounds queued bytes per connection and across connections", () => {
-  const perConnection = new WindowsBrokerConnectionState({
-    maxConnectionBytes: 3,
-    maxTotalBytes: 8,
-  });
-  open(perConnection, 1n);
-  perConnection.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1, 2, 3]) });
-  assert.throws(
-    () => perConnection.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([4]) }),
-    PROTOCOL_ERROR,
-  );
-
-  const total = new WindowsBrokerConnectionState({ maxConnectionBytes: 3, maxTotalBytes: 4 });
-  open(total, 1n);
-  open(total, 2n);
-  total.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1, 2, 3]) });
-  assert.throws(
-    () => total.accept({ type: "data", connectionId: 2n, payload: Uint8Array.from([4, 5]) }),
-    PROTOCOL_ERROR,
-  );
-});
-
-test("Windows broker state releases drained bytes back to both queue limits", () => {
-  const state = new WindowsBrokerConnectionState({ maxConnectionBytes: 4, maxTotalBytes: 4 });
-  open(state, 1n);
-  open(state, 2n);
-  state.accept({ type: "data", connectionId: 1n, payload: Uint8Array.from([1, 2, 3]) });
-
-  assert.throws(
-    () => state.accept({ type: "data", connectionId: 2n, payload: Uint8Array.from([4, 5]) }),
-    PROTOCOL_ERROR,
-  );
-  state.drain(1n, 2);
-  state.accept({ type: "data", connectionId: 2n, payload: Uint8Array.from([4, 5]) });
-
-  assert.throws(() => state.drain(1n, 2), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "fatal", 0n), PROTOCOL_ERROR);
+  accept(state, brokerToParent, "fatal", 0n, Uint8Array.from([1]));
+  assert.throws(() => accept(state, brokerToParent, "fatal", 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, brokerToParent, "ready", 0n), PROTOCOL_ERROR);
+  assert.throws(() => accept(state, parentToBroker, "close-all", 0n), PROTOCOL_ERROR);
 });

@@ -140,11 +140,19 @@ interface WindowsBrokerConnectionStateOptions {
   readonly maxTotalBytes?: number;
 }
 
-interface ConnectionState {
+export type WindowsBrokerFrameDirection = "broker-to-parent" | "parent-to-broker";
+
+const directions = ["broker-to-parent", "parent-to-broker"] as const;
+
+interface DirectionState {
   eof: boolean;
-  paused: boolean;
   queuedBytes: number;
+}
+
+interface ConnectionState {
   closed: boolean;
+  readonly directions: Record<WindowsBrokerFrameDirection, DirectionState>;
+  readonly pausedBy: Record<WindowsBrokerFrameDirection, boolean>;
 }
 
 function byteLimit(value: number | undefined, fallback: number): number {
@@ -155,6 +163,16 @@ function byteLimit(value: number | undefined, fallback: number): number {
 
 function requireEmptyPayload(frame: WindowsBrokerFrame): void {
   if (frame.payload.byteLength !== 0) throw protocolError();
+}
+
+function assertDirection(direction: WindowsBrokerFrameDirection): void {
+  if (direction !== "broker-to-parent" && direction !== "parent-to-broker") {
+    throw protocolError();
+  }
+}
+
+function oppositeDirection(direction: WindowsBrokerFrameDirection): WindowsBrokerFrameDirection {
+  return direction === "broker-to-parent" ? "parent-to-broker" : "broker-to-parent";
 }
 
 export class WindowsBrokerConnectionState {
@@ -176,25 +194,35 @@ export class WindowsBrokerConnectionState {
     this.#maxTotalBytes = byteLimit(options.maxTotalBytes, WINDOWS_BROKER_MAX_CONNECTION_BYTES);
   }
 
-  accept(frame: WindowsBrokerFrame): void {
+  accept(frame: WindowsBrokerFrame, direction: WindowsBrokerFrameDirection): void {
     assertFrame(frame);
+    assertDirection(direction);
+    if (this.#fatal || this.#closeAllAcknowledged) throw protocolError();
     switch (frame.type) {
       case "ready":
-        if (this.#ready || this.#fatal || this.#closeAllRequested) throw protocolError();
+        if (direction !== "broker-to-parent" || this.#ready || this.#closeAllRequested) {
+          throw protocolError();
+        }
         this.#ready = true;
         return;
       case "fatal":
-        if (this.#fatal) throw protocolError();
+        if (direction !== "broker-to-parent") throw protocolError();
         this.#fatal = true;
         return;
       case "close-all":
         requireEmptyPayload(frame);
-        if (this.#closeAllRequested || this.#fatal) throw protocolError();
+        if (direction !== "parent-to-broker" || !this.#ready || this.#closeAllRequested) {
+          throw protocolError();
+        }
         this.#closeAllRequested = true;
         return;
       case "close-all-ack":
         requireEmptyPayload(frame);
-        if (!this.#closeAllRequested || this.#closeAllAcknowledged || this.#fatal) {
+        if (
+          direction !== "broker-to-parent" ||
+          !this.#closeAllRequested ||
+          ![...this.#connections.values()].every((connection) => connection.closed)
+        ) {
           throw protocolError();
         }
         this.#closeAllAcknowledged = true;
@@ -202,9 +230,9 @@ export class WindowsBrokerConnectionState {
       case "open":
         requireEmptyPayload(frame);
         if (
-          this.#fatal ||
+          direction !== "broker-to-parent" ||
+          !this.#ready ||
           this.#closeAllRequested ||
-          this.#closeAllAcknowledged ||
           frame.connectionId <= this.#lastConnectionId ||
           this.#connections.has(frame.connectionId)
         ) {
@@ -213,63 +241,79 @@ export class WindowsBrokerConnectionState {
         this.#lastConnectionId = frame.connectionId;
         this.#connections.set(frame.connectionId, {
           closed: false,
-          eof: false,
-          paused: false,
-          queuedBytes: 0,
+          directions: {
+            "broker-to-parent": { eof: false, queuedBytes: 0 },
+            "parent-to-broker": { eof: false, queuedBytes: 0 },
+          },
+          pausedBy: {
+            "broker-to-parent": false,
+            "parent-to-broker": false,
+          },
         });
         return;
       case "data": {
         if (this.#closeAllRequested) throw protocolError();
         const connection = this.#activeConnection(frame.connectionId);
-        const nextConnectionBytes = connection.queuedBytes + frame.payload.byteLength;
+        const channel = connection.directions[direction];
+        if (channel.eof || connection.pausedBy[oppositeDirection(direction)]) throw protocolError();
+        const nextConnectionBytes = channel.queuedBytes + frame.payload.byteLength;
         const nextTotalBytes = this.#totalQueuedBytes + frame.payload.byteLength;
         if (
+          !Number.isSafeInteger(nextConnectionBytes) ||
+          !Number.isSafeInteger(nextTotalBytes) ||
           nextConnectionBytes > this.#maxConnectionBytes ||
           nextTotalBytes > this.#maxTotalBytes
         ) {
           throw protocolError();
         }
-        connection.queuedBytes = nextConnectionBytes;
+        channel.queuedBytes = nextConnectionBytes;
         this.#totalQueuedBytes = nextTotalBytes;
         return;
       }
       case "eof": {
         requireEmptyPayload(frame);
         const connection = this.#activeConnection(frame.connectionId);
-        if (connection.eof) throw protocolError();
-        connection.eof = true;
+        const channel = connection.directions[direction];
+        if (channel.eof) throw protocolError();
+        channel.eof = true;
         return;
       }
       case "close": {
         requireEmptyPayload(frame);
         const connection = this.#activeConnection(frame.connectionId);
+        for (const currentDirection of directions) {
+          this.#totalQueuedBytes -= connection.directions[currentDirection].queuedBytes;
+          connection.directions[currentDirection].queuedBytes = 0;
+        }
         connection.closed = true;
         return;
       }
       case "pause": {
         requireEmptyPayload(frame);
         const connection = this.#activeConnection(frame.connectionId);
-        if (connection.paused) throw protocolError();
-        connection.paused = true;
+        if (connection.pausedBy[direction]) throw protocolError();
+        connection.pausedBy[direction] = true;
         return;
       }
       case "resume": {
         requireEmptyPayload(frame);
         const connection = this.#activeConnection(frame.connectionId);
-        if (!connection.paused) throw protocolError();
-        connection.paused = false;
+        if (!connection.pausedBy[direction]) throw protocolError();
+        connection.pausedBy[direction] = false;
         return;
       }
     }
   }
 
-  drain(connectionId: bigint, bytes: number): void {
+  drain(connectionId: bigint, direction: WindowsBrokerFrameDirection, bytes: number): void {
     if (typeof connectionId !== "bigint" || !Number.isSafeInteger(bytes) || bytes < 0) {
       throw protocolError();
     }
-    const connection = this.#connections.get(connectionId);
-    if (connection === undefined || bytes > connection.queuedBytes) throw protocolError();
-    connection.queuedBytes -= bytes;
+    assertDirection(direction);
+    const connection = this.#activeConnection(connectionId);
+    const channel = connection.directions[direction];
+    if (bytes > channel.queuedBytes) throw protocolError();
+    channel.queuedBytes -= bytes;
     this.#totalQueuedBytes -= bytes;
   }
 
