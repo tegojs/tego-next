@@ -1,5 +1,14 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -252,21 +261,29 @@ function isTemporaryParent(directory) {
   return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
 }
 
-export async function verifyPackedConsumer(packedWorkspaces, consumerParentDirectory) {
+export async function withPackedConsumer(packedWorkspaces, consumerParentDirectory, callback) {
   const consumerParent = resolve(consumerParentDirectory);
   if (!isTemporaryParent(consumerParent))
     throw new Error("safe consumer directory must be an existing temporary parent");
   const parentStats = await lstat(consumerParent).catch(() => undefined);
   if (!parentStats?.isDirectory())
     throw new Error("safe consumer directory must be an existing temporary parent");
+  if (typeof callback !== "function") throw new TypeError("packed consumer callback is required");
   const names = new Set();
   for (const workspace of packedWorkspaces) {
     if (names.has(workspace.name))
       throw new Error(`packed workspace names must be unique: ${workspace.name}`);
     names.add(workspace.name);
   }
+  assertExact(
+    [...names],
+    expectedPackages.map(({ name }) => name),
+    "packed consumer requires exactly the nine public packages in canonical order",
+  );
   const consumerDirectory = await mkdtemp(join(consumerParent, "tego-packed-consumer-"));
   try {
+    if ((await readdir(consumerDirectory)).length !== 0)
+      throw new Error("packed consumer must start empty");
     const dependencies = {};
     for (const { name, tarball } of packedWorkspaces) dependencies[name] = `file:${tarball}`;
     await writeFile(
@@ -274,24 +291,50 @@ export async function verifyPackedConsumer(packedWorkspaces, consumerParentDirec
       `${JSON.stringify({ name: "tego-packed-consumer", private: true, type: "module", dependencies }, null, 2)}\n`,
     );
     await npm(consumerDirectory, ["install", "--ignore-scripts"]);
+    const canonicalConsumerDirectory = await realpath(consumerDirectory);
     for (const workspace of packedWorkspaces) {
+      const installedRoot = join(consumerDirectory, "node_modules", ...workspace.name.split("/"));
+      const installedStats = await lstat(installedRoot);
+      const canonicalInstalledRoot = await realpath(installedRoot);
+      if (
+        !installedStats.isDirectory() ||
+        installedStats.isSymbolicLink() ||
+        relative(canonicalConsumerDirectory, canonicalInstalledRoot).startsWith("..")
+      ) {
+        throw new Error(`${workspace.name} must be a physical clean-consumer install`);
+      }
       await execute(
         process.execPath,
         ["--input-type=module", "--eval", `await import(${JSON.stringify(workspace.name)})`],
-        { cwd: consumerDirectory },
+        { cwd: consumerDirectory, env: { ...process.env, NODE_PATH: "" } },
       );
     }
-    const cli = join(consumerDirectory, "node_modules", "@tego", "cli", "dist", "src", "bin.js");
-    await execute(process.execPath, [cli, "--help"], { cwd: consumerDirectory });
+    const cliRoot = join(consumerDirectory, "node_modules", "@tego", "cli");
+    const cli = join(cliRoot, "dist", "src", "bin.js");
+    await execute(process.execPath, [cli, "--help"], {
+      cwd: consumerDirectory,
+      env: { ...process.env, NODE_PATH: "" },
+    });
+    const brokerPowerShell = join(cliRoot, "dist", "src", "control", "windows-control-broker.ps1");
+    const brokerCSharp = join(cliRoot, "dist", "src", "control", "windows-control-broker.cs");
     for (const asset of ["windows-control-broker.ps1", "windows-control-broker.cs"]) {
-      const installed = await readFile(
-        join(consumerDirectory, "node_modules", "@tego", "cli", "dist", "src", "control", asset),
-      );
+      const installed = await readFile(join(cliRoot, "dist", "src", "control", asset));
       if (installed.byteLength === 0) throw new Error(`clean consumer has an empty ${asset}`);
     }
+    return await callback({
+      brokerCSharp,
+      brokerPowerShell,
+      cliRoot,
+      directory: consumerDirectory,
+      packageNames: [...names],
+    });
   } finally {
     await rm(consumerDirectory, { force: true, recursive: true });
   }
+}
+
+export async function verifyPackedConsumer(packedWorkspaces, consumerParentDirectory) {
+  await withPackedConsumer(packedWorkspaces, consumerParentDirectory, async () => undefined);
 }
 
 async function main() {

@@ -237,6 +237,28 @@ test("READY descriptor is a strict canonical versioned binary readback", () => {
   }
 });
 
+test("broker exposes the strictly decoded live READY descriptor before startup resolves", async () => {
+  const child = createFakeBrokerChild();
+  let observed: ReturnType<typeof decodeWindowsBrokerReadyDescriptor> | undefined;
+  const broker = createWindowsControlBroker({
+    endpoint: "\\\\.\\pipe\\tego-live-ready-descriptor",
+    maxConnections: 1,
+    maxQueuedBytes: 1024,
+    onReadyDescriptor(descriptor) {
+      observed = descriptor;
+    },
+    spawnBroker: () => child,
+    startupTimeoutMs: 50,
+  });
+  const parentFrames = collectParentFrames(child);
+  const startup = broker.start();
+  child.stdout.write(brokerFrame("ready", 0n, encodeReadyDescriptor()));
+  await startup;
+
+  assert.deepEqual(observed, decodeWindowsBrokerReadyDescriptor(encodeReadyDescriptor()));
+  await closeGracefully(broker, child, parentFrames);
+});
+
 test("broker spawn uses the packaged absolute script and fixed shell-free PowerShell arguments", async () => {
   const child = createFakeBrokerChild();
   let invocation:

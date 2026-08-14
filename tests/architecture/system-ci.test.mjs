@@ -9,8 +9,21 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const workflowPath = join(root, ".github", "workflows", "ci.yml");
+const windowsControlGateChildMarker = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
 const windowsControlGateMarker = "TEGO_WINDOWS_CONTROL_GATE_OK";
 const windowsControlGateRunner = join(root, "scripts", "run-windows-control-gate.mjs");
+const windowsControlGateSource = join(root, "packages", "cli", "test", "windows-control-gate.ts");
+const requiredWindowsControlGateStages = [
+  ["packed-clean-consumer", "preparePackedWindowsControlConsumer"],
+  ["powershell-csharp-self-test", "runPowerShellSelfTest"],
+  ["live-server-handle-descriptor", "startLiveDescriptor"],
+  ["status-request", "runStatusRequest"],
+  ["malformed-broker-frame-fail-closed", "runMalformedFrameFailure"],
+  ["parent-crash-cleanup", "runParentCrashCleanup"],
+  ["broker-crash-cleanup", "runBrokerCrashCleanup"],
+  ["reconnect-failure", "runReconnectFailure"],
+  ["twenty-lifecycle-rounds", "runTwentyLifecycleRounds"],
+];
 const requiredStepsByJob = {
   integration: [
     "Check out repository",
@@ -157,7 +170,7 @@ test("Windows control gate rejects non-Windows, skipped, missing, and failed exe
     signal: null,
     status: 0,
     stderr: "",
-    stdout: `${windowsControlGateMarker}\n`,
+    stdout: `${windowsControlGateChildMarker}\n`,
   };
 
   assert.throws(() => assertWindowsControlGateResult("darwin", success), /requires Windows/u);
@@ -186,6 +199,139 @@ test("Windows control gate rejects non-Windows, skipped, missing, and failed exe
     });
     assert.notEqual(result.status, 0);
     assert.doesNotMatch(result.stdout, new RegExp(windowsControlGateMarker, "u"));
+  }
+});
+
+test("Windows control gate source contract fixes every real stage before the sole marker", async () => {
+  const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
+    import(
+      new URL(
+        `../../scripts/run-windows-control-gate.mjs?source-contract=${Date.now()}`,
+        import.meta.url,
+      )
+    ),
+    readFile(windowsControlGateRunner, "utf8"),
+    readFile(windowsControlGateSource, "utf8"),
+  ]);
+
+  assert.equal(
+    typeof validateWindowsControlGateContract,
+    "function",
+    "Windows gate runner must export its structural source validator",
+  );
+  assert.deepEqual(validateWindowsControlGateContract({ gateSource, runnerSource }), []);
+});
+
+test("Windows control gate source validation rejects removed, reordered, softened, or no-op stages", async (t) => {
+  const { validateWindowsControlGateContract } = await import(
+    new URL(
+      `../../scripts/run-windows-control-gate.mjs?stage-mutations=${Date.now()}`,
+      import.meta.url,
+    )
+  );
+  assert.equal(
+    typeof validateWindowsControlGateContract,
+    "function",
+    "Windows gate runner must export its structural source validator",
+  );
+
+  const stageLines = requiredWindowsControlGateStages.map(
+    ([stage, implementation]) =>
+      `  await runWindowsControlGateStage("${stage}", ${implementation});`,
+  );
+  const markerWrite = `  process.stdout.write(\`\${WINDOWS_CONTROL_GATE_MARKER}\\n\`);`;
+  const activeStageHelper = [
+    "async function runWindowsControlGateStage(_stage, operation) {",
+    "  await operation();",
+    "}",
+  ].join("\n");
+  const runnerFixture = [
+    activeStageHelper,
+    "async function runWindowsControlGate() {",
+    stageLines[0],
+    "  await runInstalledWindowsControlGate();",
+    markerWrite,
+    "}",
+  ].join("\n");
+  const gateFixture = [
+    activeStageHelper,
+    "async function runInstalledWindowsControlGate() {",
+    ...stageLines.slice(1),
+    "}",
+  ].join("\n");
+  assert.deepEqual(
+    validateWindowsControlGateContract({ gateSource: gateFixture, runnerSource: runnerFixture }),
+    [],
+  );
+
+  for (const [index, [stage, implementation]] of requiredWindowsControlGateStages.entries()) {
+    const sourceName = index === 0 ? "runnerSource" : "gateSource";
+    const original = sourceName === "runnerSource" ? runnerFixture : gateFixture;
+    const line = stageLines[index];
+    const removed = original.replace(`${line}\n`, "");
+    const noOp = original.replace(
+      line,
+      `  await runWindowsControlGateStage("${stage}", async () => undefined);`,
+    );
+    const softened = original.replace(line, `  if (false) ${line.trim()}`);
+    let reordered;
+    if (index === 0) {
+      reordered = original.replace(
+        `${line}\n  await runInstalledWindowsControlGate();`,
+        `  await runInstalledWindowsControlGate();\n${line}`,
+      );
+    } else if (index === requiredWindowsControlGateStages.length - 1) {
+      const previousLine = stageLines[index - 1];
+      reordered = original.replace(`${previousLine}\n${line}`, `${line}\n${previousLine}`);
+    } else {
+      const nextLine = stageLines[index + 1];
+      reordered = original.replace(`${line}\n${nextLine}`, `${nextLine}\n${line}`);
+    }
+
+    for (const [mutationName, mutation] of [
+      ["removed", removed],
+      ["replaced by no-op", noOp],
+      ["softened by condition", softened],
+      ["reordered", reordered],
+    ]) {
+      await t.test(`${stage}: ${mutationName}`, () => {
+        assert.notEqual(mutation, original);
+        const diagnostics = validateWindowsControlGateContract({
+          gateSource: sourceName === "gateSource" ? mutation : gateFixture,
+          runnerSource: sourceName === "runnerSource" ? mutation : runnerFixture,
+        });
+        assert.ok(diagnostics.length > 0, `${stage} ${mutationName} must fail closed`);
+      });
+    }
+
+    assert.match(implementation, /^(?:prepare|run|start)/u);
+  }
+
+  for (const runnerMutation of [
+    runnerFixture.replace("  await runInstalledWindowsControlGate();\n", ""),
+    runnerFixture.replace(
+      "  await runInstalledWindowsControlGate();",
+      "  await Promise.resolve();",
+    ),
+    runnerFixture.replace(markerWrite, `${markerWrite}\n  await runInstalledWindowsControlGate();`),
+  ]) {
+    assert.ok(
+      validateWindowsControlGateContract({ gateSource: gateFixture, runnerSource: runnerMutation })
+        .length > 0,
+      "installed execution and the sole marker must remain ordered and non-noop",
+    );
+  }
+
+  for (const sourceName of ["gateSource", "runnerSource"]) {
+    const source = sourceName === "gateSource" ? gateFixture : runnerFixture;
+    const noOpHelper = source.replace("  await operation();", "  await Promise.resolve();");
+    assert.ok(
+      validateWindowsControlGateContract({
+        gateSource: sourceName === "gateSource" ? noOpHelper : gateFixture,
+        runnerSource: sourceName === "runnerSource" ? noOpHelper : runnerFixture,
+      }).length > 0,
+      `${sourceName} cannot replace the stage executor with a no-op`,
+    );
   }
 });
 
@@ -369,6 +515,13 @@ test("CI workflow validation rejects removal, replacement, or no-op of the Windo
       "Run Windows control security test",
       "run",
       `node -e 'console.log("${windowsControlGateMarker}")'`,
+    ),
+    mutateStepField(
+      workflow,
+      "windows-control",
+      "Run Windows control security test",
+      "timeout-minutes",
+      "12",
     ),
   ];
   for (const mutation of mutations) {

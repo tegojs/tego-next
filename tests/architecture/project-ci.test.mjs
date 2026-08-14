@@ -135,6 +135,14 @@ test("GitHub CI declares quality, Windows control, integration, and system E2E g
     assert.equal(job["timeout-minutes"], 15, `${name} CI must have a bounded job timeout`);
   }
   assert.equal(windowsControlJob["runs-on"], "windows-2025");
+  const windowsControlGate = windowsControlJob.steps.find(
+    (step) => step.name === "Run Windows control security test",
+  );
+  assert.deepEqual(windowsControlGate, {
+    name: "Run Windows control security test",
+    run: "node scripts/run-windows-control-gate.mjs",
+    "timeout-minutes": 13,
+  });
   for (const [name, job] of [
     ["PostgreSQL integration", integrationJob],
     ["process E2E", processE2eJob],

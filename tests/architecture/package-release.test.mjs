@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -98,9 +98,10 @@ test("CLI build finalization makes a freshly emitted binary executable", async (
 });
 
 test("packed public packages contain only consumer assets and install cleanly", async () => {
-  const { packWorkspaceSet, verifyPackedConsumer } = await import(
+  const { packWorkspaceSet, withPackedConsumer } = await import(
     new URL("../../scripts/package-contract.mjs", import.meta.url)
   );
+  assert.equal(typeof withPackedConsumer, "function");
   const directory = await mkdtemp(join(tmpdir(), "tego-package-contract-"));
 
   try {
@@ -145,7 +146,26 @@ test("packed public packages contain only consumer assets and install cleanly", 
         }
       }
     }
-    await verifyPackedConsumer(packed, directory);
+    await withPackedConsumer(packed, directory, async (consumer) => {
+      assert.deepEqual(
+        consumer.packageNames,
+        publicDirectories.map((directoryName) => `@tego/${directoryName}`),
+      );
+      assert.equal(
+        relative(resolve(consumer.directory), resolve(consumer.cliRoot)).startsWith(".."),
+        false,
+      );
+      assert.equal((await lstat(consumer.cliRoot)).isSymbolicLink(), false);
+      assert.equal(
+        consumer.brokerPowerShell,
+        join(consumer.cliRoot, "dist", "src", "control", "windows-control-broker.ps1"),
+      );
+      assert.equal(
+        consumer.brokerCSharp,
+        join(consumer.cliRoot, "dist", "src", "control", "windows-control-broker.cs"),
+      );
+      assert.notEqual(resolve(consumer.cliRoot).startsWith(resolve(root)), true);
+    });
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -159,6 +179,13 @@ test("Windows control gate emits fixed diagnostics without exception details", a
 
   assert.match(gate, /TEGO_WINDOWS_CONTROL_GATE_FAILED/u);
   assert.doesNotMatch(gate, /error\.(?:message|stack)|String\(error\)/u);
+  assert.match(gate, /from "@tego\/cli"/u);
+  assert.match(gate, /powershell\.exe/u);
+  assert.match(gate, /"-SelfTest"/u);
+  assert.match(gate, /process\.arch[\s\S]+"x64"/u);
+  assert.match(gate, /round < 20/u);
+  assert.match(gate, /TEGO_WINDOWS_CONTROL_CONSUMER_ROOT/u);
+  assert.doesNotMatch(gate, /\.\.\/src\/control/u);
 });
 
 test("workspace inspection rejects duplicate public names and non-alpha versions", async () => {

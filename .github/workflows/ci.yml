@@ -81,6 +81,7 @@ jobs:
       - name: Typecheck CLI
         run: npm run typecheck --workspace @tego/cli
       - name: Run Windows control security test
+        timeout-minutes: 13
         run: node scripts/run-windows-control-gate.mjs
 
   integration:

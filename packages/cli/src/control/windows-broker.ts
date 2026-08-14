@@ -14,7 +14,10 @@ import {
   type WindowsBrokerFrame,
   WindowsBrokerFrameDecoder,
 } from "./windows-broker-protocol.js";
-import { decodeWindowsBrokerReadyDescriptor } from "./windows-broker-security.js";
+import {
+  decodeWindowsBrokerReadyDescriptor,
+  type WindowsBrokerSecurityDescriptor,
+} from "./windows-broker-security.js";
 
 const WINDOWS_BROKER_SCRIPT = fileURLToPath(new URL("windows-control-broker.ps1", import.meta.url));
 const WINDOWS_BROKER_CSHARP = fileURLToPath(new URL("windows-control-broker.cs", import.meta.url));
@@ -90,6 +93,7 @@ export interface WindowsControlBrokerOptions {
   readonly maxConnections: number;
   readonly maxQueuedBytes: number;
   readonly onFailureStage?: (stage: WindowsBrokerFailureStage) => void;
+  readonly onReadyDescriptor?: (descriptor: WindowsBrokerSecurityDescriptor) => void;
   readonly shutdownTimeoutMs?: number;
   readonly spawnBroker?: WindowsBrokerSpawner;
   readonly startupTimeoutMs?: number;
@@ -260,6 +264,7 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
   readonly #maxConnections: number;
   readonly #maxQueuedBytes: number;
   readonly #onFailureStage: ((stage: WindowsBrokerFailureStage) => void) | undefined;
+  readonly #onReadyDescriptor: ((descriptor: WindowsBrokerSecurityDescriptor) => void) | undefined;
   readonly #shutdownTimeoutMs: number;
   readonly #spawnBroker: WindowsBrokerSpawner;
   readonly #startupTimeoutMs: number;
@@ -301,6 +306,7 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
     this.#maxConnections = options.maxConnections;
     this.#maxQueuedBytes = options.maxQueuedBytes;
     this.#onFailureStage = options.onFailureStage;
+    this.#onReadyDescriptor = options.onReadyDescriptor;
     this.#shutdownTimeoutMs = duration(
       options.shutdownTimeoutMs,
       WINDOWS_BROKER_SHUTDOWN_TIMEOUT_MS,
@@ -507,10 +513,12 @@ class WindowsControlBrokerAdapter implements WindowsControlBroker {
     }
     const disposition = this.#state.accept(frame, "broker-to-parent");
     switch (frame.type) {
-      case "ready":
-        decodeWindowsBrokerReadyDescriptor(frame.payload);
+      case "ready": {
+        const descriptor = decodeWindowsBrokerReadyDescriptor(frame.payload);
+        this.#onReadyDescriptor?.(descriptor);
         this.#ready.resolve();
         return;
+      }
       case "open": {
         const highWaterMark = Math.max(1, Math.floor(this.#maxQueuedBytes / this.#maxConnections));
         const connection = new BrokerConnection(this, frame.connectionId, highWaterMark);

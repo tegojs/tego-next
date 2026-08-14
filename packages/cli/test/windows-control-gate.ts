@@ -1,73 +1,482 @@
 import assert from "node:assert/strict";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import {
+  type ControlRuntimeOperations,
+  type ControlServer,
+  createWindowsControlBroker,
+  requestControl,
+  startControlServer,
+  type WindowsBrokerSecurityDescriptor,
+} from "@tego/cli";
 import { parseRuntimeStatus, type RuntimeOperations } from "@tego/contracts";
-import { requestControl } from "../src/control/client.js";
-import { type ControlRuntimeOperations, startControlServer } from "../src/control/server.js";
 
-const WINDOWS_CONTROL_GATE_MARKER = "TEGO_WINDOWS_CONTROL_GATE_OK";
+const WINDOWS_CONTROL_GATE_CHILD_MARKER = "TEGO_WINDOWS_CONTROL_GATE_INNER_OK";
+const WINDOWS_CONTROL_GATE_FAILURE = "TEGO_WINDOWS_CONTROL_GATE_FAILED";
+const WINDOWS_PIPE_FULL_CONTROL = 0x1f01ff;
+const WINDOWS_SYSTEM_SID = "S-1-5-18";
+const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
+const PROCESS_CLEANUP_TIMEOUT_MS = 15_000;
+const expectedPackageNames = [
+  "@tego/cli",
+  "@tego/contracts",
+  "@tego/drivers-local",
+  "@tego/drivers-postgres",
+  "@tego/executor-node",
+  "@tego/plugin-sdk",
+  "@tego/runtime",
+  "@tego/testkit",
+  "@tego/transport-websocket",
+];
+
+const expectedStatus = parseRuntimeStatus({
+  identity: {
+    applicationId: "application-windows-control-gate",
+    nodeId: "node-windows-control-gate",
+    runtimeId: "runtime-windows-control-gate",
+  },
+  mode: "single-main",
+  lifecycle: "running",
+  liveness: true,
+  readiness: true,
+  acceptingOperations: true,
+  drivers: [],
+  counts: {
+    deployments: 0,
+    installations: 0,
+    recoverableOperations: 0,
+    tasks: 0,
+    workers: 0,
+  },
+});
+
+interface TrackedServer {
+  readonly broker: ChildProcess;
+  readonly brokerPid: number;
+  readonly descriptor: WindowsBrokerSecurityDescriptor;
+  readonly endpoint: string;
+  readonly failure: Promise<Error>;
+  readonly server: ControlServer;
+}
+
+interface ParentFixtureReady {
+  readonly brokerPid: number;
+  readonly endpoint: string;
+  readonly parentPid: number;
+  readonly type: "ready";
+}
+
+let currentUserSid: string | undefined;
+let liveServer: TrackedServer | undefined;
 
 function gateOperations(): ControlRuntimeOperations {
   return {
     operations: {} as RuntimeOperations,
-    status: async () =>
-      parseRuntimeStatus({
-        identity: {
-          applicationId: "application-windows-control-gate",
-          nodeId: "node-windows-control-gate",
-          runtimeId: "runtime-windows-control-gate",
-        },
-        mode: "single-main",
-        lifecycle: "running",
-        liveness: true,
-        readiness: true,
-        acceptingOperations: true,
-        drivers: [],
-        counts: {
-          deployments: 0,
-          installations: 0,
-          recoverableOperations: 0,
-          tasks: 0,
-          workers: 0,
-        },
-      }),
+    status: async () => expectedStatus,
     stop: async () => undefined,
   };
 }
 
-async function runWindowsControlSecurityContract(): Promise<void> {
-  assert.equal(process.platform, "win32", "Windows control gate cannot run on another platform");
-  const endpoint = `\\\\.\\pipe\\tego-windows-control-gate-${process.pid}-${randomUUID()}`;
-  const server = await startControlServer({
-    endpoint,
-    operations: gateOperations(),
+function requiredEnvironment(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0)
+    throw new Error("Windows gate environment missing");
+  return value;
+}
+
+function isContained(parent: string, child: string): boolean {
+  const path = relative(parent, child);
+  return path !== "" && !path.startsWith("..") && !isAbsolute(path);
+}
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("Windows gate deadline exceeded")), timeoutMs);
+    timer.unref();
   });
   try {
-    const response = await requestControl({
-      endpoint,
-      operation: "runtime.status",
-      input: {},
-      requestId: "windows-control-gate-status",
-      timeoutMs: 1_000,
-    });
-    assert.equal(response.ok, true);
+    return await Promise.race([promise, timeout]);
   } finally {
-    await server.close();
+    clearTimeout(timer);
   }
-  await assert.rejects(
-    requestControl({
-      endpoint,
-      operation: "runtime.status",
-      input: {},
-      requestId: "windows-control-gate-reconnect",
-      timeoutMs: 1_000,
-    }),
+}
+
+function processExists(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw new Error("Windows process probe failed");
+  }
+}
+
+async function waitForProcessExit(processId: number): Promise<void> {
+  const deadline = Date.now() + PROCESS_CLEANUP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (!processExists(processId)) return;
+    await delay(25);
+  }
+  assert.equal(processExists(processId), false, "exact Windows process remained alive");
+}
+
+async function assertPipeUnavailable(endpoint: string): Promise<void> {
+  const deadline = Date.now() + PROCESS_CLEANUP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      await requestControl({
+        endpoint,
+        operation: "runtime.status",
+        input: {},
+        requestId: `windows-control-unavailable-${randomUUID()}`,
+        timeoutMs: 250,
+      });
+    } catch {
+      return;
+    }
+    await delay(25);
+  }
+  assert.fail("Windows control pipe remained reachable");
+}
+
+function assertDescriptor(descriptor: WindowsBrokerSecurityDescriptor): void {
+  assert.ok(currentUserSid !== undefined);
+  assert.equal(descriptor.ownerSid, currentUserSid);
+  assert.equal(descriptor.protectedDacl, true);
+  assert.deepEqual(
+    descriptor.accessRules,
+    [currentUserSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID].map((sid) => ({
+      accessMask: WINDOWS_PIPE_FULL_CONTROL,
+      callback: false as const,
+      inherited: false as const,
+      sid,
+      type: "allow" as const,
+    })),
   );
 }
 
-try {
-  await runWindowsControlSecurityContract();
-  process.stdout.write(`${WINDOWS_CONTROL_GATE_MARKER}\n`);
-} catch {
-  process.stderr.write("TEGO_WINDOWS_CONTROL_GATE_FAILED\n");
-  process.exitCode = 1;
+async function startTrackedServer(label: string): Promise<TrackedServer> {
+  const endpoint = `\\\\.\\pipe\\tego-windows-control-${label}-${process.pid}-${randomUUID()}`;
+  const failed = Promise.withResolvers<Error>();
+  let broker: ChildProcess | undefined;
+  let descriptor: WindowsBrokerSecurityDescriptor | undefined;
+  const server = await startControlServer({
+    endpoint,
+    onServerError(error) {
+      failed.resolve(error);
+    },
+    operations: gateOperations(),
+    windowsControlBrokerFactory(options) {
+      return createWindowsControlBroker({
+        ...options,
+        onReadyDescriptor(value) {
+          descriptor = value;
+        },
+        spawnBroker(command, args, spawnOptions) {
+          assert.equal(command, "powershell.exe");
+          assert.deepEqual(spawnOptions, {
+            shell: false,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+          });
+          const spawned = spawn(command, [...args], {
+            shell: false,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+          });
+          broker = spawned;
+          return spawned as never;
+        },
+      });
+    },
+  });
+  assert.ok(broker !== undefined);
+  assert.ok(Number.isSafeInteger(broker.pid) && (broker.pid ?? 0) > 0);
+  assert.ok(descriptor !== undefined);
+  assertDescriptor(descriptor);
+  return {
+    broker,
+    brokerPid: broker.pid as number,
+    descriptor,
+    endpoint,
+    failure: failed.promise,
+    server,
+  };
+}
+
+async function cleanupTrackedServer(tracked: TrackedServer): Promise<void> {
+  try {
+    await tracked.server.close();
+  } catch {}
+  if (processExists(tracked.brokerPid)) {
+    tracked.broker.kill("SIGKILL");
+  }
+  await waitForProcessExit(tracked.brokerPid);
+  await assertPipeUnavailable(tracked.endpoint);
+}
+
+async function assertStatus(endpoint: string, requestId: string): Promise<void> {
+  const response = await requestControl({
+    endpoint,
+    operation: "runtime.status",
+    input: {},
+    requestId,
+    timeoutMs: 2_000,
+  });
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.result, expectedStatus);
+}
+
+async function runWindowsControlGateStage(
+  _stage: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  await operation();
+}
+
+async function runPowerShellSelfTest(): Promise<void> {
+  assert.equal(process.platform, "win32", "Windows control gate requires win32");
+  assert.equal(process.arch, "x64", "Windows control gate requires x64");
+  const consumerRoot = await realpath(requiredEnvironment("TEGO_WINDOWS_CONTROL_CONSUMER_ROOT"));
+  const brokerPowerShell = await realpath(requiredEnvironment("TEGO_WINDOWS_CONTROL_BROKER_PS1"));
+  const brokerCSharp = await realpath(requiredEnvironment("TEGO_WINDOWS_CONTROL_BROKER_CS"));
+  const installedCliEntry = await realpath(fileURLToPath(import.meta.resolve("@tego/cli")));
+  const installedCliRoot = resolve(dirname(installedCliEntry), "..", "..");
+  const installedGate = await realpath(fileURLToPath(import.meta.url));
+  assert.equal(isContained(consumerRoot, installedCliEntry), true);
+  assert.equal(isContained(consumerRoot, installedGate), true);
+  assert.equal(isContained(installedCliRoot, brokerPowerShell), true);
+  assert.equal(isContained(installedCliRoot, brokerCSharp), true);
+  assert.equal(
+    requiredEnvironment("TEGO_WINDOWS_CONTROL_CONSUMER_PACKAGES"),
+    expectedPackageNames.join(","),
+  );
+  assert.equal(
+    brokerPowerShell,
+    join(installedCliRoot, "dist", "src", "control", "windows-control-broker.ps1"),
+  );
+  assert.equal(
+    brokerCSharp,
+    join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
+  );
+
+  const identity = spawnSync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      '[Console]::Out.WriteLine("{0}.{1}", $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor); [Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
+    ],
+    { encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true },
+  );
+  assert.equal(identity.error, undefined);
+  assert.equal(identity.signal, null);
+  assert.equal(identity.status, 0);
+  assert.equal(identity.stderr, "");
+  const identityLines = identity.stdout.trim().split(/\r?\n/u);
+  assert.equal(identityLines[0], "5.1", "PowerShell 5.1 is mandatory");
+  assert.match(identityLines[1] ?? "", /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
+  currentUserSid = identityLines[1];
+
+  const selfTest = spawnSync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      brokerPowerShell,
+      "-SelfTest",
+    ],
+    { encoding: "utf8", shell: false, timeout: 2 * 60 * 1000, windowsHide: true },
+  );
+  assert.equal(selfTest.error, undefined);
+  assert.equal(selfTest.signal, null);
+  assert.equal(selfTest.status, 0);
+  assert.equal(selfTest.stdout, "");
+  assert.equal(selfTest.stderr, "");
+}
+
+async function startLiveDescriptor(): Promise<void> {
+  liveServer = await startTrackedServer("live-descriptor");
+}
+
+async function runStatusRequest(): Promise<void> {
+  assert.ok(liveServer !== undefined);
+  await assertStatus(liveServer.endpoint, "windows-control-gate-status");
+}
+
+async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
+  assert.ok(broker.stdin !== null);
+  await new Promise<void>((resolveWrite, rejectWrite) => {
+    broker.stdin?.write(Buffer.alloc(24, 0xff), (error) =>
+      error === undefined || error === null ? resolveWrite() : rejectWrite(error),
+    );
+  });
+}
+
+async function runMalformedFrameFailure(): Promise<void> {
+  const tracked = await startTrackedServer("malformed-frame");
+  try {
+    await writeMalformedFrame(tracked.broker);
+    const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
+    assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    await waitForProcessExit(tracked.brokerPid);
+    await assertPipeUnavailable(tracked.endpoint);
+  } finally {
+    await cleanupTrackedServer(tracked);
+  }
+}
+
+async function runParentCrashFixture(): Promise<void> {
+  const tracked = await startTrackedServer("parent-crash");
+  if (process.send === undefined) throw new Error("Windows parent fixture requires IPC");
+  await new Promise<void>((resolveSend, rejectSend) => {
+    process.send?.(
+      {
+        brokerPid: tracked.brokerPid,
+        endpoint: tracked.endpoint,
+        parentPid: process.pid,
+        type: "ready",
+      } satisfies ParentFixtureReady,
+      (error) => (error === null ? resolveSend() : rejectSend(error)),
+    );
+  });
+  await new Promise<never>(() => undefined);
+}
+
+function isParentFixtureReady(value: unknown): value is ParentFixtureReady {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<ParentFixtureReady>;
+  return (
+    candidate.type === "ready" &&
+    Number.isSafeInteger(candidate.parentPid) &&
+    (candidate.parentPid ?? 0) > 0 &&
+    Number.isSafeInteger(candidate.brokerPid) &&
+    (candidate.brokerPid ?? 0) > 0 &&
+    typeof candidate.endpoint === "string" &&
+    /^\\\\\.\\pipe\\/u.test(candidate.endpoint)
+  );
+}
+
+async function runParentCrashCleanup(): Promise<void> {
+  const fixture = spawn(
+    process.execPath,
+    [fileURLToPath(import.meta.url), "--parent-crash-fixture"],
+    {
+      env: { ...process.env, NODE_PATH: "" },
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      windowsHide: true,
+    },
+  );
+  const ready = Promise.withResolvers<ParentFixtureReady>();
+  const closed = once(fixture, "close");
+  fixture.on("message", (message) => {
+    if (isParentFixtureReady(message)) ready.resolve(message);
+    else ready.reject(new Error("Windows parent fixture emitted invalid IPC"));
+  });
+  fixture.once("error", () => ready.reject(new Error("Windows parent fixture failed")));
+  fixture.once("exit", () => ready.reject(new Error("Windows parent fixture exited early")));
+  let details: ParentFixtureReady | undefined;
+  try {
+    details = await withDeadline(ready.promise, PROCESS_CLEANUP_TIMEOUT_MS);
+    assert.equal(details.parentPid, fixture.pid);
+    assert.equal(fixture.kill("SIGKILL"), true);
+    await withDeadline(
+      closed.then(() => undefined),
+      PROCESS_CLEANUP_TIMEOUT_MS,
+    );
+    await waitForProcessExit(details.parentPid);
+    await waitForProcessExit(details.brokerPid);
+    await assertPipeUnavailable(details.endpoint);
+    assert.equal(fixture.stdout?.readableEnded, true);
+    assert.equal(fixture.stderr?.readableEnded, true);
+  } finally {
+    if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
+    if (details !== undefined && processExists(details.brokerPid)) {
+      try {
+        process.kill(details.brokerPid, "SIGKILL");
+      } catch {}
+      await waitForProcessExit(details.brokerPid);
+    }
+  }
+}
+
+async function runBrokerCrashCleanup(): Promise<void> {
+  const tracked = await startTrackedServer("broker-crash");
+  try {
+    assert.equal(tracked.broker.kill("SIGKILL"), true);
+    const failure = await withDeadline(tracked.failure, PROCESS_CLEANUP_TIMEOUT_MS);
+    assert.match(failure.message, /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    await assert.rejects(tracked.server.close(), /PROTOCOL_CONTROL_ENDPOINT_UNSAFE/u);
+    await waitForProcessExit(tracked.brokerPid);
+    await assertPipeUnavailable(tracked.endpoint);
+  } finally {
+    await cleanupTrackedServer(tracked);
+  }
+}
+
+async function runReconnectFailure(): Promise<void> {
+  assert.ok(liveServer !== undefined);
+  const tracked = liveServer;
+  liveServer = undefined;
+  await tracked.server.close();
+  await waitForProcessExit(tracked.brokerPid);
+  await assertPipeUnavailable(tracked.endpoint);
+}
+
+async function runTwentyLifecycleRounds(): Promise<void> {
+  for (let round = 0; round < 20; round += 1) {
+    const tracked = await startTrackedServer(`round-${String(round)}`);
+    try {
+      await assertStatus(tracked.endpoint, `windows-control-gate-round-${String(round)}`);
+      await tracked.server.close();
+      await waitForProcessExit(tracked.brokerPid);
+      await assertPipeUnavailable(tracked.endpoint);
+    } finally {
+      await cleanupTrackedServer(tracked);
+    }
+  }
+}
+
+async function runInstalledWindowsControlGate(): Promise<void> {
+  await runWindowsControlGateStage("powershell-csharp-self-test", runPowerShellSelfTest);
+  await runWindowsControlGateStage("live-server-handle-descriptor", startLiveDescriptor);
+  await runWindowsControlGateStage("status-request", runStatusRequest);
+  await runWindowsControlGateStage("malformed-broker-frame-fail-closed", runMalformedFrameFailure);
+  await runWindowsControlGateStage("parent-crash-cleanup", runParentCrashCleanup);
+  await runWindowsControlGateStage("broker-crash-cleanup", runBrokerCrashCleanup);
+  await runWindowsControlGateStage("reconnect-failure", runReconnectFailure);
+  await runWindowsControlGateStage("twenty-lifecycle-rounds", runTwentyLifecycleRounds);
+}
+
+if (process.argv[2] === "--parent-crash-fixture") {
+  try {
+    await runParentCrashFixture();
+  } catch {
+    process.exitCode = 1;
+  }
+} else {
+  try {
+    await runInstalledWindowsControlGate();
+    process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
+  } catch {
+    if (liveServer !== undefined) await cleanupTrackedServer(liveServer);
+    process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
+    process.exitCode = 1;
+  }
 }

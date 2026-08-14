@@ -499,7 +499,11 @@ export function validateWorkflowContract(workflow) {
     { name: "Install dependencies", run: "npm ci" },
     { name: "Build CLI", run: "npm run build --workspace @tego/cli" },
     { name: "Typecheck CLI", run: "npm run typecheck --workspace @tego/cli" },
-    { name: "Run Windows control security test", run: windowsControlTestCommand },
+    {
+      name: "Run Windows control security test",
+      run: windowsControlTestCommand,
+      "timeout-minutes": 13,
+    },
   ]);
   const reporterEnvironment = {
     TEGO_POSTGRES_URL: `postgresql://tego_test:tego_test@127.0.0.1:${postgresPort}/tego_next_test`,
