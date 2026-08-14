@@ -73,8 +73,6 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let diagnosticStage = "installed-contract";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -281,42 +279,6 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerPowerShell,
     "-SelfTest",
   ];
-  const prime = spawnSync("powershell.exe", selfTestArguments, {
-    encoding: "utf8",
-    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,
-    shell: false,
-    timeout: 2 * 60 * 1000,
-    windowsHide: true,
-  });
-  const primeCode = prime.stderr.trim();
-  if (prime.error !== undefined) diagnosticStage = "prime-spawn";
-  else if (prime.signal !== null) diagnosticStage = "prime-signal";
-  else if (prime.status !== 0) {
-    const compileDiagnostic =
-      /^(TEGO_TASK4_NON_AUTHORITATIVE_COMPILE_(?:(SOURCE_MISSING|SOURCE_READ)|(SOURCE|COMPILER|OTHER)_(CS\d{4}|NONE|SUCCESS|SPAWN|MISSING)_(L[0-6])))\r?\nTEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED$/u.exec(
-        primeCode,
-      );
-    if (compileDiagnostic !== null) {
-      const compileCategory = compileDiagnostic[2]?.toLowerCase();
-      diagnosticStage =
-        compileCategory === "source_missing" || compileCategory === "source_read"
-          ? `prime-compile-${compileCategory.replace("_", "-")}`
-          : `prime-compile-${compileDiagnostic[3]?.toLowerCase()}-${compileDiagnostic[4]?.toLowerCase()}-${compileDiagnostic[5]?.toLowerCase()}`;
-    } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
-      diagnosticStage = "prime-native";
-    } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED") {
-      diagnosticStage = "prime-powershell";
-    } else diagnosticStage = "prime-exit";
-  } else if (prime.stdout !== "") diagnosticStage = "prime-stdout";
-  else if (Buffer.byteLength(prime.stderr, "utf8") > POWERSHELL_STARTUP_STDERR_MAX_BYTES) {
-    diagnosticStage = "prime-stderr";
-  } else diagnosticStage = "prime-complete";
-  assert.equal(prime.error, undefined);
-  assert.equal(prime.signal, null);
-  assert.equal(prime.status, 0);
-  assert.equal(prime.stdout, "");
-  assert.ok(Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES);
-
   const selfTest = spawnSync("powershell.exe", selfTestArguments, {
     encoding: "utf8",
     maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,
@@ -324,20 +286,6 @@ async function runPowerShellSelfTest(): Promise<void> {
     timeout: 2 * 60 * 1000,
     windowsHide: true,
   });
-  const selfTestCode = selfTest.stderr.trim();
-  if (selfTest.error !== undefined) diagnosticStage = "authoritative-spawn";
-  else if (selfTest.signal !== null) diagnosticStage = "authoritative-signal";
-  else if (selfTest.status !== 0) {
-    if (selfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED") {
-      diagnosticStage = "authoritative-compile";
-    } else if (selfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
-      diagnosticStage = "authoritative-native";
-    } else if (selfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED") {
-      diagnosticStage = "authoritative-powershell";
-    } else diagnosticStage = "authoritative-exit";
-  } else if (selfTest.stdout !== "" || selfTest.stderr !== "") {
-    diagnosticStage = "authoritative-output";
-  } else diagnosticStage = "authoritative-complete";
   assert.equal(selfTest.error, undefined);
   assert.equal(selfTest.signal, null);
   assert.equal(selfTest.status, 0);
@@ -346,12 +294,10 @@ async function runPowerShellSelfTest(): Promise<void> {
 }
 
 async function startLiveDescriptor(): Promise<void> {
-  diagnosticStage = "live-server-handle-descriptor";
   liveServer = await startTrackedServer("live-descriptor");
 }
 
 async function runStatusRequest(): Promise<void> {
-  diagnosticStage = "status-request";
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
 }
@@ -366,7 +312,6 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 }
 
 async function runMalformedFrameFailure(): Promise<void> {
-  diagnosticStage = "malformed-broker-frame-fail-closed";
   const tracked = await startTrackedServer("malformed-frame");
   try {
     await writeMalformedFrame(tracked.broker);
@@ -412,7 +357,6 @@ function isParentFixtureReady(value: unknown): value is ParentFixtureReady {
 }
 
 async function runParentCrashCleanup(): Promise<void> {
-  diagnosticStage = "parent-crash-cleanup";
   const fixture = spawn(
     process.execPath,
     [fileURLToPath(import.meta.url), "--parent-crash-fixture"],
@@ -456,7 +400,6 @@ async function runParentCrashCleanup(): Promise<void> {
 }
 
 async function runBrokerCrashCleanup(): Promise<void> {
-  diagnosticStage = "broker-crash-cleanup";
   const tracked = await startTrackedServer("broker-crash");
   try {
     assert.equal(tracked.broker.kill("SIGKILL"), true);
@@ -471,7 +414,6 @@ async function runBrokerCrashCleanup(): Promise<void> {
 }
 
 async function runReconnectFailure(): Promise<void> {
-  diagnosticStage = "reconnect-failure";
   assert.ok(liveServer !== undefined);
   const tracked = liveServer;
   liveServer = undefined;
@@ -481,7 +423,6 @@ async function runReconnectFailure(): Promise<void> {
 }
 
 async function runTwentyLifecycleRounds(): Promise<void> {
-  diagnosticStage = "twenty-lifecycle-rounds";
   for (let round = 0; round < 20; round += 1) {
     const tracked = await startTrackedServer(`round-${String(round)}`);
     try {
@@ -517,8 +458,13 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
-    if (liveServer !== undefined) await cleanupTrackedServer(liveServer);
+    const owned = liveServer;
+    liveServer = undefined;
+    if (owned !== undefined) {
+      try {
+        await cleanupTrackedServer(owned);
+      } catch {}
+    }
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
     process.exitCode = 1;
   }

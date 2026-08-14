@@ -1045,7 +1045,7 @@ public static class TegoWindowsControlBroker
         {
         }
 
-        private PipeConnection(
+        internal PipeConnection(
             Broker broker,
             SafeFileHandle handle,
             ulong id,

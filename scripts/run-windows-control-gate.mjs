@@ -23,7 +23,7 @@ const requiredWindowsControlGateStages = [
   [
     "powershell-csharp-self-test",
     "runPowerShellSelfTest",
-    ["spawnSync(", '"-SelfTest"', "prime.status", "selfTest.stderr"],
+    ["spawnSync(", '"-SelfTest"', "selfTest.status", "selfTest.stderr"],
   ],
   [
     "live-server-handle-descriptor",
@@ -106,19 +106,18 @@ function hasForbiddenGateFlow(body) {
 
 function hasStrictPowerShellSelfTest(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runPowerShellSelfTest");
-  if (body === undefined || body.includes('"-Endpoint"')) return false;
+  if (
+    body === undefined ||
+    body.includes('"-Endpoint"') ||
+    /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u.test(body)
+  )
+    return false;
   const spawnExpression = 'spawnSync("powershell.exe", selfTestArguments, {';
-  if (body.split(spawnExpression).length - 1 !== 2) return false;
-  if (body.split("maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES").length - 1 !== 2) {
+  if (body.split(spawnExpression).length - 1 !== 1) return false;
+  if (body.split("maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES").length - 1 !== 1) {
     return false;
   }
   const requiredInOrder = [
-    'const prime = spawnSync("powershell.exe", selfTestArguments, {',
-    "assert.equal(prime.error, undefined);",
-    "assert.equal(prime.signal, null);",
-    "assert.equal(prime.status, 0);",
-    'assert.equal(prime.stdout, "");',
-    'Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES',
     'const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
     "assert.equal(selfTest.error, undefined);",
     "assert.equal(selfTest.signal, null);",
@@ -131,7 +130,7 @@ function hasStrictPowerShellSelfTest(source) {
     cursor = body.indexOf(token, cursor + 1);
     if (cursor === -1) return false;
   }
-  return !/process\.(?:stdout|stderr)\.write\([^)]*prime/gu.test(body);
+  return true;
 }
 
 export function validateWindowsControlGateContract({ gateSource, runnerSource }) {
@@ -169,7 +168,10 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
     errors.push("Windows gate stage executors must await their required operation");
   }
   if (!hasStrictPowerShellSelfTest(gateSource)) {
-    errors.push("Windows gate must retain its bounded prime and strict authoritative SelfTest");
+    errors.push("Windows gate must retain one bounded strict authoritative SelfTest");
+  }
+  if (gateSource.includes("TEGO_TASK4_NON_AUTHORITATIVE")) {
+    errors.push("Windows gate cannot retain temporary diagnostic output");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(

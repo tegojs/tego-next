@@ -33,14 +33,6 @@ const windowsControlGateImplementationFixtureBodies = new Map([
     "runPowerShellSelfTest",
     [
       '  const selfTestArguments = ["-SelfTest"];',
-      '  const prime = spawnSync("powershell.exe", selfTestArguments, {',
-      "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
-      "  });",
-      "  assert.equal(prime.error, undefined);",
-      "  assert.equal(prime.signal, null);",
-      "  assert.equal(prime.status, 0);",
-      '  assert.equal(prime.stdout, "");',
-      '  assert.ok(Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES);',
       '  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
       "    maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES,",
       "  });",
@@ -475,7 +467,7 @@ test("Windows control gate validation rejects hidden control flow and implementa
   }
 });
 
-test("Windows gate validation keeps the bounded prime and strict authoritative SelfTest", async (t) => {
+test("Windows gate validation keeps one bounded strict authoritative SelfTest", async (t) => {
   const [{ validateWindowsControlGateContract }, runnerSource, gateSource] = await Promise.all([
     import(
       new URL(
@@ -486,19 +478,28 @@ test("Windows gate validation keeps the bounded prime and strict authoritative S
     readFile(windowsControlGateRunner, "utf8"),
     readFile(windowsControlGateSource, "utf8"),
   ]);
+  assert.equal(
+    gateSource.match(/spawnSync\("powershell\.exe", selfTestArguments, \{/gu)?.length,
+    1,
+  );
+  assert.doesNotMatch(gateSource, /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u);
   const mutations = [
     gateSource.replace(
-      "  assert.equal(prime.status, 0);",
-      "  assert.equal(prime.status, prime.status);",
+      "  assert.equal(selfTest.status, 0);",
+      "  assert.equal(selfTest.status, selfTest.status);",
     ),
     gateSource.replace(
       '  const selfTest = spawnSync("powershell.exe", selfTestArguments, {',
-      "  const selfTest = prime;\n  void ({",
+      '  const selfTest = spawnSync("powershell-disabled.exe", selfTestArguments, {',
     ),
     gateSource.replace('  assert.equal(selfTest.stderr, "");', "  void selfTest.stderr;"),
     gateSource.replace(
-      '  assert.ok(Buffer.byteLength(prime.stderr, "utf8") <= POWERSHELL_STARTUP_STDERR_MAX_BYTES);',
-      "  process.stderr.write(prime.stderr);",
+      "  assert.equal(selfTest.signal, null);",
+      "  assert.equal(selfTest.signal, selfTest.signal);",
+    ),
+    gateSource.replace(
+      "  assert.equal(selfTest.error, undefined);",
+      '  spawnSync("powershell.exe", selfTestArguments, {});\n  assert.equal(selfTest.error, undefined);',
     ),
   ];
 

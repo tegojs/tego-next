@@ -387,6 +387,10 @@ function assertCSharpContract(source) {
   );
   assert.match(pipeConnection, /MarkCompletedWithoutIo\(\)/u);
   assert.match(pipeConnection, /operation\.IssueWrite/u);
+  assert.match(
+    pipeConnection,
+    /internal PipeConnection\(\s*Broker broker,\s*SafeFileHandle handle,\s*ulong id,\s*ManualResetEvent shutdown,/u,
+  );
   assert.doesNotMatch(pipeConnection, /bool synchronous = WriteFile\(/u);
   assert.doesNotMatch(pipeConnection, /_readThread\.Join\(ShutdownTimeoutMilliseconds\)/u);
   assert.ok(
@@ -640,6 +644,11 @@ test("source contracts reject security and lifecycle mutations", async () => {
     mutateOnce(csharp, "_cancellationRequested = true;", ""),
     mutateOnce(csharp, "if (_cancellationRequested)", "if (false)"),
     mutateOnce(csharp, "TestWritePreIssueCancellation();", ""),
+    mutateOnce(
+      csharp,
+      / {8}internal PipeConnection\(\n {12}Broker broker,\n {12}SafeFileHandle handle,\n {12}ulong id,\n {12}ManualResetEvent shutdown,/u,
+      "        private PipeConnection(\n            Broker broker,\n            SafeFileHandle handle,\n            ulong id,\n            ManualResetEvent shutdown,",
+    ),
     mutateOnce(
       csharp,
       "pendingRead.CancellationReason == ReadCancellationReason.Pause",
