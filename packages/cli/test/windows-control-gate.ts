@@ -288,10 +288,18 @@ async function runPowerShellSelfTest(): Promise<void> {
     timeout: 2 * 60 * 1000,
     windowsHide: true,
   });
+  const primeCode = prime.stderr.trim();
   if (prime.error !== undefined) diagnosticStage = "prime-spawn";
   else if (prime.signal !== null) diagnosticStage = "prime-signal";
-  else if (prime.status !== 0) diagnosticStage = "prime-status";
-  else if (prime.stdout !== "") diagnosticStage = "prime-stdout";
+  else if (prime.status !== 0) {
+    if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED") {
+      diagnosticStage = "prime-compile";
+    } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
+      diagnosticStage = "prime-native";
+    } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED") {
+      diagnosticStage = "prime-powershell";
+    } else diagnosticStage = "prime-exit";
+  } else if (prime.stdout !== "") diagnosticStage = "prime-stdout";
   else if (Buffer.byteLength(prime.stderr, "utf8") > POWERSHELL_STARTUP_STDERR_MAX_BYTES) {
     diagnosticStage = "prime-stderr";
   } else diagnosticStage = "prime-complete";
