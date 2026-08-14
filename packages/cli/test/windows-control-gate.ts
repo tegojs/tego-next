@@ -74,6 +74,12 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
+const task4DiagnosticMarker = ["TEGO", "TASK4", "NON", "AUTHORITATIVE"].join("_");
+let nonAuthoritativeStage = "not-entered";
+let nonAuthoritativeReconnectStage = "not-entered";
+let nonAuthoritativeRound = -1;
+let nonAuthoritativeRoundStage = "not-entered";
 
 function isExpectedMalformedServerClose(error: unknown, observedFailure: Error): boolean {
   return (
@@ -255,9 +261,10 @@ async function assertStatus(endpoint: string, requestId: string): Promise<void> 
 }
 
 async function runWindowsControlGateStage(
-  _stage: string,
+  stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
+  nonAuthoritativeStage = stage;
   await operation();
 }
 
@@ -437,15 +444,21 @@ async function runBrokerCrashCleanup(): Promise<void> {
 }
 
 async function runReconnectFailure(): Promise<void> {
+  nonAuthoritativeReconnectStage = "start";
   assert.ok(liveServer !== undefined);
   const tracked = liveServer;
   try {
+    nonAuthoritativeReconnectStage = "server-close";
     await tracked.server.close();
+    nonAuthoritativeReconnectStage = "child-close";
     await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+    nonAuthoritativeReconnectStage = "pipe-proof";
     await assertPipeUnavailable(tracked.endpoint);
     assert.equal(liveServer, tracked);
     liveServer = undefined;
+    nonAuthoritativeReconnectStage = "complete";
   } finally {
+    if (liveServer === tracked) nonAuthoritativeReconnectStage = "fallback-cleanup";
     if (liveServer === tracked) {
       await cleanupTrackedServer(tracked);
       liveServer = undefined;
@@ -455,14 +468,22 @@ async function runReconnectFailure(): Promise<void> {
 
 async function runTwentyLifecycleRounds(): Promise<void> {
   for (let round = 0; round < 20; round += 1) {
+    nonAuthoritativeRound = round;
+    nonAuthoritativeRoundStage = "start";
     let tracked: TrackedServer | undefined = await startTrackedServer(`round-${String(round)}`);
     try {
+      nonAuthoritativeRoundStage = "status";
       await assertStatus(tracked.endpoint, `windows-control-gate-round-${String(round)}`);
+      nonAuthoritativeRoundStage = "server-close";
       await tracked.server.close();
+      nonAuthoritativeRoundStage = "child-close";
       await withDeadline(tracked.brokerClosed, PROCESS_CLEANUP_TIMEOUT_MS);
+      nonAuthoritativeRoundStage = "pipe-proof";
       await assertPipeUnavailable(tracked.endpoint);
       tracked = undefined;
+      nonAuthoritativeRoundStage = "complete";
     } finally {
+      if (tracked !== undefined) nonAuthoritativeRoundStage = "fallback-cleanup";
       if (tracked !== undefined) await cleanupTrackedServer(tracked);
     }
   }
@@ -490,6 +511,13 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
+    process.stderr.write(`${task4DiagnosticMarker}_STAGE:${nonAuthoritativeStage}\n`);
+    process.stderr.write(
+      `${task4DiagnosticMarker}_RECONNECT_STAGE:${nonAuthoritativeReconnectStage}\n`,
+    );
+    process.stderr.write(
+      `${task4DiagnosticMarker}_ROUND:${String(nonAuthoritativeRound)}:${nonAuthoritativeRoundStage}\n`,
+    );
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {
