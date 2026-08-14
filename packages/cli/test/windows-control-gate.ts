@@ -73,8 +73,8 @@ interface ParentFixtureReady {
 
 let currentUserSid: string | undefined;
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after the current Windows RED is localized.
-let diagnosticStage = "bootstrap";
+// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after the PowerShell RED is localized.
+let diagnosticSelfTestSubstage = "installed-paths";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -239,10 +239,9 @@ async function assertStatus(endpoint: string, requestId: string): Promise<void> 
 }
 
 async function runWindowsControlGateStage(
-  stage: string,
+  _stage: string,
   operation: () => Promise<void>,
 ): Promise<void> {
-  diagnosticStage = stage;
   await operation();
 }
 
@@ -269,6 +268,7 @@ async function initializeCurrentUserSid(): Promise<void> {
 }
 
 async function runPowerShellSelfTest(): Promise<void> {
+  diagnosticSelfTestSubstage = "installed-paths";
   assert.equal(process.platform, "win32", "Windows control gate requires win32");
   assert.equal(process.arch, "x64", "Windows control gate requires x64");
   const consumerRoot = await realpath(requiredEnvironment("TEGO_WINDOWS_CONTROL_CONSUMER_ROOT"));
@@ -293,8 +293,10 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
+  diagnosticSelfTestSubstage = "identity";
   await initializeCurrentUserSid();
 
+  diagnosticSelfTestSubstage = "self-test-invocation";
   const selfTest = spawnSync(
     "powershell.exe",
     [
@@ -309,6 +311,14 @@ async function runPowerShellSelfTest(): Promise<void> {
     ],
     { encoding: "utf8", shell: false, timeout: 2 * 60 * 1000, windowsHide: true },
   );
+  const fixedSelfTestCode = selfTest.stderr.trim();
+  if (fixedSelfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED") {
+    diagnosticSelfTestSubstage = "add-type-compile";
+  } else if (fixedSelfTestCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
+    diagnosticSelfTestSubstage = "native-self-test";
+  } else {
+    diagnosticSelfTestSubstage = "result-contract";
+  }
   assert.equal(selfTest.error, undefined);
   assert.equal(selfTest.signal, null);
   assert.equal(selfTest.status, 0);
@@ -482,7 +492,7 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
+    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_SUBSTAGE:${diagnosticSelfTestSubstage}\n`);
     if (liveServer !== undefined) await cleanupTrackedServer(liveServer);
     process.stderr.write(`${WINDOWS_CONTROL_GATE_FAILURE}\n`);
     process.exitCode = 1;
