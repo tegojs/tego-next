@@ -243,6 +243,28 @@ async function runWindowsControlGateStage(
   await operation();
 }
 
+async function initializeCurrentUserSid(): Promise<void> {
+  const identity = spawnSync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      '[Console]::Out.WriteLine("{0}.{1}", $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor); [Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
+    ],
+    { encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true },
+  );
+  assert.equal(identity.error, undefined);
+  assert.equal(identity.signal, null);
+  assert.equal(identity.status, 0);
+  assert.equal(identity.stderr, "");
+  const identityLines = identity.stdout.trim().split(/\r?\n/u);
+  assert.equal(identityLines[0], "5.1", "PowerShell 5.1 is mandatory");
+  assert.match(identityLines[1] ?? "", /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
+  currentUserSid = identityLines[1];
+}
+
 async function runPowerShellSelfTest(): Promise<void> {
   assert.equal(process.platform, "win32", "Windows control gate requires win32");
   assert.equal(process.arch, "x64", "Windows control gate requires x64");
@@ -268,26 +290,7 @@ async function runPowerShellSelfTest(): Promise<void> {
     brokerCSharp,
     join(installedCliRoot, "dist", "src", "control", "windows-control-broker.cs"),
   );
-
-  const identity = spawnSync(
-    "powershell.exe",
-    [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      '[Console]::Out.WriteLine("{0}.{1}", $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor); [Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
-    ],
-    { encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true },
-  );
-  assert.equal(identity.error, undefined);
-  assert.equal(identity.signal, null);
-  assert.equal(identity.status, 0);
-  assert.equal(identity.stderr, "");
-  const identityLines = identity.stdout.trim().split(/\r?\n/u);
-  assert.equal(identityLines[0], "5.1", "PowerShell 5.1 is mandatory");
-  assert.match(identityLines[1] ?? "", /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
-  currentUserSid = identityLines[1];
+  await initializeCurrentUserSid();
 
   const selfTest = spawnSync(
     "powershell.exe",
@@ -343,6 +346,7 @@ async function runMalformedFrameFailure(): Promise<void> {
 }
 
 async function runParentCrashFixture(): Promise<void> {
+  await initializeCurrentUserSid();
   const tracked = await startTrackedServer("parent-crash");
   if (process.send === undefined) throw new Error("Windows parent fixture requires IPC");
   await new Promise<void>((resolveSend, rejectSend) => {

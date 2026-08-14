@@ -222,6 +222,18 @@ test("Windows control gate source contract fixes every real stage before the sol
   assert.deepEqual(validateWindowsControlGateContract({ gateSource, runnerSource }), []);
 });
 
+test("Windows parent-crash fixture initializes its own descriptor identity", async () => {
+  const gateSource = await readFile(windowsControlGateSource, "utf8");
+  assert.match(
+    gateSource,
+    /async function initializeCurrentUserSid\(\): Promise<void> \{[\s\S]*?currentUserSid = identityLines\[1\];[\s\S]*?^\}/mu,
+  );
+  assert.match(
+    gateSource,
+    /async function runParentCrashFixture\(\): Promise<void> \{\s+await initializeCurrentUserSid\(\);\s+const tracked = await startTrackedServer\("parent-crash"\);/u,
+  );
+});
+
 test("Windows control gate source validation rejects removed, reordered, softened, or no-op stages", async (t) => {
   const { validateWindowsControlGateContract } = await import(
     new URL(
