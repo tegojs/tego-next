@@ -74,7 +74,7 @@ interface ParentFixtureReady {
 
 let liveServer: TrackedServer | undefined;
 // TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let diagnosticStage = "powershell-csharp-self-test";
+let diagnosticStage = "powershell-selftest-unclassified";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -288,6 +288,19 @@ async function runPowerShellSelfTest(): Promise<void> {
     timeout: 2 * 60 * 1000,
     windowsHide: true,
   });
+  if (selfTest.error !== undefined) diagnosticStage = "powershell-selftest-spawn";
+  else if (selfTest.signal !== null) diagnosticStage = "powershell-selftest-signal";
+  else if (selfTest.status !== 0) {
+    if (/^TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED\r?\n$/u.test(selfTest.stderr)) {
+      diagnosticStage = "powershell-selftest-compile";
+    } else if (/^TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED\r?\n$/u.test(selfTest.stderr)) {
+      diagnosticStage = "powershell-selftest-native";
+    } else if (/^TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED\r?\n$/u.test(selfTest.stderr)) {
+      diagnosticStage = "powershell-selftest-version";
+    } else diagnosticStage = "powershell-selftest-nonzero-other";
+  } else if (selfTest.stdout !== "" || selfTest.stderr !== "") {
+    diagnosticStage = "powershell-selftest-output";
+  } else diagnosticStage = "powershell-selftest-complete";
   assert.equal(selfTest.error, undefined);
   assert.equal(selfTest.signal, null);
   assert.equal(selfTest.status, 0);
