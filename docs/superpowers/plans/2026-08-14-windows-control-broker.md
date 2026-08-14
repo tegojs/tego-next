@@ -24,7 +24,6 @@
 **Files:**
 - Create: `packages/cli/src/control/windows-broker-protocol.ts`
 - Create: `packages/cli/test/windows-broker-protocol.test.ts`
-- Modify: `packages/cli/src/index.ts`
 
 **Interfaces:**
 - Produces:
@@ -84,7 +83,7 @@ Run the focused test, CLI typecheck, and Biome. Expected: all pass with no skipp
 - [ ] **Step 6: Commit**
 
 ```sh
-git add packages/cli/src/control/windows-broker-protocol.ts packages/cli/test/windows-broker-protocol.test.ts packages/cli/src/index.ts
+git add packages/cli/src/control/windows-broker-protocol.ts packages/cli/test/windows-broker-protocol.test.ts
 git commit -m "feat(cli): define Windows broker protocol"
 ```
 
@@ -148,6 +147,7 @@ git commit -m "feat(cli): add Windows control broker"
 
 **Files:**
 - Create: `packages/cli/src/control/windows-broker.ts`
+- Create: `packages/cli/src/control/windows-broker-security.ts`
 - Create: `packages/cli/test/windows-broker.test.ts`
 - Modify: `packages/cli/src/control/server.ts`
 - Modify: `packages/cli/test/control.test.ts`
@@ -199,7 +199,11 @@ In `startControlServer`, select Unix `net.Server` unless `process.platform === "
 
 - [ ] **Step 6: Replace admission-barrier tests and remove the obsolete helper**
 
-Delete post-listen mutation/barrier logic only after tests prove no Windows `net.Server` is created, no connection dispatches before broker READY, and broker failure leaves no reachable endpoint. Preserve injected platform-independent policy tests through an injectable broker factory.
+Move the strict descriptor types and validator into `windows-broker-security.ts`, then delete only the
+post-listen helper spawner/adapter and admission-barrier logic. Tests must prove no Windows
+`net.Server` is created, no connection dispatches before broker READY, and broker failure leaves no
+reachable endpoint. Preserve injected platform-independent policy tests through an injectable
+broker factory and validate every broker READY descriptor again in TypeScript.
 
 - [ ] **Step 7: Run GREEN and commit**
 
