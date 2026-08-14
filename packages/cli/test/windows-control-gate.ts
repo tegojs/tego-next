@@ -257,14 +257,24 @@ async function initializeCurrentUserSid(): Promise<void> {
     ],
     { encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true },
   );
+  const identityLines =
+    typeof identity.stdout === "string" ? identity.stdout.trim().split(/\r?\n/u) : [];
+  const identitySid = identityLines[1] ?? "";
+  if (identity.error !== undefined) diagnosticSelfTestSubstage = "identity-spawn";
+  else if (identity.signal !== null) diagnosticSelfTestSubstage = "identity-signal";
+  else if (identity.status !== 0) diagnosticSelfTestSubstage = "identity-exit";
+  else if (identity.stderr !== "") diagnosticSelfTestSubstage = "identity-stderr";
+  else if (identityLines[0] !== "5.1") diagnosticSelfTestSubstage = "identity-version";
+  else if (!/^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u.test(identitySid)) {
+    diagnosticSelfTestSubstage = "identity-sid";
+  } else diagnosticSelfTestSubstage = "identity-result-contract";
   assert.equal(identity.error, undefined);
   assert.equal(identity.signal, null);
   assert.equal(identity.status, 0);
   assert.equal(identity.stderr, "");
-  const identityLines = identity.stdout.trim().split(/\r?\n/u);
   assert.equal(identityLines[0], "5.1", "PowerShell 5.1 is mandatory");
-  assert.match(identityLines[1] ?? "", /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
-  currentUserSid = identityLines[1];
+  assert.match(identitySid, /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))+$/u);
+  currentUserSid = identitySid;
 }
 
 async function runPowerShellSelfTest(): Promise<void> {
