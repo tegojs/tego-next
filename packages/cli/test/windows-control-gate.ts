@@ -293,11 +293,15 @@ async function runPowerShellSelfTest(): Promise<void> {
   else if (prime.signal !== null) diagnosticStage = "prime-signal";
   else if (prime.status !== 0) {
     const compileDiagnostic =
-      /^(TEGO_TASK4_NON_AUTHORITATIVE_COMPILE_(SYNTAX|SYMBOL|TYPE|STATE|ASSEMBLY|OTHER)_(L[0-6]))\r?\nTEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED$/u.exec(
+      /^(TEGO_TASK4_NON_AUTHORITATIVE_COMPILE_(?:(SOURCE_MISSING|SOURCE_READ)|(SOURCE|COMPILER|OTHER)_(CS\d{4}|NONE|SUCCESS|SPAWN|MISSING)_(L[0-6])))\r?\nTEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED$/u.exec(
         primeCode,
       );
     if (compileDiagnostic !== null) {
-      diagnosticStage = `prime-compile-${compileDiagnostic[2]?.toLowerCase()}-${compileDiagnostic[3]?.toLowerCase()}`;
+      const compileCategory = compileDiagnostic[2]?.toLowerCase();
+      diagnosticStage =
+        compileCategory === "source_missing" || compileCategory === "source_read"
+          ? `prime-compile-${compileCategory.replace("_", "-")}`
+          : `prime-compile-${compileDiagnostic[3]?.toLowerCase()}-${compileDiagnostic[4]?.toLowerCase()}-${compileDiagnostic[5]?.toLowerCase()}`;
     } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED") {
       diagnosticStage = "prime-native";
     } else if (primeCode === "TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED") {
