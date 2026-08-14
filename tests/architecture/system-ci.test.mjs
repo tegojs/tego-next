@@ -545,10 +545,12 @@ test("Windows malformed-frame cleanup transfers ownership only after exact child
       "    await Promise.resolve();",
     ),
     gateSource.replace("    tracked = undefined;\n", ""),
-    gateSource.replace(
-      "    await assertPipeUnavailable(tracked.endpoint);\n    tracked = undefined;",
-      "    tracked = undefined;\n    await assertPipeUnavailable(tracked.endpoint);",
-    ),
+    gateSource
+      .replace("    tracked = undefined;\n", "")
+      .replace(
+        "    await assertPipeUnavailable(tracked.endpoint);",
+        "    tracked = undefined;\n    await assertPipeUnavailable(tracked.endpoint);",
+      ),
     gateSource.replace(
       "    if (tracked !== undefined) await cleanupTrackedServer(tracked);",
       "    await cleanupTrackedServer(tracked);",
