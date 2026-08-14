@@ -13,21 +13,57 @@ const helperDestination = join(
   "control",
   "windows-pipe-security.ps1",
 );
+const brokerPowerShellSource = join(root, "scripts", "windows-control-broker.ps1");
+const brokerPowerShellDestination = join(
+  root,
+  "packages",
+  "cli",
+  "dist",
+  "src",
+  "control",
+  "windows-control-broker.ps1",
+);
+const brokerCSharpSource = join(root, "scripts", "windows-control-broker.cs");
+const brokerCSharpDestination = join(
+  root,
+  "packages",
+  "cli",
+  "dist",
+  "src",
+  "control",
+  "windows-control-broker.cs",
+);
 const cliBinary = join(root, "packages", "cli", "dist", "src", "bin.js");
 
 export async function finalizeCliBuild({
   binary,
+  brokerCSharpDestination,
+  brokerCSharpSource,
+  brokerPowerShellDestination,
+  brokerPowerShellSource,
   helperDestination: destination,
   helperSource: source,
   platform = process.platform,
 }) {
-  await mkdir(dirname(destination), { recursive: true });
-  await copyFile(source, destination);
+  await Promise.all(
+    [destination, brokerPowerShellDestination, brokerCSharpDestination].map((asset) =>
+      mkdir(dirname(asset), { recursive: true }),
+    ),
+  );
+  await Promise.all([
+    copyFile(source, destination),
+    copyFile(brokerPowerShellSource, brokerPowerShellDestination),
+    copyFile(brokerCSharpSource, brokerCSharpDestination),
+  ]);
   if (platform !== "win32") await chmod(binary, 0o755);
 }
 
 await finalizeCliBuild({
   binary: cliBinary,
+  brokerCSharpDestination,
+  brokerCSharpSource,
+  brokerPowerShellDestination,
+  brokerPowerShellSource,
   helperDestination,
   helperSource,
 });

@@ -27,6 +27,7 @@
     "dist/src/**/*.d.ts",
     "dist/src/**/*.d.ts.map",
     "dist/src/**/*.ps1",
+    "dist/src/**/*.cs",
     "README.md",
     "LICENSE"
   ],

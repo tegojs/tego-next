@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execute = promisify(execFile);
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const publicDirectories = [
@@ -69,14 +73,31 @@ test("CLI build finalization makes a freshly emitted binary executable", async (
   const binary = join(directory, "bin.js");
   const helperSource = join(directory, "source.ps1");
   const helperDestination = join(directory, "control", "windows-pipe-security.ps1");
+  const brokerPowerShellSource = join(directory, "windows-control-broker.ps1");
+  const brokerPowerShellDestination = join(directory, "control", "windows-control-broker.ps1");
+  const brokerCSharpSource = join(directory, "windows-control-broker.cs");
+  const brokerCSharpDestination = join(directory, "control", "windows-control-broker.cs");
 
   try {
     await writeFile(binary, "#!/usr/bin/env node\n", { mode: 0o644 });
     await writeFile(helperSource, "helper\n");
-    await finalizeCliBuild({ binary, helperDestination, helperSource, platform: "linux" });
+    await writeFile(brokerPowerShellSource, "broker powershell\n");
+    await writeFile(brokerCSharpSource, "broker csharp\n");
+    await finalizeCliBuild({
+      binary,
+      brokerCSharpDestination,
+      brokerCSharpSource,
+      brokerPowerShellDestination,
+      brokerPowerShellSource,
+      helperDestination,
+      helperSource,
+      platform: "linux",
+    });
 
     assert.equal((await lstat(binary)).mode & 0o777, 0o755);
     assert.equal(await readFile(helperDestination, "utf8"), "helper\n");
+    assert.equal(await readFile(brokerPowerShellDestination, "utf8"), "broker powershell\n");
+    assert.equal(await readFile(brokerCSharpDestination, "utf8"), "broker csharp\n");
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -122,6 +143,18 @@ test("packed public packages contain only consumer assets and install cleanly", 
           ),
           "CLI package must include the fixed Windows pipe-security helper",
         );
+        for (const asset of ["windows-control-broker.ps1", "windows-control-broker.cs"]) {
+          const packedPath = `package/dist/src/control/${asset}`;
+          assert.ok(
+            workspace.files.some((file) => file.path === packedPath),
+            `CLI package must include ${asset}`,
+          );
+          const repositorySource = await readFile(join(root, "scripts", asset));
+          const packedSource = Buffer.from(
+            (await execute("tar", ["-xOf", workspace.tarball, packedPath])).stdout,
+          );
+          assert.deepEqual(packedSource, repositorySource, `${asset} must be byte-identical`);
+        }
       }
     }
     await verifyPackedConsumer(packed, directory);
