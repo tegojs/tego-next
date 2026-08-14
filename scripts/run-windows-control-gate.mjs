@@ -106,7 +106,12 @@ function hasForbiddenGateFlow(body) {
 
 function hasStrictPowerShellSelfTest(source) {
   const body = uniqueTopLevelAsyncFunctionBody(source, "runPowerShellSelfTest");
-  if (body === undefined || body.includes('"-Endpoint"') || /\bprime\b/u.test(body)) return false;
+  if (
+    body === undefined ||
+    body.includes('"-Endpoint"') ||
+    /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u.test(body)
+  )
+    return false;
   const spawnExpression = 'spawnSync("powershell.exe", selfTestArguments, {';
   if (body.split(spawnExpression).length - 1 !== 1) return false;
   if (body.split("maxBuffer: POWERSHELL_STARTUP_STDERR_MAX_BYTES").length - 1 !== 1) {
@@ -164,6 +169,9 @@ export function validateWindowsControlGateContract({ gateSource, runnerSource })
   }
   if (!hasStrictPowerShellSelfTest(gateSource)) {
     errors.push("Windows gate must retain one bounded strict authoritative SelfTest");
+  }
+  if (gateSource.includes("TEGO_TASK4_NON_AUTHORITATIVE")) {
+    errors.push("Windows gate cannot retain temporary diagnostic output");
   }
   for (const [stage, implementation, evidence] of requiredWindowsControlGateStages) {
     const implementationBody = uniqueTopLevelAsyncFunctionBody(

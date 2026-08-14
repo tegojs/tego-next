@@ -482,7 +482,7 @@ test("Windows gate validation keeps one bounded strict authoritative SelfTest", 
     gateSource.match(/spawnSync\("powershell\.exe", selfTestArguments, \{/gu)?.length,
     1,
   );
-  assert.doesNotMatch(gateSource, /\bprime\b/u);
+  assert.doesNotMatch(gateSource, /\bprime\b|TEGO_TASK4_NON_AUTHORITATIVE/u);
   const mutations = [
     gateSource.replace(
       "  assert.equal(selfTest.status, 0);",

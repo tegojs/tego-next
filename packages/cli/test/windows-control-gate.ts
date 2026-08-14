@@ -73,8 +73,6 @@ interface ParentFixtureReady {
 }
 
 let liveServer: TrackedServer | undefined;
-// TEMPORARY NON-AUTHORITATIVE TASK 4 DIAGNOSTIC. Remove after this Windows RED is localized.
-let diagnosticStage = "powershell-selftest-unclassified";
 
 function gateOperations(): ControlRuntimeOperations {
   return {
@@ -288,29 +286,6 @@ async function runPowerShellSelfTest(): Promise<void> {
     timeout: 2 * 60 * 1000,
     windowsHide: true,
   });
-  if (selfTest.error !== undefined) diagnosticStage = "powershell-selftest-spawn";
-  else if (selfTest.signal !== null) diagnosticStage = "powershell-selftest-signal";
-  else if (selfTest.status !== 0) {
-    if (/^TEGO_WINDOWS_CONTROL_BROKER_COMPILE_FAILED\r?\n$/u.test(selfTest.stderr)) {
-      diagnosticStage = "powershell-selftest-compile";
-    } else {
-      const nativeDiagnostic =
-        /^TEGO_TASK4_NON_AUTHORITATIVE_SELFTEST_(CODEC|DESCRIPTOR|PARENT_WATCH|INVALID_FRAME|RESOURCE_CLEANUP|PRIVATE_PIPE|WRITE_CANCEL|PENDING_CLOSE|PAUSE_RESUME|PIPE_CLEANUP)\r?\nTEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED\r?\n$/u.exec(
-          selfTest.stderr,
-        );
-      if (nativeDiagnostic !== null) {
-        diagnosticStage = `powershell-selftest-native-${nativeDiagnostic[1]?.toLowerCase().replaceAll("_", "-")}`;
-      } else if (/^TEGO_WINDOWS_CONTROL_BROKER_SELF_TEST_FAILED\r?\n$/u.test(selfTest.stderr)) {
-        diagnosticStage = "powershell-selftest-native-unclassified";
-      } else if (
-        /^TEGO_WINDOWS_CONTROL_BROKER_POWERSHELL_UNSUPPORTED\r?\n$/u.test(selfTest.stderr)
-      ) {
-        diagnosticStage = "powershell-selftest-version";
-      } else diagnosticStage = "powershell-selftest-nonzero-other";
-    }
-  } else if (selfTest.stdout !== "" || selfTest.stderr !== "") {
-    diagnosticStage = "powershell-selftest-output";
-  } else diagnosticStage = "powershell-selftest-complete";
   assert.equal(selfTest.error, undefined);
   assert.equal(selfTest.signal, null);
   assert.equal(selfTest.status, 0);
@@ -319,12 +294,10 @@ async function runPowerShellSelfTest(): Promise<void> {
 }
 
 async function startLiveDescriptor(): Promise<void> {
-  diagnosticStage = "live-server-handle-descriptor";
   liveServer = await startTrackedServer("live-descriptor");
 }
 
 async function runStatusRequest(): Promise<void> {
-  diagnosticStage = "status-request";
   assert.ok(liveServer !== undefined);
   await assertStatus(liveServer.endpoint, "windows-control-gate-status");
 }
@@ -339,7 +312,6 @@ async function writeMalformedFrame(broker: ChildProcess): Promise<void> {
 }
 
 async function runMalformedFrameFailure(): Promise<void> {
-  diagnosticStage = "malformed-broker-frame-fail-closed";
   const tracked = await startTrackedServer("malformed-frame");
   try {
     await writeMalformedFrame(tracked.broker);
@@ -385,7 +357,6 @@ function isParentFixtureReady(value: unknown): value is ParentFixtureReady {
 }
 
 async function runParentCrashCleanup(): Promise<void> {
-  diagnosticStage = "parent-crash-cleanup";
   const fixture = spawn(
     process.execPath,
     [fileURLToPath(import.meta.url), "--parent-crash-fixture"],
@@ -429,7 +400,6 @@ async function runParentCrashCleanup(): Promise<void> {
 }
 
 async function runBrokerCrashCleanup(): Promise<void> {
-  diagnosticStage = "broker-crash-cleanup";
   const tracked = await startTrackedServer("broker-crash");
   try {
     assert.equal(tracked.broker.kill("SIGKILL"), true);
@@ -444,7 +414,6 @@ async function runBrokerCrashCleanup(): Promise<void> {
 }
 
 async function runReconnectFailure(): Promise<void> {
-  diagnosticStage = "reconnect-failure";
   assert.ok(liveServer !== undefined);
   const tracked = liveServer;
   liveServer = undefined;
@@ -454,7 +423,6 @@ async function runReconnectFailure(): Promise<void> {
 }
 
 async function runTwentyLifecycleRounds(): Promise<void> {
-  diagnosticStage = "twenty-lifecycle-rounds";
   for (let round = 0; round < 20; round += 1) {
     const tracked = await startTrackedServer(`round-${String(round)}`);
     try {
@@ -490,7 +458,6 @@ if (process.argv[2] === "--parent-crash-fixture") {
     await runInstalledWindowsControlGate();
     process.stdout.write(`${WINDOWS_CONTROL_GATE_CHILD_MARKER}\n`);
   } catch {
-    process.stderr.write(`TEGO_TASK4_NON_AUTHORITATIVE_STAGE:${diagnosticStage}\n`);
     const owned = liveServer;
     liveServer = undefined;
     if (owned !== undefined) {

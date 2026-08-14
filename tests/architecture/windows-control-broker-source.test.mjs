@@ -245,6 +245,10 @@ function assertCSharpContract(source) {
   const completeOperation = balancedBlock(overlapped, "internal bool Complete(");
   const writer = balancedBlock(source, "sealed class ParentFrameWriter");
   const selfTest = balancedBlock(source, "public static int SelfTest(");
+  const descriptorSelfTest = balancedBlock(
+    source,
+    "private static void TestDescriptorConstruction(",
+  );
   const x64Guard = balancedBlock(source, "private static bool IsX64Process(");
   const pipeConnection = balancedBlock(source, "private sealed class PipeConnection");
   const broker = balancedBlock(source, "private sealed class Broker : IDisposable");
@@ -458,6 +462,7 @@ function assertCSharpContract(source) {
   assert.match(selfTest, /TestRepeatedPipeCleanup\(\)/u);
   assert.match(selfTest, /TestWritePreIssueCancellation\(\)/u);
   assert.match(selfTest, /TestPendingCloseAdmission\(\)/u);
+  assert.match(descriptorSelfTest, /callback \? new byte\[\] \{ 1, 0, 0, 0 \} : null/u);
   const pendingCloseSelfTest = balancedBlock(
     source,
     "private static void TestPendingCloseAdmission(",
@@ -644,6 +649,11 @@ test("source contracts reject security and lifecycle mutations", async () => {
     mutateOnce(csharp, "_cancellationRequested = true;", ""),
     mutateOnce(csharp, "if (_cancellationRequested)", "if (false)"),
     mutateOnce(csharp, "TestWritePreIssueCancellation();", ""),
+    mutateOnce(
+      csharp,
+      "callback ? new byte[] { 1, 0, 0, 0 } : null",
+      "callback ? new byte[] { 1 } : null",
+    ),
     mutateOnce(
       csharp,
       / {8}internal PipeConnection\(\n {12}Broker broker,\n {12}SafeFileHandle handle,\n {12}ulong id,\n {12}ManualResetEvent shutdown,/u,
