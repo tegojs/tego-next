@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const brokerPowerShellPath = new URL("../../scripts/windows-control-broker.ps1", import.meta.url);
 const brokerCSharpPath = new URL("../../scripts/windows-control-broker.cs", import.meta.url);
+const brokerAdapterPath = new URL(
+  "../../packages/cli/src/control/windows-broker.ts",
+  import.meta.url,
+);
 const taskOneProtocolPath = new URL(
   "../../packages/cli/src/control/windows-broker-protocol.ts",
   import.meta.url,
@@ -597,6 +601,22 @@ test("Windows broker protocol constants and directions exactly match Task 1", as
 
   assert.deepEqual(Object.keys(taskOneProtocol.types), expectedFrameNames);
   assert.deepEqual(brokerProtocol, taskOneProtocol);
+});
+
+test("Node close acknowledgement deadline covers native write and global settlement", async () => {
+  const [adapter, csharp] = await Promise.all([
+    readFile(brokerAdapterPath, "utf8"),
+    readFile(brokerCSharpPath, "utf8"),
+  ]);
+  const acknowledgementTimeout = Number(
+    adapter
+      .match(/WINDOWS_BROKER_CLOSE_ACKNOWLEDGEMENT_TIMEOUT_MS = ([\d_]+);/u)?.[1]
+      ?.replaceAll("_", ""),
+  );
+  const operationTimeout = Number(csharp.match(/OperationTimeoutMilliseconds = (\d+);/u)?.[1]);
+  const shutdownTimeout = Number(csharp.match(/ShutdownTimeoutMilliseconds = (\d+);/u)?.[1]);
+
+  assert.equal(acknowledgementTimeout, operationTimeout + shutdownTimeout + 1_000);
 });
 
 test("PowerShell is a fixed validating adjacent-source entry point", async () => {
