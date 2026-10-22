@@ -52,7 +52,7 @@ The runnable example is in `examples/echo-plugin`.
 
 ## Requirements
 
-- Node.js 26.5.0
+- Node.js 26.12.1
 - npm 11.13.0
 - Docker or a local PostgreSQL 16 server only for PostgreSQL integration and
   multi-Main tests
@@ -92,7 +92,7 @@ the single-Main real-process flow. PostgreSQL integration and multi-Main
 takeover remain release and CI gates.
 
 Release verification is intentionally stricter. From a clean working tree,
-using exactly Node.js 26.5.0 and npm 11.13.0, provide a PostgreSQL 16 URL:
+using exactly Node.js 26.12.1 and npm 11.13.0, provide a PostgreSQL 16 URL:
 
 ```sh
 TEGO_POSTGRES_URL=postgresql://tego_test:tego_test@127.0.0.1:55432/tego_next_test \

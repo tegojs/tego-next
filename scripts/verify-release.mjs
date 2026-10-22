@@ -9,7 +9,7 @@ import { load as parseYaml } from "js-yaml";
 import { resolveNpmCli, runManagedProcessTree } from "./run-ci-test.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const expectedNodeVersion = "v26.5.0";
+const expectedNodeVersion = "v26.12.1";
 const expectedNpmVersion = "11.13.0";
 const defaultReleaseTimeoutMs = 10 * 60 * 1000;
 const npmCli = resolveNpmCli();

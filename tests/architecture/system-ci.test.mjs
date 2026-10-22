@@ -210,7 +210,7 @@ test("release verification preflight fails closed with structured diagnostics", 
   );
   const valid = {
     gitStatus: "",
-    nodeVersion: "v26.5.0",
+    nodeVersion: "v26.12.1",
     npmVersion: "11.13.0",
     postgresUrl: "postgresql://localhost/tego",
     workflow: await readFile(workflowPath, "utf8"),
@@ -243,7 +243,7 @@ test("CI workflow validation rejects every disabled, soft-fail, misplaced, no-op
   );
   const base = {
     gitStatus: "",
-    nodeVersion: "v26.5.0",
+    nodeVersion: "v26.12.1",
     npmVersion: "11.13.0",
     postgresUrl: "postgresql://localhost/tego",
   };
@@ -283,7 +283,7 @@ test("CI workflow validation requires automatic pull-request and main push trigg
   );
   const base = {
     gitStatus: "",
-    nodeVersion: "v26.5.0",
+    nodeVersion: "v26.12.1",
     npmVersion: "11.13.0",
     postgresUrl: "postgresql://localhost/tego",
   };
@@ -324,7 +324,7 @@ test("CI workflow validation requires the deterministic package step after build
   const mutation = `${workflow.slice(0, step.start)}${workflow.slice(step.end)}`;
   const diagnostics = validateReleasePreflight({
     gitStatus: "",
-    nodeVersion: "v26.5.0",
+    nodeVersion: "v26.12.1",
     npmVersion: "11.13.0",
     postgresUrl: "postgresql://localhost/tego",
     workflow: mutation,
@@ -343,7 +343,7 @@ test("CI workflow validation rejects extra or duplicate PostgreSQL health flags"
   );
   const base = {
     gitStatus: "",
-    nodeVersion: "v26.5.0",
+    nodeVersion: "v26.12.1",
     npmVersion: "11.13.0",
     postgresUrl: "postgresql://localhost/tego",
   };
@@ -410,7 +410,7 @@ test("CI workflow validation binds action review comments to their required step
   for (const mutation of mutations) {
     const diagnostics = validateReleasePreflight({
       gitStatus: "",
-      nodeVersion: "v26.5.0",
+      nodeVersion: "v26.12.1",
       npmVersion: "11.13.0",
       postgresUrl: "postgresql://localhost/tego",
       workflow: mutation,

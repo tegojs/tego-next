@@ -197,7 +197,7 @@ test("@spec:runtime-operations/reproducible-development-environment/contributor-
     assert.match(contributor, new RegExp(`^${heading}$`, "mu"));
   }
   for (const marker of [
-    "Node.js 26.5.0",
+    "Node.js 26.12.1",
     "npm 11.13.0",
     "npm ci",
     "npm run openspec:validate",
