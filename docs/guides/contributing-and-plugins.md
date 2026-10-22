@@ -7,10 +7,10 @@ exists in phase one. Architecture and deployment details live in
 
 ## Exact toolchain setup
 
-Use exactly Node.js 26.5.0 and npm 11.13.0. The Node version is pinned in
+Use exactly Node.js 26.12.1 and npm 11.13.0. The Node version is pinned in
 `.node-version`; the npm version is pinned in `package.json`.
 
-After installing Node.js 26.5.0 with your version manager, install and verify
+After installing Node.js 26.12.1 with your version manager, install and verify
 the pinned npm:
 
 ```sh
@@ -19,7 +19,7 @@ node --version
 npm --version
 ```
 
-The expected output is `v26.5.0` and `11.13.0`. Then install the exact lockfile
+The expected output is `v26.12.1` and `11.13.0`. Then install the exact lockfile
 graph and build the workspace:
 
 ```sh

@@ -11,7 +11,7 @@ test("README documents project scope and executable contributor paths", async ()
 
   for (const marker of [
     "# Tego Next",
-    "Node.js 26.5.0",
+    "Node.js 26.12.1",
     "npm ci",
     "npm run build",
     "npm run typecheck",
